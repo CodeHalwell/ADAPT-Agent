@@ -1,7 +1,10 @@
 """Core type definitions for ADAPT-Agent."""
 
 from typing import Any, Dict, List, Optional, Protocol, TypedDict, Union
-from typing_extensions import NotRequired
+try:
+    from typing import NotRequired
+except ImportError:
+    from typing_extensions import NotRequired
 
 
 class AgentMessage(TypedDict):

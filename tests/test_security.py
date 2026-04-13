@@ -74,3 +74,15 @@ def test_taint_tracker_sanitize():
     
     tracker.sanitize("data1")
     assert not tracker.is_tainted("data1")
+
+def test_firewall_crashing_custom_filter():
+    """Test that a crashing custom filter does not block input or crash the app."""
+    firewall = Firewall()
+
+    def crashing_filter(content: str) -> bool:
+        raise ValueError("Filter crashed")
+
+    firewall.add_custom_filter(crashing_filter)
+
+    # Should not raise exception and should return True (allowed)
+    assert firewall.check_input("Test content")
