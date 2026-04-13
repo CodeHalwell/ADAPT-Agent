@@ -74,3 +74,45 @@ def test_taint_tracker_sanitize():
     
     tracker.sanitize("data1")
     assert not tracker.is_tainted("data1")
+
+def test_taint_tracker_get_stats():
+    """Test getting taint tracking statistics."""
+    tracker = TaintTracker()
+
+    # Check initial empty stats
+    stats = tracker.get_stats()
+    assert stats["total_sources"] == 0
+    assert stats["tainted_data_count"] == 0
+    assert stats["propagation_count"] == 0
+    assert stats["taint_level_distribution"] == {}
+
+    # Register some sources
+    tracker.register_source("source1", "user_input", TaintLevel.HIGH)
+    tracker.register_source("source2", "external_api", TaintLevel.LOW)
+    tracker.register_source("source3", "database", TaintLevel.HIGH)
+
+    # Mark data as tainted
+    tracker.mark_tainted("data1", ["source1", "source2"])
+    tracker.mark_tainted("data2", ["source3"])
+
+    # Propagate taint
+    tracker.propagate_taint("data1", "data3", "copy")
+
+    # Check populated stats
+    stats = tracker.get_stats()
+
+    assert stats["total_sources"] == 3
+    # data1, data2, data3
+    assert stats["tainted_data_count"] == 3
+    assert stats["propagation_count"] == 1
+
+    # data1 is tainted by source1 (HIGH) and source2 (LOW)
+    # data2 is tainted by source3 (HIGH)
+    # data3 is tainted by source1 (HIGH) and source2 (LOW) (from data1)
+    # total sources affecting data are:
+    # data1: source1, source2
+    # data2: source3
+    # data3: source1, source2
+    # So we have 3 sources contributing to high, 2 contributing to low
+    assert stats["taint_level_distribution"][TaintLevel.HIGH.value] == 3
+    assert stats["taint_level_distribution"][TaintLevel.LOW.value] == 2
