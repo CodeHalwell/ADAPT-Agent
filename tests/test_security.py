@@ -24,6 +24,41 @@ def test_firewall_blocked_pattern():
     assert firewall.check_input("Hello world")
 
 
+def test_firewall_bypass_vulnerability():
+    """Test that allowlist does not bypass blocklist."""
+    firewall = Firewall()
+    firewall.add_blocked_pattern(r"password")
+    firewall.add_allowed_pattern(r"hello")
+
+    # Even if "hello" is in the text, it should be blocked because it has "password"
+    assert not firewall.check_input("hello my password is 123")
+
+
+def test_firewall_custom_filter_fail_closed():
+    """Test that custom filters fail closed when raising an exception."""
+    firewall = Firewall()
+
+    def bad_filter(content: str) -> bool:
+        raise ValueError("Filter crashed")
+
+    firewall.add_custom_filter(bad_filter)
+
+    # Should fail closed (block the input) due to the exception
+    assert not firewall.check_input("safe content")
+
+
+def test_firewall_strict_whitelist():
+    """Test strict whitelist functionality."""
+    firewall = Firewall()
+    firewall.add_allowed_pattern(r"allowed_command")
+
+    # Should be allowed
+    assert firewall.check_input("running allowed_command")
+
+    # Should be blocked because it doesn't match the allowed pattern
+    assert not firewall.check_input("running other_command")
+
+
 def test_firewall_sanitize():
     """Test content sanitization."""
     firewall = Firewall()
