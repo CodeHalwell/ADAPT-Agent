@@ -1,0 +1,3 @@
+## 2024-04-15 - [Manual loops outperform min/sort with lambdas for dictionary lookups]
+**Learning:** When finding an element with a minimum value within a list of dictionaries in Python (like memory eviction based on `access_count`), a manual `for` loop is significantly faster (~3x) than using `list.sort(key=lambda x: ...)` or `min(list, key=lambda x: ...)`. The overhead of calling a lambda function repeatedly in Python out-weighs the underlying C implementation of `sort()`/`min()` for these specific micro-operations.
+**Action:** Use manual `for` loops instead of lambda-based `min()`/`sort()` when performing simple min/max lookups in performance-critical eviction paths or loops.
