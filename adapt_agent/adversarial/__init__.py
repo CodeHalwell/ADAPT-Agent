@@ -1,7 +1,7 @@
 """Adversarial defense for LLM agents."""
 
-from typing import Any, Dict, List, Optional
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 
 class AdversarialDefense:
@@ -10,13 +10,13 @@ class AdversarialDefense:
     Provides detection and mitigation strategies for common attack vectors
     including prompt injection, jailbreaking, and data poisoning.
     """
-    
+
     def __init__(self):
         """Initialize the AdversarialDefense."""
         self._attack_patterns: List[str] = []
         self._detected_attacks: List[Dict[str, Any]] = []
         self._defense_strategies: Dict[str, Any] = {}
-    
+
     def detect_prompt_injection(self, prompt: str) -> bool:
         """Detect potential prompt injection attacks.
         
@@ -34,15 +34,15 @@ class AdversarialDefense:
             "system:",
             "override",
         ]
-        
+
         prompt_lower = prompt.lower()
         for indicator in injection_indicators:
             if indicator in prompt_lower:
                 self._record_attack("prompt_injection", prompt, indicator)
                 return True
-        
+
         return False
-    
+
     def detect_jailbreak(self, prompt: str) -> bool:
         """Detect jailbreak attempts.
         
@@ -59,15 +59,15 @@ class AdversarialDefense:
             "act as if",
             "you are now",
         ]
-        
+
         prompt_lower = prompt.lower()
         for indicator in jailbreak_indicators:
             if indicator in prompt_lower:
                 self._record_attack("jailbreak", prompt, indicator)
                 return True
-        
+
         return False
-    
+
     def analyze_input(self, input_text: str) -> Dict[str, Any]:
         """Analyze input for multiple attack vectors.
         
@@ -78,20 +78,20 @@ class AdversarialDefense:
             Analysis results with detected threats
         """
         threats = []
-        
+
         if self.detect_prompt_injection(input_text):
             threats.append("prompt_injection")
-        
+
         if self.detect_jailbreak(input_text):
             threats.append("jailbreak")
-        
+
         return {
             "input": input_text[:100],  # Truncated for privacy
             "threats_detected": threats,
             "is_safe": len(threats) == 0,
             "timestamp": datetime.utcnow().isoformat(),
         }
-    
+
     def add_attack_pattern(self, pattern: str) -> None:
         """Add a custom attack pattern to detect.
         
@@ -99,7 +99,7 @@ class AdversarialDefense:
             pattern: Attack pattern string
         """
         self._attack_patterns.append(pattern)
-    
+
     def get_detected_attacks(
         self,
         attack_type: Optional[str] = None,
@@ -115,15 +115,15 @@ class AdversarialDefense:
             List of detected attacks
         """
         attacks = self._detected_attacks
-        
+
         if attack_type:
             attacks = [a for a in attacks if a["type"] == attack_type]
-        
+
         if limit:
             attacks = attacks[-limit:]
-        
+
         return attacks
-    
+
     def _record_attack(
         self,
         attack_type: str,
