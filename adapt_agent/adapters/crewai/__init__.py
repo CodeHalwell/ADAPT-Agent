@@ -13,7 +13,7 @@ class CrewAIAdapter(BaseAdapter):
     enabling trust management, policy enforcement, and security features
     for CrewAI-based agents.
     """
-    
+
     def wrap_agent(self, agent: Any) -> Agent:
         """Wrap a CrewAI agent with ADAPT-Agent capabilities.
         
@@ -29,7 +29,7 @@ class CrewAIAdapter(BaseAdapter):
             "CrewAI integration requires crewai package. "
             "Install with: pip install adapt-agent[crewai]"
         )
-    
+
     def extract_state(self, agent: Any) -> AgentState:
         """Extract the current state from a CrewAI agent.
         
@@ -44,7 +44,7 @@ class CrewAIAdapter(BaseAdapter):
             "CrewAI integration requires crewai package. "
             "Install with: pip install adapt-agent[crewai]"
         )
-    
+
     def inject_middleware(self, agent: Any, middleware: Any) -> Any:
         """Inject ADAPT-Agent middleware into a CrewAI agent.
         

@@ -13,7 +13,7 @@ class LangGraphAdapter(BaseAdapter):
     enabling trust management, policy enforcement, and security features
     for LangGraph-based agents.
     """
-    
+
     def wrap_agent(self, agent: Any) -> Agent:
         """Wrap a LangGraph agent with ADAPT-Agent capabilities.
         
@@ -29,7 +29,7 @@ class LangGraphAdapter(BaseAdapter):
             "LangGraph integration requires langgraph package. "
             "Install with: pip install adapt-agent[langgraph]"
         )
-    
+
     def extract_state(self, agent: Any) -> AgentState:
         """Extract the current state from a LangGraph agent.
         
@@ -44,7 +44,7 @@ class LangGraphAdapter(BaseAdapter):
             "LangGraph integration requires langgraph package. "
             "Install with: pip install adapt-agent[langgraph]"
         )
-    
+
     def inject_middleware(self, agent: Any, middleware: Any) -> Any:
         """Inject ADAPT-Agent middleware into a LangGraph agent.
         
