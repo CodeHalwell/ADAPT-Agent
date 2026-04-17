@@ -1,10 +1,13 @@
 """Firewall for LLM agent security."""
 
 from typing import Any, Callable, Dict, List, Optional, Pattern
+import logging
 import re
 from datetime import datetime
 
 from adapt_agent.core.types import AgentMessage, SecurityEvent
+
+logger = logging.getLogger(__name__)
 
 
 class Firewall:
@@ -59,12 +62,7 @@ class Firewall:
         Returns:
             True if content is allowed, False if blocked
         """
-        # Check allowed patterns first (whitelist)
-        for pattern in self._allowed_patterns:
-            if pattern.search(content):
-                return True
-        
-        # Check blocked patterns
+        # Check blocked patterns first
         for pattern in self._blocked_patterns:
             if pattern.search(content):
                 self._record_security_event(
@@ -76,7 +74,7 @@ class Firewall:
                 self._blocked_count += 1
                 return False
         
-        # Check custom filters
+        # Check custom filters (fail-closed)
         for filter_func in self._custom_filters:
             try:
                 if filter_func(content):
@@ -89,9 +87,32 @@ class Firewall:
                     self._blocked_count += 1
                     return False
             except Exception as e:
-                # Log error but don't block on filter failure
-                print(f"Error in custom filter: {e}")
+                logger.error(f"Error in custom filter: {e}")
+                self._record_security_event(
+                    event_type="blocked_input",
+                    severity="high",
+                    description=f"Input blocked due to custom filter error: {e}",
+                    metadata={"content_snippet": content[:100]},
+                )
+                self._blocked_count += 1
+                return False
         
+        # Check allowed patterns (strict whitelist)
+        if self._allowed_patterns:
+            for pattern in self._allowed_patterns:
+                if pattern.search(content):
+                    return True
+
+            # If we reach here, it didn't match any allowed patterns
+            self._record_security_event(
+                event_type="blocked_input",
+                severity="medium",
+                description="Input did not match any allowed patterns (strict whitelist)",
+                metadata={"content_snippet": content[:100]},
+            )
+            self._blocked_count += 1
+            return False
+
         return True
     
     def check_output(self, content: str) -> bool:
@@ -103,8 +124,58 @@ class Firewall:
         Returns:
             True if content is allowed, False if blocked
         """
-        # Similar logic to check_input but for outputs
-        return self.check_input(content)
+        # Check blocked patterns first
+        for pattern in self._blocked_patterns:
+            if pattern.search(content):
+                self._record_security_event(
+                    event_type="blocked_output",
+                    severity="high",
+                    description=f"Output matched blocked pattern: {pattern.pattern}",
+                    metadata={"content_snippet": content[:100]},
+                )
+                self._blocked_count += 1
+                return False
+
+        # Check custom filters (fail-closed)
+        for filter_func in self._custom_filters:
+            try:
+                if filter_func(content):
+                    self._record_security_event(
+                        event_type="blocked_output",
+                        severity="medium",
+                        description="Output blocked by custom filter",
+                        metadata={"content_snippet": content[:100]},
+                    )
+                    self._blocked_count += 1
+                    return False
+            except Exception as e:
+                logger.error(f"Error in custom filter: {e}")
+                self._record_security_event(
+                    event_type="blocked_output",
+                    severity="high",
+                    description=f"Output blocked due to custom filter error: {e}",
+                    metadata={"content_snippet": content[:100]},
+                )
+                self._blocked_count += 1
+                return False
+
+        # Check allowed patterns (strict whitelist)
+        if self._allowed_patterns:
+            for pattern in self._allowed_patterns:
+                if pattern.search(content):
+                    return True
+
+            # If we reach here, it didn't match any allowed patterns
+            self._record_security_event(
+                event_type="blocked_output",
+                severity="medium",
+                description="Output did not match any allowed patterns (strict whitelist)",
+                metadata={"content_snippet": content[:100]},
+            )
+            self._blocked_count += 1
+            return False
+
+        return True
     
     def sanitize(self, content: str, replacement: str = "[REDACTED]") -> str:
         """Sanitize content by replacing blocked patterns.
