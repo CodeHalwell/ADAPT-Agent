@@ -24,6 +24,34 @@ def test_firewall_blocked_pattern():
     assert firewall.check_input("Hello world")
 
 
+def test_firewall_allowed_pattern():
+    """Test allowed patterns strict whitelist."""
+    firewall = Firewall()
+    firewall.add_allowed_pattern(r"hello")
+
+    # Should allow
+    assert firewall.check_input("hello world")
+
+    # Should block (not in whitelist)
+    assert not firewall.check_input("goodbye world")
+
+
+def test_firewall_custom_filter_error():
+    """Test that custom filter exceptions fail closed."""
+    firewall = Firewall()
+
+    def buggy_filter(content):
+        raise ValueError("Buggy filter")
+
+    firewall.add_custom_filter(buggy_filter)
+
+    # Should fail closed and block
+    assert not firewall.check_input("test input")
+
+    stats = firewall.get_stats()
+    assert stats["total_blocked"] == 1
+
+
 def test_firewall_sanitize():
     """Test content sanitization."""
     firewall = Firewall()

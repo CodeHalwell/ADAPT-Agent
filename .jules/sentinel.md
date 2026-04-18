@@ -1,0 +1,4 @@
+## 2026-04-18 - Firewall Filter Bypass Vulnerability
+**Vulnerability:** The firewall in `adapt_agent/security/firewall.py` evaluated allowed patterns before blocked patterns and did not fail-closed when custom filters threw exceptions. Additionally, the strict whitelist path failed to record security events or increment the block count when an input did not match any allowed pattern.
+**Learning:** These structural flaws allowed malicious payloads to bypass the firewall by matching an allowed pattern or by intentionally causing custom filters to crash. The lack of telemetry for whitelist denials also hindered observability.
+**Prevention:** Always enforce a deny-by-default or deny-over-allow strategy in security pipelines. When executing user-defined or custom filter functions, wrap them in fail-closed error handling. Ensure all access-denial paths uniformly update security event logs and telemetry metrics.
