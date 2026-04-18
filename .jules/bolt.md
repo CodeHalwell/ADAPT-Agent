@@ -1,0 +1,3 @@
+## 2024-05-18 - Optimize long-term memory eviction in memory.py
+**Learning:** In performance-critical paths such as memory eviction where dictionaries are evaluated against a property (e.g., `access_count`), a manual `for` loop to find the minimum element and its index is faster than using Python's `sort()` or `min()` with a `lambda` function. The lambda call introduces significant overhead in O(n log n) sorts or even O(n) min operations compared to a simple loop.
+**Action:** When identifying bottlenecks in list of dictionary traversals, use manual loops instead of lambda-based `min()` or `sort()` to optimize performance if readibility is minimally compromised.

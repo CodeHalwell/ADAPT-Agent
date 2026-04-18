@@ -82,8 +82,14 @@ class MemorySystem:
         # Maintain capacity
         if len(self._long_term_memory) > self.long_term_capacity:
             # Remove least accessed items
-            self._long_term_memory.sort(key=lambda x: x["access_count"])
-            self._long_term_memory.pop(0)
+            # Manual loop is faster than sort() or min() with lambda for eviction
+            min_idx = 0
+            min_count = self._long_term_memory[0]["access_count"]
+            for i in range(1, len(self._long_term_memory)):
+                if self._long_term_memory[i]["access_count"] < min_count:
+                    min_count = self._long_term_memory[i]["access_count"]
+                    min_idx = i
+            self._long_term_memory.pop(min_idx)
     
     def retrieve(
         self,
