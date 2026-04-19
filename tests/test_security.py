@@ -24,6 +24,23 @@ def test_firewall_blocked_pattern():
     assert firewall.check_input("Hello world")
 
 
+def test_firewall_custom_filter_fail_closed():
+    """Test that custom filters fail closed on exceptions."""
+    firewall = Firewall()
+
+    def buggy_filter(content: str) -> bool:
+        raise ValueError("Filter crashed")
+
+    firewall.add_custom_filter(buggy_filter)
+
+    # Should block and fail closed
+    assert not firewall.check_input("Hello world")
+
+    # Verify security event was recorded
+    events = firewall.get_security_events(severity="high")
+    assert any(e["event_type"] == "filter_error" for e in events)
+
+
 def test_firewall_sanitize():
     """Test content sanitization."""
     firewall = Firewall()

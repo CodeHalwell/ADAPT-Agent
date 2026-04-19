@@ -1,0 +1,4 @@
+## 2024-04-19 - Fail-Open Custom Filters in Firewall
+**Vulnerability:** The firewall in `adapt_agent/security/firewall.py` had a fail-open design for custom filters. If a custom filter function raised an exception, the error was simply printed, and the check continued, potentially allowing malicious payloads through if they were designed to crash the validation logic.
+**Learning:** The previous implementation caught exceptions but didn't block the content upon encountering an error, violating the "Fail Securely" principle of defense-in-depth. Also, using `print` for errors is poor practice in production apps.
+**Prevention:** Always implement a fail-closed design for security filters, meaning if a filter crashes or fails to execute properly, it should deny access (return False). Also, use the standard `logging` module to properly record errors instead of `print`.
