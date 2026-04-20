@@ -1,13 +1,13 @@
 """Taint tracking for LLM agent data flow."""
 
-from typing import Any, Dict, List, Optional, Set
 from datetime import datetime
 from enum import Enum
+from typing import Any, Dict, List, Optional, Set
 
 
 class TaintLevel(Enum):
     """Taint level enumeration."""
-    
+
     UNTAINTED = "untainted"
     LOW = "low"
     MEDIUM = "medium"
@@ -17,7 +17,7 @@ class TaintLevel(Enum):
 
 class TaintSource:
     """Represents a source of taint."""
-    
+
     def __init__(
         self,
         source_id: str,
@@ -46,13 +46,13 @@ class TaintTracker:
     Implements taint tracking to identify and monitor potentially
     unsafe or untrusted data as it flows through the agent system.
     """
-    
+
     def __init__(self):
         """Initialize the TaintTracker."""
         self._taint_sources: Dict[str, TaintSource] = {}
         self._tainted_data: Dict[str, Set[str]] = {}  # data_id -> set of source_ids
         self._taint_propagation: List[Dict[str, Any]] = []
-    
+
     def register_source(
         self,
         source_id: str,
@@ -74,7 +74,7 @@ class TaintTracker:
         source = TaintSource(source_id, source_type, level, metadata)
         self._taint_sources[source_id] = source
         return source
-    
+
     def mark_tainted(
         self,
         data_id: str,
@@ -88,9 +88,9 @@ class TaintTracker:
         """
         if data_id not in self._tainted_data:
             self._tainted_data[data_id] = set()
-        
+
         self._tainted_data[data_id].update(source_ids)
-    
+
     def is_tainted(self, data_id: str) -> bool:
         """Check if data is tainted.
         
@@ -101,7 +101,7 @@ class TaintTracker:
             True if data is tainted, False otherwise
         """
         return data_id in self._tainted_data and len(self._tainted_data[data_id]) > 0
-    
+
     def get_taint_level(self, data_id: str) -> TaintLevel:
         """Get the highest taint level for data.
         
@@ -113,17 +113,17 @@ class TaintTracker:
         """
         if not self.is_tainted(data_id):
             return TaintLevel.UNTAINTED
-        
+
         source_ids = self._tainted_data[data_id]
         levels = [
             self._taint_sources[sid].level
             for sid in source_ids
             if sid in self._taint_sources
         ]
-        
+
         if not levels:
             return TaintLevel.UNTAINTED
-        
+
         # Return highest severity level
         level_order = [
             TaintLevel.UNTAINTED,
@@ -132,9 +132,9 @@ class TaintTracker:
             TaintLevel.HIGH,
             TaintLevel.CRITICAL,
         ]
-        
+
         return max(levels, key=lambda l: level_order.index(l))
-    
+
     def get_taint_sources(self, data_id: str) -> List[TaintSource]:
         """Get all taint sources affecting data.
         
@@ -146,14 +146,14 @@ class TaintTracker:
         """
         if not self.is_tainted(data_id):
             return []
-        
+
         source_ids = self._tainted_data[data_id]
         return [
             self._taint_sources[sid]
             for sid in source_ids
             if sid in self._taint_sources
         ]
-    
+
     def propagate_taint(
         self,
         from_data_id: str,
@@ -169,11 +169,11 @@ class TaintTracker:
         """
         if not self.is_tainted(from_data_id):
             return
-        
+
         # Copy taint sources to target
         source_ids = list(self._tainted_data[from_data_id])
         self.mark_tainted(to_data_id, source_ids)
-        
+
         # Record propagation
         self._taint_propagation.append({
             "from": from_data_id,
@@ -182,7 +182,7 @@ class TaintTracker:
             "timestamp": datetime.utcnow().isoformat(),
             "sources": source_ids,
         })
-    
+
     def sanitize(self, data_id: str) -> None:
         """Mark data as sanitized (remove taint).
         
@@ -191,7 +191,7 @@ class TaintTracker:
         """
         if data_id in self._tainted_data:
             del self._tainted_data[data_id]
-    
+
     def get_taint_flow(self, data_id: str) -> List[Dict[str, Any]]:
         """Get the taint propagation flow for data.
         
@@ -202,14 +202,14 @@ class TaintTracker:
             List of propagation records leading to this data
         """
         flow = []
-        
+
         # Find all propagations that led to this data
         for prop in self._taint_propagation:
             if prop["to"] == data_id:
                 flow.append(prop)
-        
+
         return flow
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """Get taint tracking statistics.
         
@@ -222,7 +222,7 @@ class TaintTracker:
                 if source_id in self._taint_sources:
                     level = self._taint_sources[source_id].level.value
                     taint_level_counts[level] = taint_level_counts.get(level, 0) + 1
-        
+
         return {
             "total_sources": len(self._taint_sources),
             "tainted_data_count": len(self._tainted_data),

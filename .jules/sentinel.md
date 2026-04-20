@@ -1,0 +1,4 @@
+## 2024-04-20 - Fail-Closed Design in Custom Security Filters
+**Vulnerability:** The firewall implementation used `print` for errors in custom filters and returned `True` (allowing input), which could allow malicious inputs to bypass the firewall if they intentionally triggered exceptions in the filters.
+**Learning:** Custom security filters should never fail open. If a filter crashes while inspecting an input, it means the security state cannot be determined, which should result in blocking the input. Additionally, logging is required for proper audibility instead of `print`.
+**Prevention:** Always implement a fail-closed design (return False/block) for error handlers within security components (like firewalls, taint trackers, or evaluators) to ensure unexpected errors do not lead to security bypasses. Use the standard `logging` module to track these incidents effectively.
