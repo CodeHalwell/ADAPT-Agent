@@ -35,6 +35,28 @@ def test_firewall_sanitize():
     assert "[REDACTED]" in sanitized
 
 
+def test_firewall_custom_filter_fail_closed():
+    """Test that firewall fails closed when a custom filter raises an exception."""
+    firewall = Firewall()
+
+    def buggy_filter(content: str) -> bool:
+        raise ValueError("Something went wrong in the filter")
+
+    firewall.add_custom_filter(buggy_filter)
+
+    # Should block due to fail-closed design
+    assert not firewall.check_input("Some valid input")
+
+    stats = firewall.get_stats()
+    assert stats["total_blocked"] == 1
+
+    events = firewall.get_security_events()
+    assert len(events) == 1
+    assert events[0]["event_type"] == "blocked_input"
+    assert events[0]["severity"] == "high"
+    assert "custom filter error" in events[0]["description"].lower()
+
+
 def test_taint_tracker_initialization():
     """Test TaintTracker initialization."""
     tracker = TaintTracker()
