@@ -1,0 +1,3 @@
+## 2024-05-18 - Avoid O(N log N) sorting for finding minimum element
+**Learning:** In performance-critical paths such as memory eviction, calling `list.sort()` to find the minimum element introduces severe overhead (O(N log N) time complexity plus Python lambda invocation overhead per comparison) when a simple linear scan can achieve it in O(N).
+**Action:** When only the minimum or maximum element needs to be removed from an unsorted list (like a cache capacity eviction), replace `.sort()` followed by `.pop()` with a manual `for` loop to identify the min/max index and then `.pop(idx)`. This minimizes Python function call overhead and drastically improves eviction performance.

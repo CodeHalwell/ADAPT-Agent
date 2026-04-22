@@ -9,12 +9,12 @@ class PatchManager:
     Provides a system for applying framework-specific patches
     to address bugs, security issues, or add enhancements.
     """
-    
+
     def __init__(self):
         """Initialize the PatchManager."""
         self._patches: Dict[str, Dict[str, Any]] = {}
         self._applied_patches: List[str] = []
-    
+
     def register_patch(
         self,
         patch_id: str,
@@ -38,7 +38,7 @@ class PatchManager:
             "patch_func": patch_func,
             "version_requirement": version_requirement,
         }
-    
+
     def apply_patch(self, patch_id: str, target: Any) -> bool:
         """Apply a patch to a target.
         
@@ -51,13 +51,13 @@ class PatchManager:
         """
         if patch_id not in self._patches:
             return False
-        
+
         if patch_id in self._applied_patches:
             # Already applied
             return True
-        
+
         patch = self._patches[patch_id]
-        
+
         try:
             patch["patch_func"](target)
             self._applied_patches.append(patch_id)
@@ -65,7 +65,7 @@ class PatchManager:
         except Exception as e:
             print(f"Error applying patch {patch_id}: {e}")
             return False
-    
+
     def list_patches(
         self,
         framework: Optional[str] = None,
@@ -79,20 +79,20 @@ class PatchManager:
             List of patch metadata
         """
         patches = []
-        
+
         for patch_id, patch_data in self._patches.items():
             if framework and patch_data["framework"] != framework:
                 continue
-            
+
             patches.append({
                 "patch_id": patch_id,
                 "framework": patch_data["framework"],
                 "description": patch_data["description"],
                 "applied": patch_id in self._applied_patches,
             })
-        
+
         return patches
-    
+
     def is_applied(self, patch_id: str) -> bool:
         """Check if a patch has been applied.
         

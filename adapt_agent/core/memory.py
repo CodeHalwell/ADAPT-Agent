@@ -1,7 +1,7 @@
 """Memory systems for LLM agents."""
 
-from typing import Any, Dict, List, Optional
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 
 class MemorySystem:
@@ -10,7 +10,7 @@ class MemorySystem:
     Provides short-term and long-term memory storage, retrieval,
     and management for agent interactions.
     """
-    
+
     def __init__(
         self,
         short_term_capacity: int = 100,
@@ -24,11 +24,11 @@ class MemorySystem:
         """
         self.short_term_capacity = short_term_capacity
         self.long_term_capacity = long_term_capacity
-        
+
         self._short_term_memory: List[Dict[str, Any]] = []
         self._long_term_memory: List[Dict[str, Any]] = []
         self._metadata: Dict[str, Any] = {}
-    
+
     def store_short_term(
         self,
         key: str,
@@ -49,13 +49,13 @@ class MemorySystem:
             "timestamp": datetime.utcnow().isoformat(),
             "access_count": 0,
         }
-        
+
         self._short_term_memory.append(memory_item)
-        
+
         # Maintain capacity
         if len(self._short_term_memory) > self.short_term_capacity:
             self._short_term_memory.pop(0)
-    
+
     def store_long_term(
         self,
         key: str,
@@ -76,15 +76,22 @@ class MemorySystem:
             "timestamp": datetime.utcnow().isoformat(),
             "access_count": 0,
         }
-        
+
         self._long_term_memory.append(memory_item)
-        
+
         # Maintain capacity
         if len(self._long_term_memory) > self.long_term_capacity:
-            # Remove least accessed items
-            self._long_term_memory.sort(key=lambda x: x["access_count"])
-            self._long_term_memory.pop(0)
-    
+            # Remove least accessed item
+            # Performance optimization: manual for loop is faster than min() or sort()
+            # for finding minimum in a list of dicts by avoiding function call overhead
+            min_idx = 0
+            min_val = self._long_term_memory[0]["access_count"]
+            for i in range(1, len(self._long_term_memory)):
+                if self._long_term_memory[i]["access_count"] < min_val:
+                    min_val = self._long_term_memory[i]["access_count"]
+                    min_idx = i
+            self._long_term_memory.pop(min_idx)
+
     def retrieve(
         self,
         key: str,
@@ -100,15 +107,15 @@ class MemorySystem:
             Retrieved value or None if not found
         """
         memory = self._long_term_memory if from_long_term else self._short_term_memory
-        
+
         for item in reversed(memory):
             if item["key"] == key:
                 item["access_count"] += 1
                 item["last_accessed"] = datetime.utcnow().isoformat()
                 return item["value"]
-        
+
         return None
-    
+
     def search(
         self,
         query: str,
@@ -126,7 +133,7 @@ class MemorySystem:
             List of matching memory items
         """
         memory = self._long_term_memory if from_long_term else self._short_term_memory
-        
+
         results = []
         for item in reversed(memory):
             # Simple substring search (can be enhanced with semantic search)
@@ -135,9 +142,9 @@ class MemorySystem:
                 results.append(item)
                 if len(results) >= limit:
                     break
-        
+
         return results
-    
+
     def consolidate(self) -> int:
         """Consolidate short-term memory into long-term memory.
         
@@ -149,22 +156,22 @@ class MemorySystem:
         # Find frequently accessed items
         threshold = 3  # Access count threshold
         consolidated = 0
-        
+
         for item in self._short_term_memory[:]:
             if item["access_count"] >= threshold:
                 self._long_term_memory.append(item.copy())
                 consolidated += 1
-        
+
         return consolidated
-    
+
     def clear_short_term(self) -> None:
         """Clear all short-term memory."""
         self._short_term_memory.clear()
-    
+
     def clear_long_term(self) -> None:
         """Clear all long-term memory."""
         self._long_term_memory.clear()
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """Get memory statistics.
         

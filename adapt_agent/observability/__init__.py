@@ -1,7 +1,7 @@
 """Observability and monitoring for LLM agents."""
 
-from typing import Any, Dict, List, Optional
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 
 class AgentObserver:
@@ -10,13 +10,13 @@ class AgentObserver:
     Tracks agent execution, logs interactions, and provides
     debugging and monitoring capabilities.
     """
-    
+
     def __init__(self):
         """Initialize the AgentObserver."""
         self._traces: List[Dict[str, Any]] = []
         self._logs: List[Dict[str, Any]] = []
         self._metrics: Dict[str, List[float]] = {}
-    
+
     def start_trace(
         self,
         trace_id: str,
@@ -46,7 +46,7 @@ class AgentObserver:
         }
         self._traces.append(trace)
         return trace
-    
+
     def end_trace(
         self,
         trace_id: str,
@@ -66,7 +66,7 @@ class AgentObserver:
                 trace["status"] = status
                 trace["result"] = result
                 break
-    
+
     def log_event(
         self,
         trace_id: str,
@@ -88,12 +88,12 @@ class AgentObserver:
             "timestamp": datetime.utcnow().isoformat(),
             "metadata": metadata or {},
         }
-        
+
         for trace in self._traces:
             if trace["trace_id"] == trace_id:
                 trace["events"].append(event)
                 break
-    
+
     def log(
         self,
         level: str,
@@ -117,7 +117,7 @@ class AgentObserver:
             "metadata": metadata or {},
         }
         self._logs.append(log_entry)
-    
+
     def record_metric(
         self,
         metric_name: str,
@@ -132,7 +132,7 @@ class AgentObserver:
         if metric_name not in self._metrics:
             self._metrics[metric_name] = []
         self._metrics[metric_name].append(value)
-    
+
     def get_traces(
         self,
         agent_id: Optional[str] = None,
@@ -150,18 +150,18 @@ class AgentObserver:
             List of traces
         """
         traces = self._traces
-        
+
         if agent_id:
             traces = [t for t in traces if t["agent_id"] == agent_id]
-        
+
         if status:
             traces = [t for t in traces if t["status"] == status]
-        
+
         if limit:
             traces = traces[-limit:]
-        
+
         return traces
-    
+
     def get_logs(
         self,
         level: Optional[str] = None,
@@ -179,18 +179,18 @@ class AgentObserver:
             List of log entries
         """
         logs = self._logs
-        
+
         if level:
             logs = [log for log in logs if log["level"] == level]
-        
+
         if agent_id:
             logs = [log for log in logs if log.get("agent_id") == agent_id]
-        
+
         if limit:
             logs = logs[-limit:]
-        
+
         return logs
-    
+
     def get_metric_stats(self, metric_name: str) -> Dict[str, float]:
         """Get statistics for a metric.
         
@@ -202,7 +202,7 @@ class AgentObserver:
         """
         if metric_name not in self._metrics or not self._metrics[metric_name]:
             return {}
-        
+
         values = self._metrics[metric_name]
         return {
             "count": len(values),

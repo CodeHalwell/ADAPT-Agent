@@ -9,12 +9,12 @@ class AgentEvaluator:
     Provides comprehensive evaluation metrics and benchmarking
     capabilities for agent quality assessment.
     """
-    
+
     def __init__(self):
         """Initialize the AgentEvaluator."""
         self._evaluation_results: List[Dict[str, Any]] = []
         self._custom_metrics: Dict[str, Callable] = {}
-    
+
     def register_metric(
         self,
         name: str,
@@ -27,7 +27,7 @@ class AgentEvaluator:
             metric_func: Function that computes the metric score
         """
         self._custom_metrics[name] = metric_func
-    
+
     def evaluate_response(
         self,
         agent_id: str,
@@ -53,7 +53,7 @@ class AgentEvaluator:
             "expected": expected_output,
             "metrics": {},
         }
-        
+
         # Apply custom metrics
         for metric_name, metric_func in self._custom_metrics.items():
             try:
@@ -62,10 +62,10 @@ class AgentEvaluator:
             except Exception as e:
                 print(f"Error computing metric {metric_name}: {e}")
                 results["metrics"][metric_name] = None
-        
+
         self._evaluation_results.append(results)
         return results
-    
+
     def compute_aggregate_metrics(
         self,
         agent_id: Optional[str] = None,
@@ -79,20 +79,20 @@ class AgentEvaluator:
             Dictionary of aggregate metric scores
         """
         results = self._evaluation_results
-        
+
         if agent_id:
             results = [r for r in results if r["agent_id"] == agent_id]
-        
+
         if not results:
             return {}
-        
+
         aggregates = {}
-        
+
         # Get all metric names
         metric_names = set()
         for result in results:
             metric_names.update(result["metrics"].keys())
-        
+
         # Compute average for each metric
         for metric_name in metric_names:
             scores = [
@@ -100,12 +100,12 @@ class AgentEvaluator:
                 for r in results
                 if metric_name in r["metrics"] and r["metrics"][metric_name] is not None
             ]
-            
+
             if scores:
                 aggregates[metric_name] = sum(scores) / len(scores)
-        
+
         return aggregates
-    
+
     def get_evaluation_results(
         self,
         agent_id: Optional[str] = None,
@@ -121,13 +121,13 @@ class AgentEvaluator:
             List of evaluation results
         """
         results = self._evaluation_results
-        
+
         if agent_id:
             results = [r for r in results if r["agent_id"] == agent_id]
-        
+
         if limit:
             results = results[-limit:]
-        
+
         return results
 
 
