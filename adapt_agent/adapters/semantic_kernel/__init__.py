@@ -13,7 +13,7 @@ class SemanticKernelAdapter(BaseAdapter):
     enabling trust management, policy enforcement, and security features
     for Semantic Kernel-based agents.
     """
-    
+
     def wrap_agent(self, agent: Any) -> Agent:
         """Wrap a Semantic Kernel agent with ADAPT-Agent capabilities.
         
@@ -29,7 +29,7 @@ class SemanticKernelAdapter(BaseAdapter):
             "Semantic Kernel integration requires semantic-kernel package. "
             "Install with: pip install adapt-agent[semantic-kernel]"
         )
-    
+
     def extract_state(self, agent: Any) -> AgentState:
         """Extract the current state from a Semantic Kernel agent.
         
@@ -44,7 +44,7 @@ class SemanticKernelAdapter(BaseAdapter):
             "Semantic Kernel integration requires semantic-kernel package. "
             "Install with: pip install adapt-agent[semantic-kernel]"
         )
-    
+
     def inject_middleware(self, agent: Any, middleware: Any) -> Any:
         """Inject ADAPT-Agent middleware into a Semantic Kernel agent.
         

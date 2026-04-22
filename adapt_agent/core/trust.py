@@ -1,7 +1,7 @@
 """Trust management for LLM agents."""
 
-from typing import Any, Dict, List, Optional
 from datetime import datetime
+from typing import Dict, List, Optional
 
 from adapt_agent.core.types import AgentState, TrustScore
 
@@ -12,7 +12,7 @@ class TrustManager:
     The TrustManager evaluates agent behavior, interactions, and outputs
     to assign and update trust scores dynamically.
     """
-    
+
     def __init__(
         self,
         initial_trust: float = 0.5,
@@ -31,7 +31,7 @@ class TrustManager:
         self.max_trust = max_trust
         self._trust_scores: Dict[str, float] = {}
         self._trust_history: Dict[str, List[TrustScore]] = {}
-    
+
     def get_trust_score(self, agent_id: str) -> float:
         """Get the current trust score for an agent.
         
@@ -42,7 +42,7 @@ class TrustManager:
             Current trust score (between min_trust and max_trust)
         """
         return self._trust_scores.get(agent_id, self.initial_trust)
-    
+
     def update_trust_score(
         self,
         agent_id: str,
@@ -63,9 +63,9 @@ class TrustManager:
         """
         current_score = self.get_trust_score(agent_id)
         new_score = max(self.min_trust, min(self.max_trust, current_score + delta))
-        
+
         self._trust_scores[agent_id] = new_score
-        
+
         # Record trust score history
         trust_record: TrustScore = {
             "score": new_score,
@@ -73,13 +73,13 @@ class TrustManager:
             "factors": factors or {},
             "timestamp": datetime.utcnow().isoformat(),
         }
-        
+
         if agent_id not in self._trust_history:
             self._trust_history[agent_id] = []
         self._trust_history[agent_id].append(trust_record)
-        
+
         return new_score
-    
+
     def evaluate_agent_state(self, agent_id: str, state: AgentState) -> TrustScore:
         """Evaluate an agent's state and calculate a trust score.
         
@@ -91,28 +91,28 @@ class TrustManager:
             Trust score calculation with factors
         """
         factors: Dict[str, float] = {}
-        
+
         # Example trust factors (can be extended)
         if "policy_violations" in state:
             violation_penalty = -0.1 * len(state["policy_violations"])
             factors["policy_compliance"] = violation_penalty
-        
+
         if "trust_score" in state:
             factors["self_reported"] = state["trust_score"]
-        
+
         # Calculate overall score
         current_score = self.get_trust_score(agent_id)
         factor_sum = sum(factors.values())
-        
+
         trust_score: TrustScore = {
             "score": max(self.min_trust, min(self.max_trust, current_score + factor_sum)),
             "confidence": 0.8,
             "factors": factors,
             "timestamp": datetime.utcnow().isoformat(),
         }
-        
+
         return trust_score
-    
+
     def is_trusted(self, agent_id: str, threshold: float = 0.6) -> bool:
         """Check if an agent meets the trust threshold.
         
@@ -124,7 +124,7 @@ class TrustManager:
             True if agent is trusted, False otherwise
         """
         return self.get_trust_score(agent_id) >= threshold
-    
+
     def get_trust_history(self, agent_id: str) -> List[TrustScore]:
         """Get the trust score history for an agent.
         

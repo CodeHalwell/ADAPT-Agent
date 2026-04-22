@@ -12,7 +12,7 @@ class BaseAdapter(ABC):
     Adapters provide integration with different LLM agent frameworks,
     converting framework-specific APIs to ADAPT-Agent's unified interface.
     """
-    
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """Initialize the adapter.
         
@@ -20,7 +20,7 @@ class BaseAdapter(ABC):
             config: Optional configuration dictionary
         """
         self.config = config or {}
-    
+
     @abstractmethod
     def wrap_agent(self, agent: Any) -> Agent:
         """Wrap a framework-specific agent with ADAPT-Agent capabilities.
@@ -32,7 +32,7 @@ class BaseAdapter(ABC):
             Wrapped agent implementing the Agent protocol
         """
         pass
-    
+
     @abstractmethod
     def extract_state(self, agent: Any) -> AgentState:
         """Extract the current state from a framework-specific agent.
@@ -44,7 +44,7 @@ class BaseAdapter(ABC):
             AgentState representing the current state
         """
         pass
-    
+
     @abstractmethod
     def inject_middleware(self, agent: Any, middleware: Any) -> Any:
         """Inject ADAPT-Agent middleware into a framework-specific agent.
@@ -57,7 +57,7 @@ class BaseAdapter(ABC):
             Modified agent with middleware
         """
         pass
-    
+
     def validate_agent(self, agent: Any) -> bool:
         """Validate that an agent is compatible with this adapter.
         
@@ -69,7 +69,7 @@ class BaseAdapter(ABC):
         """
         # Default implementation - should be overridden
         return True
-    
+
     def get_framework_name(self) -> str:
         """Get the name of the framework this adapter supports.
         

@@ -1,7 +1,7 @@
 """Policy enforcement for LLM agents."""
 
-from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
 
 from adapt_agent.core.types import AgentMessage, AgentState, PolicyRule
 
@@ -12,13 +12,13 @@ class PolicyEnforcer:
     The PolicyEnforcer validates agent actions, messages, and state changes
     against defined policies and can take corrective actions when violations occur.
     """
-    
+
     def __init__(self):
         """Initialize the PolicyEnforcer."""
         self._rules: Dict[str, PolicyRule] = {}
         self._violations: List[Dict[str, Any]] = []
         self._rule_handlers: Dict[str, Callable] = {}
-    
+
     def add_rule(
         self,
         name: str,
@@ -44,7 +44,7 @@ class PolicyEnforcer:
             "severity": severity,
         }
         self._rules[name] = rule
-    
+
     def remove_rule(self, name: str) -> bool:
         """Remove a policy rule.
         
@@ -58,7 +58,7 @@ class PolicyEnforcer:
             del self._rules[name]
             return True
         return False
-    
+
     def get_rule(self, name: str) -> Optional[PolicyRule]:
         """Get a policy rule by name.
         
@@ -69,7 +69,7 @@ class PolicyEnforcer:
             PolicyRule if found, None otherwise
         """
         return self._rules.get(name)
-    
+
     def list_rules(self) -> List[PolicyRule]:
         """List all policy rules.
         
@@ -77,7 +77,7 @@ class PolicyEnforcer:
             List of all registered policy rules
         """
         return list(self._rules.values())
-    
+
     def register_handler(self, action: str, handler: Callable) -> None:
         """Register a handler for a policy action.
         
@@ -86,7 +86,7 @@ class PolicyEnforcer:
             handler: Callable to handle the action
         """
         self._rule_handlers[action] = handler
-    
+
     def check_message(self, message: AgentMessage) -> List[str]:
         """Check a message against all policy rules.
         
@@ -97,16 +97,16 @@ class PolicyEnforcer:
             List of violated rule names
         """
         violations = []
-        
+
         for rule_name, rule in self._rules.items():
             # Simple condition checking (can be extended with more sophisticated evaluation)
             if self._evaluate_condition(rule["condition"], {"message": message}):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "message", message)
                 self._handle_violation(rule)
-        
+
         return violations
-    
+
     def check_state(self, state: AgentState) -> List[str]:
         """Check agent state against all policy rules.
         
@@ -117,15 +117,15 @@ class PolicyEnforcer:
             List of violated rule names
         """
         violations = []
-        
+
         for rule_name, rule in self._rules.items():
             if self._evaluate_condition(rule["condition"], {"state": state}):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "state", state)
                 self._handle_violation(rule)
-        
+
         return violations
-    
+
     def get_violations(
         self,
         severity: Optional[str] = None,
@@ -141,15 +141,15 @@ class PolicyEnforcer:
             List of violation records
         """
         violations = self._violations
-        
+
         if severity:
             violations = [v for v in violations if v["severity"] == severity]
-        
+
         if limit:
             violations = violations[-limit:]
-        
+
         return violations
-    
+
     def _evaluate_condition(self, condition: str, context: Dict[str, Any]) -> bool:
         """Evaluate a policy condition.
         
@@ -164,7 +164,7 @@ class PolicyEnforcer:
         # a safe expression evaluator or DSL
         # For now, always return False (no violations)
         return False
-    
+
     def _record_violation(
         self,
         rule_name: str,
@@ -187,7 +187,7 @@ class PolicyEnforcer:
             "data": data,
         }
         self._violations.append(violation)
-    
+
     def _handle_violation(self, rule: PolicyRule) -> None:
         """Handle a policy violation.
         
