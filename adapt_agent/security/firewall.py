@@ -1,10 +1,13 @@
 """Firewall for LLM agent security."""
 
+import logging
 from typing import Any, Callable, Dict, List, Optional, Pattern
 import re
 from datetime import datetime
 
 from adapt_agent.core.types import AgentMessage, SecurityEvent
+
+logger = logging.getLogger(__name__)
 
 
 class Firewall:
@@ -89,8 +92,8 @@ class Firewall:
                     self._blocked_count += 1
                     return False
             except Exception as e:
-                # Log error but don't block on filter failure
-                print(f"Error in custom filter: {e}")
+                # Log error securely without exposing internal exception details directly via print
+                logger.error(f"Error in custom filter: %s", e)
         
         return True
     

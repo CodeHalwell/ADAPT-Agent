@@ -1,6 +1,9 @@
 """Evaluation frameworks for LLM agents."""
 
+import logging
 from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class AgentEvaluator:
@@ -60,7 +63,8 @@ class AgentEvaluator:
                 score = metric_func(output_data, expected_output)
                 results["metrics"][metric_name] = score
             except Exception as e:
-                print(f"Error computing metric {metric_name}: {e}")
+                # Log error securely without exposing internal exception details directly via print
+                logger.error(f"Error computing metric %s: %s", metric_name, e)
                 results["metrics"][metric_name] = None
         
         self._evaluation_results.append(results)

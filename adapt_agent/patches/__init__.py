@@ -1,6 +1,9 @@
 """Patches and fixes for LLM agent frameworks."""
 
+import logging
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class PatchManager:
@@ -63,7 +66,8 @@ class PatchManager:
             self._applied_patches.append(patch_id)
             return True
         except Exception as e:
-            print(f"Error applying patch {patch_id}: {e}")
+            # Log error securely without exposing internal exception details directly via print
+            logger.error(f"Error applying patch %s: %s", patch_id, e)
             return False
     
     def list_patches(

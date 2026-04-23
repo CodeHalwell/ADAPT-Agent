@@ -1,10 +1,13 @@
 """Middleware system for LLM agents."""
 
+import logging
 from typing import Any, Callable, Dict, List, Optional
 from functools import wraps
 
 
 MiddlewareFunc = Callable[[Dict[str, Any]], Dict[str, Any]]
+
+logger = logging.getLogger(__name__)
 
 
 class Middleware:
@@ -114,8 +117,8 @@ class Middleware:
             try:
                 result = middleware(result)
             except Exception as e:
-                # Log error and continue (or handle based on policy)
-                print(f"Error in pre-middleware {middleware.__name__}: {e}")
+                # Log error securely without exposing internal exception details directly via print
+                logger.error(f"Error in pre-middleware %s: %s", middleware.__name__, e)
         
         return result
     
@@ -134,8 +137,8 @@ class Middleware:
             try:
                 result = middleware(result)
             except Exception as e:
-                # Log error and continue (or handle based on policy)
-                print(f"Error in post-middleware {middleware.__name__}: {e}")
+                # Log error securely without exposing internal exception details directly via print
+                logger.error(f"Error in post-middleware %s: %s", middleware.__name__, e)
         
         return result
     
