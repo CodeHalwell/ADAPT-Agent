@@ -1,3 +1,0 @@
-## 2024-05-19 - [Taint Level Calculation Overhead]
-**Learning:** In `adapt_agent/security/taint_tracker.py`, the `get_taint_level` method repeatedly allocates a static list `level_order` on every call and uses `max(levels, key=lambda l: level_order.index(l))`. This results in excessive function calls (`lambda` and `.index()` for each element) and list allocations, causing a significant performance penalty (O(N*M) where N is source elements and M is level length) for an operation that could be O(N) with early exit.
-**Action:** Replace dynamic list allocation and `max()` with a class-level priority dictionary (`_LEVEL_PRIORITY`) and a simple iteration loop. Include an early exit when the maximum possible taint level (`CRITICAL`) is encountered.

@@ -1,9 +1,8 @@
 """Firewall for LLM agent security."""
 
+from typing import Any, Callable, Dict, List, Optional, Pattern
 import re
 from datetime import datetime
-from re import Pattern
-from typing import Any, Callable, Dict, List, Optional
 
 from adapt_agent.core.types import AgentMessage, SecurityEvent
 

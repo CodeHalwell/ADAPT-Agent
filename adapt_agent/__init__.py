@@ -8,10 +8,10 @@ __version__ = "0.1.0"
 
 # Core exports
 from adapt_agent.core import (
+    TrustManager,
+    PolicyEnforcer,
     MemorySystem,
     Middleware,
-    PolicyEnforcer,
-    TrustManager,
 )
 
 # Security exports

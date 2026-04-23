@@ -1,7 +1,7 @@
 """Adversarial defense for LLM agents."""
 
-from datetime import datetime
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 
 
 class AdversarialDefense:

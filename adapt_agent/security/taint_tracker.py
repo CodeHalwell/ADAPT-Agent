@@ -1,8 +1,8 @@
 """Taint tracking for LLM agent data flow."""
 
+from typing import Any, Dict, List, Optional, Set
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set
 
 
 class TaintLevel(Enum):

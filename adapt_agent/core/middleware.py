@@ -1,7 +1,8 @@
 """Middleware system for LLM agents."""
 
-from functools import wraps
 from typing import Any, Callable, Dict, List, Optional
+from functools import wraps
+
 
 MiddlewareFunc = Callable[[Dict[str, Any]], Dict[str, Any]]
 

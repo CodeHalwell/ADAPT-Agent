@@ -1,6 +1,7 @@
 """Tests for core functionality."""
 
-from adapt_agent.core import MemorySystem, Middleware, PolicyEnforcer, TrustManager
+import pytest
+from adapt_agent.core import TrustManager, PolicyEnforcer, MemorySystem, Middleware
 
 
 def test_trust_manager_initialization():

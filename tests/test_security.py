@@ -1,5 +1,6 @@
 """Tests for security functionality."""
 
+import pytest
 from adapt_agent.security import Firewall, TaintTracker
 from adapt_agent.security.taint_tracker import TaintLevel
 
