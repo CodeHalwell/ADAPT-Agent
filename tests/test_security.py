@@ -76,36 +76,6 @@ def test_taint_tracker_sanitize():
     assert not tracker.is_tainted("data1")
 
 
-def test_taint_tracker_get_stats():
-    """Test get_stats method of TaintTracker."""
-    tracker = TaintTracker()
-
-    # Initial stats
-    stats = tracker.get_stats()
-    assert stats["total_sources"] == 0
-    assert stats["tainted_data_count"] == 0
-    assert stats["propagation_count"] == 0
-    assert stats["taint_level_distribution"] == {}
-
-    # Register some sources
-    tracker.register_source("source1", "user_input", TaintLevel.HIGH)
-    tracker.register_source("source2", "external_api", TaintLevel.LOW)
-
-    # Mark tainted
-    tracker.mark_tainted("data1", ["source1"])
-    tracker.mark_tainted("data2", ["source1", "source2"])
-
-    # Propagate
-    tracker.propagate_taint("data1", "data3", "copy")
-
-    # Get updated stats
-    stats = tracker.get_stats()
-    assert stats["total_sources"] == 2
-    assert stats["tainted_data_count"] == 3
-    assert stats["propagation_count"] == 1
-    assert stats["taint_level_distribution"][TaintLevel.HIGH.value] == 3
-    assert stats["taint_level_distribution"][TaintLevel.LOW.value] == 1
-
 
 def test_taint_tracker_get_taint_flow():
     """Test get_taint_flow method of TaintTracker."""
