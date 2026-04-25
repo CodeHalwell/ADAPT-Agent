@@ -1,7 +1,7 @@
 """Policy enforcement for LLM agents."""
 
 from typing import Any, Callable, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from adapt_agent.core.types import AgentMessage, AgentState, PolicyRule
 
@@ -183,7 +183,7 @@ class PolicyEnforcer:
             "rule_name": rule_name,
             "violation_type": violation_type,
             "severity": rule["severity"],
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "data": data,
         }
         self._violations.append(violation)

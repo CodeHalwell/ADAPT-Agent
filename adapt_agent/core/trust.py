@@ -1,7 +1,7 @@
 """Trust management for LLM agents."""
 
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from adapt_agent.core.types import AgentState, TrustScore
 
@@ -71,7 +71,7 @@ class TrustManager:
             "score": new_score,
             "confidence": 1.0,
             "factors": factors or {},
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         
         if agent_id not in self._trust_history:
@@ -108,7 +108,7 @@ class TrustManager:
             "score": max(self.min_trust, min(self.max_trust, current_score + factor_sum)),
             "confidence": 0.8,
             "factors": factors,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         
         return trust_score

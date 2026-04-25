@@ -3,7 +3,7 @@
 from typing import Any, Callable, Dict, List, Optional, Pattern
 import re
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from adapt_agent.core.types import AgentMessage, SecurityEvent
 
@@ -202,7 +202,7 @@ class Firewall:
             "event_type": event_type,
             "severity": severity,
             "description": description,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata,
         }
         self._security_events.append(event)
