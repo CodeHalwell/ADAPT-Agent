@@ -1,7 +1,7 @@
 """Adversarial defense for LLM agents."""
 
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class AdversarialDefense:
@@ -89,7 +89,7 @@ class AdversarialDefense:
             "input": input_text[:100],  # Truncated for privacy
             "threats_detected": threats,
             "is_safe": len(threats) == 0,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     
     def add_attack_pattern(self, pattern: str) -> None:
@@ -141,7 +141,7 @@ class AdversarialDefense:
             "type": attack_type,
             "content": content[:100],  # Truncated
             "indicator": indicator,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._detected_attacks.append(attack)
 

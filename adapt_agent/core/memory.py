@@ -1,7 +1,7 @@
 """Memory systems for LLM agents."""
 
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class MemorySystem:
@@ -46,7 +46,7 @@ class MemorySystem:
             "key": key,
             "value": value,
             "metadata": metadata or {},
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "access_count": 0,
         }
         
@@ -73,7 +73,7 @@ class MemorySystem:
             "key": key,
             "value": value,
             "metadata": metadata or {},
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "access_count": 0,
         }
         
@@ -110,7 +110,7 @@ class MemorySystem:
         for item in reversed(memory):
             if item["key"] == key:
                 item["access_count"] += 1
-                item["last_accessed"] = datetime.utcnow().isoformat()
+                item["last_accessed"] = datetime.now(timezone.utc).isoformat()
                 return item["value"]
         
         return None

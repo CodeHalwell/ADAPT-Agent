@@ -1,6 +1,6 @@
 """Taint tracking for LLM agent data flow."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 
@@ -37,7 +37,7 @@ class TaintSource:
         self.source_type = source_type
         self.level = level
         self.metadata = metadata or {}
-        self.timestamp = datetime.utcnow().isoformat()
+        self.timestamp = datetime.now(timezone.utc).isoformat()
 
 
 class TaintTracker:
@@ -183,7 +183,7 @@ class TaintTracker:
             "from": from_data_id,
             "to": to_data_id,
             "operation": operation,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "sources": source_ids,
         })
 

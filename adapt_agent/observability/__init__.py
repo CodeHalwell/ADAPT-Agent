@@ -1,6 +1,6 @@
 """Observability and monitoring for LLM agents."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 
@@ -40,7 +40,7 @@ class AgentObserver:
             "trace_id": trace_id,
             "agent_id": agent_id,
             "operation": operation,
-            "start_time": datetime.utcnow().isoformat(),
+            "start_time": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
             "events": [],
             "status": "active",
@@ -64,7 +64,7 @@ class AgentObserver:
         # ⚡ Bolt: Replaced O(N) loop with O(1) dictionary lookup
         if trace_id in self._traces:
             trace = self._traces[trace_id]
-            trace["end_time"] = datetime.utcnow().isoformat()
+            trace["end_time"] = datetime.now(timezone.utc).isoformat()
             trace["status"] = status
             trace["result"] = result
 
@@ -86,7 +86,7 @@ class AgentObserver:
         event = {
             "event_type": event_type,
             "description": description,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
         }
 
@@ -113,7 +113,7 @@ class AgentObserver:
             "level": level,
             "message": message,
             "agent_id": agent_id,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
         }
         self._logs.append(log_entry)
