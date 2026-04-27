@@ -181,10 +181,19 @@ class Firewall:
         events = self._security_events
 
         if severity:
-            events = [e for e in events if e["severity"] == severity]
+            # ⚡ Bolt: Fast path for finding limited recent events with a specific severity
+            if limit:
+                results = []
+                for e in reversed(events):
+                    if e["severity"] == severity:
+                        results.append(e)
+                        if len(results) >= limit:
+                            break
+                return list(reversed(results))
+            return [e for e in events if e["severity"] == severity]
 
         if limit:
-            events = events[-limit:]
+            return events[-limit:]
 
         return events
 
