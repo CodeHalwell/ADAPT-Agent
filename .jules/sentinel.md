@@ -6,3 +6,7 @@
 **Vulnerability:** The Firewall class tracked `_security_events` in an unbounded list and lacked a maximum length check on input payload length, opening the agent up to Memory Leak / Memory Exhaustion via thousands of generated security events, and DoS / ReDoS attacks on regular expressions.
 **Learning:** Security controls processing arbitrary user input, particularly LLM inputs and adversarial attempts, can generate logs dynamically. If these logs are unbounded, they can crash the system. Processing arbitrarily long text fields with regex patterns runs the severe risk of taking O(2^N) or O(N^2) evaluation time (ReDoS).
 **Prevention:** Always implement `max_events` limits (capping arrays/lists) for internal tracking arrays, and always implement explicit string length maximums for security scanners before running resource-intensive regex processing.
+## 2026-05-02 - List Bounding for DoS Prevention
+**Vulnerability:** Core tracking components (`PolicyEnforcer`, `TaintTracker`, `AgentObserver`) tracked events in unbounded lists (`_violations`, `_taint_propagation`, `_logs`), posing a Denial of Service (DoS) risk via memory exhaustion.
+**Learning:** Unbounded tracking of events generated dynamically by arbitrary inputs can crash the system. Bounding list sizes is crucial for long-running agents.
+**Prevention:** Always implement max length checks (`max_violations`, `max_propagations`, `max_logs`) for internal tracking arrays, and cap arrays/lists when appending.

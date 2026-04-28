@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Optional
 
 
 class TaintLevel(Enum):
@@ -23,10 +23,10 @@ class TaintSource:
         source_id: str,
         source_type: str,
         level: TaintLevel,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ):
         """Initialize a TaintSource.
-        
+
         Args:
             source_id: Unique identifier for the source
             source_type: Type of taint source (e.g., 'user_input', 'external_api')
@@ -42,7 +42,7 @@ class TaintSource:
 
 class TaintTracker:
     """Tracks data taint throughout agent execution.
-    
+
     Implements taint tracking to identify and monitor potentially
     unsafe or untrusted data as it flows through the agent system.
     """
@@ -55,27 +55,32 @@ class TaintTracker:
         TaintLevel.CRITICAL: 4,
     }
 
-    def __init__(self):
-        """Initialize the TaintTracker."""
-        self._taint_sources: Dict[str, TaintSource] = {}
-        self._tainted_data: Dict[str, Set[str]] = {}  # data_id -> set of source_ids
-        self._taint_propagation: List[Dict[str, Any]] = []
+    def __init__(self, max_propagations: int = 1000):
+        """Initialize the TaintTracker.
+
+        Args:
+            max_propagations: Maximum number of taint propagations to store in memory.
+        """
+        self.max_propagations = max_propagations
+        self._taint_sources: dict[str, TaintSource] = {}
+        self._tainted_data: dict[str, set[str]] = {}  # data_id -> set of source_ids
+        self._taint_propagation: list[dict[str, Any]] = []
 
     def register_source(
         self,
         source_id: str,
         source_type: str,
         level: TaintLevel = TaintLevel.MEDIUM,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> TaintSource:
         """Register a new taint source.
-        
+
         Args:
             source_id: Unique identifier for the source
             source_type: Type of taint source
             level: Taint level
             metadata: Optional metadata
-            
+
         Returns:
             Created TaintSource
         """
@@ -86,10 +91,10 @@ class TaintTracker:
     def mark_tainted(
         self,
         data_id: str,
-        source_ids: List[str],
+        source_ids: list[str],
     ) -> None:
         """Mark data as tainted by specific sources.
-        
+
         Args:
             data_id: Identifier for the data
             source_ids: List of taint source IDs
@@ -101,10 +106,10 @@ class TaintTracker:
 
     def is_tainted(self, data_id: str) -> bool:
         """Check if data is tainted.
-        
+
         Args:
             data_id: Identifier for the data
-            
+
         Returns:
             True if data is tainted, False otherwise
         """
@@ -112,10 +117,10 @@ class TaintTracker:
 
     def get_taint_level(self, data_id: str) -> TaintLevel:
         """Get the highest taint level for data.
-        
+
         Args:
             data_id: Identifier for the data
-            
+
         Returns:
             Highest taint level affecting the data
         """
@@ -139,12 +144,12 @@ class TaintTracker:
 
         return max_level
 
-    def get_taint_sources(self, data_id: str) -> List[TaintSource]:
+    def get_taint_sources(self, data_id: str) -> list[TaintSource]:
         """Get all taint sources affecting data.
-        
+
         Args:
             data_id: Identifier for the data
-            
+
         Returns:
             List of TaintSource objects
         """
@@ -165,7 +170,7 @@ class TaintTracker:
         operation: str = "unknown",
     ) -> None:
         """Propagate taint from one data to another.
-        
+
         Args:
             from_data_id: Source data identifier
             to_data_id: Target data identifier
@@ -187,21 +192,25 @@ class TaintTracker:
             "sources": source_ids,
         })
 
+        # SECURITY: Prevent unbounded memory growth
+        if len(self._taint_propagation) > self.max_propagations:
+            self._taint_propagation.pop(0)
+
     def sanitize(self, data_id: str) -> None:
         """Mark data as sanitized (remove taint).
-        
+
         Args:
             data_id: Identifier for the data
         """
         if data_id in self._tainted_data:
             del self._tainted_data[data_id]
 
-    def get_taint_flow(self, data_id: str) -> List[Dict[str, Any]]:
+    def get_taint_flow(self, data_id: str) -> list[dict[str, Any]]:
         """Get the taint propagation flow for data.
-        
+
         Args:
             data_id: Identifier for the data
-            
+
         Returns:
             List of propagation records leading to this data
         """
@@ -214,9 +223,9 @@ class TaintTracker:
 
         return flow
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get taint tracking statistics.
-        
+
         Returns:
             Dictionary of statistics
         """
