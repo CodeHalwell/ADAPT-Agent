@@ -11,8 +11,13 @@ class AgentObserver:
     debugging and monitoring capabilities.
     """
 
-    def __init__(self):
-        """Initialize the AgentObserver."""
+    def __init__(self, max_logs: int = 1000):
+        """Initialize the AgentObserver.
+
+        Args:
+            max_logs: Maximum number of logs to store in memory.
+        """
+        self.max_logs = max_logs
         # ⚡ Bolt: Using a dict instead of list for O(1) trace lookups
         self._traces: dict[str, dict[str, Any]] = {}
         self._logs: list[dict[str, Any]] = []
@@ -117,6 +122,10 @@ class AgentObserver:
             "metadata": metadata or {},
         }
         self._logs.append(log_entry)
+
+        # SECURITY: Prevent unbounded memory growth
+        if len(self._logs) > self.max_logs:
+            self._logs.pop(0)
 
     def record_metric(
         self,

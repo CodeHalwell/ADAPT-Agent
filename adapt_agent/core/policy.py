@@ -13,8 +13,13 @@ class PolicyEnforcer:
     against defined policies and can take corrective actions when violations occur.
     """
 
-    def __init__(self):
-        """Initialize the PolicyEnforcer."""
+    def __init__(self, max_violations: int = 1000):
+        """Initialize the PolicyEnforcer.
+
+        Args:
+            max_violations: Maximum number of violations to store in memory.
+        """
+        self.max_violations = max_violations
         self._rules: dict[str, PolicyRule] = {}
         self._violations: list[dict[str, Any]] = []
         self._rule_handlers: dict[str, Callable] = {}
@@ -196,6 +201,10 @@ class PolicyEnforcer:
             "data": data,
         }
         self._violations.append(violation)
+
+        # SECURITY: Prevent unbounded memory growth
+        if len(self._violations) > self.max_violations:
+            self._violations.pop(0)
 
     def _handle_violation(self, rule: PolicyRule) -> None:
         """Handle a policy violation.
