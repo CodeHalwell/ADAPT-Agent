@@ -172,16 +172,25 @@ class AgentObserver:
         Returns:
             List of traces
         """
-        traces = list(self._traces.values())
+        # ⚡ Bolt: Using reversed() with early-exit limits O(N) operations to O(limit)
+        if limit is not None:
+            results = []
+            for t in reversed(self._traces.values()):
+                if agent_id and t["agent_id"] != agent_id:
+                    continue
+                if status and t["status"] != status:
+                    continue
+                results.append(t)
+                if len(results) >= limit:
+                    break
+            return list(reversed(results))
 
+        traces = list(self._traces.values())
         if agent_id:
             traces = [t for t in traces if t["agent_id"] == agent_id]
 
         if status:
             traces = [t for t in traces if t["status"] == status]
-
-        if limit:
-            traces = traces[-limit:]
 
         return traces
 
@@ -201,16 +210,25 @@ class AgentObserver:
         Returns:
             List of log entries
         """
-        logs = self._logs
+        # ⚡ Bolt: Using reversed() with early-exit limits O(N) operations to O(limit)
+        if limit is not None:
+            results = []
+            for log in reversed(self._logs):
+                if level and log["level"] != level:
+                    continue
+                if agent_id and log.get("agent_id") != agent_id:
+                    continue
+                results.append(log)
+                if len(results) >= limit:
+                    break
+            return list(reversed(results))
 
+        logs = self._logs
         if level:
             logs = [log for log in logs if log["level"] == level]
 
         if agent_id:
             logs = [log for log in logs if log.get("agent_id") == agent_id]
-
-        if limit:
-            logs = logs[-limit:]
 
         return logs
 
