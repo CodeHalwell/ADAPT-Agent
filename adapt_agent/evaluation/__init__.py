@@ -123,13 +123,20 @@ class AgentEvaluator:
         Returns:
             List of evaluation results
         """
-        results = self._evaluation_results
+        # ⚡ Bolt: Using reversed() with early-exit limits O(N) operations to O(limit)
+        if limit is not None:
+            results = []
+            for r in reversed(self._evaluation_results):
+                if agent_id and r["agent_id"] != agent_id:
+                    continue
+                results.append(r)
+                if len(results) >= limit:
+                    break
+            return list(reversed(results))
 
+        results = self._evaluation_results
         if agent_id:
             results = [r for r in results if r["agent_id"] == agent_id]
-
-        if limit:
-            results = results[-limit:]
 
         return results
 

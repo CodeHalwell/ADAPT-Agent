@@ -9,3 +9,6 @@
 ## 2024-05-25 - Efficient recent item filtering
 **Learning:** In `adapt_agent/core/policy.py`, filtering a large chronologically ordered list for a limited number of recent matches using standard list comprehensions (e.g., `[v for v in items if condition][-limit:]`) is highly inefficient because it processes all `N` elements.
 **Action:** When searching for a limited number of recent items matching a condition, iterate backwards using `reversed(items)` and early-exit (`break`) once the limit is reached to achieve an `O(L)` operation where `L` is the number of inspected elements.
+## 2024-05-18 - Early Exit Filtering
+**Learning:** `get_evaluation_results` suffered from iterating over the whole history using list comprehensions when returning a limited set of results, adding overhead that scaled linearly with total items rather than requested limits.
+**Action:** Replace `list_comprehensions` acting on full arrays with backwards iteration (`reversed()`) combined with an early exit (`break`) based on `limit`.
