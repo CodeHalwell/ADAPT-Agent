@@ -13,8 +13,13 @@ class AgentEvaluator:
     capabilities for agent quality assessment.
     """
 
-    def __init__(self):
-        """Initialize the AgentEvaluator."""
+    def __init__(self, max_results: int = 1000):
+        """Initialize the AgentEvaluator.
+
+        Args:
+            max_results: Maximum number of evaluation results to store in memory.
+        """
+        self.max_results = max_results
         self._evaluation_results: list[dict[str, Any]] = []
         self._custom_metrics: dict[str, Callable] = {}
 
@@ -67,6 +72,11 @@ class AgentEvaluator:
                 results["metrics"][metric_name] = None
 
         self._evaluation_results.append(results)
+
+        # SECURITY: Prevent unbounded memory growth
+        if len(self._evaluation_results) > self.max_results:
+            self._evaluation_results.pop(0)
+
         return results
 
     def compute_aggregate_metrics(
