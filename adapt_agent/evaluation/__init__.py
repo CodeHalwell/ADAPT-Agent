@@ -99,25 +99,20 @@ class AgentEvaluator:
         if not results:
             return {}
 
-        aggregates = {}
-
-        # Get all metric names
-        metric_names = set()
+        # ⚡ Bolt: Single O(N) pass over results instead of O(N*M) passes
+        sums = {}
+        counts = {}
         for result in results:
-            metric_names.update(result["metrics"].keys())
+            for metric_name, score in result["metrics"].items():
+                if score is not None:
+                    sums[metric_name] = sums.get(metric_name, 0.0) + score
+                    counts[metric_name] = counts.get(metric_name, 0) + 1
 
-        # Compute average for each metric
-        for metric_name in metric_names:
-            scores = [
-                r["metrics"][metric_name]
-                for r in results
-                if metric_name in r["metrics"] and r["metrics"][metric_name] is not None
-            ]
-
-            if scores:
-                aggregates[metric_name] = sum(scores) / len(scores)
-
-        return aggregates
+        return {
+            name: sums[name] / count
+            for name, count in counts.items()
+            if count > 0
+        }
 
     def get_evaluation_results(
         self,

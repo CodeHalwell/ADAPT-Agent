@@ -12,3 +12,7 @@
 ## 2024-05-18 - Early Exit Filtering
 **Learning:** `get_evaluation_results` suffered from iterating over the whole history using list comprehensions when returning a limited set of results, adding overhead that scaled linearly with total items rather than requested limits.
 **Action:** Replace `list_comprehensions` acting on full arrays with backwards iteration (`reversed()`) combined with an early exit (`break`) based on `limit`.
+
+## 2024-05-26 - O(N*M) to O(N) aggregate metrics optimization
+**Learning:** In `adapt_agent/evaluation/__init__.py`, calculating aggregate metrics previously involved multiple passes over all results (first finding unique metrics, then searching for each metric). This resulted in O(N*M) operations where N is results and M is metrics.
+**Action:** Replace multiple-pass accumulation with a single O(N) pass using dictionaries to build sums and counts concurrently, then format the result dict.
