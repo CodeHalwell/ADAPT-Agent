@@ -1,7 +1,6 @@
 """Tests for core functionality."""
 
-import pytest
-from adapt_agent.core import TrustManager, PolicyEnforcer, MemorySystem, Middleware
+from adapt_agent.core import MemorySystem, Middleware, PolicyEnforcer, TrustManager
 
 
 def test_trust_manager_initialization():
@@ -24,11 +23,11 @@ def test_trust_manager_update_score():
     """Test updating trust score."""
     trust_manager = TrustManager()
     agent_id = "test_agent"
-    
+
     # Increase trust
     new_score = trust_manager.update_trust_score(agent_id, 0.2)
     assert new_score == 0.7
-    
+
     # Decrease trust
     new_score = trust_manager.update_trust_score(agent_id, -0.3)
     assert abs(new_score - 0.4) < 0.0001  # Use approximate comparison for floats
@@ -44,17 +43,38 @@ def test_policy_enforcer_add_rule():
         action="warn",
         severity="low"
     )
-    
+
     rule = enforcer.get_rule("test_rule")
     assert rule is not None
     assert rule["name"] == "test_rule"
+
+
+def test_policy_enforcer_evaluate_condition():
+    """Test the AST-based condition evaluation."""
+    enforcer = PolicyEnforcer()
+
+    # Basic comparison
+    context = {"state": {"trust_score": 0.3}}
+    assert enforcer._evaluate_condition("state['trust_score'] < 0.5", context) is True
+    assert enforcer._evaluate_condition("state['trust_score'] > 0.5", context) is False
+
+    # Boolean operators and string inclusion
+    context = {"message": {"role": "user", "content": "my password is foo"}}
+    condition = "message['role'] == 'user' and 'password' in message['content']"
+    assert enforcer._evaluate_condition(condition, context) is True
+
+    # Error handling (unsupported node)
+    assert enforcer._evaluate_condition("import os", context) is False
+
+    # Error handling (unknown variable)
+    assert enforcer._evaluate_condition("unknown_var == 1", context) is False
 
 
 def test_memory_system_short_term():
     """Test short-term memory storage and retrieval."""
     memory = MemorySystem()
     memory.store_short_term("key1", "value1")
-    
+
     value = memory.retrieve("key1")
     assert value == "value1"
 
@@ -63,7 +83,7 @@ def test_memory_system_long_term():
     """Test long-term memory storage and retrieval."""
     memory = MemorySystem()
     memory.store_long_term("key1", "value1")
-    
+
     value = memory.retrieve("key1", from_long_term=True)
     assert value == "value1"
 

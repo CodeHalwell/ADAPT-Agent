@@ -10,3 +10,7 @@
 **Vulnerability:** Core tracking components (`PolicyEnforcer`, `TaintTracker`, `AgentObserver`) tracked events in unbounded lists (`_violations`, `_taint_propagation`, `_logs`), posing a Denial of Service (DoS) risk via memory exhaustion.
 **Learning:** Unbounded tracking of events generated dynamically by arbitrary inputs can crash the system. Bounding list sizes is crucial for long-running agents.
 **Prevention:** Always implement max length checks (`max_violations`, `max_propagations`, `max_logs`) for internal tracking arrays, and cap arrays/lists when appending.
+## 2026-05-05 - AST Whitelisting vs Arbitrary eval()
+**Vulnerability:** A feature designed to dynamically evaluate expressions (such as condition strings) used a placeholder that returned `False`. A naive implementation would have used Python's built-in `eval()`, which is a critical security risk (arbitrary code execution) if untrusted inputs can influence the evaluated string.
+**Learning:** `eval()` should essentially never be used when processing inputs that may contain adversarial data or dynamically generated content without a strict, air-gapped sandbox.
+**Prevention:** Always implement a safe expression evaluator using an Abstract Syntax Tree (AST) whitelisting approach (via `ast.parse` and carefully walking the nodes) when simple dynamic condition evaluations are required, explicitly forbidding function calls (`ast.Call`), attribute access (`ast.Attribute`), and unbounded operations (e.g. `ast.Pow`).
