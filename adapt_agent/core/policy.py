@@ -1,9 +1,14 @@
 """Policy enforcement for LLM agents."""
 
+import ast
+import logging
+import operator
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from adapt_agent.core.types import AgentMessage, AgentState, PolicyRule
+
+logger = logging.getLogger(__name__)
 
 
 class PolicyEnforcer:
@@ -174,10 +179,71 @@ class PolicyEnforcer:
         Returns:
             True if condition is met (violation), False otherwise
         """
-        # Placeholder implementation - real implementation would use
-        # a safe expression evaluator or DSL
-        # For now, always return False (no violations)
-        return False
+        operators = {
+            ast.Eq: operator.eq, ast.NotEq: operator.ne,
+            ast.Lt: operator.lt, ast.LtE: operator.le,
+            ast.Gt: operator.gt, ast.GtE: operator.ge,
+            ast.In: lambda a, b: a in b, ast.NotIn: lambda a, b: a not in b,
+        }
+
+        binops = {
+            ast.Add: operator.add, ast.Sub: operator.sub,
+            ast.Mult: operator.mul, ast.Div: operator.truediv,
+        }
+
+        def eval_node(node: ast.AST) -> Any:
+            if isinstance(node, ast.Constant):
+                return node.value
+            elif isinstance(node, ast.Name):
+                if node.id in context:
+                    return context[node.id]
+                raise ValueError(f"Unknown variable: {node.id}")
+            elif isinstance(node, ast.Compare):
+                left = eval_node(node.left)
+                for op, comp in zip(node.ops, node.comparators):
+                    right = eval_node(comp)
+                    if type(op) not in operators:
+                        raise ValueError(f"Unsupported operator: {type(op)}")
+                    if not operators[type(op)](left, right):
+                        return False
+                    left = right
+                return True
+            elif isinstance(node, ast.BoolOp):
+                if isinstance(node.op, ast.And):
+                    for value in node.values:
+                        if not eval_node(value):
+                            return False
+                    return True
+                elif isinstance(node.op, ast.Or):
+                    for value in node.values:
+                        if eval_node(value):
+                            return True
+                    return False
+                raise ValueError(f"Unsupported boolean operator: {type(node.op)}")
+            elif isinstance(node, ast.BinOp):
+                left = eval_node(node.left)
+                right = eval_node(node.right)
+                if type(node.op) not in binops:
+                    raise ValueError(f"Unsupported binary operator: {type(node.op)}")
+                return binops[type(node.op)](left, right)
+            elif isinstance(node, ast.Subscript):
+                val = eval_node(node.value)
+                if isinstance(node.slice, ast.Slice):
+                    raise ValueError("Slices are not supported")
+                slice_val = eval_node(node.slice)
+                try:
+                    return val[slice_val]
+                except (KeyError, IndexError, TypeError):
+                    return None
+            else:
+                raise ValueError(f"Unsupported AST node: {type(node)}")
+
+        try:
+            tree = ast.parse(condition, mode='eval')
+            return bool(eval_node(tree.body))
+        except Exception as e:
+            logger.error(f"Error evaluating condition '{condition}': {e}")
+            return False
 
     def _record_violation(
         self,
