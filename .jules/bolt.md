@@ -16,3 +16,7 @@
 ## 2024-05-26 - O(N*M) to O(N) aggregate metrics optimization
 **Learning:** In `adapt_agent/evaluation/__init__.py`, calculating aggregate metrics previously involved multiple passes over all results (first finding unique metrics, then searching for each metric). This resulted in O(N*M) operations where N is results and M is metrics.
 **Action:** Replace multiple-pass accumulation with a single O(N) pass using dictionaries to build sums and counts concurrently, then format the result dict.
+
+## 2024-05-27 - Early Exit Filtering in Adversarial Defense
+**Learning:** In `adapt_agent/adversarial/__init__.py`, `get_detected_attacks` filtered a large chronologically ordered list using standard list comprehensions, evaluating the entire list even when a limited subset was requested. This caused O(N) overhead when returning recent items.
+**Action:** Replace `list_comprehensions` with backwards iteration (`reversed()`) combined with an early exit (`break`) based on `limit`.

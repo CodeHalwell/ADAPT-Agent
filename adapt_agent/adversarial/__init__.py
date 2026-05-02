@@ -119,15 +119,19 @@ class AdversarialDefense:
         Returns:
             List of detected attacks
         """
-        attacks = self._detected_attacks
+        if limit is None and not attack_type:
+            return list(self._detected_attacks)
 
-        if attack_type:
-            attacks = [a for a in attacks if a["type"] == attack_type]
+        results = []
+        for attack in reversed(self._detected_attacks):
+            if attack_type and attack["type"] != attack_type:
+                continue
 
-        if limit:
-            attacks = attacks[-limit:]
+            results.append(attack)
+            if limit and len(results) >= limit:
+                break
 
-        return attacks
+        return list(reversed(results))
 
     def _record_attack(
         self,
