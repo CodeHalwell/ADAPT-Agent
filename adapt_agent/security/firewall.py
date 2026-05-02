@@ -83,7 +83,7 @@ class Firewall:
 
         # Check allowed patterns first (whitelist)
         for pattern in self._allowed_patterns:
-            if pattern.search(content):
+            if pattern.fullmatch(content):
                 return True
 
         # Check blocked patterns
