@@ -55,13 +55,15 @@ class TaintTracker:
         TaintLevel.CRITICAL: 4,
     }
 
-    def __init__(self, max_propagations: int = 1000):
+    def __init__(self, max_propagations: int = 1000, max_tracked_items: int = 1000):
         """Initialize the TaintTracker.
 
         Args:
             max_propagations: Maximum number of taint propagations to store in memory.
+            max_tracked_items: Maximum number of sources and tainted items to track in memory.
         """
         self.max_propagations = max_propagations
+        self.max_tracked_items = max_tracked_items
         self._taint_sources: dict[str, TaintSource] = {}
         self._tainted_data: dict[str, set[str]] = {}  # data_id -> set of source_ids
         self._taint_propagation: list[dict[str, Any]] = []
@@ -86,6 +88,12 @@ class TaintTracker:
         """
         source = TaintSource(source_id, source_type, level, metadata)
         self._taint_sources[source_id] = source
+
+        # SECURITY: Prevent memory exhaustion from unbounded dictionary
+        if len(self._taint_sources) > self.max_tracked_items:
+            oldest_source = next(iter(self._taint_sources))
+            del self._taint_sources[oldest_source]
+
         return source
 
     def mark_tainted(
@@ -103,6 +111,11 @@ class TaintTracker:
             self._tainted_data[data_id] = set()
 
         self._tainted_data[data_id].update(source_ids)
+
+        # SECURITY: Prevent memory exhaustion from unbounded dictionary
+        if len(self._tainted_data) > self.max_tracked_items:
+            oldest_data = next(iter(self._tainted_data))
+            del self._tainted_data[oldest_data]
 
     def is_tainted(self, data_id: str) -> bool:
         """Check if data is tainted.

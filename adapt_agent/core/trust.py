@@ -19,6 +19,7 @@ class TrustManager:
         min_trust: float = 0.0,
         max_trust: float = 1.0,
         max_history: int = 1000,
+        max_agents: int = 1000,
     ):
         """Initialize the TrustManager.
 
@@ -27,11 +28,13 @@ class TrustManager:
             min_trust: Minimum allowed trust score
             max_trust: Maximum allowed trust score
             max_history: Maximum number of trust history entries to store per agent
+            max_agents: Maximum number of agents to track in memory
         """
         self.initial_trust = initial_trust
         self.min_trust = min_trust
         self.max_trust = max_trust
         self.max_history = max_history
+        self.max_agents = max_agents
         self._trust_scores: dict[str, float] = {}
         self._trust_history: dict[str, list[TrustScore]] = {}
 
@@ -84,6 +87,13 @@ class TrustManager:
         # SECURITY: Prevent unbounded memory growth
         if len(self._trust_history[agent_id]) > self.max_history:
             self._trust_history[agent_id].pop(0)
+
+        # SECURITY: Prevent memory exhaustion from unbounded unique agents
+        if len(self._trust_scores) > self.max_agents:
+            oldest_agent = next(iter(self._trust_scores))
+            del self._trust_scores[oldest_agent]
+            if oldest_agent in self._trust_history:
+                del self._trust_history[oldest_agent]
 
         return new_score
 
