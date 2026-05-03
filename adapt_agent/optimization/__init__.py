@@ -65,14 +65,25 @@ class AgentOptimizer:
         """
         suggestions = []
 
-        # Analyze metrics for this agent
-        agent_metrics = [m for m in self._metrics if m["agent_id"] == agent_id]
+        # ⚡ Bolt: Single O(N) pass to collect metrics and avoid repeated array traversals
+        count = 0
+        total_time = 0.0
+        total_tokens = 0
+        has_tokens = False
 
-        if not agent_metrics:
+        for m in self._metrics:
+            if m["agent_id"] == agent_id:
+                count += 1
+                total_time += m["execution_time"]
+                if "token_usage" in m and m["token_usage"] is not None:
+                    has_tokens = True
+                    total_tokens += m["token_usage"]
+
+        if count == 0:
             return suggestions
 
         # Check for slow execution
-        avg_time = sum(m["execution_time"] for m in agent_metrics) / len(agent_metrics)
+        avg_time = total_time / count
         if avg_time > 5.0:  # threshold in seconds
             suggestions.append({
                 "type": "performance",
@@ -83,8 +94,8 @@ class AgentOptimizer:
             })
 
         # Check for high token usage
-        if agent_metrics[0].get("token_usage"):
-            avg_tokens = sum(m.get("token_usage", 0) for m in agent_metrics) / len(agent_metrics)
+        if has_tokens:
+            avg_tokens = total_tokens / count
             if avg_tokens > 1000:
                 suggestions.append({
                     "type": "efficiency",
@@ -112,15 +123,25 @@ class AgentOptimizer:
         Returns:
             Statistics dictionary
         """
-        agent_metrics = [m for m in self._metrics if m["agent_id"] == agent_id]
+        # ⚡ Bolt: Single O(N) pass to avoid repeated list traversals for calculation
+        count = 0
+        total_time = 0.0
+        success_count = 0
 
-        if not agent_metrics:
+        for m in self._metrics:
+            if m["agent_id"] == agent_id:
+                count += 1
+                total_time += m["execution_time"]
+                if m.get("success", False):
+                    success_count += 1
+
+        if count == 0:
             return {}
 
         return {
-            "total_executions": len(agent_metrics),
-            "avg_execution_time": sum(m["execution_time"] for m in agent_metrics) / len(agent_metrics),
-            "success_rate": sum(1 for m in agent_metrics if m["success"]) / len(agent_metrics),
+            "total_executions": count,
+            "avg_execution_time": total_time / count,
+            "success_rate": success_count / count,
         }
 
 
