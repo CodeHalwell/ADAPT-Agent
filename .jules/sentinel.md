@@ -18,3 +18,7 @@
 **Vulnerability:** The `Firewall` class's explicit whitelist mechanism (`_allowed_patterns`) used `pattern.search(content)`, which allowed arbitrary inputs to bypass security blocks as long as they contained an allowed substring anywhere within them (e.g., `allowed_str malicious_payload`).
 **Learning:** Using regex `search` instead of `fullmatch` for access control or whitelisting creates a severe bypass vulnerability because it fails to enforce boundary conditions on the input.
 **Prevention:** Always use `pattern.fullmatch()` or explicitly define boundary anchors (`^` and `$`) when evaluating inputs against a whitelist to ensure the *entire* input is allowed.
+## 2026-05-09 - Dictionary Bounding for DoS Prevention
+**Vulnerability:** Unbounded dictionaries in `TaintTracker` (e.g., `_tainted_data`, `_taint_sources`) and `TrustManager` (mapping dynamically generated `agent_id`s) present latent memory exhaustion (DoS) vulnerabilities if an attacker can continually generate unique IDs.
+**Learning:** Even dictionaries that track keys rather than lists can lead to unbounded memory growth if the keys represent dynamic, externally influencable properties like unique IDs, agents, or tracking contexts.
+**Prevention:** Always implement maximum length constraints (`max_tracked_items`, `max_agents`) for internally tracked dictionaries when elements are generated over time, and delete older entries using `next(iter(dict))` to prevent memory exhaustion DoS.
