@@ -20,3 +20,6 @@
 ## 2024-05-27 - Early Exit Filtering in Adversarial Defense
 **Learning:** In `adapt_agent/adversarial/__init__.py`, `get_detected_attacks` filtered a large chronologically ordered list using standard list comprehensions, evaluating the entire list even when a limited subset was requested. This caused O(N) overhead when returning recent items.
 **Action:** Replace `list_comprehensions` with backwards iteration (`reversed()`) combined with an early exit (`break`) based on `limit`.
+## 2024-05-28 - Eliminating redundant list traversals
+**Learning:** In `adapt_agent/optimization/__init__.py`, `_compute_statistics` and `suggest_optimizations` previously used list comprehensions followed by multiple generator expressions (`sum(...)`) to filter and compute metric totals (time, success, tokens). This resulted in iterating over the same list multiple times. A single-pass loop reduces overhead and improves performance.
+**Action:** When computing multiple aggregates over a filtered list of dictionaries, use a single manual loop to calculate sums and counts concurrently, rather than stacking multiple list comprehensions or `sum()` generators.
