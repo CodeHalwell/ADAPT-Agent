@@ -4,11 +4,18 @@ import ast
 import logging
 import operator
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, Callable, Optional
 
 from adapt_agent.core.types import AgentMessage, AgentState, PolicyRule
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1024)
+def _parse_condition(condition: str) -> ast.AST:
+    """Cache AST parsing for policy conditions."""
+    return ast.parse(condition, mode="eval")
 
 
 class PolicyEnforcer:
@@ -17,6 +24,24 @@ class PolicyEnforcer:
     The PolicyEnforcer validates agent actions, messages, and state changes
     against defined policies and can take corrective actions when violations occur.
     """
+
+    _OPERATORS = {
+        ast.Eq: operator.eq,
+        ast.NotEq: operator.ne,
+        ast.Lt: operator.lt,
+        ast.LtE: operator.le,
+        ast.Gt: operator.gt,
+        ast.GtE: operator.ge,
+        ast.In: lambda a, b: a in b,
+        ast.NotIn: lambda a, b: a not in b,
+    }
+
+    _BINOPS = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+    }
 
     def __init__(self, max_violations: int = 1000):
         """Initialize the PolicyEnforcer.
@@ -179,17 +204,6 @@ class PolicyEnforcer:
         Returns:
             True if condition is met (violation), False otherwise
         """
-        operators = {
-            ast.Eq: operator.eq, ast.NotEq: operator.ne,
-            ast.Lt: operator.lt, ast.LtE: operator.le,
-            ast.Gt: operator.gt, ast.GtE: operator.ge,
-            ast.In: lambda a, b: a in b, ast.NotIn: lambda a, b: a not in b,
-        }
-
-        binops = {
-            ast.Add: operator.add, ast.Sub: operator.sub,
-            ast.Mult: operator.mul, ast.Div: operator.truediv,
-        }
 
         def eval_node(node: ast.AST) -> Any:
             if isinstance(node, ast.Constant):
@@ -202,9 +216,9 @@ class PolicyEnforcer:
                 left = eval_node(node.left)
                 for op, comp in zip(node.ops, node.comparators):
                     right = eval_node(comp)
-                    if type(op) not in operators:
+                    if type(op) not in self._OPERATORS:
                         raise ValueError(f"Unsupported operator: {type(op)}")
-                    if not operators[type(op)](left, right):
+                    if not self._OPERATORS[type(op)](left, right):
                         return False
                     left = right
                 return True
@@ -223,9 +237,9 @@ class PolicyEnforcer:
             elif isinstance(node, ast.BinOp):
                 left = eval_node(node.left)
                 right = eval_node(node.right)
-                if type(node.op) not in binops:
+                if type(node.op) not in self._BINOPS:
                     raise ValueError(f"Unsupported binary operator: {type(node.op)}")
-                return binops[type(node.op)](left, right)
+                return self._BINOPS[type(node.op)](left, right)
             elif isinstance(node, ast.Subscript):
                 val = eval_node(node.value)
                 if isinstance(node.slice, ast.Slice):
@@ -239,7 +253,7 @@ class PolicyEnforcer:
                 raise ValueError(f"Unsupported AST node: {type(node)}")
 
         try:
-            tree = ast.parse(condition, mode='eval')
+            tree = _parse_condition(condition)
             return bool(eval_node(tree.body))
         except Exception as e:
             logger.error(f"Error evaluating condition '{condition}': {e}")
