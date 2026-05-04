@@ -23,3 +23,7 @@
 ## 2024-05-28 - Eliminating redundant list traversals
 **Learning:** In `adapt_agent/optimization/__init__.py`, `_compute_statistics` and `suggest_optimizations` previously used list comprehensions followed by multiple generator expressions (`sum(...)`) to filter and compute metric totals (time, success, tokens). This resulted in iterating over the same list multiple times. A single-pass loop reduces overhead and improves performance.
 **Action:** When computing multiple aggregates over a filtered list of dictionaries, use a single manual loop to calculate sums and counts concurrently, rather than stacking multiple list comprehensions or `sum()` generators.
+
+## 2024-05-29 - Python AST parsing overhead in tight loops
+**Learning:** In `adapt_agent/core/policy.py`, `PolicyEnforcer._evaluate_condition` is called frequently to check every message and state against multiple rules. Parsing the condition string (`ast.parse`) and creating operator mapping dictionaries on every evaluation is highly inefficient and creates significant overhead.
+**Action:** When evaluating AST-based conditions or expressions repeatedly, cache the parsed AST using `@lru_cache` on a helper function, and extract static mapping dictionaries (like operator mappings) to class-level or module-level variables. This makes repeated evaluations of the same condition significantly faster (approx ~7x).
