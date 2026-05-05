@@ -22,3 +22,7 @@
 **Vulnerability:** Unbounded dictionaries in `TaintTracker` (e.g., `_tainted_data`, `_taint_sources`) and `TrustManager` (mapping dynamically generated `agent_id`s) present latent memory exhaustion (DoS) vulnerabilities if an attacker can continually generate unique IDs.
 **Learning:** Even dictionaries that track keys rather than lists can lead to unbounded memory growth if the keys represent dynamic, externally influencable properties like unique IDs, agents, or tracking contexts.
 **Prevention:** Always implement maximum length constraints (`max_tracked_items`, `max_agents`) for internally tracked dictionaries when elements are generated over time, and delete older entries using `next(iter(dict))` to prevent memory exhaustion DoS.
+## 2024-05-24 - [Information Leakage in Event Metadata]
+**Vulnerability:** Exception messages (`str(e)`) were being leaked into security event metadata which may be exposed or aggregated in systems accessible by lower-privilege users.
+**Learning:** While full exception traces should be kept in internal application logs (`logger.error(..., exc_info=True)`) for debugging, they must never be included in system events, API responses, or metadata that could be accessed externally or by less privileged observers.
+**Prevention:** Always separate internal diagnostic logging from event metadata. Sanitize errors in event metadata to generic messages like "An error occurred" while logging the full exception using the internal `logger`.
