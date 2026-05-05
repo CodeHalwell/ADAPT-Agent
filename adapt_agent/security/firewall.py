@@ -117,7 +117,7 @@ class Firewall:
                     event_type="blocked_input",
                     severity="high",
                     description="Input blocked due to custom filter error",
-                    metadata={"content_snippet": content[:100], "error": str(e)},
+                    metadata={"content_snippet": content[:100], "error": "An error occurred"},
                 )
                 self._blocked_count += 1
                 return False
