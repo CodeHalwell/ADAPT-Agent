@@ -189,7 +189,8 @@ class Firewall:
                         results.append(e)
                         if len(results) >= limit:
                             break
-                return list(reversed(results))
+                results.reverse()
+                return results
             return [e for e in events if e["severity"] == severity]
 
         if limit:

@@ -186,7 +186,8 @@ class PolicyEnforcer:
                         results.append(v)
                         if len(results) >= limit:
                             break
-                return list(reversed(results))
+                results.reverse()
+                return results
             return [v for v in violations if v["severity"] == severity]
 
         if limit:
