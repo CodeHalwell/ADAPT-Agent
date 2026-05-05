@@ -183,7 +183,8 @@ class AgentObserver:
                 results.append(t)
                 if len(results) >= limit:
                     break
-            return list(reversed(results))
+            results.reverse()
+            return results
 
         traces = list(self._traces.values())
         if agent_id:
@@ -221,7 +222,8 @@ class AgentObserver:
                 results.append(log)
                 if len(results) >= limit:
                     break
-            return list(reversed(results))
+            results.reverse()
+            return results
 
         logs = self._logs
         if level:

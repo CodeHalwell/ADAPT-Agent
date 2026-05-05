@@ -108,11 +108,7 @@ class AgentEvaluator:
                     sums[metric_name] = sums.get(metric_name, 0.0) + score
                     counts[metric_name] = counts.get(metric_name, 0) + 1
 
-        return {
-            name: sums[name] / count
-            for name, count in counts.items()
-            if count > 0
-        }
+        return {name: sums[name] / count for name, count in counts.items() if count > 0}
 
     def get_evaluation_results(
         self,
@@ -137,7 +133,8 @@ class AgentEvaluator:
                 results.append(r)
                 if len(results) >= limit:
                     break
-            return list(reversed(results))
+            results.reverse()
+            return results
 
         results = self._evaluation_results
         if agent_id:

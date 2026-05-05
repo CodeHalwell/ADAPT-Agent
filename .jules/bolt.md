@@ -27,3 +27,6 @@
 ## 2024-05-29 - Python AST parsing overhead in tight loops
 **Learning:** In `adapt_agent/core/policy.py`, `PolicyEnforcer._evaluate_condition` is called frequently to check every message and state against multiple rules. Parsing the condition string (`ast.parse`) and creating operator mapping dictionaries on every evaluation is highly inefficient and creates significant overhead.
 **Action:** When evaluating AST-based conditions or expressions repeatedly, cache the parsed AST using `@lru_cache` on a helper function, and extract static mapping dictionaries (like operator mappings) to class-level or module-level variables. This makes repeated evaluations of the same condition significantly faster (approx ~7x).
+## 2024-05-05 - In-place reverse optimization for fetching limited recent items
+**Learning:** When filtering large chronologically ordered lists for a limited number of recent matches, replacing `list(reversed(results))` with in-place `results.reverse()` provides a significant speedup by avoiding unnecessary iterator and list object allocations.
+**Action:** Always prefer in-place `.reverse()` followed by returning the list over `list(reversed())` for returning chronologically filtered sub-lists.

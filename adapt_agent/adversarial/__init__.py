@@ -131,7 +131,8 @@ class AdversarialDefense:
             if limit and len(results) >= limit:
                 break
 
-        return list(reversed(results))
+        results.reverse()
+        return results
 
     def _record_attack(
         self,
