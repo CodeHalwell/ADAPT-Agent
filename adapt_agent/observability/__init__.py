@@ -11,17 +11,28 @@ class AgentObserver:
     debugging and monitoring capabilities.
     """
 
-    def __init__(self, max_logs: int = 1000, max_traces: int = 1000, max_metrics: int = 1000):
+    def __init__(
+        self,
+        max_logs: int = 1000,
+        max_traces: int = 1000,
+        max_metrics: int = 1000,
+        max_events_per_trace: int = 1000,
+        max_metric_names: int = 1000,
+    ):
         """Initialize the AgentObserver.
 
         Args:
             max_logs: Maximum number of logs to store in memory.
             max_traces: Maximum number of traces to store in memory.
             max_metrics: Maximum number of metrics to store in memory.
+            max_events_per_trace: Maximum number of events to store per trace.
+            max_metric_names: Maximum number of metric names to store in memory.
         """
         self.max_logs = max_logs
         self.max_traces = max_traces
         self.max_metrics = max_metrics
+        self.max_events_per_trace = max_events_per_trace
+        self.max_metric_names = max_metric_names
         # ⚡ Bolt: Using a dict instead of list for O(1) trace lookups
         self._traces: dict[str, dict[str, Any]] = {}
         self._logs: list[dict[str, Any]] = []
@@ -108,6 +119,9 @@ class AgentObserver:
         # ⚡ Bolt: Replaced O(N) loop with O(1) dictionary lookup
         if trace_id in self._traces:
             self._traces[trace_id]["events"].append(event)
+            # SECURITY: Prevent unbounded memory growth
+            if len(self._traces[trace_id]["events"]) > self.max_events_per_trace:
+                self._traces[trace_id]["events"].pop(0)
 
     def log(
         self,
@@ -150,6 +164,11 @@ class AgentObserver:
         """
         if metric_name not in self._metrics:
             self._metrics[metric_name] = []
+            # SECURITY: Prevent memory exhaustion from unbounded dictionary
+            if len(self._metrics) > self.max_metric_names:
+                oldest_metric = next(iter(self._metrics))
+                del self._metrics[oldest_metric]
+
         self._metrics[metric_name].append(value)
 
         # SECURITY: Prevent unbounded memory growth
