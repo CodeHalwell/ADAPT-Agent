@@ -36,20 +36,27 @@ class Middleware:
             name: Optional name for the middleware
             priority: Priority (higher runs first)
         """
+        resolved_name = name or middleware.__name__
+        self._middleware_metadata[resolved_name] = {
+            "type": "pre",
+            "priority": priority,
+            "function": middleware,
+        }
+
         self._pre_middleware.append(middleware)
+
+        # Create mapping of function objects to priority
+        func_priorities = {
+            m["function"]: m["priority"]
+            for m in self._middleware_metadata.values()
+            if m["type"] == "pre"
+        }
 
         # Sort by priority
         self._pre_middleware.sort(
-            key=lambda m: self._middleware_metadata.get(m.__name__, {}).get("priority", 0),
+            key=lambda m: func_priorities.get(m, 0),
             reverse=True,
         )
-
-        if name:
-            self._middleware_metadata[name] = {
-                "type": "pre",
-                "priority": priority,
-                "function": middleware,
-            }
 
     def add_post_middleware(
         self,
@@ -64,20 +71,27 @@ class Middleware:
             name: Optional name for the middleware
             priority: Priority (higher runs first)
         """
+        resolved_name = name or middleware.__name__
+        self._middleware_metadata[resolved_name] = {
+            "type": "post",
+            "priority": priority,
+            "function": middleware,
+        }
+
         self._post_middleware.append(middleware)
+
+        # Create mapping of function objects to priority
+        func_priorities = {
+            m["function"]: m["priority"]
+            for m in self._middleware_metadata.values()
+            if m["type"] == "post"
+        }
 
         # Sort by priority
         self._post_middleware.sort(
-            key=lambda m: self._middleware_metadata.get(m.__name__, {}).get("priority", 0),
+            key=lambda m: func_priorities.get(m, 0),
             reverse=True,
         )
-
-        if name:
-            self._middleware_metadata[name] = {
-                "type": "post",
-                "priority": priority,
-                "function": middleware,
-            }
 
     def remove_middleware(self, name: str) -> bool:
         """Remove a middleware by name.
