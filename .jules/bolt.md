@@ -30,3 +30,6 @@
 ## 2024-05-05 - In-place reverse optimization for fetching limited recent items
 **Learning:** When filtering large chronologically ordered lists for a limited number of recent matches, replacing `list(reversed(results))` with in-place `results.reverse()` provides a significant speedup by avoiding unnecessary iterator and list object allocations.
 **Action:** Always prefer in-place `.reverse()` followed by returning the list over `list(reversed())` for returning chronologically filtered sub-lists.
+## 2024-05-30 - Single-pass list comprehensions for chained filters
+**Learning:** In `adapt_agent/observability/__init__.py`, chaining multiple list comprehensions (e.g., `res = [x for x in data if condition1]; res = [x for x in res if condition2]`) causes the program to iterate over the dataset multiple times and allocate intermediate arrays in memory.
+**Action:** When applying multiple filter conditions to a list or iterable, combine the conditions using `and` inside a single list comprehension or manual loop to avoid intermediate allocations and reduce the operation to a single O(N) pass.

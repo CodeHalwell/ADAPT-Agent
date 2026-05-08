@@ -205,14 +205,15 @@ class AgentObserver:
             results.reverse()
             return results
 
-        traces = list(self._traces.values())
+        # ⚡ Bolt: Use a single-pass list comprehension with combined conditions to avoid intermediate array allocations and O(N) passes
+        if agent_id and status:
+            return [t for t in self._traces.values() if t["agent_id"] == agent_id and t["status"] == status]
         if agent_id:
-            traces = [t for t in traces if t["agent_id"] == agent_id]
-
+            return [t for t in self._traces.values() if t["agent_id"] == agent_id]
         if status:
-            traces = [t for t in traces if t["status"] == status]
+            return [t for t in self._traces.values() if t["status"] == status]
 
-        return traces
+        return list(self._traces.values())
 
     def get_logs(
         self,
@@ -244,14 +245,15 @@ class AgentObserver:
             results.reverse()
             return results
 
-        logs = self._logs
+        # ⚡ Bolt: Use a single-pass list comprehension with combined conditions to avoid intermediate array allocations and O(N) passes
+        if level and agent_id:
+            return [log for log in self._logs if log["level"] == level and log.get("agent_id") == agent_id]
         if level:
-            logs = [log for log in logs if log["level"] == level]
-
+            return [log for log in self._logs if log["level"] == level]
         if agent_id:
-            logs = [log for log in logs if log.get("agent_id") == agent_id]
+            return [log for log in self._logs if log.get("agent_id") == agent_id]
 
-        return logs
+        return list(self._logs)
 
     def get_metric_stats(self, metric_name: str) -> dict[str, float]:
         """Get statistics for a metric.
