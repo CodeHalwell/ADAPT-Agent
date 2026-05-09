@@ -33,3 +33,6 @@
 ## 2024-05-30 - Single-pass list comprehensions for chained filters
 **Learning:** In `adapt_agent/observability/__init__.py`, chaining multiple list comprehensions (e.g., `res = [x for x in data if condition1]; res = [x for x in res if condition2]`) causes the program to iterate over the dataset multiple times and allocate intermediate arrays in memory.
 **Action:** When applying multiple filter conditions to a list or iterable, combine the conditions using `and` inside a single list comprehension or manual loop to avoid intermediate allocations and reduce the operation to a single O(N) pass.
+## 2024-05-14 - Redundant string lowercasing in search loops
+**Learning:** Redundantly calling `.lower()` on invariants inside a traversal loop over thousands of items causes measurable execution delay due to string allocation and iteration overhead.
+**Action:** Extract loop-invariant string operations (like `query.lower()`) outside of tight iteration paths to speed up text-based searches, specifically in large internal datasets like `MemorySystem`.
