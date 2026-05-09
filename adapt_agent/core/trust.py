@@ -114,8 +114,10 @@ class TrustManager:
             violation_penalty = -0.1 * len(state["policy_violations"])
             factors["policy_compliance"] = violation_penalty
 
-        if "trust_score" in state:
-            factors["self_reported"] = state["trust_score"]
+        # SECURITY: Do not incorporate unvalidated trust scores from the agent's state
+        # to prevent privilege escalation where an agent self-assigns maximum trust.
+        # if "trust_score" in state:
+        #     factors["self_reported"] = state["trust_score"]
 
         # Calculate overall score
         current_score = self.get_trust_score(agent_id)
