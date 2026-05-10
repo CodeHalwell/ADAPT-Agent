@@ -38,3 +38,8 @@
 **Vulnerability:** The `TrustManager.evaluate_agent_state` method incorporated an unvalidated `trust_score` directly from the agent's state (`state["trust_score"]`), allowing a malicious agent to self-assign maximum trust and bypass subsequent security checks based on trust levels.
 **Learning:** Security evaluations must never blindly trust or incorporate inputs provided by the entity being evaluated, especially regarding its own trust, reputation, or authorization level.
 **Prevention:** Always calculate trust, reputation, or authorization scores server-side based on objective metrics and behaviors (e.g., policy violations), and never rely on self-reported security attributes from untrusted entities.
+
+## 2025-05-10 - [Memory Exhaustion DoS in MemorySystem]
+**Vulnerability:** The `MemorySystem.consolidate` method in `adapt_agent/core/memory.py` directly appended items from short-term memory to `_long_term_memory`, bypassing the capacity limits enforced by `store_long_term`.
+**Learning:** Hardcoded state updates or direct list append operations can bypass capacity bounding limits, making the system susceptible to a Denial of Service (DoS) memory exhaustion vulnerability.
+**Prevention:** Always use established interface methods (like `store_long_term`) which internally handle bound limitations rather than directly mutating internal state arrays.
