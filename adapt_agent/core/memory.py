@@ -160,7 +160,9 @@ class MemorySystem:
 
         for item in self._short_term_memory[:]:
             if item["access_count"] >= threshold:
-                self._long_term_memory.append(item.copy())
+                # SECURITY: Use store_long_term instead of append to enforce capacity limits (DoS prevention)
+                self.store_long_term(item["key"], item["value"], item.get("metadata"))
+                self._short_term_memory.remove(item)
                 consolidated += 1
 
         return consolidated
