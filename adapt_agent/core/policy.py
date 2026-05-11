@@ -132,10 +132,12 @@ class PolicyEnforcer:
             List of violated rule names
         """
         violations = []
+        # ⚡ Bolt: Hoist context instantiation outside the loop to avoid redundant object creation
+        context = {"message": message}
 
         for rule_name, rule in self._rules.items():
             # Simple condition checking (can be extended with more sophisticated evaluation)
-            if self._evaluate_condition(rule["condition"], {"message": message}):
+            if self._evaluate_condition(rule["condition"], context):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "message", message)
                 self._handle_violation(rule)
@@ -152,9 +154,11 @@ class PolicyEnforcer:
             List of violated rule names
         """
         violations = []
+        # ⚡ Bolt: Hoist context instantiation outside the loop to avoid redundant object creation
+        context = {"state": state}
 
         for rule_name, rule in self._rules.items():
-            if self._evaluate_condition(rule["condition"], {"state": state}):
+            if self._evaluate_condition(rule["condition"], context):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "state", state)
                 self._handle_violation(rule)

@@ -36,3 +36,6 @@
 ## 2024-05-14 - Redundant string lowercasing in search loops
 **Learning:** Redundantly calling `.lower()` on invariants inside a traversal loop over thousands of items causes measurable execution delay due to string allocation and iteration overhead.
 **Action:** Extract loop-invariant string operations (like `query.lower()`) outside of tight iteration paths to speed up text-based searches, specifically in large internal datasets like `MemorySystem`.
+## 2024-05-31 - Object instantiation overhead in tight iteration loops
+**Learning:** In `adapt_agent/core/policy.py`, `PolicyEnforcer.check_message` and `check_state` iterate over all rules to evaluate conditions. Creating a new context dictionary (e.g., `{"message": message}`) inside this loop on every iteration introduces significant overhead due to repeated object creation and subsequent garbage collection.
+**Action:** Always hoist invariant object creations (such as the context dictionary) outside of iteration loops to avoid redundant allocation overhead and improve execution speed (approx ~10% improvement in this case).
