@@ -39,3 +39,6 @@
 ## 2024-05-31 - Object instantiation overhead in tight iteration loops
 **Learning:** In `adapt_agent/core/policy.py`, `PolicyEnforcer.check_message` and `check_state` iterate over all rules to evaluate conditions. Creating a new context dictionary (e.g., `{"message": message}`) inside this loop on every iteration introduces significant overhead due to repeated object creation and subsequent garbage collection.
 **Action:** Always hoist invariant object creations (such as the context dictionary) outside of iteration loops to avoid redundant allocation overhead and improve execution speed (approx ~10% improvement in this case).
+## 2024-06-01 - O(N) to O(1) membership checking optimization
+**Learning:** In `adapt_agent/patches/__init__.py`, storing tracking data (like applied patches) in a `list` requires O(N) membership checks (`if item in list`). Using a `set` instead provides O(1) membership checks.
+**Action:** When repeatedly checking if an item exists within a collection (e.g., membership checks or deduplication), use a `set` instead of a `list` to optimize time complexity, unless ordering or duplicate storage is strictly required.

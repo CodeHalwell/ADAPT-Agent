@@ -16,7 +16,8 @@ class PatchManager:
     def __init__(self):
         """Initialize the PatchManager."""
         self._patches: dict[str, dict[str, Any]] = {}
-        self._applied_patches: list[str] = []
+        # ⚡ Bolt: Use a set instead of a list to optimize membership checks from O(N) to O(1)
+        self._applied_patches: set[str] = set()
 
     def register_patch(
         self,
@@ -63,7 +64,7 @@ class PatchManager:
 
         try:
             patch["patch_func"](target)
-            self._applied_patches.append(patch_id)
+            self._applied_patches.add(patch_id)
             return True
         except Exception as e:
             logger.error(f"Error applying patch {patch_id}: {e}")
