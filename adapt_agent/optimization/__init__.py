@@ -85,25 +85,29 @@ class AgentOptimizer:
         # Check for slow execution
         avg_time = total_time / count
         if avg_time > 5.0:  # threshold in seconds
-            suggestions.append({
-                "type": "performance",
-                "severity": "medium",
-                "suggestion": "Consider caching frequently accessed data or using faster models",
-                "metric": "execution_time",
-                "value": avg_time,
-            })
+            suggestions.append(
+                {
+                    "type": "performance",
+                    "severity": "medium",
+                    "suggestion": "Consider caching frequently accessed data or using faster models",
+                    "metric": "execution_time",
+                    "value": avg_time,
+                }
+            )
 
         # Check for high token usage
         if has_tokens:
             avg_tokens = total_tokens / count
             if avg_tokens > 1000:
-                suggestions.append({
-                    "type": "efficiency",
-                    "severity": "low",
-                    "suggestion": "High token usage detected. Consider prompt optimization",
-                    "metric": "token_usage",
-                    "value": avg_tokens,
-                })
+                suggestions.append(
+                    {
+                        "type": "efficiency",
+                        "severity": "low",
+                        "suggestion": "High token usage detected. Consider prompt optimization",
+                        "metric": "token_usage",
+                        "value": avg_tokens,
+                    }
+                )
 
         self._optimization_suggestions.extend(suggestions)
 

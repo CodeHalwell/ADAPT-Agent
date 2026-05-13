@@ -73,6 +73,23 @@ class AdversarialDefense:
 
         return False
 
+    def detect_custom_pattern(self, prompt: str) -> bool:
+        """Detect custom attack patterns.
+
+        Args:
+            prompt: Input prompt to analyze
+
+        Returns:
+            True if custom pattern detected, False otherwise
+        """
+        prompt_lower = prompt.lower()
+        for pattern in self._attack_patterns:
+            if pattern.lower() in prompt_lower:
+                self._record_attack("custom_pattern", prompt, pattern)
+                return True
+
+        return False
+
     def analyze_input(self, input_text: str) -> dict[str, Any]:
         """Analyze input for multiple attack vectors.
 
@@ -89,6 +106,9 @@ class AdversarialDefense:
 
         if self.detect_jailbreak(input_text):
             threats.append("jailbreak")
+
+        if self.detect_custom_pattern(input_text):
+            threats.append("custom_pattern")
 
         return {
             "input": input_text[:100],  # Truncated for privacy

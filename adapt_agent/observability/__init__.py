@@ -207,7 +207,11 @@ class AgentObserver:
 
         # ⚡ Bolt: Use a single-pass list comprehension with combined conditions to avoid intermediate array allocations and O(N) passes
         if agent_id and status:
-            return [t for t in self._traces.values() if t["agent_id"] == agent_id and t["status"] == status]
+            return [
+                t
+                for t in self._traces.values()
+                if t["agent_id"] == agent_id and t["status"] == status
+            ]
         if agent_id:
             return [t for t in self._traces.values() if t["agent_id"] == agent_id]
         if status:
@@ -247,7 +251,11 @@ class AgentObserver:
 
         # ⚡ Bolt: Use a single-pass list comprehension with combined conditions to avoid intermediate array allocations and O(N) passes
         if level and agent_id:
-            return [log for log in self._logs if log["level"] == level and log.get("agent_id") == agent_id]
+            return [
+                log
+                for log in self._logs
+                if log["level"] == level and log.get("agent_id") == agent_id
+            ]
         if level:
             return [log for log in self._logs if log["level"] == level]
         if agent_id:

@@ -170,11 +170,7 @@ class TaintTracker:
             return []
 
         source_ids = self._tainted_data[data_id]
-        return [
-            self._taint_sources[sid]
-            for sid in source_ids
-            if sid in self._taint_sources
-        ]
+        return [self._taint_sources[sid] for sid in source_ids if sid in self._taint_sources]
 
     def propagate_taint(
         self,
@@ -197,13 +193,15 @@ class TaintTracker:
         self.mark_tainted(to_data_id, source_ids)
 
         # Record propagation
-        self._taint_propagation.append({
-            "from": from_data_id,
-            "to": to_data_id,
-            "operation": operation,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "sources": source_ids,
-        })
+        self._taint_propagation.append(
+            {
+                "from": from_data_id,
+                "to": to_data_id,
+                "operation": operation,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "sources": source_ids,
+            }
+        )
 
         # SECURITY: Prevent unbounded memory growth
         if len(self._taint_propagation) > self.max_propagations:

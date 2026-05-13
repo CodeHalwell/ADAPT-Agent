@@ -43,3 +43,7 @@
 **Vulnerability:** The `MemorySystem.consolidate` method in `adapt_agent/core/memory.py` directly appended items from short-term memory to `_long_term_memory`, bypassing the capacity limits enforced by `store_long_term`.
 **Learning:** Hardcoded state updates or direct list append operations can bypass capacity bounding limits, making the system susceptible to a Denial of Service (DoS) memory exhaustion vulnerability.
 **Prevention:** Always use established interface methods (like `store_long_term`) which internally handle bound limitations rather than directly mutating internal state arrays.
+## 2026-05-13 - Broken Custom Attack Pattern Enforcement
+**Vulnerability:** The `AdversarialDefense.analyze_input` method allowed adding custom attack patterns via `add_attack_pattern`, but failed to actually check the input text against these patterns, rendering custom defenses useless and allowing malicious inputs to bypass the intended blocklist.
+**Learning:** Implementing configuration (adding patterns) without ensuring its integration into the main execution pathway (`analyze_input`) creates a false sense of security. Attackers could bypass rules administrators believed were enforced.
+**Prevention:** Always verify that newly added security rules, patterns, or configurations are actively called and evaluated during the core request inspection flow. Write integration tests that explicitly trigger the custom rules.
