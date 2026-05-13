@@ -1,5 +1,5 @@
-import pytest
 from adapt_agent.observability import AgentObserver
+
 
 def test_get_logs_limit():
     observer = AgentObserver(max_logs=100)
@@ -10,6 +10,7 @@ def test_get_logs_limit():
     assert len(logs) == 3
     assert logs[0]["message"] == "test7"
     assert logs[2]["message"] == "test9"
+
 
 def test_get_traces_limit():
     observer = AgentObserver()
