@@ -157,13 +157,18 @@ class MemorySystem:
         # Find frequently accessed items
         threshold = 3  # Access count threshold
         consolidated = 0
+        new_short_term = []
 
-        for item in self._short_term_memory[:]:
+        # ⚡ Bolt: Replace O(N²) list.remove() in a loop with O(N) list comprehension/rebuilding
+        for item in self._short_term_memory:
             if item["access_count"] >= threshold:
                 # SECURITY: Use store_long_term instead of append to enforce capacity limits (DoS prevention)
                 self.store_long_term(item["key"], item["value"], item.get("metadata"))
-                self._short_term_memory.remove(item)
                 consolidated += 1
+            else:
+                new_short_term.append(item)
+
+        self._short_term_memory = new_short_term
 
         return consolidated
 

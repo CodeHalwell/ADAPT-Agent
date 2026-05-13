@@ -42,3 +42,6 @@
 ## 2024-06-01 - O(N) to O(1) membership checking optimization
 **Learning:** In `adapt_agent/patches/__init__.py`, storing tracking data (like applied patches) in a `list` requires O(N) membership checks (`if item in list`). Using a `set` instead provides O(1) membership checks.
 **Action:** When repeatedly checking if an item exists within a collection (e.g., membership checks or deduplication), use a `set` instead of a `list` to optimize time complexity, unless ordering or duplicate storage is strictly required.
+## 2024-05-13 - O(N²) List Removal in Memory System Consolidation
+**Learning:** Removing items from a list in Python using `.remove()` inside a loop that iterates over a copy of the list (`list[:]`) creates an O(N²) performance bottleneck. This occurs because `remove()` must scan the list to find the value and then shift all subsequent elements left, multiplying the loop iterations by the length of the list.
+**Action:** Always prefer an O(N) list rebuilding strategy (e.g., using a list comprehension or creating a new list and appending items to keep) over using `.remove()` or `del` inside a loop for bulk removals.
