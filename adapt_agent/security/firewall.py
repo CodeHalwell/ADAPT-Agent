@@ -76,7 +76,7 @@ class Firewall:
                 event_type="blocked_input",
                 severity="high",
                 description=f"Input length {len(content)} exceeds maximum allowed {self.max_content_length}",
-                metadata={"content_snippet": content[:100], "length": len(content)},
+                metadata={"content_snippet": self.sanitize(content[:256])[:100], "length": len(content)},
             )
             self._blocked_count += 1
             return False
@@ -93,7 +93,7 @@ class Firewall:
                     event_type="blocked_input",
                     severity="high",
                     description=f"Input matched blocked pattern: {pattern.pattern}",
-                    metadata={"content_snippet": content[:100]},
+                    metadata={"content_snippet": self.sanitize(content[:256])[:100]},
                 )
                 self._blocked_count += 1
                 return False
@@ -106,7 +106,7 @@ class Firewall:
                         event_type="blocked_input",
                         severity="medium",
                         description="Input blocked by custom filter",
-                        metadata={"content_snippet": content[:100]},
+                        metadata={"content_snippet": self.sanitize(content[:256])[:100]},
                     )
                     self._blocked_count += 1
                     return False
@@ -117,7 +117,7 @@ class Firewall:
                     event_type="blocked_input",
                     severity="high",
                     description="Input blocked due to custom filter error",
-                    metadata={"content_snippet": content[:100], "error": "An error occurred"},
+                    metadata={"content_snippet": self.sanitize(content[:256])[:100], "error": "An error occurred"},
                 )
                 self._blocked_count += 1
                 return False

@@ -47,3 +47,8 @@
 **Vulnerability:** The `AdversarialDefense.analyze_input` method allowed adding custom attack patterns via `add_attack_pattern`, but failed to actually check the input text against these patterns, rendering custom defenses useless and allowing malicious inputs to bypass the intended blocklist.
 **Learning:** Implementing configuration (adding patterns) without ensuring its integration into the main execution pathway (`analyze_input`) creates a false sense of security. Attackers could bypass rules administrators believed were enforced.
 **Prevention:** Always verify that newly added security rules, patterns, or configurations are actively called and evaluated during the core request inspection flow. Write integration tests that explicitly trigger the custom rules.
+
+## 2024-05-14 - Exposed sensitive data in firewall events
+**Vulnerability:** Firewall records raw, unredacted content snippets (`content[:100]`) in its internal security events when blocking input, leaking the sensitive data it was supposed to block.
+**Learning:** Security mechanisms that log or record events must also sanitize the data they store to avoid becoming the source of a leak themselves (logging blocked secrets).
+**Prevention:** Always apply sanitization (e.g. `self.sanitize()`) before storing snippets or payloads in logs, metrics, or event trackers.
