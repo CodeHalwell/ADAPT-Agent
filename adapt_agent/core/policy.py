@@ -217,6 +217,14 @@ class PolicyEnforcer:
                 if node.id in context:
                     return context[node.id]
                 raise ValueError(f"Unknown variable: {node.id}")
+            elif isinstance(node, ast.List):
+                return [eval_node(elt) for elt in node.elts]
+            elif isinstance(node, ast.Tuple):
+                return tuple(eval_node(elt) for elt in node.elts)
+            elif isinstance(node, ast.Set):
+                return {eval_node(elt) for elt in node.elts}
+            elif isinstance(node, ast.Dict):
+                return {eval_node(k): eval_node(v) for k, v in zip(node.keys, node.values)}
             elif isinstance(node, ast.Compare):
                 left = eval_node(node.left)
                 for op, comp in zip(node.ops, node.comparators):

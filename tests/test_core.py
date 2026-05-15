@@ -59,6 +59,13 @@ def test_policy_enforcer_evaluate_condition():
     condition = "message['role'] == 'user' and 'password' in message['content']"
     assert enforcer._evaluate_condition(condition, context) is True
 
+    # Collection types
+    context = {"item": "b", "data": {"a": 1, "b": 2}}
+    assert enforcer._evaluate_condition("item in ['a', 'b', 'c']", context) is True
+    assert enforcer._evaluate_condition("item in ('a', 'b', 'c')", context) is True
+    assert enforcer._evaluate_condition("item in {'a', 'b', 'c'}", context) is True
+    assert enforcer._evaluate_condition("item in {'a': 1, 'b': 2}", context) is True
+
     # Error handling (unsupported node)
     assert enforcer._evaluate_condition("import os", context) is False
 
