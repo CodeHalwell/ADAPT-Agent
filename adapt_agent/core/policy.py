@@ -209,68 +209,72 @@ class PolicyEnforcer:
         Returns:
             True if condition is met (violation), False otherwise
         """
-
-        def eval_node(node: ast.AST) -> Any:
-            if isinstance(node, ast.Constant):
-                return node.value
-            elif isinstance(node, ast.Name):
-                if node.id in context:
-                    return context[node.id]
-                raise ValueError(f"Unknown variable: {node.id}")
-            elif isinstance(node, ast.List):
-                return [eval_node(elt) for elt in node.elts]
-            elif isinstance(node, ast.Tuple):
-                return tuple(eval_node(elt) for elt in node.elts)
-            elif isinstance(node, ast.Set):
-                return {eval_node(elt) for elt in node.elts}
-            elif isinstance(node, ast.Dict):
-                return {eval_node(k): eval_node(v) for k, v in zip(node.keys, node.values)}
-            elif isinstance(node, ast.Compare):
-                left = eval_node(node.left)
-                for op, comp in zip(node.ops, node.comparators):
-                    right = eval_node(comp)
-                    if type(op) not in self._OPERATORS:
-                        raise ValueError(f"Unsupported operator: {type(op)}")
-                    if not self._OPERATORS[type(op)](left, right):
-                        return False
-                    left = right
-                return True
-            elif isinstance(node, ast.BoolOp):
-                if isinstance(node.op, ast.And):
-                    for value in node.values:
-                        if not eval_node(value):
-                            return False
-                    return True
-                elif isinstance(node.op, ast.Or):
-                    for value in node.values:
-                        if eval_node(value):
-                            return True
-                    return False
-                raise ValueError(f"Unsupported boolean operator: {type(node.op)}")
-            elif isinstance(node, ast.BinOp):
-                left = eval_node(node.left)
-                right = eval_node(node.right)
-                if type(node.op) not in self._BINOPS:
-                    raise ValueError(f"Unsupported binary operator: {type(node.op)}")
-                return self._BINOPS[type(node.op)](left, right)
-            elif isinstance(node, ast.Subscript):
-                val = eval_node(node.value)
-                if isinstance(node.slice, ast.Slice):
-                    raise ValueError("Slices are not supported")
-                slice_val = eval_node(node.slice)
-                try:
-                    return val[slice_val]
-                except (KeyError, IndexError, TypeError):
-                    return None
-            else:
-                raise ValueError(f"Unsupported AST node: {type(node)}")
-
         try:
             tree = _parse_condition(condition)
-            return bool(eval_node(tree.body))
+            return bool(self._eval_node(tree.body, context))
         except Exception as e:
             logger.error(f"Error evaluating condition '{condition}': {e}")
             return False
+
+    def _eval_node(self, node: ast.AST, context: dict[str, Any]) -> Any:
+        node_type = type(node)
+        if node_type is ast.Constant:
+            return node.value
+        elif node_type is ast.Name:
+            if node.id in context:
+                return context[node.id]
+            raise ValueError(f"Unknown variable: {node.id}")
+        elif node_type is ast.List:
+            return [self._eval_node(elt, context) for elt in node.elts]
+        elif node_type is ast.Tuple:
+            return tuple(self._eval_node(elt, context) for elt in node.elts)
+        elif node_type is ast.Set:
+            return {self._eval_node(elt, context) for elt in node.elts}
+        elif node_type is ast.Dict:
+            return {self._eval_node(k, context): self._eval_node(v, context) for k, v in zip(node.keys, node.values)}
+        elif node_type is ast.Compare:
+            left = self._eval_node(node.left, context)
+            for op, comp in zip(node.ops, node.comparators):
+                right = self._eval_node(comp, context)
+                op_type = type(op)
+                if op_type not in self._OPERATORS:
+                    raise ValueError(f"Unsupported operator: {op_type}")
+                if not self._OPERATORS[op_type](left, right):
+                    return False
+                left = right
+            return True
+        elif node_type is ast.BoolOp:
+            op_type = type(node.op)
+            if op_type is ast.And:
+                for value in node.values:
+                    if not self._eval_node(value, context):
+                        return False
+                return True
+            elif op_type is ast.Or:
+                for value in node.values:
+                    if self._eval_node(value, context):
+                        return True
+                return False
+            raise ValueError(f"Unsupported boolean operator: {op_type}")
+        elif node_type is ast.BinOp:
+            left = self._eval_node(node.left, context)
+            right = self._eval_node(node.right, context)
+            op_type = type(node.op)
+            if op_type not in self._BINOPS:
+                raise ValueError(f"Unsupported binary operator: {op_type}")
+            return self._BINOPS[op_type](left, right)
+        elif node_type is ast.Subscript:
+            val = self._eval_node(node.value, context)
+            slice_type = type(node.slice)
+            if slice_type is ast.Slice:
+                raise ValueError("Slices are not supported")
+            slice_val = self._eval_node(node.slice, context)
+            try:
+                return val[slice_val]
+            except (KeyError, IndexError, TypeError):
+                return None
+        else:
+            raise ValueError(f"Unsupported AST node: {node_type}")
 
     def _record_violation(
         self,
