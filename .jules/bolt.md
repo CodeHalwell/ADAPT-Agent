@@ -45,3 +45,7 @@
 ## 2024-05-13 - O(N²) List Removal in Memory System Consolidation
 **Learning:** Removing items from a list in Python using `.remove()` inside a loop that iterates over a copy of the list (`list[:]`) creates an O(N²) performance bottleneck. This occurs because `remove()` must scan the list to find the value and then shift all subsequent elements left, multiplying the loop iterations by the length of the list.
 **Action:** Always prefer an O(N) list rebuilding strategy (e.g., using a list comprehension or creating a new list and appending items to keep) over using `.remove()` or `del` inside a loop for bulk removals.
+
+## 2024-05-16 - Prevent redefining functions inside evaluation loops
+**Learning:** Redefining inner functions (e.g., `def eval_node(node)`) recursively for every rule evaluation causes unnecessary object creation overhead in Python, acting as a major performance bottleneck for AST evaluation. Moving these inside instance methods and replacing `isinstance` with `type(node) is` speeds up evaluation by >30%.
+**Action:** Always hoist functions out of tight evaluation loops into instance/class methods if they don't require external closures. Additionally, use `type(node) is X` over `isinstance` for slight speedup in hot paths where subtyping is not required.
