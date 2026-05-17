@@ -125,6 +125,9 @@ class Middleware:
         Returns:
             Processed data
         """
+        if not self._pre_middleware:
+            return data
+
         result = data.copy()
 
         for middleware in self._pre_middleware:
@@ -145,6 +148,9 @@ class Middleware:
         Returns:
             Processed data
         """
+        if not self._post_middleware:
+            return data
+
         result = data.copy()
 
         for middleware in self._post_middleware:
@@ -168,6 +174,10 @@ class Middleware:
 
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # ⚡ Bolt: Fast path when no middleware is registered
+            if not self._pre_middleware and not self._post_middleware:
+                return func(*args, **kwargs)
+
             # Convert args/kwargs to dict for middleware
             input_data = {"args": args, "kwargs": kwargs}
 
@@ -179,6 +189,10 @@ class Middleware:
                 *processed_input["args"],
                 **processed_input["kwargs"],
             )
+
+            # ⚡ Bolt: Fast path if only pre-middleware is present
+            if not self._post_middleware:
+                return result
 
             # Post-process
             output_data = {"result": result}
