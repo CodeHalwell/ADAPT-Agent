@@ -231,7 +231,10 @@ class PolicyEnforcer:
         elif node_type is ast.Set:
             return {self._eval_node(elt, context) for elt in node.elts}
         elif node_type is ast.Dict:
-            return {self._eval_node(k, context): self._eval_node(v, context) for k, v in zip(node.keys, node.values)}
+            return {
+                self._eval_node(k, context): self._eval_node(v, context)
+                for k, v in zip(node.keys, node.values)
+            }
         elif node_type is ast.Compare:
             left = self._eval_node(node.left, context)
             for op, comp in zip(node.ops, node.comparators):
