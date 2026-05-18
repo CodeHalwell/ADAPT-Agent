@@ -125,6 +125,10 @@ class Middleware:
         Returns:
             Processed data
         """
+        # ⚡ Bolt: Fast path to bypass allocation/overhead when no middleware is registered
+        if not self._pre_middleware:
+            return data
+
         result = data.copy()
 
         for middleware in self._pre_middleware:
@@ -145,6 +149,10 @@ class Middleware:
         Returns:
             Processed data
         """
+        # ⚡ Bolt: Fast path to bypass allocation/overhead when no middleware is registered
+        if not self._post_middleware:
+            return data
+
         result = data.copy()
 
         for middleware in self._post_middleware:
@@ -168,6 +176,10 @@ class Middleware:
 
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # ⚡ Bolt: Fast path to avoid all wrapper allocations when no middleware is registered
+            if not self._pre_middleware and not self._post_middleware:
+                return func(*args, **kwargs)
+
             # Convert args/kwargs to dict for middleware
             input_data = {"args": args, "kwargs": kwargs}
 
