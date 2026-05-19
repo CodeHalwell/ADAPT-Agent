@@ -28,3 +28,26 @@ def test_adversarial_defense_custom_pattern():
     assert attacks[0]["type"] == "custom_pattern"
     assert attacks[0]["indicator"] == "baking bad"
     assert attacks[0]["content"] == malicious_input[:100]
+
+
+def test_adversarial_defense_max_content_length():
+    """Test that max_content_length prevents unbounded input analysis (DoS)."""
+    defense = AdversarialDefense(max_content_length=50)
+
+    # Analyze valid input
+    safe_input = "Short safe input."
+    result = defense.analyze_input(safe_input)
+    assert result["is_safe"] is True
+
+    # Analyze input exceeding limit
+    long_input = "A" * 100
+    result = defense.analyze_input(long_input)
+    assert result["is_safe"] is False
+    assert "length_exceeded" in result["threats_detected"]
+
+    # Verify the attack was recorded
+    attacks = defense.get_detected_attacks()
+    assert len(attacks) == 1
+    assert attacks[0]["type"] == "length_exceeded"
+    assert "exceeds maximum 50" in attacks[0]["indicator"]
+    assert attacks[0]["content"] == long_input[:100]
