@@ -11,16 +11,18 @@ class AdversarialDefense:
     including prompt injection, jailbreaking, and data poisoning.
     """
 
-    def __init__(self, max_attacks: int = 1000):
+    def __init__(self, max_attacks: int = 1000, max_content_length: Optional[int] = None):
         """Initialize the AdversarialDefense.
 
         Args:
             max_attacks: Maximum number of detected attacks to store in memory.
+            max_content_length: Optional maximum allowed length for input content to mitigate DoS risks.
         """
         self._attack_patterns: list[str] = []
         self._detected_attacks: list[dict[str, Any]] = []
         self._defense_strategies: dict[str, Any] = {}
         self.max_attacks = max_attacks
+        self.max_content_length = max_content_length
 
     def detect_prompt_injection(self, prompt: str) -> bool:
         """Detect potential prompt injection attacks.
@@ -100,6 +102,18 @@ class AdversarialDefense:
             Analysis results with detected threats
         """
         threats = []
+
+        # SECURITY: Mitigate Denial of Service (DoS) risks by enforcing a content length limit
+        if self.max_content_length is not None and len(input_text) > self.max_content_length:
+            threats.append("content_length_exceeded")
+            self._record_attack("content_length_exceeded", input_text, "Length limit exceeded")
+            # Fail fast to prevent expensive operations on large inputs (DoS)
+            return {
+                "input": input_text[:100],  # Truncated for privacy
+                "threats_detected": threats,
+                "is_safe": False,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
         if self.detect_prompt_injection(input_text):
             threats.append("prompt_injection")

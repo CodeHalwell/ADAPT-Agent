@@ -52,3 +52,8 @@
 **Vulnerability:** Firewall records raw, unredacted content snippets (`content[:100]`) in its internal security events when blocking input, leaking the sensitive data it was supposed to block.
 **Learning:** Security mechanisms that log or record events must also sanitize the data they store to avoid becoming the source of a leak themselves (logging blocked secrets).
 **Prevention:** Always apply sanitization (e.g. `self.sanitize()`) before storing snippets or payloads in logs, metrics, or event trackers.
+
+## 2026-05-24 - AdversarialDefense Resource Exhaustion / Unbounded Growth
+**Vulnerability:** The `AdversarialDefense.analyze_input` method analyzed strings against an unbounded list of regex indicators (`_attack_patterns`, etc.) without a maximum length check on the input payload length, opening the agent up to Memory Leak / Memory Exhaustion and DoS / ReDoS attacks on regular expressions from oversized inputs.
+**Learning:** Security controls processing arbitrary user input, particularly LLM inputs and adversarial attempts, can generate logs dynamically and process strings that consume excessive CPU and memory.
+**Prevention:** Always implement explicit string length maximums (`max_content_length`) for security scanners before running resource-intensive regex processing, and ensure the method returns immediately (short-circuits) when length is exceeded to actually mitigate the DoS risk.
