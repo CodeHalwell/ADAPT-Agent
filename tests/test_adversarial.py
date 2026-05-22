@@ -28,3 +28,25 @@ def test_adversarial_defense_custom_pattern():
     assert attacks[0]["type"] == "custom_pattern"
     assert attacks[0]["indicator"] == "baking bad"
     assert attacks[0]["content"] == malicious_input[:100]
+
+
+def test_adversarial_defense_dos_mitigation():
+    """Test that overly long inputs are blocked to prevent DoS."""
+    defense = AdversarialDefense(max_content_length=50)
+
+    # Safe input
+    safe_input = "This is a short safe prompt."
+    result = defense.analyze_input(safe_input)
+    assert result["is_safe"] is True
+
+    # DoS input
+    malicious_input = "A" * 100
+    result = defense.analyze_input(malicious_input)
+    assert result["is_safe"] is False
+    assert "dos_attack" in result["threats_detected"]
+
+    # Verify the attack was recorded
+    attacks = defense.get_detected_attacks()
+    assert len(attacks) == 1
+    assert attacks[0]["type"] == "dos_attack"
+    assert attacks[0]["indicator"] == "content_length_exceeded"

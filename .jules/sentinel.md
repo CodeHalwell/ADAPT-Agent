@@ -52,3 +52,7 @@
 **Vulnerability:** Firewall records raw, unredacted content snippets (`content[:100]`) in its internal security events when blocking input, leaking the sensitive data it was supposed to block.
 **Learning:** Security mechanisms that log or record events must also sanitize the data they store to avoid becoming the source of a leak themselves (logging blocked secrets).
 **Prevention:** Always apply sanitization (e.g. `self.sanitize()`) before storing snippets or payloads in logs, metrics, or event trackers.
+## 2025-02-24 - DoS Protection in analyze_input
+**Vulnerability:** Denial of Service (DoS) vulnerability via memory exhaustion or ReDoS attacks caused by passing unboundedly large inputs to the text analysis methods.
+**Learning:** `AdversarialDefense.analyze_input` originally processed all inputs through pattern matchers without checking their length, which could result in severe performance degradation or DoS.
+**Prevention:** Implement an early check enforcing `max_content_length` in `analyze_input` to block and log overly long inputs before applying downstream detection methods.
