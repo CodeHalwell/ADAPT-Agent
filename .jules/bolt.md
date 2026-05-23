@@ -49,3 +49,6 @@
 ## 2024-05-16 - Prevent redefining functions inside evaluation loops
 **Learning:** Redefining inner functions (e.g., `def eval_node(node)`) recursively for every rule evaluation causes unnecessary object creation overhead in Python, acting as a major performance bottleneck for AST evaluation. Moving these inside instance methods and replacing `isinstance` with `type(node) is` speeds up evaluation by >30%.
 **Action:** Always hoist functions out of tight evaluation loops into instance/class methods if they don't require external closures. Additionally, use `type(node) is X` over `isinstance` for slight speedup in hot paths where subtyping is not required.
+## 2024-06-05 - Fast Path for Empty Middleware
+**Learning:** `adapt_agent/core/middleware.py` wrapped all agent interactions, and even when no middleware was registered, it still performed `data.copy()` and multiple dictionary instantiations (for `args` and `kwargs`). This adds unnecessary overhead to hot paths where middleware isn't actively being used.
+**Action:** When creating wrapper functions or processors that iterate over extensible lists (like middleware or plugins), add an early return (`if not self._pre_middleware`) to bypass dictionary allocation, dictionary copies, and wrapper overhead entirely.
