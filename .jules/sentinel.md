@@ -56,3 +56,11 @@
 **Vulnerability:** The `AdversarialDefense` class lacked a maximum length check on input payload length before processing input through multiple `.lower()` conversions and substring searches. This opened the agent up to a Denial of Service (DoS) vulnerability via CPU or memory exhaustion if an attacker submitted extremely large strings.
 **Learning:** Security controls processing arbitrary user input, particularly LLM inputs and adversarial attempts, can be vectors for DoS. Processing arbitrarily long text fields with loops or string copies can crash the system.
 **Prevention:** Always implement explicit string length maximums for security scanners (`max_content_length`) and enforce them by immediately returning an error/block before running resource-intensive text processing.
+## 2024-05-25 - Firewall Partial Secret Leakage
+**Vulnerability:** Early truncation of input before sanitization causes regex pattern matching to fail on secrets spanning the truncation boundary, leaking partial secrets in event logs.
+**Learning:** Sanitization must always be applied to the complete input string before any truncation for storage, to ensure pattern matchers can accurately detect and redact sensitive data.
+**Prevention:** Apply truncation only after `self.sanitize(content)` has completed.
+## 2024-05-25 - AST Evaluation Depth Limit
+**Vulnerability:** Unbounded recursion in `_eval_node` could lead to a Denial of Service (DoS) via `RecursionError` if an attacker supplies a deeply nested AST.
+**Learning:** Recursive evaluation functions processing untrusted AST structures must enforce depth limits to prevent stack exhaustion.
+**Prevention:** Added a `depth` parameter to track recursion depth and bounded it at 50 to raise a `ValueError` early.
