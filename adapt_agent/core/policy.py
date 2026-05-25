@@ -216,7 +216,9 @@ class PolicyEnforcer:
             logger.error(f"Error evaluating condition '{condition}': {e}")
             return False
 
-    def _eval_node(self, node: ast.AST, context: dict[str, Any]) -> Any:
+    def _eval_node(self, node: ast.AST, context: dict[str, Any], depth: int = 0) -> Any:
+        if depth > 50:
+            raise ValueError("Maximum evaluation depth exceeded (DoS protection)")
         node_type = type(node)
         if node_type is ast.Constant:
             return node.value
@@ -225,20 +227,20 @@ class PolicyEnforcer:
                 return context[node.id]
             raise ValueError(f"Unknown variable: {node.id}")
         elif node_type is ast.List:
-            return [self._eval_node(elt, context) for elt in node.elts]
+            return [self._eval_node(elt, context, depth + 1) for elt in node.elts]
         elif node_type is ast.Tuple:
-            return tuple(self._eval_node(elt, context) for elt in node.elts)
+            return tuple(self._eval_node(elt, context, depth + 1) for elt in node.elts)
         elif node_type is ast.Set:
-            return {self._eval_node(elt, context) for elt in node.elts}
+            return {self._eval_node(elt, context, depth + 1) for elt in node.elts}
         elif node_type is ast.Dict:
             return {
-                self._eval_node(k, context): self._eval_node(v, context)
+                self._eval_node(k, context, depth + 1): self._eval_node(v, context, depth + 1)
                 for k, v in zip(node.keys, node.values)
             }
         elif node_type is ast.Compare:
-            left = self._eval_node(node.left, context)
+            left = self._eval_node(node.left, context, depth + 1)
             for op, comp in zip(node.ops, node.comparators):
-                right = self._eval_node(comp, context)
+                right = self._eval_node(comp, context, depth + 1)
                 op_type = type(op)
                 if op_type not in self._OPERATORS:
                     raise ValueError(f"Unsupported operator: {op_type}")
@@ -250,28 +252,28 @@ class PolicyEnforcer:
             op_type = type(node.op)
             if op_type is ast.And:
                 for value in node.values:
-                    if not self._eval_node(value, context):
+                    if not self._eval_node(value, context, depth + 1):
                         return False
                 return True
             elif op_type is ast.Or:
                 for value in node.values:
-                    if self._eval_node(value, context):
+                    if self._eval_node(value, context, depth + 1):
                         return True
                 return False
             raise ValueError(f"Unsupported boolean operator: {op_type}")
         elif node_type is ast.BinOp:
-            left = self._eval_node(node.left, context)
-            right = self._eval_node(node.right, context)
+            left = self._eval_node(node.left, context, depth + 1)
+            right = self._eval_node(node.right, context, depth + 1)
             op_type = type(node.op)
             if op_type not in self._BINOPS:
                 raise ValueError(f"Unsupported binary operator: {op_type}")
             return self._BINOPS[op_type](left, right)
         elif node_type is ast.Subscript:
-            val = self._eval_node(node.value, context)
+            val = self._eval_node(node.value, context, depth + 1)
             slice_type = type(node.slice)
             if slice_type is ast.Slice:
                 raise ValueError("Slices are not supported")
-            slice_val = self._eval_node(node.slice, context)
+            slice_val = self._eval_node(node.slice, context, depth + 1)
             try:
                 return val[slice_val]
             except (KeyError, IndexError, TypeError):
