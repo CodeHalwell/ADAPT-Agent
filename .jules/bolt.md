@@ -52,3 +52,6 @@
 ## 2024-06-05 - Fast Path for Empty Middleware
 **Learning:** `adapt_agent/core/middleware.py` wrapped all agent interactions, and even when no middleware was registered, it still performed `data.copy()` and multiple dictionary instantiations (for `args` and `kwargs`). This adds unnecessary overhead to hot paths where middleware isn't actively being used.
 **Action:** When creating wrapper functions or processors that iterate over extensible lists (like middleware or plugins), add an early return (`if not self._pre_middleware`) to bypass dictionary allocation, dictionary copies, and wrapper overhead entirely.
+## 2024-06-08 - Redundant list allocations and string transformations in hot paths
+**Learning:** In `adapt_agent/adversarial/__init__.py`, `AdversarialDefense.analyze_input` called multiple detection methods which each instantiated their own list of indicators and called `.lower()` on the prompt. This caused significant execution delay due to object allocation and string transformation overhead when run in tight loops.
+**Action:** When a method checks an input against a static set of patterns, store the patterns as class-level constants (tuples). Furthermore, when multiple methods operate on the same string transformations (e.g. `lower()`), hoist the transformation to the caller and pass it to the methods to avoid redundant recomputations.

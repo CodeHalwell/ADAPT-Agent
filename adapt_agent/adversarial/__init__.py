@@ -11,6 +11,22 @@ class AdversarialDefense:
     including prompt injection, jailbreaking, and data poisoning.
     """
 
+    # ⚡ Bolt: Class-level constants to avoid list reallocation
+    _INJECTION_INDICATORS = (
+        "ignore previous instructions",
+        "disregard all",
+        "new instructions:",
+        "system:",
+        "override",
+    )
+
+    _JAILBREAK_INDICATORS = (
+        "pretend you are",
+        "roleplay as",
+        "act as if",
+        "you are now",
+    )
+
     def __init__(self, max_attacks: int = 1000, max_content_length: Optional[int] = None):
         """Initialize the AdversarialDefense.
 
@@ -24,67 +40,53 @@ class AdversarialDefense:
         self.max_attacks = max_attacks
         self.max_content_length = max_content_length
 
-    def detect_prompt_injection(self, prompt: str) -> bool:
+    def detect_prompt_injection(self, prompt: str, prompt_lower: Optional[str] = None) -> bool:
         """Detect potential prompt injection attacks.
 
         Args:
             prompt: Input prompt to analyze
+            prompt_lower: Optional pre-computed lowercased prompt
 
         Returns:
             True if attack detected, False otherwise
         """
-        # Common prompt injection patterns
-        injection_indicators = [
-            "ignore previous instructions",
-            "disregard all",
-            "new instructions:",
-            "system:",
-            "override",
-        ]
-
-        prompt_lower = prompt.lower()
-        for indicator in injection_indicators:
+        prompt_lower = prompt_lower or prompt.lower()
+        for indicator in self._INJECTION_INDICATORS:
             if indicator in prompt_lower:
                 self._record_attack("prompt_injection", prompt, indicator)
                 return True
 
         return False
 
-    def detect_jailbreak(self, prompt: str) -> bool:
+    def detect_jailbreak(self, prompt: str, prompt_lower: Optional[str] = None) -> bool:
         """Detect jailbreak attempts.
 
         Args:
             prompt: Input prompt to analyze
+            prompt_lower: Optional pre-computed lowercased prompt
 
         Returns:
             True if jailbreak detected, False otherwise
         """
-        # Common jailbreak patterns
-        jailbreak_indicators = [
-            "pretend you are",
-            "roleplay as",
-            "act as if",
-            "you are now",
-        ]
-
-        prompt_lower = prompt.lower()
-        for indicator in jailbreak_indicators:
+        prompt_lower = prompt_lower or prompt.lower()
+        for indicator in self._JAILBREAK_INDICATORS:
             if indicator in prompt_lower:
                 self._record_attack("jailbreak", prompt, indicator)
                 return True
 
         return False
 
-    def detect_custom_pattern(self, prompt: str) -> bool:
+    def detect_custom_pattern(self, prompt: str, prompt_lower: Optional[str] = None) -> bool:
         """Detect custom attack patterns.
 
         Args:
             prompt: Input prompt to analyze
+            prompt_lower: Optional pre-computed lowercased prompt
 
         Returns:
             True if custom pattern detected, False otherwise
         """
-        prompt_lower = prompt.lower()
+        prompt_lower = prompt_lower or prompt.lower()
         for pattern in self._attack_patterns:
             if pattern.lower() in prompt_lower:
                 self._record_attack("custom_pattern", prompt, pattern)
@@ -116,14 +118,16 @@ class AdversarialDefense:
             }
 
         threats = []
+        # ⚡ Bolt: Cache input_text.lower() once to avoid redundant allocations
+        input_lower = input_text.lower()
 
-        if self.detect_prompt_injection(input_text):
+        if self.detect_prompt_injection(input_text, input_lower):
             threats.append("prompt_injection")
 
-        if self.detect_jailbreak(input_text):
+        if self.detect_jailbreak(input_text, input_lower):
             threats.append("jailbreak")
 
-        if self.detect_custom_pattern(input_text):
+        if self.detect_custom_pattern(input_text, input_lower):
             threats.append("custom_pattern")
 
         return {
