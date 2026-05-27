@@ -109,6 +109,9 @@ class AgentObserver:
             description: Event description
             metadata: Optional metadata
         """
+        # SECURITY: DoS protection by limiting description length
+        description = description[:10000] if description else description
+
         event = {
             "event_type": event_type,
             "description": description,
@@ -138,6 +141,9 @@ class AgentObserver:
             agent_id: Optional agent identifier
             metadata: Optional metadata
         """
+        # SECURITY: DoS protection by limiting message length
+        message = message[:10000] if message else message
+
         log_entry = {
             "level": level,
             "message": message,
