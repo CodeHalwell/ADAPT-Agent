@@ -109,9 +109,12 @@ class AgentObserver:
             description: Event description
             metadata: Optional metadata
         """
+        # SECURITY: Mitigate memory exhaustion DoS by limiting description length
+        safe_description = description[:10000] if len(description) > 10000 else description
+
         event = {
             "event_type": event_type,
-            "description": description,
+            "description": safe_description,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
         }
@@ -138,9 +141,12 @@ class AgentObserver:
             agent_id: Optional agent identifier
             metadata: Optional metadata
         """
+        # SECURITY: Mitigate memory exhaustion DoS by limiting message length
+        safe_message = message[:10000] if len(message) > 10000 else message
+
         log_entry = {
             "level": level,
-            "message": message,
+            "message": safe_message,
             "agent_id": agent_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},

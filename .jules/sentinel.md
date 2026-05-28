@@ -64,3 +64,7 @@
 **Vulnerability:** Unbounded recursion in `_eval_node` could lead to a Denial of Service (DoS) via `RecursionError` if an attacker supplies a deeply nested AST.
 **Learning:** Recursive evaluation functions processing untrusted AST structures must enforce depth limits to prevent stack exhaustion.
 **Prevention:** Added a `depth` parameter to track recursion depth and bounded it at 50 to raise a `ValueError` early.
+## 2026-05-27 - AgentObserver Unbounded Logging Strings DoS
+**Vulnerability:** The `AgentObserver` class logged trace events and raw messages via `log_event` and `log` respectively without enforcing any length limits on the input strings (e.g., `description`, `message`). This exposed a Denial of Service (DoS) vulnerability via memory exhaustion if an attacker submitted extremely large strings to be logged.
+**Learning:** Even when limiting the *number* of logged events, failing to bound the *size* of each individual logged item allows memory exhaustion attacks through overly large payloads.
+**Prevention:** Always implement explicit string length maximums for attributes that store arbitrary text (like `description` and `message`) in logging or observability components, truncating them before storage to a safe upper limit (e.g., 10000 characters).
