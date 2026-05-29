@@ -111,7 +111,7 @@ class AgentObserver:
         """
         event = {
             "event_type": event_type,
-            "description": description,
+            "description": description[:10000],
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
         }
@@ -140,7 +140,7 @@ class AgentObserver:
         """
         log_entry = {
             "level": level,
-            "message": message,
+            "message": message[:10000],
             "agent_id": agent_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
