@@ -55,3 +55,6 @@
 ## 2024-05-18 - Optimize AdversarialDefense String Formatting
 **Learning:** In performance-critical paths (e.g., `AdversarialDefense.analyze_input`), redundant list instantiations and string transformations like `.lower()` can cause unnecessary recomputations and allocations in hot loops.
 **Action:** Store indicator patterns as class-level tuples (e.g., `_INJECTION_INDICATORS`) to prevent redundant instantiations, and hoist repetitive string transformations to the parent caller, passing them down as arguments to sub-methods.
+## 2024-06-06 - Pre-computing lowercased string constraints
+**Learning:** In `adapt_agent/adversarial/__init__.py`, `AdversarialDefense.detect_custom_pattern` checks input against a dynamic list of custom attack patterns. Continuously calling `.lower()` on each pattern inside the hot evaluation loop creates significant and redundant O(N) overhead during input analysis.
+**Action:** Always pre-compute and store lowercased strings in parallel data structures (e.g., `_attack_patterns_tuple`) at insertion time, and use `zip()` to iterate over them alongside the original data in hot paths to avoid repeated runtime string allocation and conversion.
