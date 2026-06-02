@@ -55,3 +55,6 @@
 ## 2024-05-18 - Optimize AdversarialDefense String Formatting
 **Learning:** In performance-critical paths (e.g., `AdversarialDefense.analyze_input`), redundant list instantiations and string transformations like `.lower()` can cause unnecessary recomputations and allocations in hot loops.
 **Action:** Store indicator patterns as class-level tuples (e.g., `_INJECTION_INDICATORS`) to prevent redundant instantiations, and hoist repetitive string transformations to the parent caller, passing them down as arguments to sub-methods.
+## 2024-06-06 - Pre-computing invariant text manipulations for parallel arrays
+**Learning:** In `adapt_agent/adversarial/__init__.py`, `AdversarialDefense.detect_custom_pattern` evaluates input against patterns dynamically. Calling `.lower()` on each custom pattern inside the hot evaluation loop results in O(N) string allocation overhead per analysis run.
+**Action:** Optimize custom pattern matching by pre-computing transformed strings (like `.lower()`) into a parallel list or tuple (e.g., `_attack_patterns_tuple`) during insertion (`add_attack_pattern`). Use `zip()` in the hot loop to iterate over the original and pre-computed values concurrently, avoiding redundant manipulation overhead while preserving the public API of the original list.

@@ -34,6 +34,8 @@ class AdversarialDefense:
             max_content_length: Optional maximum allowed length for input content.
         """
         self._attack_patterns: list[str] = []
+        # ⚡ Bolt: Store a pre-computed lowercase tuple version to avoid O(N) string manipulation overhead
+        self._attack_patterns_tuple: list[str] = []
         self._detected_attacks: list[dict[str, Any]] = []
         self._defense_strategies: dict[str, Any] = {}
         self.max_attacks = max_attacks
@@ -86,9 +88,9 @@ class AdversarialDefense:
             True if custom pattern detected, False otherwise
         """
         prompt_lower = prompt_lower if prompt_lower is not None else prompt.lower()
-        for pattern in self._attack_patterns:
-            if pattern.lower() in prompt_lower:
-                self._record_attack("custom_pattern", prompt, pattern)
+        for orig_pattern, lower_pattern in zip(self._attack_patterns, self._attack_patterns_tuple):
+            if lower_pattern in prompt_lower:
+                self._record_attack("custom_pattern", prompt, orig_pattern)
                 return True
 
         return False
@@ -142,6 +144,7 @@ class AdversarialDefense:
             pattern: Attack pattern string
         """
         self._attack_patterns.append(pattern)
+        self._attack_patterns_tuple.append(pattern.lower())
 
     def get_detected_attacks(
         self,
