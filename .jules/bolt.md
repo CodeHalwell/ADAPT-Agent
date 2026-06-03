@@ -55,3 +55,7 @@
 ## 2024-05-18 - Optimize AdversarialDefense String Formatting
 **Learning:** In performance-critical paths (e.g., `AdversarialDefense.analyze_input`), redundant list instantiations and string transformations like `.lower()` can cause unnecessary recomputations and allocations in hot loops.
 **Action:** Store indicator patterns as class-level tuples (e.g., `_INJECTION_INDICATORS`) to prevent redundant instantiations, and hoist repetitive string transformations to the parent caller, passing them down as arguments to sub-methods.
+
+## 2025-05-15 - Fast Pattern Matching in Hot Loops
+**Learning:** In performance-critical functions like `detect_custom_pattern` in `AdversarialDefense`, calling `.lower()` on strings inside a hot loop (especially nested iterations) incurs significant object creation and string manipulation overhead in Python.
+**Action:** Pre-compute and store transformed strings (like lowercase versions) in a parallel list/tuple during insertion time (e.g., in `add_attack_pattern`). Use the pre-computed structures for evaluation in the hot loop while maintaining the original collection for external APIs and recording.
