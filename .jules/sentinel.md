@@ -68,3 +68,7 @@
 **Vulnerability:** The `AgentObserver` class logged messages (`log`) and events (`log_event`) without bounding the length of the `message` and `description` string fields. This posed a Denial of Service (DoS) risk via memory exhaustion if an attacker dynamically generated and logged very large strings.
 **Learning:** Storing string values in in-memory logs and event trackers without an upper bound is a memory exhaustion vulnerability, even if the total number of entries is bounded.
 **Prevention:** Always implement maximum string length limits (e.g., truncating to 10000 characters) for user-provided or dynamically generated data stored in in-memory structures like logs, events, or metadata.
+## 2024-05-24 - DoS Vulnerability in AST parsing
+**Vulnerability:** CPU Exhaustion from unbound condition strings in `PolicyEnforcer`.
+**Learning:** `ast.parse` is highly resource intensive. If arbitrary input isn't bounded before passing to `ast.parse`, malicious users can submit massive, convoluted condition strings that consume excessive CPU time or memory, leading to a Denial of Service.
+**Prevention:** Enforce hard length limits on condition strings passed to rule systems before they reach `ast.parse`.
