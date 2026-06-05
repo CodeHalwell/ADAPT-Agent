@@ -71,6 +71,10 @@ class PolicyEnforcer:
             action: Action to take on violation (warn, block, modify)
             severity: Severity level (low, medium, high, critical)
         """
+        # SECURITY: Prevent CPU/memory exhaustion DoS during AST parsing
+        if len(condition) > 1024:
+            raise ValueError("Condition length exceeds maximum allowed 1024 characters")
+
         rule: PolicyRule = {
             "name": name,
             "description": description,
