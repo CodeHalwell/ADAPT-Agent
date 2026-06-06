@@ -72,3 +72,8 @@
 **Vulnerability:** CPU Exhaustion from unbound condition strings in `PolicyEnforcer`.
 **Learning:** `ast.parse` is highly resource intensive. If arbitrary input isn't bounded before passing to `ast.parse`, malicious users can submit massive, convoluted condition strings that consume excessive CPU time or memory, leading to a Denial of Service.
 **Prevention:** Enforce hard length limits on condition strings passed to rule systems before they reach `ast.parse`.
+
+## 2024-06-06 - Log Poisoning Vulnerability in Adversarial Defense
+**Vulnerability:** The `_record_attack` method in `AdversarialDefense` truncated attack `content` but did not explicitly sanitize it to escape newline (`\n`) and carriage return (`\r`) characters. This created a log poisoning vulnerability where an attacker could inject forged log entries or obscure real attacks by inserting multiline payloads.
+**Learning:** Even when input is truncated to prevent Denial of Service (DoS) attacks, it must still be sanitized to neutralize control characters that can corrupt downstream observability, logging, or reporting systems.
+**Prevention:** Explicitly sanitize untrusted input (e.g., escaping `\n` to `\\n` and `\r` to `\\r`) before storing it in internal buffers or records. Ensure sanitization happens after an initial length truncation to avoid ReDoS or memory exhaustion vulnerabilities on massive inputs.

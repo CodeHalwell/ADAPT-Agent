@@ -189,7 +189,9 @@ class AdversarialDefense:
         """
         attack = {
             "type": attack_type,
-            "content": content[:100],  # Truncated
+            "content": content[:256]
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")[:100],  # Truncated and sanitized
             "indicator": indicator,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
