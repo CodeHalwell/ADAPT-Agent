@@ -68,3 +68,8 @@
 **Vulnerability:** The `AgentObserver` class logged messages (`log`) and events (`log_event`) without bounding the length of the `message` and `description` string fields. This posed a Denial of Service (DoS) risk via memory exhaustion if an attacker dynamically generated and logged very large strings.
 **Learning:** Storing string values in in-memory logs and event trackers without an upper bound is a memory exhaustion vulnerability, even if the total number of entries is bounded.
 **Prevention:** Always implement maximum string length limits (e.g., truncating to 10000 characters) for user-provided or dynamically generated data stored in in-memory structures like logs, events, or metadata.
+
+## 2024-06-06 - Log Poisoning Vulnerability in Adversarial Defense
+**Vulnerability:** The `_record_attack` method in `AdversarialDefense` truncated attack `content` but did not explicitly sanitize it to escape newline (`\n`) and carriage return (`\r`) characters. This created a log poisoning vulnerability where an attacker could inject forged log entries or obscure real attacks by inserting multiline payloads.
+**Learning:** Even when input is truncated to prevent Denial of Service (DoS) attacks, it must still be sanitized to neutralize control characters that can corrupt downstream observability, logging, or reporting systems.
+**Prevention:** Explicitly sanitize untrusted input (e.g., escaping `\n` to `\\n` and `\r` to `\\r`) before storing it in internal buffers or records. Ensure sanitization happens after an initial length truncation to avoid ReDoS or memory exhaustion vulnerabilities on massive inputs.
