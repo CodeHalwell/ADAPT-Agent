@@ -93,16 +93,16 @@ class AgentEvaluator:
         """
         results = self._evaluation_results
 
-        if agent_id:
-            results = [r for r in results if r["agent_id"] == agent_id]
-
         if not results:
             return {}
 
         # ⚡ Bolt: Single O(N) pass over results instead of O(N*M) passes
+        # Filter agent_id during iteration to prevent redundant memory allocation and O(N) traversal
         sums = {}
         counts = {}
         for result in results:
+            if agent_id and result["agent_id"] != agent_id:
+                continue
             for metric_name, score in result["metrics"].items():
                 if score is not None:
                     sums[metric_name] = sums.get(metric_name, 0.0) + score
