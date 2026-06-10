@@ -58,3 +58,6 @@
 ## 2024-06-08 - String manipulation overhead in iteration loops
 **Learning:** In `adapt_agent/adversarial/__init__.py`, `AdversarialDefense.detect_custom_pattern` evaluated `.lower()` for every attack pattern inside a tight iteration loop, adding string manipulation overhead to a hot path.
 **Action:** When searching with static, case-insensitive patterns against a changing string, pre-compute the lowercased patterns alongside their original variants upon insertion, and store them as tuples `(pattern, pattern_lower)`. This replaces an O(N) string transformation bottleneck during iteration with a fast subset lookup.
+## 2024-06-10 - Avoid list comprehensions for intermediate filtering in evaluation
+**Learning:** Instantiating intermediate filtered lists for computing aggregate metrics causes redundant memory allocation and O(N) traversal overhead.
+**Action:** When filtering objects to perform simple aggregations, integrate the filter condition (`continue`) directly into the main iteration loop instead of allocating a separate intermediate filtered list.
