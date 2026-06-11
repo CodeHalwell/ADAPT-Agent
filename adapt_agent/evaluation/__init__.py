@@ -91,18 +91,19 @@ class AgentEvaluator:
         Returns:
             Dictionary of aggregate metric scores
         """
-        results = self._evaluation_results
-
-        if agent_id:
-            results = [r for r in results if r["agent_id"] == agent_id]
-
-        if not results:
+        if not self._evaluation_results:
             return {}
 
-        # ⚡ Bolt: Single O(N) pass over results instead of O(N*M) passes
         sums = {}
         counts = {}
-        for result in results:
+
+        # ⚡ Bolt: Integrated filter condition directly into the main iteration loop
+        # to avoid instantiating an intermediate filtered list, reducing memory allocation
+        # and redundant O(N) traversal overhead.
+        for result in self._evaluation_results:
+            if agent_id and result["agent_id"] != agent_id:
+                continue
+
             for metric_name, score in result["metrics"].items():
                 if score is not None:
                     sums[metric_name] = sums.get(metric_name, 0.0) + score
