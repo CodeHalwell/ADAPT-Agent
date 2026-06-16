@@ -148,7 +148,9 @@ class TaintTracker:
         for sid in source_ids:
             if sid in self._taint_sources:
                 lvl = self._taint_sources[sid].level
-                if lvl == TaintLevel.CRITICAL:
+                if (
+                    lvl is TaintLevel.CRITICAL
+                ):  # ⚡ Bolt: Fast identity check bypasses __eq__ method overhead in hot loop
                     return TaintLevel.CRITICAL
                 pri = self._LEVEL_PRIORITY[lvl]
                 if pri > max_priority:
