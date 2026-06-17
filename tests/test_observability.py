@@ -21,3 +21,15 @@ def test_get_traces_limit():
     assert len(traces) == 2
     assert traces[0]["trace_id"] == "3"
     assert traces[1]["trace_id"] == "4"
+
+
+def test_log_poisoning_prevention():
+    observer = AgentObserver()
+    observer.log(level="info", message="Line 1\nLine 2\rLine 3")
+    logs = observer.get_logs()
+    assert logs[0]["message"] == "Line 1\\nLine 2\\rLine 3"
+
+    observer.start_trace(trace_id="1", agent_id="agent1", operation="op")
+    observer.log_event(trace_id="1", event_type="test", description="Desc 1\nDesc 2\rDesc 3")
+    traces = observer.get_traces()
+    assert traces[0]["events"][0]["description"] == "Desc 1\\nDesc 2\\rDesc 3"
