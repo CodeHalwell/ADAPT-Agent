@@ -148,7 +148,8 @@ class TaintTracker:
         for sid in source_ids:
             if sid in self._taint_sources:
                 lvl = self._taint_sources[sid].level
-                if lvl == TaintLevel.CRITICAL:
+                # ⚡ Bolt: Fast Enum comparison using identity check ('is') instead of equality ('==') to bypass __eq__ overhead
+                if lvl is TaintLevel.CRITICAL:
                     return TaintLevel.CRITICAL
                 pri = self._LEVEL_PRIORITY[lvl]
                 if pri > max_priority:
