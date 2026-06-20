@@ -61,3 +61,7 @@
 ## 2024-06-12 - Eliminate intermediate array allocation in metric aggregation
 **Learning:** In `adapt_agent/evaluation/__init__.py`, calculating aggregate metrics using list comprehensions to filter results before looping over them creates intermediate array allocations and causes redundant iterations over the dataset.
 **Action:** When computing aggregates over a filtered list of results, combine the filter condition directly into the main iteration loop instead of instantiating an intermediate filtered list. This reduces memory allocations and O(N) traversal overhead.
+
+## 2024-06-25 - Fast Enum identity comparison in tight loops
+**Learning:** Python Enums in tight loops are relatively slow to compare. Identity checks (`is`) bypass `__eq__` method overhead and are faster than equality checks (`==`) because Enum members are singletons.
+**Action:** In performance-critical loops checking against a specific Enum member (like `TaintLevel.CRITICAL`), use `is` rather than `==` for faster execution.
