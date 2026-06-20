@@ -111,7 +111,8 @@ class AgentObserver:
         """
         event = {
             "event_type": event_type,
-            "description": description[:10000],
+            # SECURITY: Prevent log poisoning by escaping newlines and carriage returns
+            "description": description[:10000].replace("\n", "\\n").replace("\r", "\\r"),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
         }
@@ -140,7 +141,8 @@ class AgentObserver:
         """
         log_entry = {
             "level": level,
-            "message": message[:10000],
+            # SECURITY: Prevent log poisoning by escaping newlines and carriage returns
+            "message": message[:10000].replace("\n", "\\n").replace("\r", "\\r"),
             "agent_id": agent_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
