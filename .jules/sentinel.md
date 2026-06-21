@@ -77,3 +77,8 @@
 **Vulnerability:** The `_record_attack` method in `AdversarialDefense` truncated attack `content` but did not explicitly sanitize it to escape newline (`\n`) and carriage return (`\r`) characters. This created a log poisoning vulnerability where an attacker could inject forged log entries or obscure real attacks by inserting multiline payloads.
 **Learning:** Even when input is truncated to prevent Denial of Service (DoS) attacks, it must still be sanitized to neutralize control characters that can corrupt downstream observability, logging, or reporting systems.
 **Prevention:** Explicitly sanitize untrusted input (e.g., escaping `\n` to `\\n` and `\r` to `\\r`) before storing it in internal buffers or records. Ensure sanitization happens after an initial length truncation to avoid ReDoS or memory exhaustion vulnerabilities on massive inputs.
+
+## 2024-06-08 - Log Poisoning Vulnerability in AgentObserver
+**Vulnerability:** The `AgentObserver` class recorded log messages and event descriptions but did not explicitly sanitize them to escape newline (`\n`) and carriage return (`\r`) characters after length truncation.
+**Learning:** This creates a log poisoning vulnerability where an attacker could inject forged log entries or obscure real events by inserting multiline payloads into `message` or `description` fields.
+**Prevention:** Explicitly sanitize untrusted input (e.g., escaping `\n` to `\\n` and `\r` to `\\r`) before storing it in internal buffers or logs, ensuring this sanitization happens after any initial length truncations to avoid memory exhaustion during replacement.
