@@ -21,3 +21,25 @@ def test_get_traces_limit():
     assert len(traces) == 2
     assert traces[0]["trace_id"] == "3"
     assert traces[1]["trace_id"] == "4"
+
+
+def test_log_poisoning_prevention():
+    observer = AgentObserver()
+
+    # Test log poisoning prevention
+    malicious_log = "user login\n[ERROR] system compromised"
+    observer.log(level="info", message=malicious_log, agent_id="agent1")
+    logs = observer.get_logs(limit=1)
+    assert "\n" not in logs[0]["message"]
+    assert "\\n" in logs[0]["message"]
+
+    # Test event poisoning prevention
+    observer.start_trace(trace_id="trace1", agent_id="agent1", operation="op")
+    malicious_event = "started task\r\n[CRITICAL] deleted all files"
+    observer.log_event(trace_id="trace1", event_type="task", description=malicious_event)
+    traces = observer.get_traces(limit=1)
+    event = traces[0]["events"][0]
+    assert "\n" not in event["description"]
+    assert "\r" not in event["description"]
+    assert "\\n" in event["description"]
+    assert "\\r" in event["description"]
