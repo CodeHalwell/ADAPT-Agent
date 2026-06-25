@@ -64,3 +64,6 @@
 ## 2024-06-15 - Enum identity comparison optimization
 **Learning:** In performance-critical tight loops, comparing Python Enums using equality (`==`) introduces overhead from `__eq__` method dispatch.
 **Action:** Always prefer identity checks (`is`) over equality checks (`==`) when comparing Python Enums, as Enum members are singletons and identity checks bypass method overhead.
+## 2024-06-25 - Avoid redundant data copies in middleware hot paths
+**Learning:** Locally constructed, ephemeral objects in hot execution paths (like wrapper closures) do not need to be defensibly copied (`dict.copy()`) before being modified by internal components. Passing them to general-purpose functions that defensively copy data can lead to unnecessary allocations and measurable performance overhead.
+**Action:** When wrapping functions or orchestrating execution pipelines, inline processing logic that operates directly on freshly constructed context dictionaries rather than routing them through general-purpose API methods that enforce defensive copying.
