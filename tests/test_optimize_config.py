@@ -293,6 +293,31 @@ def test_build_dataset_missing_file():
         build_dataset(DatasetSpec(path="/no/such/data.jsonl"))
 
 
+def test_build_target_non_callable_entrypoint_is_friendly_error():
+    # A non-callable entrypoint must raise TrainingConfigError, not a raw TypeError.
+    from adapt_agent.optimization.config import build_target
+
+    cfg = parse_training_config(
+        {
+            "target": {"entrypoint": "math:pi"},  # a float, not callable
+            "dataset": {"path": "x"},
+        }
+    )
+    with pytest.raises(TrainingConfigError):
+        build_target(cfg)
+
+
+def test_invalid_seed_is_friendly_error():
+    with pytest.raises(TrainingConfigError):
+        parse_training_config(
+            {
+                "target": {"entrypoint": "builtins:str"},
+                "dataset": {"path": "x"},
+                "optimizer": {"seed": [1, 2, 3]},  # not an int
+            }
+        )
+
+
 def test_min_improvement_threaded_into_default_optimizer():
     # The 'default' pipeline must respect a configured min_improvement (not drop it).
     from adapt_agent.optimization.config import build_optimizer

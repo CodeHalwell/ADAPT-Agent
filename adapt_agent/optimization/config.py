@@ -312,13 +312,20 @@ def parse_training_config(raw: dict[str, Any]) -> TrainingConfig:
         raise TrainingConfigError(
             f"Unknown optimizer type {opt_type!r}. Available: {sorted(_OPTIMIZER_TYPES)}"
         )
+    seed_raw = opt_raw.get("seed", 0)
+    try:
+        seed = int(seed_raw) if seed_raw is not None else None
+    except (TypeError, ValueError) as exc:
+        raise TrainingConfigError(
+            f"optimizer.seed must be an integer or null, got {seed_raw!r}"
+        ) from exc
     optimizer = OptimizerSpec(
         type=opt_type,
         max_evals=int(opt_raw.get("max_evals", 60)),
         min_improvement=(
             float(opt_raw["min_improvement"]) if "min_improvement" in opt_raw else None
         ),
-        seed=opt_raw.get("seed", 0),
+        seed=seed,
         kinds=list(opt_raw["kinds"]) if opt_raw.get("kinds") else None,
         suggest_tools=bool(opt_raw.get("suggest_tools", True)),
         verbose=bool(opt_raw.get("verbose", False)),
@@ -505,17 +512,35 @@ def build_target(config: TrainingConfig) -> OptimizableAgent:
     elif target_spec.entrypoint:
         runner = _resolve_object(target_spec.entrypoint)
 
-    if components:
-        agent = OptimizableAgent.from_components(
-            components=components, runner=runner, name=target_spec.name
-        )
-    elif runner is not None:
-        agent = OptimizableAgent.from_callable(runner, name=target_spec.name)
-    else:  # pragma: no cover - guarded in parse
-        raise TrainingConfigError("target needs an entrypoint/runner or components")
+    # Surface wiring problems (non-callable entrypoint, un-inferrable runner) as a
+    # friendly TrainingConfigError rather than a raw TypeError/ValueError from deep
+    # inside OptimizableAgent.
+    try:
+        if components:
+            agent = OptimizableAgent.from_components(
+                components=components, runner=runner, name=target_spec.name
+            )
+        elif runner is not None:
+            agent = OptimizableAgent.from_callable(runner, name=target_spec.name)
+        else:  # pragma: no cover - guarded in parse
+            raise TrainingConfigError("target needs an entrypoint/runner or components")
+    except TrainingConfigError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise TrainingConfigError(f"could not build target: {exc}") from exc
 
     for pspec in config.parameters:
-        agent.add_parameter(_build_parameter(pspec, components))
+        try:
+            agent.add_parameter(_build_parameter(pspec, components))
+        except TrainingConfigError:
+            raise
+        except ValueError as exc:
+            # Most likely a name clash with an auto-introspected parameter.
+            raise TrainingConfigError(
+                f"parameter {pspec.name!r} could not be added ({exc}); it may collide "
+                f"with an auto-introspected parameter -- rename it or drop the explicit "
+                f"declaration"
+            ) from exc
     return agent
 
 
@@ -618,9 +643,9 @@ def build_optimizer(config: TrainingConfig, harness: EvaluationHarness, judge: A
     cls = _OPTIMIZER_TYPES[spec.type]
     kwargs: dict[str, Any] = dict(common)
     kwargs["judge"] = judge
-    # Strategies that support these extras.
-    if spec.type in ("coordinate_ascent", "bootstrap_few_shot", "evolutionary"):
-        kwargs["suggest_tools"] = spec.suggest_tools and judge is not None
+    # All optimizers accept suggest_tools (base Optimizer); honour the config key
+    # for every strategy rather than silently dropping it for grid/random.
+    kwargs["suggest_tools"] = spec.suggest_tools and judge is not None
     if spec.type == "coordinate_ascent" and spec.kinds:
         kwargs["kinds"] = tuple(_coerce_kind(k) for k in spec.kinds)
     optimizer: Optimizer = cls(harness, **kwargs)
