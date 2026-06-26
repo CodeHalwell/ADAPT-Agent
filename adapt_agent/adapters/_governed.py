@@ -42,8 +42,8 @@ caller at the framework's native async API.
 import asyncio
 import inspect
 import uuid
-from collections.abc import AsyncIterable
-from typing import Any, Callable, Optional, cast
+from collections.abc import AsyncIterable, Callable
+from typing import Any, cast
 
 from adapt_agent.adapters.base import BaseAdapter
 from adapt_agent.adversarial import AdversarialDefense
@@ -268,14 +268,14 @@ class GovernedAdapter(BaseAdapter):
 
     def __init__(
         self,
-        config: Optional[dict[str, Any]] = None,
+        config: dict[str, Any] | None = None,
         *,
-        firewall: Optional[Firewall] = None,
-        defense: Optional[AdversarialDefense] = None,
-        policy_enforcer: Optional[PolicyEnforcer] = None,
-        observer: Optional[AgentObserver] = None,
-        middleware: Optional[Middleware] = None,
-        agent_id: Optional[str] = None,
+        firewall: Firewall | None = None,
+        defense: AdversarialDefense | None = None,
+        policy_enforcer: PolicyEnforcer | None = None,
+        observer: AgentObserver | None = None,
+        middleware: Middleware | None = None,
+        agent_id: str | None = None,
         block_on_violation: bool = True,
     ):
         super().__init__(config)
@@ -289,7 +289,7 @@ class GovernedAdapter(BaseAdapter):
 
     # -- framework-specific hooks ---------------------------------------------
 
-    def _resolve_runner(self, agent: Any) -> Optional[Runner]:
+    def _resolve_runner(self, agent: Any) -> Runner | None:
         """Return a callable that runs ``agent`` given prepared input, or ``None``.
 
         The default looks for the first callable attribute named in

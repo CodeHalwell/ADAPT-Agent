@@ -31,7 +31,8 @@ Example -- an orchestrator with two specialist sub-agents::
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from adapt_agent.optimization.evaluation import _RUN_METHOD_NAMES, resolve_runner
 from adapt_agent.optimization.introspection import introspect_components

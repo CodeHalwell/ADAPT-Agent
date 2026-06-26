@@ -3,9 +3,10 @@
 import ast
 import logging
 import operator
+from collections.abc import Callable
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Callable, Optional, cast
+from typing import Any, cast
 
 from adapt_agent.core.types import AgentMessage, AgentState, PolicyRule
 
@@ -145,7 +146,7 @@ class PolicyEnforcer:
             return True
         return False
 
-    def get_rule(self, name: str) -> Optional[PolicyRule]:
+    def get_rule(self, name: str) -> PolicyRule | None:
         """Get a policy rule by name.
 
         Args:
@@ -218,8 +219,8 @@ class PolicyEnforcer:
 
     def get_violations(
         self,
-        severity: Optional[str] = None,
-        limit: Optional[int] = None,
+        severity: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Get recorded policy violations.
 
@@ -254,7 +255,7 @@ class PolicyEnforcer:
         self,
         condition: str,
         context: dict[str, Any],
-        rule_name: Optional[str] = None,
+        rule_name: str | None = None,
     ) -> bool:
         """Evaluate a policy condition.
 
@@ -314,13 +315,13 @@ class PolicyEnforcer:
             dict_node = cast(ast.Dict, node)
             return {
                 self._eval_node(k, context, depth + 1): self._eval_node(v, context, depth + 1)
-                for k, v in zip(dict_node.keys, dict_node.values)
+                for k, v in zip(dict_node.keys, dict_node.values, strict=False)
                 if k is not None
             }
         elif node_type is ast.Compare:
             cmp_node = cast(ast.Compare, node)
             left = self._eval_node(cmp_node.left, context, depth + 1)
-            for op, comp in zip(cmp_node.ops, cmp_node.comparators):
+            for op, comp in zip(cmp_node.ops, cmp_node.comparators, strict=False):
                 right = self._eval_node(comp, context, depth + 1)
                 op_type = type(op)
                 if op_type not in self._OPERATORS:

@@ -3,7 +3,7 @@
 **A**dversarial **D**efense &amp; **P**olicy **T**raining for LLM **Agent**s — a security and governance toolkit for LLM agents.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/)
 
 ADAPT-Agent is a Python library that adds a layer of security and governance controls around LLM agents. It provides a firewall for screening inputs and outputs, a policy engine for enforcing rules on agent messages and state, adversarial-attack detection (prompt injection / jailbreak), trust scoring, taint tracking, and observability — plus framework adapters that wrap an existing agent so these controls run automatically on every execution.
 

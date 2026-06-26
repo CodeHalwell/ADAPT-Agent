@@ -33,7 +33,8 @@ from __future__ import annotations
 import logging
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +92,21 @@ def _call_with_sampling_retry(fn: Callable[..., Any], kwargs: dict[str, Any]) ->
     except Exception as exc:  # noqa: BLE001 - re-raised unless it is a sampling error
         if not _sampling_error(exc):
             raise
-        if not any(key in kwargs for key in _SAMPLING_KEYS):
+        # Sampling params may sit at the top level or nested inside a ``config``
+        # mapping (Gemini's google-genai passes temperature/top_p/top_k inside
+        # ``config=``). Detect and strip them from whichever place they live.
+        nested = kwargs.get("config")
+        has_top_level = any(key in kwargs for key in _SAMPLING_KEYS)
+        has_nested = isinstance(nested, dict) and any(key in nested for key in _SAMPLING_KEYS)
+        if not has_top_level and not has_nested:
             raise
         logger.warning(
             "SDK rejected sampling params (%s); retrying without temperature/top_p/top_k.",
             exc,
         )
         retry = {k: v for k, v in kwargs.items() if k not in _SAMPLING_KEYS}
+        if isinstance(retry.get("config"), dict):
+            retry["config"] = {k: v for k, v in retry["config"].items() if k not in _SAMPLING_KEYS}
         return fn(**retry)
 
 

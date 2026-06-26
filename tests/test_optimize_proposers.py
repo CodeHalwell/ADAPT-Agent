@@ -249,7 +249,7 @@ def test_prompt_mutation_appends_directives():
     # each candidate is base + one of the known directives
     from adapt_agent.optimization.proposers import _PROMPT_DIRECTIVES
 
-    for v, d in zip(out, _PROMPT_DIRECTIVES):
+    for v, d in zip(out, _PROMPT_DIRECTIVES, strict=False):
         assert v.endswith(d)
 
 

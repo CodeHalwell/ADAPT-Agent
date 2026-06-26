@@ -735,6 +735,7 @@ def make_default_optimizer(
     max_evals: int = 60,
     seed: int | None = 0,
     verbose: bool = False,
+    min_improvement: float | None = None,
 ) -> PipelineOptimizer:
     """Build a sensible "do all the optimizations" pipeline.
 
@@ -748,7 +749,9 @@ def make_default_optimizer(
     its tool stage record advisory new-tool/skill recommendations on the result.
     """
     per_stage = max(5, max_evals // 4)
-    common = {"seed": seed, "judge": judge, "verbose": verbose}
+    common: dict[str, Any] = {"seed": seed, "judge": judge, "verbose": verbose}
+    if min_improvement is not None:
+        common["min_improvement"] = min_improvement
     suggest = judge is not None
     stages: list[Optimizer] = [
         BootstrapFewShotOptimizer(harness, max_evals=per_stage, **common),

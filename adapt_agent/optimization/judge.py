@@ -31,8 +31,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from adapt_agent.optimization.providers import ModelProvider
@@ -689,12 +690,21 @@ def _extract_string_list(text: str, *, key: str) -> list[str]:
             candidates = None
     if isinstance(candidates, list):
         return [str(item).strip() for item in candidates if str(item).strip()]
-    # Fallback: split bullet / numbered lines.
+    # Fallback: prefer genuine list markers (so conversational pre/postambles
+    # like "Here are the weaknesses:" are not mistaken for items). Only if no
+    # marked lines exist do we fall back to every non-empty line.
     items: list[str] = []
     for line in cleaned.splitlines():
-        stripped = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
-        if stripped:
-            items.append(stripped)
+        match = re.match(r"^\s*(?:[-*•]|\d+[.)])\s*(.+)", line)
+        if match:
+            stripped = match.group(1).strip()
+            if stripped:
+                items.append(stripped)
+    if not items:
+        for line in cleaned.splitlines():
+            stripped = line.strip()
+            if stripped:
+                items.append(stripped)
     return items
 
 

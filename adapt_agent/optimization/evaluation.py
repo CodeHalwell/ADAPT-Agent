@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, cast
+from typing import Any, cast
 
 from adapt_agent.optimization.dataset import Example, GoldenDataset
 from adapt_agent.optimization.metrics import Metric, MetricFn, coerce_metric

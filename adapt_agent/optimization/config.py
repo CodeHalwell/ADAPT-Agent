@@ -70,9 +70,10 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from adapt_agent.optimization.dataset import GoldenDataset
 from adapt_agent.optimization.evaluation import EvaluationHarness
@@ -604,6 +605,7 @@ def build_optimizer(config: TrainingConfig, harness: EvaluationHarness, judge: A
             max_evals=spec.max_evals,
             seed=spec.seed,
             verbose=spec.verbose,
+            min_improvement=spec.min_improvement,
         )
 
     cls = _OPTIMIZER_TYPES[spec.type]

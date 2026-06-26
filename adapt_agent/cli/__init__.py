@@ -81,7 +81,7 @@ def _builtin_metric_names() -> list[str]:
     return list(_BUILTIN_METRIC_NAMES)
 
 
-def main(args: Optional[list[str]] = None) -> int:
+def main(args: list[str] | None = None) -> int:
     """Main entry point for the CLI.
 
     Args:
@@ -351,7 +351,7 @@ def _cmd_validate(config_file: str, as_json: bool = False) -> int:
     return 1 if errors else 0
 
 
-def _cmd_monitor(agent_id: str, config_file: Optional[str] = None, as_json: bool = False) -> int:
+def _cmd_monitor(agent_id: str, config_file: str | None = None, as_json: bool = False) -> int:
     """Initialise the observability stack for an agent and report readiness."""
     # Imported lazily to keep `info`/`validate` fast and dependency-light.
     from adapt_agent.observability import AgentObserver
@@ -476,7 +476,7 @@ def _build_components(specs: list[str]) -> dict[str, Any]:
     return components
 
 
-def _build_judge(provider: Optional[str], model: Optional[str]) -> Any:
+def _build_judge(provider: str | None, model: str | None) -> Any:
     """Construct an LLM judge for a provider name, or ``None`` when unset."""
     if not provider:
         return None
@@ -485,7 +485,7 @@ def _build_judge(provider: Optional[str], model: Optional[str]) -> Any:
     return get_judge(provider, model=model)
 
 
-def _build_metrics(names: list[str], judge: Any, primary: Optional[str]) -> tuple[list[Any], str]:
+def _build_metrics(names: list[str], judge: Any, primary: str | None) -> tuple[list[Any], str]:
     """Build the metric list (built-ins + optional judge) and the primary name."""
     from adapt_agent.optimization import get_metric
 

@@ -15,9 +15,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections.abc import Callable
 from datetime import datetime, timezone
 from re import Pattern
-from typing import Any, Callable
+from typing import Any
 
 from adapt_agent.core.types import AgentMessage, SecurityEvent
 

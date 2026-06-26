@@ -267,6 +267,26 @@ def test_build_dataset_missing_file():
         build_dataset(DatasetSpec(path="/no/such/data.jsonl"))
 
 
+def test_min_improvement_threaded_into_default_optimizer():
+    # The 'default' pipeline must respect a configured min_improvement (not drop it).
+    from adapt_agent.optimization.config import build_optimizer
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import exact_match
+
+    cfg = parse_training_config(
+        {
+            "target": {"entrypoint": "builtins:str"},
+            "dataset": {"path": "x"},
+            "optimizer": {"type": "default", "max_evals": 20, "min_improvement": 0.05},
+        }
+    )
+    harness = EvaluationHarness([exact_match()])
+    optimizer = build_optimizer(cfg, harness, judge=None)
+    # Every stage of the pipeline should carry the configured threshold.
+    assert optimizer.min_improvement == pytest.approx(0.05)
+    assert all(stage.min_improvement == pytest.approx(0.05) for stage in optimizer.stages)
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_mini_app():
     yield
