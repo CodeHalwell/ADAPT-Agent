@@ -110,11 +110,11 @@ class TaintTracker:
         source = TaintSource(source_id, source_type, level, metadata)
         self._taint_sources[source_id] = source
 
-        # SECURITY: Prevent memory exhaustion from unbounded dictionary, but never
-        # evict a source that is still referenced by live tainted data (that would
-        # silently change its effective level via the fail-closed path).
+        # SECURITY: Prevent memory exhaustion from an unbounded dictionary. Prefer
+        # evicting an unreferenced source (invisible), but the cap must hold even
+        # when every source is referenced -- otherwise the DoS bound is defeated.
         if len(self._taint_sources) > self.max_tracked_items:
-            self._evict_unreferenced_source(protect=source_id)
+            self._evict_source(protect=source_id)
 
         return source
 
@@ -125,20 +125,40 @@ class TaintTracker:
             referenced.update(sources)
         return referenced
 
-    def _evict_unreferenced_source(self, *, protect: str | None = None) -> None:
-        """Evict the oldest source that is not referenced by live tainted data.
+    def _evict_source(self, *, protect: str | None = None) -> None:
+        """Evict one source to keep ``_taint_sources`` bounded (DoS cap).
 
-        If every excess source is still referenced, no eviction occurs (we keep
-        the data rather than create a fail-closed downgrade hazard).
+        Eviction order, each step preserving the no-downgrade guarantee:
+
+        1. The oldest source **not** referenced by live tainted data -- removing it
+           is invisible to every data item.
+        2. Otherwise (all sources referenced) the oldest referenced source whose
+           level does not exceed ``unknown_source_level``. A referenced source that
+           goes missing reads as ``unknown_source_level`` (fail-closed), so this can
+           only *raise* a data item's effective taint, never lower it -- yet it
+           still frees a slot so the cap holds.
+
+        Only if no source can be evicted without lowering some item's taint (an
+        unusual config where ``unknown_source_level`` sits below a live source's
+        level) is the cap left temporarily exceeded, preferring the security
+        guarantee over the memory bound.
 
         Args:
             protect: A source ID to never evict (e.g. the just-registered one).
         """
         referenced = self._referenced_source_ids()
+        # 1. Prefer an unreferenced source -- eviction is fully invisible.
         for source_id in self._taint_sources:
+            if source_id != protect and source_id not in referenced:
+                del self._taint_sources[source_id]
+                return
+        # 2. Fall back to a referenced source we can drop without a downgrade,
+        #    because the fail-closed unknown level is at least as high as its own.
+        unknown_priority = self._LEVEL_PRIORITY[self.unknown_source_level]
+        for source_id, source in self._taint_sources.items():
             if source_id == protect:
                 continue
-            if source_id not in referenced:
+            if self._LEVEL_PRIORITY[source.level] <= unknown_priority:
                 del self._taint_sources[source_id]
                 return
 
