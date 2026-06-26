@@ -135,11 +135,11 @@ class AgentEvaluator:
             results.reverse()
             return results
 
-        results = self._evaluation_results
         if agent_id:
-            results = [r for r in results if r["agent_id"] == agent_id]
+            return [r for r in self._evaluation_results if r["agent_id"] == agent_id]
 
-        return results
+        # Return a shallow copy so callers cannot mutate the internal buffer.
+        return list(self._evaluation_results)
 
 
 __all__ = ["AgentEvaluator"]

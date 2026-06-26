@@ -136,8 +136,9 @@ def test_get_stats():
     assert stats["propagation_count"] == 1
 
     dist = stats["taint_level_distribution"]
-    # s1 (HIGH) appears in d1, d2, d3 -> 3; s2 (LOW) appears in d2 -> 1.
-    assert dist["high"] == 3
+    # Distinct sources are counted once regardless of how many data items they
+    # taint: s1 (HIGH) and s2 (LOW) each appear once.
+    assert dist["high"] == 1
     assert dist["low"] == 1
 
 
@@ -169,3 +170,15 @@ def test_max_propagations_bounds_records():
         tracker.propagate_taint("src", f"dst{i}")
 
     assert len(tracker._taint_propagation) <= 3
+
+
+def test_get_stats_counts_each_source_once():
+    """A single source tainting many data items is counted once per level."""
+    tracker = TaintTracker()
+    tracker.register_source("s1", "user_input", TaintLevel.HIGH)
+
+    for i in range(5):
+        tracker.mark_tainted(f"d{i}", ["s1"])
+
+    dist = tracker.get_stats()["taint_level_distribution"]
+    assert dist["high"] == 1

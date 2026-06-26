@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full `monitor` command output streaming for live observability sessions (planned).
 - Production-ready Semantic Kernel and CrewAI adapters (currently experimental/planned).
 
+### Fixed
+
+- `TaintTracker.get_stats` now counts each distinct source once per taint level
+  instead of once per (data, source) pairing, so a source tainting many data
+  items no longer inflates the `taint_level_distribution`.
+- `AgentEvaluator.get_evaluation_results` now returns a shallow copy when called
+  without filters, preventing callers from mutating the evaluator's internal
+  results buffer.
+
 ## [0.2.0] - 2026-06-26
 
 This release is a productisation pass that turns the 0.1.0 proof of concept into a

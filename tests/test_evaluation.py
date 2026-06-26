@@ -166,3 +166,15 @@ def test_max_results_bounding_drops_oldest():
     assert len(evaluator._evaluation_results) == 3
     # Oldest dropped, newest retained, in chronological order.
     assert [r["output"] for r in evaluator._evaluation_results] == [3, 4, 5]
+
+
+def test_get_evaluation_results_returns_copy_not_internal_reference():
+    """Mutating the returned list must not affect the evaluator's internal state."""
+    evaluator = AgentEvaluator()
+    evaluator.evaluate_response("a", "i", "o")
+
+    results = evaluator.get_evaluation_results()
+    results.clear()
+
+    # Internal buffer is untouched.
+    assert len(evaluator.get_evaluation_results()) == 1

@@ -128,13 +128,11 @@ def test_taint_tracker_get_stats():
     assert stats["tainted_data_count"] == 3
     assert stats["propagation_count"] == 1
 
-    # data1 is tainted by source1 (HIGH) and source2 (LOW)
-    # data2 is tainted by source3 (HIGH)
-    # data3 is tainted by source1 (HIGH) and source2 (LOW) (from data1)
-    # total sources affecting data are:
-    # data1: source1, source2
-    # data2: source3
-    # data3: source1, source2
-    # So we have 3 sources contributing to high, 2 contributing to low
-    assert stats["taint_level_distribution"][TaintLevel.HIGH.value] == 3
-    assert stats["taint_level_distribution"][TaintLevel.LOW.value] == 2
+    # Each distinct source is counted once by its level, regardless of how many
+    # data items it taints:
+    #   source1 (HIGH) taints data1, data3
+    #   source2 (LOW)  taints data1, data3
+    #   source3 (HIGH) taints data2
+    # So: HIGH -> {source1, source3} = 2, LOW -> {source2} = 1
+    assert stats["taint_level_distribution"][TaintLevel.HIGH.value] == 2
+    assert stats["taint_level_distribution"][TaintLevel.LOW.value] == 1
