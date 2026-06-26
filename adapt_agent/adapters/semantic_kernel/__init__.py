@@ -1,62 +1,46 @@
-"""Semantic Kernel adapter for ADAPT-Agent."""
+"""Semantic Kernel adapter for ADAPT-Agent.
+
+.. warning::
+   **Experimental / planned.** This adapter is a placeholder defining the
+   intended interface. Its methods raise :class:`NotImplementedError`. For a
+   fully implemented integration today, use
+   :class:`~adapt_agent.adapters.LangGraphAdapter`. Track progress in the
+   project's issue tracker.
+"""
 
 from typing import Any
 
 from adapt_agent.adapters.base import BaseAdapter
 from adapt_agent.core.types import Agent, AgentState
 
+_PLANNED_MESSAGE = (
+    "The Semantic Kernel adapter is experimental and not yet implemented. "
+    "Use adapt_agent.adapters.LangGraphAdapter for a supported integration, "
+    "or follow https://github.com/CodeHalwell/ADAPT-Agent/issues for status."
+)
+
 
 class SemanticKernelAdapter(BaseAdapter):
-    """Adapter for integrating with Semantic Kernel agents.
+    """Planned adapter for integrating with Semantic Kernel agents.
 
-    Provides seamless integration between ADAPT-Agent and Semantic Kernel,
-    enabling trust management, policy enforcement, and security features
-    for Semantic Kernel-based agents.
+    This class defines the target interface but does not yet provide a working
+    implementation. All operations raise :class:`NotImplementedError`.
     """
 
+    #: Marks this adapter as not production-ready.
+    __experimental__ = True
+
     def wrap_agent(self, agent: Any) -> Agent:
-        """Wrap a Semantic Kernel agent with ADAPT-Agent capabilities.
-
-        Args:
-            agent: Semantic Kernel agent instance
-
-        Returns:
-            Wrapped agent implementing the Agent protocol
-        """
-        # Implementation would wrap the Semantic Kernel agent
-        # This is a placeholder showing the structure
-        raise NotImplementedError(
-            "Semantic Kernel integration requires semantic-kernel package. "
-            "Install with: pip install adapt-agent[semantic-kernel]"
-        )
+        """Not implemented. See class docstring."""
+        raise NotImplementedError(_PLANNED_MESSAGE)
 
     def extract_state(self, agent: Any) -> AgentState:
-        """Extract the current state from a Semantic Kernel agent.
-
-        Args:
-            agent: Semantic Kernel agent instance
-
-        Returns:
-            AgentState representing the current state
-        """
-        # Placeholder implementation
-        raise NotImplementedError(
-            "Semantic Kernel integration requires semantic-kernel package. "
-            "Install with: pip install adapt-agent[semantic-kernel]"
-        )
+        """Not implemented. See class docstring."""
+        raise NotImplementedError(_PLANNED_MESSAGE)
 
     def inject_middleware(self, agent: Any, middleware: Any) -> Any:
-        """Inject ADAPT-Agent middleware into a Semantic Kernel agent.
+        """Not implemented. See class docstring."""
+        raise NotImplementedError(_PLANNED_MESSAGE)
 
-        Args:
-            agent: Semantic Kernel agent instance
-            middleware: Middleware to inject
 
-        Returns:
-            Modified agent with middleware
-        """
-        # Placeholder implementation
-        raise NotImplementedError(
-            "Semantic Kernel integration requires semantic-kernel package. "
-            "Install with: pip install adapt-agent[semantic-kernel]"
-        )
+__all__ = ["SemanticKernelAdapter"]

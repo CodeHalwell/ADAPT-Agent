@@ -97,8 +97,8 @@ class AgentEvaluator:
             return {}
 
         # ⚡ Bolt: Single O(N) pass over results instead of O(N*M) passes. Also integrated filter condition to avoid intermediate list allocation.
-        sums = {}
-        counts = {}
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
         for result in results:
             if agent_id and result["agent_id"] != agent_id:
                 continue

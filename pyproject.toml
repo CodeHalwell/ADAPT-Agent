@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adapt-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "ADAPT-Agent: Adversarial Defense & Policy Training for LLM Agents - A comprehensive library for LLM agent optimization and security"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
-    {name = "ADAPT-Agent Contributors"}
+    {name = "Daniel Halwell", email = "danielhalwell@gmail.com"},
+]
+maintainers = [
+    {name = "Daniel Halwell", email = "danielhalwell@gmail.com"},
 ]
 keywords = [
     "llm",
@@ -20,20 +23,23 @@ keywords = [
     "adversarial",
     "policy",
     "trust",
-    "ai-safety"
+    "ai-safety",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Security",
+    "Typing :: Typed",
 ]
 dependencies = [
     "typing-extensions>=4.5.0",
@@ -46,33 +52,43 @@ dev = [
     "black>=23.0",
     "ruff>=0.1.0",
     "mypy>=1.0",
+    "build>=1.0",
+]
+docs = [
+    "mkdocs>=1.5",
+    "mkdocs-material>=9.0",
 ]
 langgraph = [
-    "langgraph>=0.0.1",
+    "langgraph>=0.2.0",
 ]
+# NOTE: Semantic Kernel and CrewAI adapters are experimental / planned. The
+# packages below are declared so the extras resolve, but the adapters currently
+# raise NotImplementedError. See docs/adapters.md for the support matrix.
 semantic-kernel = [
-    "semantic-kernel>=0.3.0",
+    "semantic-kernel>=1.0.0",
 ]
 crewai = [
-    "crewai>=0.1.0",
+    "crewai>=0.40.0",
 ]
 all = [
-    "adapt-agent[dev,langgraph,semantic-kernel,crewai]",
+    "adapt-agent[langgraph,semantic-kernel,crewai]",
 ]
 
 [project.urls]
 Homepage = "https://github.com/CodeHalwell/ADAPT-Agent"
 Repository = "https://github.com/CodeHalwell/ADAPT-Agent"
+Documentation = "https://github.com/CodeHalwell/ADAPT-Agent/tree/main/docs"
+Changelog = "https://github.com/CodeHalwell/ADAPT-Agent/blob/main/CHANGELOG.md"
 Issues = "https://github.com/CodeHalwell/ADAPT-Agent/issues"
 
 [project.scripts]
 adapt-agent = "adapt_agent.cli:main"
 
-[tool.setuptools]
-packages = ["adapt_agent"]
+[tool.setuptools.packages.find]
+include = ["adapt_agent*"]
 
-[tool.setuptools.package-dir]
-adapt_agent = "adapt_agent"
+[tool.setuptools.package-data]
+adapt_agent = ["py.typed"]
 
 [tool.black]
 line-length = 100
@@ -82,6 +98,8 @@ include = '\.pyi?$'
 [tool.ruff]
 line-length = 100
 target-version = "py39"
+
+[tool.ruff.lint]
 select = [
     "E",  # pycodestyle errors
     "W",  # pycodestyle warnings
@@ -95,7 +113,7 @@ ignore = [
     "E501", # line too long (handled by black)
 ]
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 
 [tool.mypy]
@@ -110,9 +128,25 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 warn_no_return = true
 
+[[tool.mypy.overrides]]
+module = ["langgraph.*", "semantic_kernel.*", "crewai.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
 addopts = "-v --cov=adapt_agent --cov-report=term-missing"
+
+[tool.coverage.run]
+branch = true
+source = ["adapt_agent"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

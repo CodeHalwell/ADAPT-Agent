@@ -240,7 +240,7 @@ class TaintTracker:
         Returns:
             Dictionary of statistics
         """
-        taint_level_counts = {}
+        taint_level_counts: dict[str, int] = {}
         for sources in self._tainted_data.values():
             for source_id in sources:
                 if source_id in self._taint_sources:

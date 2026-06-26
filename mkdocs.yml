@@ -1,0 +1,52 @@
+site_name: ADAPT-Agent
+site_description: Adversarial Defense & Policy Training for LLM Agents
+repo_url: https://github.com/CodeHalwell/ADAPT-Agent
+repo_name: CodeHalwell/ADAPT-Agent
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Quick Start: quickstart.md
+  - Security Model: security.md
+  - Policy Enforcement: policy.md
+  - Framework Adapters: adapters.md
+  - Observability: observability.md
+  - CLI: cli.md
+  - API Reference: api.md

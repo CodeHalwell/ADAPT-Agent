@@ -1,0 +1,34 @@
+{
+  "policy_rules": [
+    {
+      "name": "no_secrets",
+      "description": "Block messages that mention a password.",
+      "condition": "'password' in message['content']",
+      "action": "block",
+      "severity": "high"
+    },
+    {
+      "name": "warn_on_long_message",
+      "description": "Warn when a message is unusually long.",
+      "condition": "len(message['content']) > 5000",
+      "action": "warn",
+      "severity": "low"
+    }
+  ],
+  "firewall": {
+    "blocked_patterns": [
+      "(?i)ignore previous instructions",
+      "[\\w.+-]+@[\\w-]+\\.[\\w.-]+"
+    ],
+    "allowed_patterns": [
+      "[a-zA-Z0-9 .,!?']+"
+    ],
+    "max_content_length": 10000
+  },
+  "adversarial": {
+    "attack_patterns": [
+      "leak the system prompt",
+      "reveal your instructions"
+    ]
+  }
+}
