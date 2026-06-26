@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dataset-driven optimization & evaluation subsystem** (`adapt_agent.optimization`).
+  Evaluate any agent against a golden dataset and automatically optimize it --
+  tuning prompts, few-shot examples, models, hyperparameters, routing/topology,
+  and tool allow-lists -- for a single agent, six specialists, an
+  orchestrator + sub-agents, or a workflow, across every supported framework. All
+  import-safe and offline-testable (no LLM SDK or framework imported unless used).
+  New building blocks:
+  - `GoldenDataset` / `Example` -- load from list / JSON / JSONL / CSV, split,
+    sample.
+  - `Parameter` / `SearchSpace` -- tunable knobs bound to live framework objects.
+  - `OptimizableAgent` -- wrap arbitrary agent code as `run()` + a search space,
+    via `from_agent` / `from_components` / `from_callable`.
+  - `LLMJudge` -- provider-agnostic model-graded scoring **and** prompt
+    improvement, used at every stage (`score`/`compare`/`critique`/
+    `improve_prompt`/`as_metric`). Provider-specific subclasses `ClaudeJudge`,
+    `OpenAIJudge`, `AzureOpenAIJudge`, `GeminiJudge`, `MistralJudge`,
+    `CohereJudge`, `GroqJudge`, `TogetherJudge`, `OpenRouterJudge`, `OllamaJudge`,
+    `BedrockJudge`, `HuggingFaceJudge` (+ `get_judge`).
+  - `ModelProvider` and concrete providers (`anthropic`, `openai`,
+    `azure_openai`, `gemini`, `mistral`, `cohere`, `groq`, `together`,
+    `openrouter`, `ollama`, `bedrock`, `huggingface`, plus `callable` / `echo`),
+    each importing its SDK lazily; `get_provider` / `register_provider`.
+  - Metrics: `exact_match`, `contains`, `regex_match`, `token_f1`, `jaccard`,
+    `numeric_close`, `json_subset`, `levenshtein_ratio`, and `LLMJudge.as_metric`.
+  - `EvaluationHarness` / `EvaluationReport` -- run an agent over a dataset,
+    aggregate scores, surface failures.
+  - Proposers (`CandidateProposer`, `NumericProposer`, `PromptMutationProposer`,
+    `FewShotProposer`, `LLMProposer`) and optimizers (`CoordinateAscentOptimizer`,
+    `BootstrapFewShotOptimizer`, `GridSearchOptimizer`, `RandomSearchOptimizer`,
+    `EvolutionaryOptimizer`, `PipelineOptimizer`, `make_default_optimizer`).
+  - **Deep per-framework introspection** for all seven adapters (LangGraph,
+    Microsoft Agent Framework, Google ADK, Pydantic AI, CrewAI, OpenAI Agents,
+    Claude Agent SDK): turn a live agent object into bound, tunable parameters
+    (`adapt_agent.optimization.introspection`).
+  - The evaluation engine is re-exported from `adapt_agent.evaluation` so it is
+    discoverable in the "eval" namespace, and key symbols from the package root.
+  - **CLI commands** `adapt-agent evaluate` and `adapt-agent optimize` that load
+    an agent (``module:attribute``, with ``()`` to call a factory) and a golden
+    dataset (``.json``/``.jsonl``/``.csv``), score it with built-in metrics
+    and/or an LLM judge (``--judge claude|openai|gemini|...``), and optimize it
+    (``--optimizer``, ``--component NAME=module:attr`` for multi-agent systems,
+    ``--save-config``, ``--val-data``, ``--json``).
+  - Docs (`docs/optimization.md`, expanded `docs/cli.md`) and a runnable, offline
+    example (`examples/06_optimize_with_golden_dataset.py`).
 - **Shared `GovernedAdapter` base** (`adapt_agent.adapters._governed`) factoring
   out the framework-agnostic governance pipeline (input screening, policy,
   middleware, traced execution, output screening) with transparent handling of

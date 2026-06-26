@@ -47,6 +47,7 @@ nav:
   - Security Model: security.md
   - Policy Enforcement: policy.md
   - Framework Adapters: adapters.md
+  - Optimization & Evaluation: optimization.md
   - Observability: observability.md
   - CLI: cli.md
   - API Reference: api.md

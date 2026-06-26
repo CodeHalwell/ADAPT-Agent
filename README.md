@@ -28,10 +28,26 @@ The library is import-safe with no required heavyweight dependencies: it ships w
 - **`AgentObserver`** — tracing (`start_trace`/`end_trace`) and structured logging for agent executions.
 
 ### Evaluation
-- **`AgentEvaluator`** — evaluation utilities for agent behaviour.
+- **`AgentEvaluator`** — runtime evaluation utilities for agent behaviour.
+- **`GoldenDataset` / `EvaluationHarness`** — evaluate any agent against a golden
+  dataset with built-in metrics (`exact_match`, `token_f1`, `numeric_close`, …)
+  or an **LLM-as-judge**. Re-exported from `adapt_agent.evaluation`.
 
 ### Optimization
-- **`AgentOptimizer`** — tools for optimizing agent performance.
+- **`AgentOptimizer`** — runtime performance-metrics collector + tuning hints.
+- **`OptimizableAgent` + optimizers** — wrap any agent (single, six specialists,
+  orchestrator + sub-agents, or a workflow, across every supported framework) and
+  automatically optimize its prompts, few-shot examples, models, hyperparameters,
+  routing/topology, and tools against a golden dataset. Deep per-framework
+  introspection turns a live agent into tunable parameters.
+- **`LLMJudge`** (provider-agnostic, with `ClaudeJudge` / `OpenAIJudge` /
+  `GeminiJudge` / … subclasses) — model-graded scoring **and** judge-driven prompt
+  improvement, used at every stage. Backed by pluggable `ModelProvider`s
+  (Anthropic, OpenAI, Azure, Gemini, Mistral, Cohere, Groq, Together, Ollama,
+  Bedrock, Hugging Face, …) that import their SDK lazily.
+
+See [docs/optimization.md](docs/optimization.md) and
+[examples/06_optimize_with_golden_dataset.py](examples/06_optimize_with_golden_dataset.py).
 
 ### Patches
 - **`PatchManager`** — management of framework-specific patches.
@@ -179,6 +195,20 @@ adapt-agent validate config.json --json
 # Initialise monitoring for an agent and print a readiness snapshot
 adapt-agent monitor --agent-id my-agent
 adapt-agent monitor --agent-id my-agent --config config.json --json
+
+# Evaluate an agent against a golden dataset (target is module:attribute)
+adapt-agent evaluate myapp.agents:agent --data golden.jsonl --metric exact_match
+adapt-agent evaluate "myapp.agents:build()" --data golden.jsonl --judge claude --primary judge
+
+# Optimize an agent (prompts/few-shot/models/hyperparams/routing/tools) in place
+adapt-agent optimize "myapp.agents:build()" --data golden.jsonl --metric token_f1 \
+    --judge openai --optimizer default --max-evals 60 --save-config best.json
+
+# Optimize a multi-agent system: target is the entrypoint, components are tunable
+adapt-agent optimize myapp.app:orchestrate \
+    --component researcher=myapp.agents:researcher \
+    --component writer=myapp.agents:writer \
+    --data golden.jsonl --metric exact_match --judge gemini
 ```
 
 ### Configuration file schema (JSON)

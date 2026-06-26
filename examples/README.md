@@ -9,6 +9,7 @@ python examples/02_adversarial_defense.py
 python examples/03_langgraph_guarded_agent.py
 python examples/04_observability.py
 python examples/05_multi_framework_adapters.py
+python examples/06_optimize_with_golden_dataset.py
 ```
 
 None of these examples require any optional dependencies (including
@@ -67,6 +68,16 @@ fakes (so it needs **no** optional dependencies). Demonstrates that every
 adapter shares one constructor and one pipeline, that async agents (`.run`
 coroutines, `query` async generators) are driven synchronously, and that a
 prompt-injection input is blocked identically across all of them.
+
+### `06_optimize_with_golden_dataset.py`
+Runs the full **optimization** loop end to end with **no API key and no
+network**: a `GoldenDataset`, an `OptimizableAgent` wrapping a tiny
+orchestrator + specialist system whose behaviour depends on a tunable prompt, an
+`LLMJudge` (backed by a deterministic offline stub) used both as a scoring metric
+and to rewrite the prompt from failures, and a `CoordinateAscentOptimizer` that
+improves the baseline and applies the winning configuration back onto the live
+agent. Swap the stub for `ClaudeJudge` / `OpenAIJudge` / `GeminiJudge` for real
+optimization.
 
 ## Configuration file
 

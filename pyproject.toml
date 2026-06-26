@@ -147,6 +147,23 @@ module = [
     "crewai.*",
     "agents.*",
     "claude_agent_sdk.*",
+    # Optional LLM-provider SDKs (imported lazily by adapt_agent.optimization.providers)
+    "anthropic",
+    "anthropic.*",
+    "openai",
+    "openai.*",
+    "google",
+    "google.*",
+    "google.generativeai",
+    "google.generativeai.*",
+    "mistralai",
+    "mistralai.*",
+    "cohere",
+    "cohere.*",
+    "boto3",
+    "boto3.*",
+    "huggingface_hub",
+    "huggingface_hub.*",
 ]
 ignore_missing_imports = true
 
