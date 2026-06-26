@@ -26,7 +26,8 @@ Features:
   - Trust management and policy enforcement
   - Security firewall and taint tracking
   - Adversarial defense (prompt injection / jailbreak detection)
-  - LangGraph adapter (Semantic Kernel & CrewAI: experimental)
+  - Adapters: LangGraph, Microsoft Agent Framework, Google ADK,
+    Pydantic AI, CrewAI, OpenAI Agents SDK, Claude Agent SDK
   - Performance optimization, evaluation and observability
 ```
 

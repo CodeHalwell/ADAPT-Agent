@@ -61,17 +61,26 @@ docs = [
 langgraph = [
     "langgraph>=0.2.0",
 ]
-# NOTE: Semantic Kernel and CrewAI adapters are experimental / planned. The
-# packages below are declared so the extras resolve, but the adapters currently
-# raise NotImplementedError. See docs/adapters.md for the support matrix.
-semantic-kernel = [
-    "semantic-kernel>=1.0.0",
+microsoft-agent-framework = [
+    "agent-framework>=1.0.0",
+]
+google-adk = [
+    "google-adk>=0.1.0",
+]
+pydantic-ai = [
+    "pydantic-ai>=0.0.14",
 ]
 crewai = [
     "crewai>=0.40.0",
 ]
+openai-agents = [
+    "openai-agents>=0.0.1",
+]
+claude-agent = [
+    "claude-agent-sdk>=0.0.1",
+]
 all = [
-    "adapt-agent[langgraph,semantic-kernel,crewai]",
+    "adapt-agent[langgraph,microsoft-agent-framework,google-adk,pydantic-ai,crewai,openai-agents,claude-agent]",
 ]
 
 [project.urls]
@@ -129,7 +138,16 @@ warn_unused_ignores = true
 warn_no_return = true
 
 [[tool.mypy.overrides]]
-module = ["langgraph.*", "semantic_kernel.*", "crewai.*"]
+module = [
+    "langgraph.*",
+    "agent_framework.*",
+    "google.adk.*",
+    "google.genai.*",
+    "pydantic_ai.*",
+    "crewai.*",
+    "agents.*",
+    "claude_agent_sdk.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

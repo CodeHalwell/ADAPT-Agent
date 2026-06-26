@@ -235,8 +235,10 @@ Abstract methods: `wrap_agent(agent) -> Agent`,
 Concrete helpers: `validate_agent(agent) -> bool`,
 `get_framework_name() -> str`.
 
-Concrete adapters (from `adapt_agent.adapters`): `LangGraphAdapter` (supported),
-`SemanticKernelAdapter` and `CrewAIAdapter` (experimental).
+All concrete adapters subclass `GovernedAdapter`, which implements the shared
+governance pipeline. Available from `adapt_agent.adapters`: `LangGraphAdapter`,
+`MicrosoftAgentFrameworkAdapter`, `GoogleADKAdapter`, `PydanticAIAdapter`,
+`CrewAIAdapter`, `OpenAIAgentsAdapter`, `ClaudeAgentSDKAdapter`.
 
 ---
 

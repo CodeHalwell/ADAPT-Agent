@@ -8,6 +8,7 @@ python examples/01_firewall_and_policy.py
 python examples/02_adversarial_defense.py
 python examples/03_langgraph_guarded_agent.py
 python examples/04_observability.py
+python examples/05_multi_framework_adapters.py
 ```
 
 None of these examples require any optional dependencies (including
@@ -58,6 +59,14 @@ Wraps an agent with `LangGraphAdapter`, configured with a `Firewall`,
 Uses `AgentObserver` to start/observe a trace, log events, and record metrics,
 then prints `get_metric_stats` and `get_traces`. It also shows `AgentEvaluator`
 with a custom metric and `compute_aggregate_metrics`.
+
+### `05_multi_framework_adapters.py`
+Runs the **same** governed payload through the Pydantic AI, Microsoft Agent
+Framework, CrewAI, and Claude Agent SDK adapters using tiny framework-shaped
+fakes (so it needs **no** optional dependencies). Demonstrates that every
+adapter shares one constructor and one pipeline, that async agents (`.run`
+coroutines, `query` async generators) are driven synchronously, and that a
+prompt-injection input is blocked identically across all of them.
 
 ## Configuration file
 

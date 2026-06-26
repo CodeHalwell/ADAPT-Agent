@@ -3,9 +3,7 @@
 import pytest
 
 from adapt_agent.adapters import (
-    CrewAIAdapter,
     LangGraphAdapter,
-    SemanticKernelAdapter,
 )
 from adapt_agent.adapters.langgraph import _extract_texts
 from adapt_agent.adversarial import AdversarialDefense
@@ -370,21 +368,6 @@ def test_extract_texts_shallow_string_collected():
     data = {"a": {"b": {"c": "shallow"}}}
     texts = _extract_texts(data)
     assert "shallow" in texts
-
-
-# --------------------------------------------------------------------------- #
-# Experimental adapters
-# --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("adapter_cls", [SemanticKernelAdapter, CrewAIAdapter])
-def test_experimental_adapters_not_implemented(adapter_cls):
-    adapter = adapter_cls()
-    assert adapter.__experimental__ is True
-    with pytest.raises(NotImplementedError):
-        adapter.wrap_agent(object())
-    with pytest.raises(NotImplementedError):
-        adapter.extract_state(object())
-    with pytest.raises(NotImplementedError):
-        adapter.inject_middleware(object(), object())
 
 
 # --------------------------------------------------------------------------- #

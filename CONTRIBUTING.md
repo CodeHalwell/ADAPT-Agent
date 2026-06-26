@@ -80,9 +80,9 @@ Contributions are welcome across the library, including:
 - **Core** (`adapt_agent/core`) — trust management, policy enforcement, memory,
   middleware.
 - **Security** (`adapt_agent/security`) — firewall and taint tracking.
-- **Adapters** (`adapt_agent/adapters`) — the LangGraph adapter is the most
-  mature; Semantic Kernel and CrewAI are experimental/planned and are great places
-  to help.
+- **Adapters** (`adapt_agent/adapters`) — all adapters share the
+  `GovernedAdapter` base; adding support for a new framework is usually a thin
+  subclass. New framework integrations are a great place to help.
 - **CLI** (`adapt_agent/cli`) — `info`, `validate`, and `monitor` commands.
 - **Optimization, adversarial defense, evaluation, observability, and patches.**
 

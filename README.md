@@ -7,7 +7,7 @@
 
 ADAPT-Agent is a Python library that adds a layer of security and governance controls around LLM agents. It provides a firewall for screening inputs and outputs, a policy engine for enforcing rules on agent messages and state, adversarial-attack detection (prompt injection / jailbreak), trust scoring, taint tracking, and observability — plus framework adapters that wrap an existing agent so these controls run automatically on every execution.
 
-The library is import-safe with no required heavyweight dependencies: it ships with only `typing-extensions`, and optional agent frameworks are imported lazily, so you can `import adapt_agent` without installing LangGraph, Semantic Kernel, or CrewAI.
+The library is import-safe with no required heavyweight dependencies: it ships with only `typing-extensions`, and optional agent frameworks are imported lazily, so you can `import adapt_agent` without installing LangGraph, Pydantic AI, CrewAI, or any other supported framework.
 
 ## Features
 
@@ -41,13 +41,19 @@ The library is import-safe with no required heavyweight dependencies: it ships w
 
 ## Adapter support matrix
 
-Adapters integrate ADAPT-Agent's controls with third-party agent frameworks. Importing an adapter class never imports the underlying framework; the framework is only imported when you actually wrap an agent. **Only the LangGraph adapter is implemented today.**
+Adapters integrate ADAPT-Agent's controls with third-party agent frameworks. Importing an adapter class never imports the underlying framework; the framework is only imported when you actually wrap and run an agent. Every adapter shares one governance pipeline (input screening → policy → middleware → traced execution → output screening) and the same keyword-only constructor.
 
-| Framework        | Status                  | Class                    | Notes                                                              |
-| ---------------- | ----------------------- | ------------------------ | ----------------------------------------------------------------- |
-| LangGraph        | **Supported**           | `LangGraphAdapter`       | Fully implemented. Wraps any compiled graph with an `invoke` method. |
-| Semantic Kernel  | Experimental / Planned  | `SemanticKernelAdapter`  | Placeholder interface; all methods raise `NotImplementedError`.   |
-| CrewAI           | Experimental / Planned  | `CrewAIAdapter`          | Placeholder interface; all methods raise `NotImplementedError`.   |
+| Framework                  | Class                             | Extra                                   | Wrap target                       |
+| -------------------------- | --------------------------------- | --------------------------------------- | --------------------------------- |
+| LangGraph                  | `LangGraphAdapter`                | `adapt-agent[langgraph]`                | compiled graph (`.invoke`)        |
+| Microsoft Agent Framework  | `MicrosoftAgentFrameworkAdapter`  | `adapt-agent[microsoft-agent-framework]`| `ChatAgent` (`.run`)              |
+| Google ADK                 | `GoogleADKAdapter`                | `adapt-agent[google-adk]`               | callable driving a `Runner`       |
+| Pydantic AI                | `PydanticAIAdapter`               | `adapt-agent[pydantic-ai]`              | `Agent` (`.run_sync` / `.run`)    |
+| CrewAI                     | `CrewAIAdapter`                   | `adapt-agent[crewai]`                   | `Crew` (`.kickoff`)               |
+| OpenAI Agents SDK          | `OpenAIAgentsAdapter`             | `adapt-agent[openai-agents]`            | `Agent` (driven via `Runner`)     |
+| Claude Agent SDK           | `ClaudeAgentSDKAdapter`           | `adapt-agent[claude-agent]`             | `query` function                  |
+
+Async-only frameworks (Microsoft Agent Framework, Google ADK, Claude Agent SDK) are driven synchronously — coroutines are awaited and async event streams are drained — so `execute` stays synchronous and the firewall scans every result. See [docs/adapters.md](docs/adapters.md) for per-framework walkthroughs.
 
 ## Installation
 
@@ -58,8 +64,14 @@ pip install adapt-agent
 ### Optional dependencies (extras)
 
 ```bash
-# LangGraph adapter support (the only implemented adapter)
+# A single framework adapter (install only what you use)
 pip install adapt-agent[langgraph]
+pip install adapt-agent[microsoft-agent-framework]
+pip install adapt-agent[google-adk]
+pip install adapt-agent[pydantic-ai]
+pip install adapt-agent[crewai]
+pip install adapt-agent[openai-agents]
+pip install adapt-agent[claude-agent]
 
 # Development tooling (pytest, ruff, black, mypy, build)
 pip install adapt-agent[dev]
@@ -67,11 +79,11 @@ pip install adapt-agent[dev]
 # Documentation tooling (mkdocs, mkdocs-material)
 pip install adapt-agent[docs]
 
-# Everything (langgraph + semantic-kernel + crewai)
+# Every framework adapter at once
 pip install adapt-agent[all]
 ```
 
-> **Note:** The `semantic-kernel` and `crewai` extras (also pulled in by `[all]`) install the respective frameworks, but the adapters themselves are experimental and currently raise `NotImplementedError`. Use the LangGraph adapter for a working integration.
+> **Note:** Each framework extra installs that framework so its adapter can run; `adapt_agent` itself stays import-safe without any of them.
 
 ## Quick Start
 
@@ -200,10 +212,15 @@ Validation checks that policy-rule conditions parse as Python expressions, that 
 ```
 adapt_agent/
 ├── core/              # Types, TrustManager, PolicyEnforcer, MemorySystem, Middleware
-├── adapters/          # Framework adapters
-│   ├── langgraph/     # LangGraphAdapter (supported)
-│   ├── semantic_kernel/  # SemanticKernelAdapter (experimental / planned)
-│   └── crewai/        # CrewAIAdapter (experimental / planned)
+├── adapters/          # Framework adapters (all share GovernedAdapter)
+│   ├── _governed.py   # GovernedAdapter base + shared governance pipeline
+│   ├── langgraph/                  # LangGraphAdapter
+│   ├── microsoft_agent_framework/  # MicrosoftAgentFrameworkAdapter
+│   ├── google_adk/                 # GoogleADKAdapter
+│   ├── pydantic_ai/                # PydanticAIAdapter
+│   ├── crewai/                     # CrewAIAdapter
+│   ├── openai_agents/              # OpenAIAgentsAdapter
+│   └── claude_agent/               # ClaudeAgentSDKAdapter
 ├── security/          # Firewall, TaintTracker
 ├── adversarial/       # AdversarialDefense
 ├── optimization/      # AgentOptimizer
