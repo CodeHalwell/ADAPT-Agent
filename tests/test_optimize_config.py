@@ -149,6 +149,32 @@ def test_temperature_bounds_clamped_to_provider_max():
     assert _validate_bounds(spec) == (0.0, 1.0)
 
 
+def test_temperature_bounds_entirely_above_max_collapse_not_inverted():
+    # [3.0, 4.0] with max 2.0 must clamp BOTH ends -> (2.0, 2.0), never (3.0, 2.0).
+    spec = ParameterSpec(name="t", kind="hyperparam", attr="temperature", bounds=(3.0, 4.0))
+    low, high = _validate_bounds(spec)
+    assert low <= high
+    assert (low, high) == (2.0, 2.0)
+
+
+def test_default_optimizer_honors_suggest_tools_false():
+    from adapt_agent.optimization.config import build_optimizer
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import exact_match
+
+    cfg = parse_training_config(
+        {
+            "target": {"entrypoint": "builtins:str"},
+            "dataset": {"path": "x"},
+            "optimizer": {"type": "default", "suggest_tools": False},
+        }
+    )
+    harness = EvaluationHarness([exact_match()])
+    optimizer = build_optimizer(cfg, harness, judge=None)
+    assert optimizer.suggest_tools is False
+    assert all(not stage.suggest_tools for stage in optimizer.stages)
+
+
 def test_non_temperature_bounds_not_clamped():
     spec = ParameterSpec(
         name="max_round_count", kind="routing", attr="max_round_count", bounds=(4, 12)

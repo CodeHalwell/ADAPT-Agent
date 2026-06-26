@@ -736,6 +736,7 @@ def make_default_optimizer(
     seed: int | None = 0,
     verbose: bool = False,
     min_improvement: float | None = None,
+    suggest_tools: bool | None = None,
 ) -> PipelineOptimizer:
     """Build a sensible "do all the optimizations" pipeline.
 
@@ -745,14 +746,15 @@ def make_default_optimizer(
     (drop-one ablation, plus judge-driven new-tool *suggestions* when a judge is
     supplied). Budget is split across the four stages.
 
-    When a ``judge`` is supplied, ``suggest_tools`` is enabled so the pipeline and
-    its tool stage record advisory new-tool/skill recommendations on the result.
+    ``suggest_tools`` controls whether the pipeline records advisory new-tool/skill
+    recommendations: ``None`` (default) auto-enables it whenever a ``judge`` is
+    supplied; pass ``True``/``False`` to force it on or off.
     """
     per_stage = max(5, max_evals // 4)
     common: dict[str, Any] = {"seed": seed, "judge": judge, "verbose": verbose}
     if min_improvement is not None:
         common["min_improvement"] = min_improvement
-    suggest = judge is not None
+    suggest = (judge is not None) if suggest_tools is None else suggest_tools
     stages: list[Optimizer] = [
         BootstrapFewShotOptimizer(harness, max_evals=per_stage, **common),
         CoordinateAscentOptimizer(
