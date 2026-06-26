@@ -146,8 +146,8 @@ def _extract_prompt(payload: Any) -> str:
                 if isinstance(content, str) and (role == "user" or role is None):
                     return content
             last = messages[-1]
-            last_content = last.get("content") if isinstance(last, dict) else getattr(
-                last, "content", None
+            last_content = (
+                last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
             )
             if isinstance(last_content, str):
                 return last_content
