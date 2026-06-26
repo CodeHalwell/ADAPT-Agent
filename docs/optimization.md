@@ -8,8 +8,9 @@ built or which framework it uses.
 The same machinery works for a single "mega" agent, six specialist agents, an
 orchestrator delegating to sub-agents, or a multi-step workflow, even when the
 code is spread across many files (a `src/` package, an `agents/` directory, a
-FastAPI backend, ...). Everything is **import-safe and dependency-free**: no LLM
-SDK or agent framework is imported unless you actually use one.
+FastAPI backend, ...). Each LLM SDK and agent framework is imported **lazily** --
+only when you actually use one -- so you install just the providers and frameworks
+your system needs.
 
 ## The pieces
 

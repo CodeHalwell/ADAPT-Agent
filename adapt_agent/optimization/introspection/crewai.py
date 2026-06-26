@@ -22,6 +22,7 @@ from typing import Any
 from adapt_agent.optimization.introspection import (
     bind_attr,
     register,
+    tool_subset_candidates,
 )
 from adapt_agent.optimization.parameters import Parameter, ParameterKind
 
@@ -31,7 +32,9 @@ def _predicate(obj: Any) -> bool:
 
     A ``Crew`` has an ``agents`` list/tuple and a callable ``kickoff``. We
     explicitly reject objects belonging to other frameworks (those carrying
-    ``handoffs``/``sub_agents``/``system_prompt``) to avoid false positives.
+    ``handoffs``/``sub_agents``/``system_prompt``/``chat_client``) to avoid false
+    positives -- in particular a Microsoft Agent Framework ``ChatAgent`` (which
+    carries ``chat_client``) must never be hijacked here.
     """
     try:
         agents = getattr(obj, "agents", None)
@@ -39,7 +42,7 @@ def _predicate(obj: Any) -> bool:
             return False
         if not callable(getattr(obj, "kickoff", None)):
             return False
-        for foreign in ("handoffs", "sub_agents", "system_prompt"):
+        for foreign in ("handoffs", "sub_agents", "system_prompt", "chat_client"):
             if hasattr(obj, foreign):
                 return False
         return True
@@ -79,6 +82,7 @@ def _introspect_llm(llm: Any, component: str) -> list[Parameter]:
             f"{component}.max_tokens",
             ParameterKind.HYPERPARAM,
             component=component,
+            bounds=(1, 32000),
         ),
     ]
     params.extend(p for p in candidates if p is not None)
@@ -113,7 +117,19 @@ def _introspect_agent(agent: Any, index: int) -> list[Parameter]:
     elif llm is not None:
         params.extend(_introspect_llm(llm, component))
 
-    tools = bind_attr(agent, "tools", f"{component}.tools", ParameterKind.TOOL, component=component)
+    current_tools = getattr(agent, "tools", None)
+    tools = bind_attr(
+        agent,
+        "tools",
+        f"{component}.tools",
+        ParameterKind.TOOL,
+        component=component,
+        candidates=(
+            tool_subset_candidates(current_tools)
+            if isinstance(current_tools, (list, tuple))
+            else None
+        ),
+    )
     if tools is not None:
         params.append(tools)
 

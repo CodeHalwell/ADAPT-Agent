@@ -151,6 +151,67 @@ def test_max_tracked_items_bounds_sources():
     assert len(tracker._taint_sources) <= 3
 
 
+def test_evicted_source_is_fail_closed_to_max():
+    """A source referenced by live tainted data but missing from the registry
+    must be treated as the configured max taint level, not UNTAINTED."""
+    tracker = TaintTracker()
+    tracker.register_source("s1", "user_input", TaintLevel.CRITICAL)
+    tracker.mark_tainted("d1", ["s1"])
+    assert tracker.get_taint_level("d1") is TaintLevel.CRITICAL
+
+    # Simulate the source being evicted/lost while data still references it.
+    del tracker._taint_sources["s1"]
+
+    # FAIL-CLOSED: still tainted, and at the configured maximum (CRITICAL).
+    assert tracker.is_tainted("d1") is True
+    assert tracker.get_taint_level("d1") is TaintLevel.CRITICAL
+
+    sources = tracker.get_taint_sources("d1")
+    assert len(sources) == 1
+    assert sources[0].level is TaintLevel.CRITICAL
+    assert sources[0].metadata.get("fail_closed") is True
+
+    dist = tracker.get_stats()["taint_level_distribution"]
+    assert dist.get("critical") == 1
+
+
+def test_unknown_source_level_is_configurable():
+    tracker = TaintTracker(unknown_source_level=TaintLevel.HIGH)
+    tracker.mark_tainted("d1", ["ghost"])  # never registered
+    assert tracker.get_taint_level("d1") is TaintLevel.HIGH
+
+
+def test_eviction_skips_referenced_sources():
+    """Sources still referenced by live tainted data are not evicted; an
+    unreferenced one is dropped instead."""
+    tracker = TaintTracker(max_tracked_items=2)
+    tracker.register_source("ref1", "user_input", TaintLevel.HIGH)
+    tracker.register_source("ref2", "user_input", TaintLevel.HIGH)
+    # Both are referenced by live data.
+    tracker.mark_tainted("d1", ["ref1", "ref2"])
+
+    # Registering a third (unreferenced) source exceeds the cap. An unreferenced
+    # source must be the victim, never a referenced one.
+    tracker.register_source("unref", "user_input", TaintLevel.LOW)
+
+    assert "ref1" in tracker._taint_sources
+    assert "ref2" in tracker._taint_sources
+    # The referenced data still resolves to its true level, not a downgrade.
+    assert tracker.get_taint_level("d1") is TaintLevel.HIGH
+
+
+def test_propagation_buffer_is_deque():
+    from collections import deque
+
+    tracker = TaintTracker(max_propagations=2)
+    assert isinstance(tracker._taint_propagation, deque)
+    tracker.register_source("s1", "user_input", TaintLevel.LOW)
+    tracker.mark_tainted("src", ["s1"])
+    for i in range(5):
+        tracker.propagate_taint("src", f"dst{i}")
+    assert len(tracker._taint_propagation) == 2
+
+
 def test_max_tracked_items_bounds_tainted_data():
     tracker = TaintTracker(max_tracked_items=3)
     tracker.register_source("s1", "user_input", TaintLevel.LOW)

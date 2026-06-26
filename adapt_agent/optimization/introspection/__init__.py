@@ -148,6 +148,29 @@ def introspect_components(components: dict[str, Any]) -> list[Parameter]:
     return params
 
 
+def tool_subset_candidates(tools: list | tuple, *, max_candidates: int = 8) -> list[list]:
+    """Return candidate tool/skill subsets for optimization.
+
+    The full set is returned first, then each *drop-one* subset (single-tool
+    ablation), bounded to ``max_candidates`` total. This makes tool/skill
+    selection a real search space the optimizer can explore: the optimizer can
+    discover that removing a distracting or harmful tool improves the agent.
+
+    Returns ``[]`` for fewer than two tools, since with 0 or 1 tools there is no
+    meaningful subset to search (the only drop-one subset of a single tool is the
+    empty set, which is rarely useful and is left out for safety).
+    """
+    items = list(tools)
+    if len(items) < 2:
+        return []
+    candidates: list[list] = [list(items)]
+    for i in range(len(items)):
+        if len(candidates) >= max_candidates:
+            break
+        candidates.append([item for j, item in enumerate(items) if j != i])
+    return candidates
+
+
 # -- binding helpers ----------------------------------------------------------
 
 
@@ -274,6 +297,7 @@ __all__ = [
     "detect",
     "introspect",
     "introspect_components",
+    "tool_subset_candidates",
     "bind_attr",
     "bind_item",
     "bind_mapping_key",

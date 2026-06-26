@@ -1,5 +1,7 @@
 """Tests for the Middleware system."""
 
+import pytest
+
 from adapt_agent.core import Middleware
 
 
@@ -99,6 +101,107 @@ def test_middleware_exception_is_caught_and_pipeline_continues(caplog):
     assert calls == ["after"]
     assert result["after"] is True
     assert any("boom" in rec.message for rec in caplog.records)
+
+
+def test_fail_closed_aborts_pre_pipeline_on_error():
+    """With fail_closed=True, a raising pre-middleware aborts (re-raises)."""
+    mw = Middleware(fail_closed=True)
+    calls = []
+
+    def boom(data):
+        raise RuntimeError("sanitizer failed")
+
+    def after(data):
+        calls.append("after")
+        data["after"] = True
+        return data
+
+    mw.add_pre_middleware(boom, name="boom", priority=10)
+    mw.add_pre_middleware(after, name="after", priority=1)
+
+    with pytest.raises(RuntimeError, match="sanitizer failed"):
+        mw.process_input({})
+
+    # Pipeline aborted: the downstream middleware never ran.
+    assert calls == []
+
+
+def test_fail_closed_aborts_post_pipeline_on_error():
+    """With fail_closed=True, a raising post-middleware aborts (re-raises)."""
+    mw = Middleware(fail_closed=True)
+
+    def boom(data):
+        raise ValueError("kaboom")
+
+    mw.add_post_middleware(boom, name="boom")
+    with pytest.raises(ValueError, match="kaboom"):
+        mw.process_output({"result": 5})
+
+
+def test_fail_open_is_default_and_continues(caplog):
+    """Default (fail_closed=False) logs the error and passes data through."""
+    mw = Middleware()
+    assert mw.fail_closed is False
+
+    def boom(data):
+        raise RuntimeError("boom")
+
+    mw.add_pre_middleware(boom, name="boom")
+    with caplog.at_level("ERROR"):
+        result = mw.process_input({"x": 1})
+    # Unmodified data flows through and the error is logged clearly.
+    assert result["x"] == 1
+    assert any("boom" in rec.message for rec in caplog.records)
+
+
+def test_duplicate_pre_middleware_name_rejected():
+    """Registering two pre-middleware with the same name raises."""
+    mw = Middleware()
+
+    def a(data):
+        return data
+
+    def b(data):
+        return data
+
+    mw.add_pre_middleware(a, name="dup")
+    with pytest.raises(ValueError, match="already registered"):
+        mw.add_pre_middleware(b, name="dup")
+
+    # Registry not corrupted: still exactly one entry, and remove works once.
+    assert len(mw.list_middleware()) == 1
+    assert mw.remove_middleware("dup") is True
+    assert mw.remove_middleware("dup") is False
+
+
+def test_duplicate_post_middleware_name_rejected():
+    """Registering two post-middleware with the same name raises."""
+    mw = Middleware()
+
+    def a(data):
+        return data
+
+    def b(data):
+        return data
+
+    mw.add_post_middleware(a, name="dup")
+    with pytest.raises(ValueError, match="already registered"):
+        mw.add_post_middleware(b, name="dup")
+
+
+def test_duplicate_name_across_pre_and_post_rejected():
+    """A pre and a post middleware cannot share the same name."""
+    mw = Middleware()
+
+    def a(data):
+        return data
+
+    def b(data):
+        return data
+
+    mw.add_pre_middleware(a, name="dup")
+    with pytest.raises(ValueError, match="already registered"):
+        mw.add_post_middleware(b, name="dup")
 
 
 def test_process_output_exception_is_caught(caplog):

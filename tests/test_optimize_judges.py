@@ -407,6 +407,79 @@ def test_provider_kwargs_routed_to_provider():
     assert judge.provider.max_tokens == 42
 
 
+# -- adversarial / score_is_normalized threading -------------------------------
+
+
+def _capture_base_init(monkeypatch):
+    """Patch the LLMJudge base __init__ to record the kwargs it receives.
+
+    Independent of whether judge.py (agent A2) has finished adding the new
+    keyword-only params: we only assert that ProviderJudge forwards them to the
+    base constructor, which is judges.py's responsibility.
+    """
+    captured: dict = {}
+
+    def fake_init(self, complete, **kw):
+        captured["complete"] = complete
+        captured["kw"] = kw
+
+    monkeypatch.setattr(LLMJudge, "__init__", fake_init)
+    return captured
+
+
+def test_adversarial_threads_to_base(monkeypatch):
+    captured = _capture_base_init(monkeypatch)
+    ClaudeJudge(client=FakeAnthropicClient(SCORE_JSON), adversarial=True)
+    assert captured["kw"].get("adversarial") is True
+
+
+def test_score_is_normalized_threads_to_base(monkeypatch):
+    captured = _capture_base_init(monkeypatch)
+    ClaudeJudge(client=FakeAnthropicClient(SCORE_JSON), score_is_normalized=True)
+    assert captured["kw"].get("score_is_normalized") is True
+
+
+def test_both_new_kwargs_thread_and_default_off(monkeypatch):
+    captured = _capture_base_init(monkeypatch)
+    # When not supplied, judges.py must NOT inject them (defaults live on the base).
+    ClaudeJudge(client=FakeAnthropicClient(SCORE_JSON))
+    assert "adversarial" not in captured["kw"]
+    assert "score_is_normalized" not in captured["kw"]
+
+
+def test_new_kwargs_thread_through_get_judge(monkeypatch):
+    captured = _capture_base_init(monkeypatch)
+    get_judge(
+        "openai",
+        client=FakeOpenAIClient(SCORE_JSON),
+        adversarial=True,
+        score_is_normalized=True,
+    )
+    assert captured["kw"].get("adversarial") is True
+    assert captured["kw"].get("score_is_normalized") is True
+
+
+def test_new_kwargs_are_judge_kwargs_not_provider_kwargs():
+    judge_kw, provider_kw = _split_kwargs(
+        {"adversarial": True, "score_is_normalized": True, "api_key": "k"}
+    )
+    assert judge_kw == {"adversarial": True, "score_is_normalized": True}
+    assert provider_kw == {"api_key": "k"}
+
+
+def test_positional_model_used_over_default():
+    # The positional ``model`` arg must beat the class default_model.
+    via_default = ClaudeJudge(client=FakeAnthropicClient(SCORE_JSON))
+    assert via_default.provider.model == "claude-opus-4-8"
+    via_positional = ClaudeJudge("pos-model", client=FakeAnthropicClient(SCORE_JSON))
+    assert via_positional.provider.model == "pos-model"
+
+
+def test_model_in_kwargs_used_when_no_positional():
+    judge = ClaudeJudge(client=FakeAnthropicClient(SCORE_JSON), model="kw-model")
+    assert judge.provider.model == "kw-model"
+
+
 # -- import safety -------------------------------------------------------------
 
 

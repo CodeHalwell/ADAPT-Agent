@@ -8,7 +8,10 @@ It is complementary to the dataset-driven optimization engine in this package
 against a golden dataset.
 """
 
-from typing import Any, Optional
+from __future__ import annotations
+
+from collections import deque
+from typing import Any
 
 
 class AgentOptimizer:
@@ -27,14 +30,32 @@ class AgentOptimizer:
         """
         self.max_metrics = max_metrics
         self.max_suggestions = max_suggestions
-        self._metrics: list[dict[str, Any]] = []
-        self._optimization_suggestions: list[dict[str, Any]] = []
+        # deque(maxlen=...) is an O(1) ring buffer: it evicts the oldest entry
+        # on overflow instead of the O(N) ``list.pop(0)`` shift used before.
+        self._metrics: deque[dict[str, Any]] = deque(maxlen=max_metrics)
+        # Latest suggestions stored per agent (replace, not append). This keeps
+        # the buffer free of the duplicate suggestions that accumulated when the
+        # same agent was analyzed repeatedly.
+        self._suggestions_by_agent: dict[str, list[dict[str, Any]]] = {}
+        self._suggestion_order: deque[str] = deque()
+
+    @property
+    def _optimization_suggestions(self) -> list[dict[str, Any]]:
+        """Flattened view of stored suggestions (one block per agent).
+
+        Retained for backward compatibility with callers/tests that inspected
+        the previously-public buffer.
+        """
+        flat: list[dict[str, Any]] = []
+        for agent_id in self._suggestion_order:
+            flat.extend(self._suggestions_by_agent.get(agent_id, []))
+        return flat
 
     def analyze_performance(
         self,
         agent_id: str,
         execution_time: float,
-        token_usage: Optional[int] = None,
+        token_usage: int | None = None,
         success: bool = True,
     ) -> dict[str, Any]:
         """Analyze agent performance metrics.
@@ -54,16 +75,16 @@ class AgentOptimizer:
             "token_usage": token_usage,
             "success": success,
         }
+        # deque(maxlen=...) drops the oldest metric automatically on overflow.
         self._metrics.append(metric)
-
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._metrics) > self.max_metrics:
-            self._metrics.pop(0)
 
         return self._compute_statistics(agent_id)
 
     def suggest_optimizations(self, agent_id: str) -> list[dict[str, Any]]:
         """Generate optimization suggestions for an agent.
+
+        Suggestions are stored per agent and replaced on each call (the latest
+        analysis wins), so repeated calls do not accumulate duplicate entries.
 
         Args:
             agent_id: Unique identifier for the agent
@@ -117,14 +138,30 @@ class AgentOptimizer:
                     }
                 )
 
-        self._optimization_suggestions.extend(suggestions)
-
-        # SECURITY: Prevent unbounded memory growth
-        excess = len(self._optimization_suggestions) - self.max_suggestions
-        if excess > 0:
-            self._optimization_suggestions = self._optimization_suggestions[excess:]
+        self._store_suggestions(agent_id, suggestions)
 
         return suggestions
+
+    def _store_suggestions(self, agent_id: str, suggestions: list[dict[str, Any]]) -> None:
+        """Store the latest suggestions for an agent (replace, not append).
+
+        Args:
+            agent_id: Unique identifier for the agent.
+            suggestions: The suggestions produced for this agent.
+        """
+        if agent_id in self._suggestions_by_agent:
+            self._suggestion_order.remove(agent_id)
+        self._suggestions_by_agent[agent_id] = list(suggestions)
+        self._suggestion_order.append(agent_id)
+
+        # SECURITY: Prevent unbounded memory growth. Evict whole agents (oldest
+        # first) until the total stored suggestion count fits the budget.
+        while (
+            sum(len(v) for v in self._suggestions_by_agent.values()) > self.max_suggestions
+            and self._suggestion_order
+        ):
+            oldest = self._suggestion_order.popleft()
+            self._suggestions_by_agent.pop(oldest, None)
 
     def _compute_statistics(self, agent_id: str) -> dict[str, Any]:
         """Compute statistics for an agent.

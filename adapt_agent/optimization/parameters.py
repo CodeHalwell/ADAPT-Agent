@@ -15,11 +15,14 @@ sample, apply, snapshot, and restore parameter values.
 
 from __future__ import annotations
 
+import logging
 import random
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 
 class ParameterKind(str, Enum):
@@ -33,7 +36,8 @@ class ParameterKind(str, Enum):
     MODEL = "model"  # model / deployment identifier
     HYPERPARAM = "hyperparam"  # temperature, top_p, max_tokens, ...
     ROUTING = "routing"  # orchestrator routing / handoff / topology knobs
-    TOOL = "tool"  # tool / skill allow-lists and selection
+    TOOL = "tool"  # framework tools / functions allow-lists and selection
+    SKILL = "skill"  # named skills / plugins (e.g. Semantic-Kernel skills)
 
 
 @dataclass
@@ -78,6 +82,11 @@ class Parameter:
     component: str | None = None
     mutable: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: Set to ``True`` by :meth:`write` when the bound ``setter`` raises. Once a
+    #: write has failed the parameter is considered non-optimizable so the
+    #: optimizer stops trying to change a knob it cannot actually write. Not part
+    #: of the public constructor contract.
+    _write_failed: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.name or not isinstance(self.name, str):
@@ -92,8 +101,13 @@ class Parameter:
 
     @property
     def optimizable(self) -> bool:
-        """``True`` if an optimizer is allowed to change this parameter."""
-        return self.mutable and self.setter is not None
+        """``True`` if an optimizer is allowed to change this parameter.
+
+        A knob whose :meth:`write` has already failed (``_write_failed``) is no
+        longer optimizable: the binding is effectively read-only at runtime even
+        if a ``setter`` was supplied, so the optimizer must not keep retrying it.
+        """
+        return self.mutable and self.setter is not None and not self._write_failed
 
     def read(self) -> Any:
         """Return the live value (via ``getter``) or the cached ``value``."""
@@ -109,12 +123,28 @@ class Parameter:
     def write(self, new_value: Any) -> None:
         """Write ``new_value`` onto the live component and update the cache.
 
+        A setter that *raises* (e.g. a frozen/read-only framework attribute that
+        only fails at write time) must never abort an optimization run. In that
+        case the exception is caught and logged, ``_write_failed`` is set so the
+        parameter becomes non-:attr:`optimizable`, and ``self.value`` is left
+        unchanged. Only the genuine "no setter" case still raises.
+
         Raises:
             ValueError: If the parameter has no setter (it is read-only).
         """
         if self.setter is None:
             raise ValueError(f"Parameter {self.name!r} is read-only (no setter)")
-        self.setter(new_value)
+        try:
+            self.setter(new_value)
+        except Exception:
+            # The bound attribute cannot actually be written (e.g. frozen). Mark
+            # the parameter non-optimizable and keep going rather than crashing
+            # the whole optimization run.
+            logger.warning(
+                "Parameter %r setter failed; marking non-optimizable", self.name, exc_info=True
+            )
+            self._write_failed = True
+            return
         self.value = new_value
 
     def enumerate_candidates(self, *, numeric_points: int = 5) -> list[Any]:

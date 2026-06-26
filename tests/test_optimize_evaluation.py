@@ -322,6 +322,79 @@ def test_report_failures_custom_threshold():
     assert len(report.failures(threshold=0.7)) == 2  # 0.6 < 0.7
 
 
+def test_harness_failure_threshold_default_is_one():
+    # Unconfigured harness keeps the historical "perfect-only passes" behaviour.
+    h = EvaluationHarness(_const_metric("a", 0.6))
+    report = h.evaluate(lambda x: x, _dataset())
+    assert report.failure_threshold == 1.0
+    # 0.6 < 1.0 -> every example is a failure by default.
+    assert len(report.failures()) == 2
+
+
+def test_harness_configurable_failure_threshold_propagates_to_report():
+    # A tunable threshold avoids flooding failures() for continuous metrics.
+    h = EvaluationHarness(_const_metric("a", 0.6), failure_threshold=0.5)
+    report = h.evaluate(lambda x: x, _dataset())
+    assert report.failure_threshold == 0.5
+    # 0.6 >= 0.5 -> no failures when relying on the harness default.
+    assert report.failures() == []
+    # An explicit threshold still overrides the harness default.
+    assert len(report.failures(threshold=0.7)) == 2
+
+
+def test_harness_failure_threshold_does_not_drop_errors():
+    # Errored examples are always reported regardless of the threshold.
+    def runner(x):
+        if x == "yo":
+            raise RuntimeError("boom")
+        return x
+
+    h = EvaluationHarness(_const_metric("a", 1.0), failure_threshold=0.0)
+    report = h.evaluate(runner, _dataset())
+    fails = report.failures()
+    assert len(fails) == 1
+    assert fails[0].error is not None
+
+
+def test_report_failure_threshold_default_when_constructed_directly():
+    # A report built directly (not via the harness) defaults to 1.0.
+    rep = EvaluationReport(aggregate={"a": 0.5}, primary_metric="a")
+    assert rep.failure_threshold == 1.0
+
+
+def test_report_below_named_metric_excludes_errors():
+    def runner(x):
+        if x == "yo":
+            raise RuntimeError("boom")
+        return x
+
+    h = EvaluationHarness([_echo_match(), _const_metric("always", 1.0)])
+    report = h.evaluate(runner, _dataset())
+    # 'always' scores 1.0 for the surviving example and 0.0 for the errored one.
+    below = report.below("always", 0.5)
+    # Only the errored example scores below 0.5; it is included via its 0.0 score.
+    assert len(below) == 1
+    assert below[0].error is not None
+    # Nothing is below 0.0.
+    assert report.below("always", 0.0) == []
+
+
+def test_harness_cache_flag_is_noop_and_reevaluates():
+    # The reserved cache flag must not change behaviour: the agent is re-run.
+    calls = []
+
+    def runner(x):
+        calls.append(x)
+        return x
+
+    h = EvaluationHarness(_echo_match(), cache=True)
+    assert h.cache is True
+    h.evaluate(runner, _dataset())
+    h.evaluate(runner, _dataset())
+    # Each evaluate ran both examples again (no memoization).
+    assert len(calls) == 4
+
+
 def test_report_failures_specific_metric_and_errors_included():
     def runner(x):
         if x == "yo":

@@ -27,12 +27,17 @@ from adapt_agent.optimization.introspection import (
     bind_attr,
     bind_item,
     register,
+    tool_subset_candidates,
 )
 from adapt_agent.optimization.parameters import Parameter, ParameterKind
 
 #: Attributes that identify *other* frameworks' agent objects; their presence
 #: means the object is not a Claude Agent SDK options object.
 _FOREIGN_ATTRS = ("handoffs", "sub_agents", "agents", "kickoff", "instructions")
+
+#: The discrete set of Claude Agent SDK ``permission_mode`` values. Exposing
+#: these as candidates makes the knob a real (searchable) routing parameter.
+_PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions"]
 
 
 def _predicate(obj: Any) -> bool:
@@ -89,6 +94,14 @@ def _introspect(obj: Any) -> list[Parameter]:
     try:
         params.extend(_introspect_system_prompt(obj, component))
 
+        # Tool allow-list: when two or more tools are present, offer drop-one
+        # ablation candidates so the optimizer can actually search which tools
+        # to keep instead of treating it as an inert knob.
+        allowed = getattr(obj, "allowed_tools", None)
+        allowed_candidates = (
+            tool_subset_candidates(allowed) if isinstance(allowed, (list, tuple)) else None
+        )
+
         candidates = [
             bind_attr(obj, "model", f"{component}.model", ParameterKind.MODEL, component=component),
             bind_attr(
@@ -97,6 +110,7 @@ def _introspect(obj: Any) -> list[Parameter]:
                 f"{component}.allowed_tools",
                 ParameterKind.TOOL,
                 component=component,
+                candidates=allowed_candidates or None,
             ),
             bind_attr(
                 obj,
@@ -113,12 +127,15 @@ def _introspect(obj: Any) -> list[Parameter]:
                 component=component,
                 bounds=(1, 100),
             ),
+            # ``permission_mode`` is a small discrete enum; giving it explicit
+            # candidates turns it from a dead knob into a searchable one.
             bind_attr(
                 obj,
                 "permission_mode",
                 f"{component}.permission_mode",
                 ParameterKind.ROUTING,
                 component=component,
+                candidates=list(_PERMISSION_MODES),
             ),
         ]
         params.extend(p for p in candidates if p is not None)

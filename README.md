@@ -7,7 +7,7 @@
 
 ADAPT-Agent is a Python library that adds a layer of security and governance controls around LLM agents. It provides a firewall for screening inputs and outputs, a policy engine for enforcing rules on agent messages and state, adversarial-attack detection (prompt injection / jailbreak), trust scoring, taint tracking, and observability — plus framework adapters that wrap an existing agent so these controls run automatically on every execution.
 
-The library is import-safe with no required heavyweight dependencies: it ships with only `typing-extensions`, and optional agent frameworks are imported lazily, so you can `import adapt_agent` without installing LangGraph, Pydantic AI, CrewAI, or any other supported framework.
+The library keeps its core install light and imports each agent framework **lazily** — only when you actually wrap and run an agent. You can `import adapt_agent` and use the security, governance, and optimization layers without installing LangGraph, Pydantic AI, CrewAI, or any other supported framework; you install the extra for the framework you actually use. Core utilities the toolkit needs to do its job (e.g. `typing-extensions`, and `pyyaml` for the YAML training config) are installed as ordinary dependencies.
 
 ## Features
 
@@ -99,7 +99,7 @@ pip install adapt-agent[docs]
 pip install adapt-agent[all]
 ```
 
-> **Note:** Each framework extra installs that framework so its adapter can run; `adapt_agent` itself stays import-safe without any of them.
+> **Note:** Each framework extra installs that framework so its adapter can run; `adapt_agent` itself imports a framework only when you wrap an agent from it, so you never need a framework you don't use.
 
 ## Quick Start
 
@@ -209,6 +209,10 @@ adapt-agent optimize myapp.app:orchestrate \
     --component researcher=myapp.agents:researcher \
     --component writer=myapp.agents:writer \
     --data golden.jsonl --metric exact_match --judge gemini
+
+# "Train" from a single declarative config (target, dataset, judge, optimizer,
+# tool/skill knobs, magentic routing limits, ...) — see examples/train.example.yaml
+adapt-agent train train.yaml
 ```
 
 ### Configuration file schema (JSON)

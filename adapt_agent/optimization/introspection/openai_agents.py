@@ -22,6 +22,7 @@ from typing import Any
 from adapt_agent.optimization.introspection import (
     bind_attr,
     register,
+    tool_subset_candidates,
 )
 from adapt_agent.optimization.parameters import Parameter, ParameterKind
 
@@ -34,15 +35,33 @@ def _slugify(name: Any) -> str:
     return slug or "agent"
 
 
+#: Markers that belong to *other* frameworks. An object carrying any of these is
+#: not an OpenAI Agents ``Agent`` -- ``chat_client`` is the Microsoft Agent
+#: Framework ``ChatAgent`` signal, ``kickoff`` is CrewAI, ``sub_agents`` is Google
+#: ADK. Rejecting them stops this introspector (registered *before* Microsoft)
+#: from hijacking a Microsoft ChatAgent / magentic orchestrator.
+_FOREIGN_MARKERS = ("chat_client", "kickoff", "sub_agents")
+
+
 def _predicate(obj: Any) -> bool:
     """Return ``True`` for an OpenAI Agents ``Agent``-shaped object.
 
     An ``Agent`` has ``instructions``, ``tools`` and -- distinctively -- a
-    ``handoffs`` attribute, which separates it from the other frameworks. Wrapped
-    so it never raises.
+    ``handoffs`` *list/tuple*, which separates it from the other frameworks.
+    Objects carrying foreign markers (``chat_client``/``kickoff``/``sub_agents``)
+    are rejected outright so a Microsoft ``ChatAgent`` or magentic orchestrator is
+    never misrouted here. Wrapped so it never raises.
     """
     try:
-        return hasattr(obj, "instructions") and hasattr(obj, "handoffs") and hasattr(obj, "tools")
+        for foreign in _FOREIGN_MARKERS:
+            if hasattr(obj, foreign):
+                return False
+        if not (hasattr(obj, "instructions") and hasattr(obj, "tools")):
+            return False
+        # Require handoffs to actually be a list/tuple, not merely present: a
+        # bare/None ``handoffs`` attribute is too weak a signal and would let this
+        # introspector claim objects from other frameworks.
+        return isinstance(getattr(obj, "handoffs", None), (list, tuple))
     except Exception:
         return False
 
@@ -141,10 +160,23 @@ def _introspect_agent(obj: Any, params: list[Parameter], visited: set[int]) -> N
     _introspect_model(obj, component, params)
     _introspect_model_settings(obj, component, params)
 
-    # tools -> TOOL allow-list (bind the list attribute itself).
+    # tools -> TOOL allow-list (bind the list attribute itself). When there are
+    # >=2 tools, attach drop-one ablation candidates so tool selection is a real
+    # search space rather than a single fixed value.
     if hasattr(obj, "tools"):
+        current_tools = getattr(obj, "tools", None)
+        candidates = (
+            tool_subset_candidates(current_tools)
+            if isinstance(current_tools, (list, tuple))
+            else None
+        )
         tools = bind_attr(
-            obj, "tools", f"{component}.tools", ParameterKind.TOOL, component=component
+            obj,
+            "tools",
+            f"{component}.tools",
+            ParameterKind.TOOL,
+            component=component,
+            candidates=candidates or None,
         )
         if tools is not None:
             params.append(tools)

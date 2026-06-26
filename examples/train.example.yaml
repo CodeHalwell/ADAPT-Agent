@@ -1,0 +1,68 @@
+# ADAPT-Agent training configuration (run with: `adapt-agent train train.yaml`)
+#
+# This declarative file wires a full optimization ("training") run: it tunes your
+# agents' prompts, few-shot blocks, models, hyperparameters, routing knobs, and
+# tool/skill allow-lists against a golden dataset, scored by an LLM-as-judge that
+# can also act as a critical *adversary*.
+
+target:
+  # The entrypoint that drives your whole system: a callable `input -> output`.
+  # For a Microsoft Agent Framework magentic workflow, this is typically
+  # `workflow.as_agent(...)` exposed as a module attribute.
+  entrypoint: "myapp.app:run"
+  # The live sub-agents to introspect for tunable knobs (prompts/models/tools...).
+  # Each is a "module:attribute" reference; they are the SAME live objects the
+  # entrypoint runs, so applying a candidate config changes the next run.
+  components:
+    manager:    "myapp.agents:manager"
+    researcher: "myapp.agents:researcher"
+    writer:     "myapp.agents:writer"
+    coder:      "myapp.agents:coder"
+    reviewer:   "myapp.agents:reviewer"
+
+dataset:
+  path: "golden.jsonl"        # .jsonl / .json / .csv
+  format: jsonl               # optional; inferred from the extension otherwise
+  # input_key: question       # optional explicit column overrides
+  # expected_key: answer
+  # val_path: holdout.jsonl   # optional held-out validation split
+
+judge:
+  provider: anthropic          # anthropic/claude, openai, gemini, mistral, ...
+  model: claude-opus-4-8
+  adversarial: true            # grade as a harsh critic/adversary (reward-hack resistant)
+  scale: 10
+  pass_threshold: 0.6
+  criteria: "correct, safe, on-task, and concise"
+  metric_name: quality         # the judge metric's reporting name
+
+metrics: [exact_match, token_f1]
+primary_metric: quality        # default: the judge metric when a judge is set
+
+optimizer:
+  type: default                # default | coordinate_ascent | grid | random | evolutionary | bootstrap_few_shot
+  max_evals: 60
+  min_improvement: 0.001       # avoid accepting candidates that only won on judge noise
+  seed: 0
+  suggest_tools: true          # let the judge propose NEW tools/skills from failures
+  # kinds: [prompt, tool, skill]   # optional: restrict what gets tuned
+
+# Explicit knobs no framework auto-exposes (magentic round limits, a model pool,
+# a routing threshold, ...). Each binds live to a component attribute.
+parameters:
+  - name: workflow.max_round_count
+    kind: routing
+    component: manager            # any resolved component object that holds the knob
+    attr_path: workflow.max_round_count
+    bounds: [4, 12]
+    step: 1
+  - name: manager.model
+    kind: model
+    component: manager
+    attr_path: chat_client.model_id
+    candidates: ["gpt-4o", "o3-mini"]
+  - name: manager.temperature
+    kind: hyperparam
+    component: manager
+    attr_path: chat_client.temperature
+    bounds: [0.0, 1.5]            # clamped to the provider's max with a warning if needed

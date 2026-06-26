@@ -48,6 +48,11 @@ class ProposalContext:
         judge: An optional LLM judge for critique-driven proposals.
         rng: Seeded RNG for reproducible sampling/selection.
         n: Desired number of candidates (a hint, not a hard guarantee).
+        recommendations: Shared sink for advisory, human-readable suggestions
+            (e.g. new tools/skills to add). The optimizer passes one list in on
+            every context and reads it back after the search; proposers that
+            cannot return live values (such as :class:`LLMToolProposer`) append
+            their ideas here instead.
     """
 
     parameter: Parameter
@@ -57,6 +62,7 @@ class ProposalContext:
     judge: LLMJudge | None = None
     rng: random.Random = field(default_factory=random.Random)
     n: int = 4
+    recommendations: list[str] = field(default_factory=list)
 
 
 class Proposer:
@@ -122,8 +128,7 @@ class NumericProposer(Proposer):
 _PROMPT_DIRECTIVES = (
     "Think step by step and reason carefully before giving your final answer.",
     "Be concise and precise. Do not include irrelevant information.",
-    "Ground every claim in the provided context; if you are unsure, say so "
-    "rather than guessing.",
+    "Ground every claim in the provided context; if you are unsure, say so rather than guessing.",
     "Follow the requested output format exactly.",
     "Double-check your answer for correctness before responding.",
 )
@@ -301,6 +306,121 @@ class LLMProposer(Proposer):
         return next(iter(criteria)) if len(criteria) == 1 else None
 
 
+class ToolAblationProposer(Proposer):
+    """Proposes drop-one tool/skill subsets for selection optimization.
+
+    Tool/skill selection becomes a real search space when each candidate is the
+    full set minus one member (ablation). This proposer simply surfaces the
+    parameter's pre-computed candidate subsets (see
+    :func:`adapt_agent.optimization.introspection.tool_subset_candidates`),
+    excluding the current value, so the optimizer can evaluate each subset.
+    """
+
+    name = "tool_ablation"
+
+    def supports(self, parameter: Parameter) -> bool:
+        return parameter.kind in (ParameterKind.TOOL, ParameterKind.SKILL)
+
+    def propose(self, ctx: ProposalContext) -> list[Any]:
+        current = ctx.parameter.read()
+        options = ctx.parameter.enumerate_candidates()
+        # Candidate subsets are typically lists/tuples (unhashable), so compare
+        # by equality rather than relying on set membership.
+        return [o for o in options if o != current]
+
+
+class LLMToolProposer(Proposer):
+    """Advisory new-tool/skill suggestions via the LLM judge.
+
+    Unlike :class:`ToolAblationProposer` (which searches over *existing* tools),
+    this proposer asks the judge for *new* tools/skills that might help, based on
+    observed failures. Since it cannot synthesize live callables, it never
+    returns candidate values -- it records human-readable suggestions into
+    :attr:`ProposalContext.recommendations` and returns ``[]``. This keeps tool
+    *selection* (a real search) separate from new-tool *suggestion* (advisory).
+
+    Args:
+        judge: The judge used to suggest tools. If ``None`` at propose time,
+            falls back to the judge on the :class:`ProposalContext`.
+        max_failures: How many failure records to pass to the judge (bounded).
+        n: How many tool suggestions to request.
+    """
+
+    name = "llm_tool"
+
+    def __init__(
+        self,
+        judge: LLMJudge | None = None,
+        *,
+        max_failures: int = 5,
+        n: int = 3,
+    ):
+        self.judge = judge
+        self.max_failures = max_failures
+        self.n = n
+
+    def supports(self, parameter: Parameter) -> bool:
+        return parameter.kind in (ParameterKind.TOOL, ParameterKind.SKILL)
+
+    def propose(self, ctx: ProposalContext) -> list[Any]:
+        judge = self.judge or ctx.judge
+        if judge is None:
+            return []
+        component = ctx.parameter.component or ""
+        current_tools = self._current_tool_names(ctx.parameter.read())
+        failures = self._failure_records(ctx)
+        suggestions = judge.suggest_tools(component, failures, current_tools, n=self.n)
+        label = f"[{component}] " if component else ""
+        for s in suggestions:
+            if not isinstance(s, dict):
+                continue
+            name = s.get("name") or "(unnamed)"
+            description = s.get("description") or ""
+            rationale = s.get("rationale") or ""
+            text = f"{label}consider tool: {name}"
+            if description:
+                text += f" -- {description}"
+            if rationale:
+                text += f" ({rationale})"
+            if text not in ctx.recommendations:
+                ctx.recommendations.append(text)
+        # Advisory only: never synthesize live callables as candidate values.
+        return []
+
+    @staticmethod
+    def _current_tool_names(current: Any) -> list[str]:
+        if not current:
+            return []
+        if isinstance(current, (list, tuple, set)):
+            return [LLMToolProposer._tool_name(t) for t in current]
+        return [LLMToolProposer._tool_name(current)]
+
+    @staticmethod
+    def _tool_name(tool: Any) -> str:
+        if isinstance(tool, str):
+            return tool
+        return getattr(tool, "name", None) or getattr(tool, "__name__", None) or str(tool)
+
+    def _failure_records(self, ctx: ProposalContext) -> list[dict[str, Any]]:
+        if ctx.report is None:
+            return []
+        failing = ctx.report.failures()
+        if not failing:
+            return []
+        sample = failing[: self.max_failures]
+        records: list[dict[str, Any]] = []
+        for r in sample:
+            records.append(
+                {
+                    "input": r.inputs,
+                    "output": r.output if r.error is None else f"<error: {r.error}>",
+                    "expected": r.expected,
+                    "critique": "",
+                }
+            )
+        return records
+
+
 def default_proposers(judge: LLMJudge | None = None) -> list[Proposer]:
     """A sensible default proposer set covering every parameter kind.
 
@@ -316,8 +436,11 @@ def default_proposers(judge: LLMJudge | None = None) -> list[Proposer]:
             FewShotProposer(),
             CandidateProposer(),
             NumericProposer(),
+            ToolAblationProposer(),
         ]
     )
+    if judge is not None:
+        proposers.append(LLMToolProposer())
     return proposers
 
 
@@ -334,6 +457,8 @@ __all__ = [
     "PromptMutationProposer",
     "FewShotProposer",
     "LLMProposer",
+    "ToolAblationProposer",
+    "LLMToolProposer",
     "default_proposers",
     "proposers_for",
 ]

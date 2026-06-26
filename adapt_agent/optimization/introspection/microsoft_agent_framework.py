@@ -26,6 +26,7 @@ from typing import Any
 from adapt_agent.optimization.introspection import (
     bind_attr,
     register,
+    tool_subset_candidates,
 )
 from adapt_agent.optimization.parameters import Parameter, ParameterKind
 
@@ -90,9 +91,32 @@ def _introspect_hyperparams(source: Any, component: str) -> list[Parameter]:
             f"{component}.max_tokens",
             ParameterKind.HYPERPARAM,
             component=component,
+            bounds=(1, 32000),
         ),
     ]
     return [p for p in candidates if p is not None]
+
+
+def _bind_tool_like(obj: Any, attr: str, component: str, kind: ParameterKind) -> Parameter | None:
+    """Bind a ``tools``/``skills`` list/tuple attribute as an optimizable parameter.
+
+    When the attribute holds a list/tuple with >=2 entries, attach drop-one
+    ablation candidates (via :func:`tool_subset_candidates`) so the optimizer can
+    actually search tool/skill selection. With <2 entries the parameter is still
+    bound (for visibility) but carries no extra candidates.
+    """
+    current = getattr(obj, attr, None)
+    if not isinstance(current, (list, tuple)):
+        return None
+    candidates = tool_subset_candidates(current)
+    return bind_attr(
+        obj,
+        attr,
+        f"{component}.{attr}",
+        kind,
+        component=component,
+        candidates=candidates or None,
+    )
 
 
 def _introspect(obj: Any) -> list[Parameter]:
@@ -133,13 +157,15 @@ def _introspect(obj: Any) -> list[Parameter]:
                 params.append(param)
                 seen.add(param.name)
 
-        tools = getattr(obj, "tools", None)
-        if isinstance(tools, (list, tuple)):
-            tool_param = bind_attr(
-                obj, "tools", f"{component}.tools", ParameterKind.TOOL, component=component
-            )
-            if tool_param is not None:
-                params.append(tool_param)
+        tool_param = _bind_tool_like(obj, "tools", component, ParameterKind.TOOL)
+        if tool_param is not None:
+            params.append(tool_param)
+
+        # ``skills`` (Semantic-Kernel-style named skills/plugins) are optimized
+        # the same way as tools, under ParameterKind.SKILL.
+        skill_param = _bind_tool_like(obj, "skills", component, ParameterKind.SKILL)
+        if skill_param is not None:
+            params.append(skill_param)
     except Exception:
         return params
     return params

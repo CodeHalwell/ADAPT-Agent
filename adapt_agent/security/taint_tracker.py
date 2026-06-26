@@ -1,8 +1,11 @@
 """Taint tracking for LLM agent data flow."""
 
+from __future__ import annotations
+
+from collections import deque
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 
 class TaintLevel(Enum):
@@ -23,7 +26,7 @@ class TaintSource:
         source_id: str,
         source_type: str,
         level: TaintLevel,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ):
         """Initialize a TaintSource.
 
@@ -45,6 +48,15 @@ class TaintTracker:
 
     Implements taint tracking to identify and monitor potentially
     unsafe or untrusted data as it flows through the agent system.
+
+    Fail-closed design: if data is tainted by a ``source_id`` that is not (or no
+    longer) present in ``_taint_sources`` -- for example because the source was
+    evicted under memory pressure -- the missing source is treated as the
+    configured ``unknown_source_level`` (default :data:`TaintLevel.CRITICAL`),
+    NOT as untainted. Silently downgrading data referenced by an unknown source
+    to UNTAINTED would be a security hole (an attacker could evict a CRITICAL
+    source to launder its tainted data). For the same reason, eviction never
+    removes a source that is still referenced by live tainted data.
     """
 
     _LEVEL_PRIORITY = {
@@ -55,25 +67,34 @@ class TaintTracker:
         TaintLevel.CRITICAL: 4,
     }
 
-    def __init__(self, max_propagations: int = 1000, max_tracked_items: int = 1000):
+    def __init__(
+        self,
+        max_propagations: int = 1000,
+        max_tracked_items: int = 1000,
+        unknown_source_level: TaintLevel = TaintLevel.CRITICAL,
+    ):
         """Initialize the TaintTracker.
 
         Args:
             max_propagations: Maximum number of taint propagations to store in memory.
             max_tracked_items: Maximum number of sources and tainted items to track in memory.
+            unknown_source_level: Taint level assigned to a referenced-but-missing
+                source (fail-closed). Defaults to the maximum, CRITICAL.
         """
         self.max_propagations = max_propagations
         self.max_tracked_items = max_tracked_items
+        self.unknown_source_level = unknown_source_level
         self._taint_sources: dict[str, TaintSource] = {}
         self._tainted_data: dict[str, set[str]] = {}  # data_id -> set of source_ids
-        self._taint_propagation: list[dict[str, Any]] = []
+        # deque(maxlen) bounds the ring buffer in O(1) without list.pop(0).
+        self._taint_propagation: deque[dict[str, Any]] = deque(maxlen=max_propagations)
 
     def register_source(
         self,
         source_id: str,
         source_type: str,
         level: TaintLevel = TaintLevel.MEDIUM,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> TaintSource:
         """Register a new taint source.
 
@@ -89,12 +110,37 @@ class TaintTracker:
         source = TaintSource(source_id, source_type, level, metadata)
         self._taint_sources[source_id] = source
 
-        # SECURITY: Prevent memory exhaustion from unbounded dictionary
+        # SECURITY: Prevent memory exhaustion from unbounded dictionary, but never
+        # evict a source that is still referenced by live tainted data (that would
+        # silently change its effective level via the fail-closed path).
         if len(self._taint_sources) > self.max_tracked_items:
-            oldest_source = next(iter(self._taint_sources))
-            del self._taint_sources[oldest_source]
+            self._evict_unreferenced_source(protect=source_id)
 
         return source
+
+    def _referenced_source_ids(self) -> set[str]:
+        """Return the set of source IDs referenced by live tainted data."""
+        referenced: set[str] = set()
+        for sources in self._tainted_data.values():
+            referenced.update(sources)
+        return referenced
+
+    def _evict_unreferenced_source(self, *, protect: str | None = None) -> None:
+        """Evict the oldest source that is not referenced by live tainted data.
+
+        If every excess source is still referenced, no eviction occurs (we keep
+        the data rather than create a fail-closed downgrade hazard).
+
+        Args:
+            protect: A source ID to never evict (e.g. the just-registered one).
+        """
+        referenced = self._referenced_source_ids()
+        for source_id in self._taint_sources:
+            if source_id == protect:
+                continue
+            if source_id not in referenced:
+                del self._taint_sources[source_id]
+                return
 
     def mark_tainted(
         self,
@@ -112,7 +158,7 @@ class TaintTracker:
 
         self._tainted_data[data_id].update(source_ids)
 
-        # SECURITY: Prevent memory exhaustion from unbounded dictionary
+        # SECURITY: Prevent memory exhaustion from unbounded dictionary.
         if len(self._tainted_data) > self.max_tracked_items:
             oldest_data = next(iter(self._tainted_data))
             del self._tainted_data[oldest_data]
@@ -131,6 +177,10 @@ class TaintTracker:
     def get_taint_level(self, data_id: str) -> TaintLevel:
         """Get the highest taint level for data.
 
+        Fail-closed: any referenced source that is missing from
+        ``_taint_sources`` is treated as ``unknown_source_level`` (default
+        CRITICAL) rather than untainted.
+
         Args:
             data_id: Identifier for the data
 
@@ -146,19 +196,23 @@ class TaintTracker:
         max_priority = 0
 
         for sid in source_ids:
-            if sid in self._taint_sources:
-                lvl = self._taint_sources[sid].level
-                if lvl is TaintLevel.CRITICAL:
-                    return TaintLevel.CRITICAL
-                pri = self._LEVEL_PRIORITY[lvl]
-                if pri > max_priority:
-                    max_level = lvl
-                    max_priority = pri
+            source = self._taint_sources.get(sid)
+            lvl = source.level if source is not None else self.unknown_source_level
+            if lvl is TaintLevel.CRITICAL:
+                return TaintLevel.CRITICAL
+            pri = self._LEVEL_PRIORITY[lvl]
+            if pri > max_priority:
+                max_level = lvl
+                max_priority = pri
 
         return max_level
 
     def get_taint_sources(self, data_id: str) -> list[TaintSource]:
         """Get all taint sources affecting data.
+
+        Fail-closed: for any referenced source missing from the registry, a
+        synthetic :class:`TaintSource` at ``unknown_source_level`` is returned so
+        callers never see tainted data as having zero sources.
 
         Args:
             data_id: Identifier for the data
@@ -169,8 +223,18 @@ class TaintTracker:
         if not self.is_tainted(data_id):
             return []
 
-        source_ids = self._tainted_data[data_id]
-        return [self._taint_sources[sid] for sid in source_ids if sid in self._taint_sources]
+        sources: list[TaintSource] = []
+        for sid in self._tainted_data[data_id]:
+            source = self._taint_sources.get(sid)
+            if source is None:
+                source = TaintSource(
+                    source_id=sid,
+                    source_type="unknown",
+                    level=self.unknown_source_level,
+                    metadata={"fail_closed": True},
+                )
+            sources.append(source)
+        return sources
 
     def propagate_taint(
         self,
@@ -192,7 +256,7 @@ class TaintTracker:
         source_ids = list(self._tainted_data[from_data_id])
         self.mark_tainted(to_data_id, source_ids)
 
-        # Record propagation
+        # Record propagation (deque(maxlen) bounds this automatically).
         self._taint_propagation.append(
             {
                 "from": from_data_id,
@@ -202,10 +266,6 @@ class TaintTracker:
                 "sources": source_ids,
             }
         )
-
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._taint_propagation) > self.max_propagations:
-            self._taint_propagation.pop(0)
 
     def sanitize(self, data_id: str) -> None:
         """Mark data as sanitized (remove taint).
@@ -237,6 +297,10 @@ class TaintTracker:
     def get_stats(self) -> dict[str, Any]:
         """Get taint tracking statistics.
 
+        Fail-closed: distinct sources referenced by live tainted data but missing
+        from the registry are counted under ``unknown_source_level`` rather than
+        being dropped from the distribution.
+
         Returns:
             Dictionary of statistics
         """
@@ -250,9 +314,9 @@ class TaintTracker:
                     continue
                 seen_sources.add(source_id)
                 source = self._taint_sources.get(source_id)
-                if source is not None:
-                    level = source.level.value
-                    taint_level_counts[level] = taint_level_counts.get(level, 0) + 1
+                level = source.level if source is not None else self.unknown_source_level
+                key = level.value
+                taint_level_counts[key] = taint_level_counts.get(key, 0) + 1
 
         return {
             "total_sources": len(self._taint_sources),

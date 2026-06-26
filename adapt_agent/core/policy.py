@@ -11,11 +11,41 @@ from adapt_agent.core.types import AgentMessage, AgentState, PolicyRule
 
 logger = logging.getLogger(__name__)
 
+# Maximum number of AST nodes allowed in a single condition. This bounds CPU on
+# pathological-but-shallow conditions (e.g. a flat 250-element literal) that the
+# depth cap alone would not catch.
+MAX_CONDITION_NODES = 200
+
+
+class ConditionEvaluationError(Exception):
+    """Raised when a policy condition cannot be evaluated.
+
+    This is deliberately distinct from a condition simply evaluating to ``False``
+    so the enforcer can tell "the rule did not match" apart from "the rule could
+    not be checked" and apply its fail-open/fail-closed policy accordingly.
+    """
+
+
+def _count_nodes(tree: ast.AST) -> int:
+    """Count the total number of AST nodes in ``tree``."""
+    return sum(1 for _ in ast.walk(tree))
+
 
 @lru_cache(maxsize=1024)
 def _parse_condition(condition: str) -> ast.Expression:
-    """Cache AST parsing for policy conditions."""
-    return ast.parse(condition, mode="eval")
+    """Cache AST parsing for policy conditions.
+
+    Raises:
+        ValueError: if the parsed condition exceeds ``MAX_CONDITION_NODES`` nodes.
+    """
+    tree = ast.parse(condition, mode="eval")
+    node_count = _count_nodes(tree)
+    if node_count > MAX_CONDITION_NODES:
+        raise ValueError(
+            f"Condition node count {node_count} exceeds maximum allowed "
+            f"{MAX_CONDITION_NODES} (DoS protection)"
+        )
+    return tree
 
 
 class PolicyEnforcer:
@@ -43,13 +73,21 @@ class PolicyEnforcer:
         ast.Div: operator.truediv,
     }
 
-    def __init__(self, max_violations: int = 1000):
+    def __init__(self, max_violations: int = 1000, fail_closed: bool = False):
         """Initialize the PolicyEnforcer.
 
         Args:
             max_violations: Maximum number of violations to store in memory.
+            fail_closed: How to treat a condition that cannot be evaluated
+                (unknown variable, unsupported node, arithmetic error, ...).
+                When ``False`` (default) such an error is logged and treated as
+                "no violation" (fail-open) — preserving historical behaviour.
+                When ``True`` the error is logged and treated as a VIOLATION so
+                that ``block`` rules still fire on malformed or edge-case input
+                (fail-closed). In either case the error is always logged.
         """
         self.max_violations = max_violations
+        self.fail_closed = fail_closed
         self._rules: dict[str, PolicyRule] = {}
         self._violations: list[dict[str, Any]] = []
         self._rule_handlers: dict[str, Callable] = {}
@@ -76,6 +114,13 @@ class PolicyEnforcer:
             raise ValueError(
                 f"Condition length {len(condition)} exceeds maximum allowed length of 1024"
             )
+
+        # SECURITY: Bound CPU on pathological-but-shallow conditions (e.g. a flat
+        # 250-element literal) by rejecting conditions with too many AST nodes at
+        # registration time. ``_parse_condition`` raises ValueError when the node
+        # count exceeds ``MAX_CONDITION_NODES``; it also surfaces syntax errors so
+        # rules with broken syntax are rejected up front rather than silently.
+        _parse_condition(condition)
 
         rule: PolicyRule = {
             "name": name,
@@ -143,7 +188,7 @@ class PolicyEnforcer:
 
         for rule_name, rule in self._rules.items():
             # Simple condition checking (can be extended with more sophisticated evaluation)
-            if self._evaluate_condition(rule["condition"], context):
+            if self._evaluate_condition(rule["condition"], context, rule_name):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "message", message)
                 self._handle_violation(rule)
@@ -164,7 +209,7 @@ class PolicyEnforcer:
         context = {"state": state}
 
         for rule_name, rule in self._rules.items():
-            if self._evaluate_condition(rule["condition"], context):
+            if self._evaluate_condition(rule["condition"], context, rule_name):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "state", state)
                 self._handle_violation(rule)
@@ -205,22 +250,42 @@ class PolicyEnforcer:
 
         return violations
 
-    def _evaluate_condition(self, condition: str, context: dict[str, Any]) -> bool:
+    def _evaluate_condition(
+        self,
+        condition: str,
+        context: dict[str, Any],
+        rule_name: Optional[str] = None,
+    ) -> bool:
         """Evaluate a policy condition.
+
+        Distinguishes a condition that evaluates to ``False`` (no violation) from
+        a condition that cannot be evaluated at all (unknown variable, unsupported
+        node, arithmetic error, ...). An evaluation error is always logged as a
+        warning; it is then treated as a violation when ``self.fail_closed`` is set
+        and as "no violation" otherwise (fail-open, the historical behaviour).
 
         Args:
             condition: Condition expression
             context: Context for evaluation
+            rule_name: Name of the owning rule, for clearer log messages
 
         Returns:
-            True if condition is met (violation), False otherwise
+            True if condition is met (violation), False otherwise. On an
+            evaluation error returns ``self.fail_closed``.
         """
         try:
             tree = _parse_condition(condition)
             return bool(self._eval_node(tree.body, context))
         except Exception as e:
-            logger.error(f"Error evaluating condition '{condition}': {e}")
-            return False
+            label = f" for rule '{rule_name}'" if rule_name else ""
+            logger.warning(
+                "Error evaluating policy condition%s '%s': %s — treating as %s",
+                label,
+                condition,
+                e,
+                "VIOLATION (fail_closed)" if self.fail_closed else "no violation (fail_open)",
+            )
+            return self.fail_closed
 
     def _eval_node(self, node: ast.AST, context: dict[str, Any], depth: int = 0) -> Any:
         if depth > 50:

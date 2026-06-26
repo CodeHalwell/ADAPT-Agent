@@ -30,9 +30,75 @@ Examples::
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
+
+#: Substrings identifying Anthropic models that reject user-set sampling
+#: parameters (``temperature`` / ``top_p`` / ``top_k``) with a 400 error.
+#: For these models the sampling params MUST be omitted entirely.
+_NO_SAMPLING_MODEL_MARKERS: tuple[str, ...] = (
+    "opus-4-8",
+    "opus-4-7",
+    "fable-5",  # also matches "claude-fable-5"
+)
+
+
+def _model_rejects_sampling(model: str | None) -> bool:
+    """Return ``True`` if ``model`` rejects user-set sampling parameters.
+
+    Some Anthropic models (Opus 4.8, Opus 4.7, Fable 5 / Mythos 5) return a 400
+    if ``temperature``, ``top_p`` or ``top_k`` are supplied. Their ids are
+    matched case-insensitively against :data:`_NO_SAMPLING_MODEL_MARKERS`.
+    """
+    if not model:
+        return False
+    lowered = model.lower()
+    return any(marker in lowered for marker in _NO_SAMPLING_MODEL_MARKERS)
+
+
+def _sampling_error(exc: Exception) -> bool:
+    """Heuristic: does ``exc`` look like a 400/invalid-request about sampling?
+
+    Detects errors raised by an SDK when ``temperature`` / ``top_p`` / ``top_k``
+    are unsupported, so the call can be retried once without those params.
+    """
+    text = str(exc).lower()
+    mentions_param = any(p in text for p in ("temperature", "top_p", "top_k", "top-p", "top-k"))
+    looks_like_400 = any(
+        token in text
+        for token in ("400", "invalid_request", "invalid request", "unsupported", "not supported")
+    )
+    return mentions_param and looks_like_400
+
+
+_SAMPLING_KEYS: tuple[str, ...] = ("temperature", "top_p", "top_k")
+
+
+def _call_with_sampling_retry(fn: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
+    """Call ``fn(**kwargs)``; on a sampling-related 400, retry once without them.
+
+    Never lets a sampling parameter crash a completion: if the SDK raises an
+    error that looks like an invalid-request about ``temperature`` / ``top_p`` /
+    ``top_k`` (see :func:`_sampling_error`), the offending keys are stripped and
+    the call is retried exactly once. Any other error propagates unchanged.
+    """
+    try:
+        return fn(**kwargs)
+    except Exception as exc:  # noqa: BLE001 - re-raised unless it is a sampling error
+        if not _sampling_error(exc):
+            raise
+        if not any(key in kwargs for key in _SAMPLING_KEYS):
+            raise
+        logger.warning(
+            "SDK rejected sampling params (%s); retrying without temperature/top_p/top_k.",
+            exc,
+        )
+        retry = {k: v for k, v in kwargs.items() if k not in _SAMPLING_KEYS}
+        return fn(**retry)
 
 
 class ModelProvider(ABC):
@@ -50,6 +116,10 @@ class ModelProvider(ABC):
     """
 
     name: str = "provider"
+
+    #: Highest sampling temperature this provider's API accepts. Requested
+    #: temperatures are clamped into ``[0, max_temperature]`` before the call.
+    max_temperature: float = 2.0
 
     def __init__(
         self,
@@ -83,6 +153,38 @@ class ModelProvider(ABC):
             "max_tokens": overrides.get("max_tokens", self.max_tokens),
             "system": overrides.get("system", self.system),
         }
+
+    def _sampling(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """Resolve sampling params (``temperature``/``top_p``) safely.
+
+        Returns a dict containing only the sampling keys that should be sent to
+        the SDK:
+
+        * Models that reject user-set sampling (Anthropic Opus 4.8/4.7, Fable 5)
+          get an EMPTY dict -- ``temperature``/``top_p``/``top_k`` are omitted.
+        * Otherwise ``temperature`` is clamped into ``[0, max_temperature]`` and
+          ``top_p`` (if supplied) into ``[0, 1]``. A requested temperature above
+          the maximum is logged and clamped rather than crashing the call.
+        """
+        if _model_rejects_sampling(self.model):
+            return {}
+
+        temperature = overrides.get("temperature", self.temperature)
+        result: dict[str, Any] = {}
+        if temperature is not None:
+            if temperature > self.max_temperature:
+                logger.warning(
+                    "Requested temperature %s exceeds max %s for model %r; clamping.",
+                    temperature,
+                    self.max_temperature,
+                    self.model,
+                )
+            result["temperature"] = min(max(temperature, 0.0), self.max_temperature)
+
+        top_p = overrides.get("top_p")
+        if top_p is not None:
+            result["top_p"] = min(max(top_p, 0.0), 1.0)
+        return result
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return f"{type(self).__name__}(model={self.model!r})"
@@ -143,6 +245,7 @@ class AnthropicProvider(ModelProvider):
     """
 
     name = "anthropic"
+    max_temperature = 1.0
 
     def __init__(
         self,
@@ -169,16 +272,17 @@ class AnthropicProvider(ModelProvider):
 
     def complete(self, prompt: str, **overrides: Any) -> str:
         cfg = self._resolved(overrides)
+        sampling = self._sampling(overrides)
         client = self._get_client()
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": cfg["max_tokens"],
-            "temperature": cfg["temperature"],
             "messages": [{"role": "user", "content": prompt}],
+            **sampling,
         }
         if cfg["system"]:
             kwargs["system"] = cfg["system"]
-        message = client.messages.create(**kwargs)
+        message = _call_with_sampling_retry(client.messages.create, kwargs)
         return _join_text_blocks(getattr(message, "content", message))
 
 
@@ -190,6 +294,7 @@ class OpenAIProvider(ModelProvider):
     """
 
     name = "openai"
+    max_temperature = 2.0
     #: Env var consulted for the API key (overridden by OpenAI-compatible subclasses).
     api_key_env = "OPENAI_API_KEY"
     #: Default base URL (``None`` -> the SDK default). Subclasses point this at
@@ -226,17 +331,19 @@ class OpenAIProvider(ModelProvider):
 
     def complete(self, prompt: str, **overrides: Any) -> str:
         cfg = self._resolved(overrides)
+        sampling = self._sampling(overrides)
         client = self._get_client()
         messages = []
         if cfg["system"]:
             messages.append({"role": "system", "content": cfg["system"]})
         messages.append({"role": "user", "content": prompt})
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=cfg["temperature"],
-            max_tokens=cfg["max_tokens"],
-        )
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": cfg["max_tokens"],
+            **sampling,
+        }
+        response = _call_with_sampling_retry(client.chat.completions.create, kwargs)
         return response.choices[0].message.content or ""
 
 
@@ -371,16 +478,22 @@ class GeminiProvider(ModelProvider):
 
     def complete(self, prompt: str, **overrides: Any) -> str:
         cfg = self._resolved(overrides)
+        sampling = self._sampling(overrides)
         client = self._get_client()
         full_prompt = f"{cfg['system']}\n\n{prompt}" if cfg["system"] else prompt
         if self._legacy:  # google.generativeai
             model = client.GenerativeModel(self.model)
             response = model.generate_content(full_prompt)
             return getattr(response, "text", "") or ""
-        # google-genai
-        config = {"temperature": cfg["temperature"], "max_output_tokens": cfg["max_tokens"]}
-        response = client.models.generate_content(
-            model=self.model, contents=full_prompt, config=config
+        # google-genai. Gemini nests sampling inside its generation config.
+        config: dict[str, Any] = {"max_output_tokens": cfg["max_tokens"]}
+        if "temperature" in sampling:
+            config["temperature"] = sampling["temperature"]
+        if "top_p" in sampling:
+            config["top_p"] = sampling["top_p"]
+        response = _call_with_sampling_retry(
+            lambda **kw: client.models.generate_content(model=self.model, **kw),
+            {"contents": full_prompt, "config": config},
         )
         return getattr(response, "text", "") or ""
 
@@ -413,17 +526,19 @@ class MistralProvider(ModelProvider):
 
     def complete(self, prompt: str, **overrides: Any) -> str:
         cfg = self._resolved(overrides)
+        sampling = self._sampling(overrides)
         client = self._get_client()
         messages = []
         if cfg["system"]:
             messages.append({"role": "system", "content": cfg["system"]})
         messages.append({"role": "user", "content": prompt})
-        response = client.chat.complete(
-            model=self.model,
-            messages=messages,
-            temperature=cfg["temperature"],
-            max_tokens=cfg["max_tokens"],
-        )
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": cfg["max_tokens"],
+            **sampling,
+        }
+        response = _call_with_sampling_retry(client.chat.complete, kwargs)
         return response.choices[0].message.content or ""
 
 
@@ -431,6 +546,7 @@ class CohereProvider(ModelProvider):
     """Cohere provider (uses the ``cohere`` SDK v2, imported lazily)."""
 
     name = "cohere"
+    max_temperature = 1.0
 
     def __init__(
         self,
@@ -455,12 +571,14 @@ class CohereProvider(ModelProvider):
 
     def complete(self, prompt: str, **overrides: Any) -> str:
         cfg = self._resolved(overrides)
+        sampling = self._sampling(overrides)
         client = self._get_client()
         messages = []
         if cfg["system"]:
             messages.append({"role": "system", "content": cfg["system"]})
         messages.append({"role": "user", "content": prompt})
-        response = client.chat(model=self.model, messages=messages, temperature=cfg["temperature"])
+        kwargs: dict[str, Any] = {"model": self.model, "messages": messages, **sampling}
+        response = _call_with_sampling_retry(client.chat, kwargs)
         return _join_text_blocks(getattr(response.message, "content", ""))
 
 
@@ -468,6 +586,7 @@ class BedrockProvider(ModelProvider):
     """AWS Bedrock provider via the Converse API (uses ``boto3``, imported lazily)."""
 
     name = "bedrock"
+    max_temperature = 1.0
 
     def __init__(
         self,
@@ -492,18 +611,35 @@ class BedrockProvider(ModelProvider):
 
     def complete(self, prompt: str, **overrides: Any) -> str:
         cfg = self._resolved(overrides)
+        sampling = self._sampling(overrides)
         client = self._get_client()
+        inference_config: dict[str, Any] = {"maxTokens": cfg["max_tokens"]}
+        if "temperature" in sampling:
+            inference_config["temperature"] = sampling["temperature"]
+        if "top_p" in sampling:
+            inference_config["topP"] = sampling["top_p"]
         kwargs: dict[str, Any] = {
             "modelId": self.model,
             "messages": [{"role": "user", "content": [{"text": prompt}]}],
-            "inferenceConfig": {
-                "temperature": cfg["temperature"],
-                "maxTokens": cfg["max_tokens"],
-            },
+            "inferenceConfig": inference_config,
         }
         if cfg["system"]:
             kwargs["system"] = [{"text": cfg["system"]}]
-        response = client.converse(**kwargs)
+
+        def _converse(**call_kwargs: Any) -> Any:
+            # Bedrock nests sampling under inferenceConfig; on a sampling-related
+            # 400 strip those keys (keeping maxTokens) and retry once.
+            try:
+                return client.converse(**call_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if not _sampling_error(exc):
+                    raise
+                cfg_only = {"maxTokens": call_kwargs["inferenceConfig"].get("maxTokens")}
+                logger.warning("Bedrock rejected sampling params (%s); retrying without them.", exc)
+                retry = {**call_kwargs, "inferenceConfig": cfg_only}
+                return client.converse(**retry)
+
+        response = _converse(**kwargs)
         blocks = response["output"]["message"]["content"]
         return "".join(b.get("text", "") for b in blocks)
 
@@ -538,13 +674,15 @@ class HuggingFaceProvider(ModelProvider):
 
     def complete(self, prompt: str, **overrides: Any) -> str:
         cfg = self._resolved(overrides)
+        sampling = self._sampling(overrides)
         client = self._get_client()
         messages = []
         if cfg["system"]:
             messages.append({"role": "system", "content": cfg["system"]})
         messages.append({"role": "user", "content": prompt})
-        response = client.chat_completion(
-            messages, model=self.model, temperature=cfg["temperature"], max_tokens=cfg["max_tokens"]
+        kwargs: dict[str, Any] = {"model": self.model, "max_tokens": cfg["max_tokens"], **sampling}
+        response = _call_with_sampling_retry(
+            lambda **kw: client.chat_completion(messages, **kw), kwargs
         )
         return response.choices[0].message.content or ""
 

@@ -12,6 +12,7 @@ from adapt_agent.optimization.introspection import (
     introspect,
     introspect_components,
     register,
+    tool_subset_candidates,
 )
 from adapt_agent.optimization.parameters import Parameter, ParameterKind
 
@@ -326,6 +327,38 @@ def test_bind_mapping_key_missing_key_returns_none():
             self.settings = {"other": 1}
 
     assert bind_mapping_key(Obj(), "settings", "k", "n", ParameterKind.HYPERPARAM) is None
+
+
+# -- tool_subset_candidates ---------------------------------------------------
+
+
+def test_tool_subset_candidates_empty_for_few_tools():
+    assert tool_subset_candidates([]) == []
+    assert tool_subset_candidates(["only"]) == []
+
+
+def test_tool_subset_candidates_full_set_then_drop_one():
+    cands = tool_subset_candidates(["a", "b", "c"])
+    # Full set first.
+    assert cands[0] == ["a", "b", "c"]
+    # Then each drop-one subset, in order.
+    assert cands[1:] == [["b", "c"], ["a", "c"], ["a", "b"]]
+    # The originals are not mutated and each candidate is a fresh list.
+    assert cands[0] is not cands[1]
+
+
+def test_tool_subset_candidates_accepts_tuple():
+    cands = tool_subset_candidates(("x", "y"))
+    assert cands[0] == ["x", "y"]
+    assert all(isinstance(c, list) for c in cands)
+
+
+def test_tool_subset_candidates_bounded():
+    tools = list(range(20))
+    cands = tool_subset_candidates(tools, max_candidates=4)
+    # Full set + 3 drop-one subsets == 4 total.
+    assert len(cands) == 4
+    assert cands[0] == tools
 
 
 # -- available() loads real framework modules ---------------------------------

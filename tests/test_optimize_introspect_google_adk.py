@@ -127,6 +127,57 @@ def test_instruction_provider_callable_not_emitted_as_prompt():
     assert "dyn.model" in names
 
 
+def test_two_nameless_sub_agents_do_not_collide():
+    # Two sub-agents without a usable ``name`` previously both collapsed to the
+    # component "agent", producing duplicate parameter names. The positional
+    # index in the fallback now keeps them distinct.
+    child_a = FakeLlmAgent(name="", instruction="First nameless child.")
+    child_b = FakeLlmAgent(name="", instruction="Second nameless child.")
+    parent = FakeLlmAgent(
+        name="root",
+        instruction="Coordinate the nameless children.",
+        sub_agents=[child_a, child_b],
+    )
+    params = introspect(parent)
+    names = [p.name for p in params]
+
+    # No duplicate parameter names overall.
+    assert len(names) == len(set(names))
+    # Each nameless child got a distinct, index-based component namespace.
+    assert "root.agent_0.instruction" in names
+    assert "root.agent_1.instruction" in names
+
+
+def test_tools_are_optimizable_with_drop_one_candidates():
+    agent = _make_agent()  # parent has tools ["search", "calc"]
+    params = introspect(agent)
+    tools = next(p for p in params if p.name == "coordinator_agent.tools")
+
+    assert tools.kind is ParameterKind.TOOL
+    assert tools.candidates is not None
+    # Full set first, then each drop-one subset.
+    assert tools.candidates[0] == ["search", "calc"]
+    assert ["calc"] in tools.candidates
+    assert ["search"] in tools.candidates
+    # With candidates the knob is enumerable beyond its single current value.
+    assert len(tools.enumerate_candidates()) >= 2
+
+
+def test_single_tool_has_no_ablation_candidates():
+    agent = FakeLlmAgent(name="solo", instruction="hi", tools=["only"])
+    params = introspect(agent)
+    tools = next(p for p in params if p.name == "solo.tools")
+    # Fewer than two tools -> no meaningful subset search.
+    assert tools.candidates is None
+
+
+def test_max_output_tokens_is_bounded():
+    agent = _make_agent()
+    params = introspect(agent)
+    mot = next(p for p in params if p.name == "coordinator_agent.max_output_tokens")
+    assert mot.bounds == (1, 32000)
+
+
 def test_predicate_rejects_unrelated_object():
     assert adk._predicate(object()) is False
 

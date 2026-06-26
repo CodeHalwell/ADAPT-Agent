@@ -1,8 +1,10 @@
 """Middleware system for LLM agents."""
 
+from __future__ import annotations
+
 import logging
 from functools import wraps
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +17,26 @@ class Middleware:
 
     Provides a composable middleware pipeline for pre-processing and
     post-processing agent inputs and outputs.
+
+    Failure policy is explicit. By default the pipeline is *fail-open*: a
+    middleware that raises is logged and skipped, and the (unmodified) data
+    flows on to the next middleware. This is convenient but dangerous when a
+    middleware is a security control (e.g. a sanitizer): if it crashes, raw
+    data would silently pass through. Set ``fail_closed=True`` to make a
+    raising middleware abort the pipeline by re-raising, so a sanitizer failure
+    stops the request instead of leaking unsanitized data.
     """
 
-    def __init__(self):
-        """Initialize the Middleware system."""
+    def __init__(self, fail_closed: bool = False):
+        """Initialize the Middleware system.
+
+        Args:
+            fail_closed: When True, a middleware that raises aborts the whole
+                pipeline (the exception is re-raised) instead of being logged
+                and skipped. When False (default), the error is logged and the
+                pipeline continues with the unmodified data (fail-open).
+        """
+        self.fail_closed = fail_closed
         self._pre_middleware: list[MiddlewareFunc] = []
         self._post_middleware: list[MiddlewareFunc] = []
         self._middleware_metadata: dict[str, dict[str, Any]] = {}
@@ -26,7 +44,7 @@ class Middleware:
     def add_pre_middleware(
         self,
         middleware: MiddlewareFunc,
-        name: Optional[str] = None,
+        name: str | None = None,
         priority: int = 0,
     ) -> None:
         """Add middleware to run before agent execution.
@@ -35,8 +53,12 @@ class Middleware:
             middleware: Middleware function
             name: Optional name for the middleware
             priority: Priority (higher runs first)
+
+        Raises:
+            ValueError: If a middleware with the same name is already registered.
         """
         resolved_name = name or middleware.__name__
+        self._reject_duplicate_name(resolved_name)
         self._middleware_metadata[resolved_name] = {
             "type": "pre",
             "priority": priority,
@@ -61,7 +83,7 @@ class Middleware:
     def add_post_middleware(
         self,
         middleware: MiddlewareFunc,
-        name: Optional[str] = None,
+        name: str | None = None,
         priority: int = 0,
     ) -> None:
         """Add middleware to run after agent execution.
@@ -70,8 +92,12 @@ class Middleware:
             middleware: Middleware function
             name: Optional name for the middleware
             priority: Priority (higher runs first)
+
+        Raises:
+            ValueError: If a middleware with the same name is already registered.
         """
         resolved_name = name or middleware.__name__
+        self._reject_duplicate_name(resolved_name)
         self._middleware_metadata[resolved_name] = {
             "type": "post",
             "priority": priority,
@@ -92,6 +118,25 @@ class Middleware:
             key=lambda m: func_priorities.get(m, 0),
             reverse=True,
         )
+
+    def _reject_duplicate_name(self, name: str) -> None:
+        """Reject a duplicate middleware name.
+
+        A single ``_middleware_metadata`` entry is keyed by name, so allowing
+        two middlewares to share a name corrupts the registry: both functions
+        get appended to the pipeline but only one metadata entry exists, and
+        ``remove_middleware`` would then orphan the other. Refuse up front.
+
+        Args:
+            name: Resolved middleware name.
+
+        Raises:
+            ValueError: If the name is already registered.
+        """
+        if name in self._middleware_metadata:
+            raise ValueError(
+                f"Middleware named {name!r} is already registered; " "names must be unique"
+            )
 
     def remove_middleware(self, name: str) -> bool:
         """Remove a middleware by name.
@@ -124,6 +169,10 @@ class Middleware:
 
         Returns:
             Processed data
+
+        Raises:
+            Exception: If ``fail_closed`` is True and a middleware raises, the
+                original exception is propagated (the pipeline aborts).
         """
         if not self._pre_middleware:
             return data
@@ -134,8 +183,20 @@ class Middleware:
             try:
                 result = middleware(result)
             except Exception as e:
-                # Log error and continue (or handle based on policy)
-                logger.error(f"Error in pre-middleware {middleware.__name__}: {e}")
+                if self.fail_closed:
+                    logger.error(
+                        "Aborting pre-middleware pipeline: %s raised %s " "(fail_closed=True)",
+                        middleware.__name__,
+                        e,
+                    )
+                    raise
+                # Fail-open: log clearly and continue with unmodified data.
+                logger.error(
+                    "Error in pre-middleware %s: %s (fail_closed=False, "
+                    "passing data through unmodified)",
+                    middleware.__name__,
+                    e,
+                )
 
         return result
 
@@ -147,6 +208,10 @@ class Middleware:
 
         Returns:
             Processed data
+
+        Raises:
+            Exception: If ``fail_closed`` is True and a middleware raises, the
+                original exception is propagated (the pipeline aborts).
         """
         if not self._post_middleware:
             return data
@@ -157,8 +222,20 @@ class Middleware:
             try:
                 result = middleware(result)
             except Exception as e:
-                # Log error and continue (or handle based on policy)
-                logger.error(f"Error in post-middleware {middleware.__name__}: {e}")
+                if self.fail_closed:
+                    logger.error(
+                        "Aborting post-middleware pipeline: %s raised %s " "(fail_closed=True)",
+                        middleware.__name__,
+                        e,
+                    )
+                    raise
+                # Fail-open: log clearly and continue with unmodified data.
+                logger.error(
+                    "Error in post-middleware %s: %s (fail_closed=False, "
+                    "passing data through unmodified)",
+                    middleware.__name__,
+                    e,
+                )
 
         return result
 

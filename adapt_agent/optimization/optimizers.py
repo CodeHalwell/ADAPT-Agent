@@ -73,6 +73,9 @@ class OptimizationResult:
         history: Every :class:`Trial` evaluated, in order.
         best_report: The :class:`EvaluationReport` for the winning configuration.
         validation_score: Score of ``best_config`` on a held-out set, if provided.
+        recommendations: Advisory, human-readable suggestions gathered during the
+            run (e.g. new tools/skills the judge proposes). These are never applied
+            automatically -- the optimizer only *selects* among existing tools.
     """
 
     best_config: dict[str, Any]
@@ -82,6 +85,7 @@ class OptimizationResult:
     history: list[Trial] = field(default_factory=list)
     best_report: EvaluationReport | None = None
     validation_score: float | None = None
+    recommendations: list[str] = field(default_factory=list)
 
     @property
     def improved(self) -> bool:
@@ -104,6 +108,7 @@ class OptimizationResult:
             "validation_score": self.validation_score,
             "n_evals": self.n_evals,
             "best_config": self.best_config,
+            "recommendations": list(self.recommendations),
         }
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
@@ -122,8 +127,16 @@ class Optimizer:
         max_evals: Hard cap on candidate evaluations (budget guard).
         seed: RNG seed for reproducible search.
         min_improvement: Minimum primary-metric gain required to accept a
-            candidate over the current best (avoids churn on noise).
+            candidate over the current best. Defaults to ``1e-3``: small enough to
+            keep real gains, but large enough to avoid *chasing judge noise* -- an
+            LLM judge's score wobbles by far more than ``1e-9`` between runs, so a
+            near-zero threshold would "accept" candidates that only won by jitter.
         judge: Optional LLM judge made available to proposers.
+        suggest_tools: When True *and* a ``judge`` is set, after the search the
+            optimizer asks the judge to propose NEW tools/skills for components
+            that own a TOOL/SKILL parameter and records them as advisory
+            ``recommendations`` (never applied automatically). Off by default;
+            :func:`make_default_optimizer` turns it on when a judge is present.
         verbose: Emit per-trial logging at INFO level.
     """
 
@@ -135,8 +148,9 @@ class Optimizer:
         *,
         max_evals: int = 50,
         seed: int | None = 0,
-        min_improvement: float = 1e-9,
+        min_improvement: float = 1e-3,
         judge: Any = None,
+        suggest_tools: bool = False,
         verbose: bool = False,
     ):
         self.harness = harness
@@ -144,11 +158,14 @@ class Optimizer:
         self.seed = seed
         self.min_improvement = min_improvement
         self.judge = judge
+        self.suggest_tools = suggest_tools
         self.verbose = verbose
         self._rng = random.Random(seed)
         # Set per-run by the search strategy before evaluating candidates; the
         # baseline values every candidate config is composed on top of.
         self._baseline_snapshot: dict[str, Any] = {}
+        # Shared advisory-suggestion sink, replaced per ``optimize`` call.
+        self._recommendations: list[str] = []
 
     # -- public API ------------------------------------------------------------
 
@@ -179,6 +196,10 @@ class Optimizer:
         if self.verbose:
             logger.info("[%s] baseline score=%.4f", self.strategy_name, baseline_score)
 
+        # One shared sink threaded through every ProposalContext and read back
+        # after the search (proposers may append advisory suggestions to it).
+        self._recommendations = []
+
         state = _SearchState(
             best_config={},
             best_score=baseline_score,
@@ -197,6 +218,9 @@ class Optimizer:
         if val_dataset:
             validation_score = self.harness.evaluate(target, val_dataset).score
 
+        recommendations = list(self._recommendations)
+        recommendations.extend(self._suggest_tools(target, state))
+
         result = OptimizationResult(
             best_config=state.best_config,
             best_score=state.best_score,
@@ -205,6 +229,7 @@ class Optimizer:
             history=state.history,
             best_report=state.best_report,
             validation_score=validation_score,
+            recommendations=recommendations,
         )
         if self.verbose:
             logger.info("[%s] %r", self.strategy_name, result)
@@ -284,7 +309,79 @@ class Optimizer:
             judge=self.judge,
             rng=self._rng,
             n=n,
+            recommendations=self._recommendations,
         )
+
+    # -- tool/skill suggestion -------------------------------------------------
+
+    def _suggest_tools(self, target: OptimizableAgent, state: _SearchState) -> list[str]:
+        """Ask the judge to propose new tools/skills for TOOL/SKILL components.
+
+        Advisory only: the returned strings describe tools/skills the judge thinks
+        would help, drawn from the best configuration's remaining failures. Nothing
+        here is applied to the live agent -- the optimizer only *selects* among
+        existing tools (via ablation proposers).
+        """
+        if not self.judge or not self.suggest_tools:
+            return []
+        suggest = getattr(self.judge, "suggest_tools", None)
+        if not callable(suggest):
+            return []
+
+        params = [
+            p
+            for p in target.search_space.optimizable()
+            if p.kind in (ParameterKind.TOOL, ParameterKind.SKILL)
+        ]
+        if not params:
+            return []
+
+        failures = self._failure_records(state)
+        out: list[str] = []
+        for param in params:
+            component = param.component or param.name
+            current = param.read()
+            current_tools = list(current) if isinstance(current, (list, tuple)) else []
+            try:
+                items = suggest(component, failures, current_tools)
+            except Exception as exc:  # a flaky judge must not abort the run
+                logger.warning("suggest_tools failed for %s: %s", component, exc)
+                continue
+            for item in items or []:
+                out.append(self._format_tool_suggestion(component, item))
+        return out
+
+    @staticmethod
+    def _failure_records(state: _SearchState) -> list[dict[str, Any]]:
+        """Convert the best report's failing ExampleResults into judge-ready dicts."""
+        report = state.best_report
+        if report is None:
+            return []
+        records: list[dict[str, Any]] = []
+        for r in report.failures():
+            records.append(
+                {
+                    "input": r.inputs,
+                    "output": r.output if r.error is None else f"<error: {r.error}>",
+                    "expected": r.expected,
+                }
+            )
+        return records
+
+    @staticmethod
+    def _format_tool_suggestion(component: str, item: Any) -> str:
+        """Render a judge tool suggestion as a single human-readable line."""
+        if isinstance(item, dict):
+            name = item.get("name", "<unnamed>")
+            description = item.get("description", "")
+            rationale = item.get("rationale", "")
+            parts = [f"[{component}] tool '{name}'"]
+            if description:
+                parts.append(str(description))
+            if rationale:
+                parts.append(f"(why: {rationale})")
+            return ": ".join(parts[:2]) + (f" {parts[2]}" if len(parts) > 2 else "")
+        return f"[{component}] {item}"
 
 
 @dataclass
@@ -581,6 +678,7 @@ class PipelineOptimizer(Optimizer):
         baseline_score = self.harness.evaluate(target, dataset).score
 
         combined_history: list[Trial] = []
+        combined_recommendations: list[str] = []
         best_config: dict[str, Any] = {}
         best_score = baseline_score
         best_report: EvaluationReport | None = None
@@ -588,6 +686,7 @@ class PipelineOptimizer(Optimizer):
         for stage in self.stages:
             stage_result = stage.optimize(target, dataset)  # applies stage best in place
             combined_history.extend(stage_result.history)
+            combined_recommendations.extend(stage_result.recommendations)
             # The live target now carries this stage's best; accumulate the diff.
             if stage_result.best_score >= best_score:
                 best_score = stage_result.best_score
@@ -601,6 +700,17 @@ class PipelineOptimizer(Optimizer):
             target.apply(best_config)
 
         validation_score = self.harness.evaluate(target, val_dataset).score if val_dataset else None
+
+        # Optionally run the pipeline-level tool suggestion on the cumulative best,
+        # then dedupe so a repeated suggestion from several stages appears once.
+        pipeline_state = _SearchState(
+            best_config=best_config,
+            best_score=best_score,
+            best_report=best_report,
+            baseline_snapshot=baseline_snapshot,
+            history=combined_history,
+        )
+        combined_recommendations.extend(self._suggest_tools(target, pipeline_state))
         return OptimizationResult(
             best_config=best_config,
             best_score=best_score,
@@ -609,6 +719,7 @@ class PipelineOptimizer(Optimizer):
             history=combined_history,
             best_report=best_report,
             validation_score=validation_score,
+            recommendations=_dedup(combined_recommendations),
         )
 
     def _search(
@@ -629,10 +740,16 @@ def make_default_optimizer(
 
     Stages: bootstrap few-shot examples, then coordinate-ascent over prompts
     (LLM-judge-driven when a ``judge`` is supplied), then grid over models /
-    hyperparameters / routing / tools. Budget is split across stages.
+    hyperparameters / routing, then coordinate-ascent over tools/skills
+    (drop-one ablation, plus judge-driven new-tool *suggestions* when a judge is
+    supplied). Budget is split across the four stages.
+
+    When a ``judge`` is supplied, ``suggest_tools`` is enabled so the pipeline and
+    its tool stage record advisory new-tool/skill recommendations on the result.
     """
-    per_stage = max(5, max_evals // 3)
+    per_stage = max(5, max_evals // 4)
     common = {"seed": seed, "judge": judge, "verbose": verbose}
+    suggest = judge is not None
     stages: list[Optimizer] = [
         BootstrapFewShotOptimizer(harness, max_evals=per_stage, **common),
         CoordinateAscentOptimizer(
@@ -642,8 +759,15 @@ def make_default_optimizer(
             **common,
         ),
         GridSearchOptimizer(harness, max_evals=per_stage, max_configs=per_stage, **common),
+        CoordinateAscentOptimizer(
+            harness,
+            max_evals=per_stage,
+            kinds=(ParameterKind.TOOL, ParameterKind.SKILL),
+            suggest_tools=suggest,
+            **common,
+        ),
     ]
-    return PipelineOptimizer(harness, stages, max_evals=max_evals, **common)
+    return PipelineOptimizer(harness, stages, max_evals=max_evals, suggest_tools=suggest, **common)
 
 
 def _dedup(values: list[Any]) -> list[Any]:

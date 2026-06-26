@@ -43,6 +43,7 @@ classifiers = [
 ]
 dependencies = [
     "typing-extensions>=4.5.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -164,6 +165,9 @@ module = [
     "boto3.*",
     "huggingface_hub",
     "huggingface_hub.*",
+    # PyYAML ships no type stubs in this project's pinned set
+    "yaml",
+    "yaml.*",
 ]
 ignore_missing_imports = true
 

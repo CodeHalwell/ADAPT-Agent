@@ -20,6 +20,7 @@ from adapt_agent.optimization.introspection import (
     bind_attr,
     bind_mapping_key,
     register,
+    tool_subset_candidates,
 )
 from adapt_agent.optimization.parameters import Parameter, ParameterKind
 
@@ -29,8 +30,9 @@ def _predicate(obj: Any) -> bool:
 
     A match needs a callable ``run_sync`` and a ``model`` attribute, plus either
     the private ``_system_prompts`` tuple or a public ``system_prompt``. We
-    explicitly reject objects that carry multi-agent / handoff markers so we do
-    not steal objects belonging to other frameworks' introspectors.
+    explicitly reject objects that carry multi-agent / handoff markers (or a
+    ``chat_client``, which a Microsoft Agent Framework ``ChatAgent`` carries) so
+    we do not steal objects belonging to other frameworks' introspectors.
     """
     try:
         if not callable(getattr(obj, "run_sync", None)):
@@ -39,7 +41,7 @@ def _predicate(obj: Any) -> bool:
             return False
         if not (hasattr(obj, "_system_prompts") or hasattr(obj, "system_prompt")):
             return False
-        for foreign in ("handoffs", "sub_agents", "agents", "allowed_tools"):
+        for foreign in ("handoffs", "sub_agents", "agents", "allowed_tools", "chat_client"):
             if hasattr(obj, foreign):
                 return False
         return True
@@ -175,10 +177,25 @@ def _model_settings_params(obj: Any, component: str) -> list[Parameter]:
 
 
 def _tool_param(obj: Any, component: str) -> Parameter | None:
-    """Expose a TOOL parameter bound to the agent's function-tool registry."""
+    """Expose a TOOL parameter bound to the agent's function-tool registry.
+
+    When the registry is a list/tuple of two or more tools the parameter is made
+    *optimizable* via drop-one ablation ``candidates`` so the optimizer can search
+    tool subsets.
+    """
     for attr in ("_function_tools", "tools"):
         if hasattr(obj, attr):
-            return bind_attr(obj, attr, "agent.tools", ParameterKind.TOOL, component=component)
+            current = getattr(obj, attr, None)
+            return bind_attr(
+                obj,
+                attr,
+                "agent.tools",
+                ParameterKind.TOOL,
+                component=component,
+                candidates=(
+                    tool_subset_candidates(current) if isinstance(current, (list, tuple)) else None
+                ),
+            )
     return None
 
 

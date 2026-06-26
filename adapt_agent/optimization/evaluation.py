@@ -105,6 +105,12 @@ class EvaluationReport:
     results: list[ExampleResult] = field(default_factory=list)
     n_errors: int = 0
     total_latency: float = 0.0
+    #: Default threshold used by :meth:`failures` when none is supplied. Set by
+    #: the producing :class:`EvaluationHarness` from its ``failure_threshold``;
+    #: ``1.0`` reproduces the historical "anything short of perfect is a failure"
+    #: behaviour. Lower it for continuous-score metrics so :meth:`failures`
+    #: isn't flooded.
+    failure_threshold: float = 1.0
 
     @property
     def score(self) -> float:
@@ -119,18 +125,35 @@ class EvaluationReport:
     def avg_latency(self) -> float:
         return self.total_latency / self.n if self.results else 0.0
 
-    def failures(self, *, metric: str | None = None, threshold: float = 1.0) -> list[ExampleResult]:
+    def failures(
+        self, *, metric: str | None = None, threshold: float | None = None
+    ) -> list[ExampleResult]:
         """Return examples scoring below ``threshold`` on a metric (or errored).
 
         Defaults to the primary metric. Useful for feeding an LLM proposer the
         cases an instruction still gets wrong.
+
+        When ``threshold`` is ``None`` it falls back to :attr:`failure_threshold`
+        (set by the producing harness, default ``1.0``). Supplying ``threshold``
+        explicitly always wins. Lower the threshold for continuous-score metrics
+        so this doesn't return every imperfect example.
         """
         name = metric or self.primary_metric
+        cutoff = self.failure_threshold if threshold is None else threshold
         out: list[ExampleResult] = []
         for r in self.results:
-            if r.error is not None or r.scores.get(name, 0.0) < threshold:
+            if r.error is not None or r.scores.get(name, 0.0) < cutoff:
                 out.append(r)
         return out
+
+    def below(self, metric: str, threshold: float) -> list[ExampleResult]:
+        """Return examples whose ``metric`` score is below ``threshold``.
+
+        Unlike :meth:`failures`, this looks only at the named metric's score and
+        does **not** force-include errored examples (an errored example simply
+        scores ``0.0`` and is included if that is below ``threshold``).
+        """
+        return [r for r in self.results if r.scores.get(metric, 0.0) < threshold]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -162,6 +185,15 @@ class EvaluationHarness:
             ``False`` to keep reports small for very large datasets).
         max_results: Cap on stored per-example results (bounds memory on huge
             datasets); aggregates are computed over everything regardless.
+        failure_threshold: Default cutoff for
+            :meth:`EvaluationReport.failures` on reports this harness produces.
+            ``1.0`` (the default) keeps the historical "only a perfect score
+            passes" behaviour; lower it for continuous-score metrics so the
+            failure set used by proposers isn't flooded with near-misses.
+        cache: Reserved flag for future result memoization. Currently a no-op:
+            ``evaluate`` always re-runs the agent so results stay correct even
+            for stateful/impure agents. Kept so callers can opt in later without
+            a signature change; setting it does **not** enable any caching today.
     """
 
     def __init__(
@@ -171,6 +203,8 @@ class EvaluationHarness:
         primary_metric: str | None = None,
         capture_output: bool = True,
         max_results: int = 10_000,
+        failure_threshold: float = 1.0,
+        cache: bool = False,
     ):
         self.metrics: list[Metric] = self._normalize_metrics(metrics)
         if not self.metrics:
@@ -183,6 +217,9 @@ class EvaluationHarness:
             raise ValueError(f"primary_metric {self.primary_metric!r} not among metrics {names}")
         self.capture_output = capture_output
         self.max_results = max_results
+        self.failure_threshold = failure_threshold
+        # Reserved: no caching is performed today (see class docstring).
+        self.cache = cache
 
     @staticmethod
     def _normalize_metrics(metrics: Any) -> list[Metric]:
@@ -233,6 +270,7 @@ class EvaluationHarness:
             results=results,
             n_errors=n_errors,
             total_latency=total_latency,
+            failure_threshold=self.failure_threshold,
         )
 
     def _run_one(self, runner: Callable[[Any], Any], index: int, example: Example) -> ExampleResult:

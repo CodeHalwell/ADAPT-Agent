@@ -232,12 +232,17 @@ def test_coordinate_ascent_improves_via_candidates():
 
 
 def fake_complete(prompt: str) -> str:
-    """Deterministic judge completion: rewrites instructions to GOOD_PROMPT."""
-    if "Rewrite the instruction" in prompt:
+    """Deterministic judge completion: rewrites instructions to GOOD_PROMPT.
+
+    The judge now places its task instructions in the provider ``system=`` argument
+    and passes only the data (current instruction + failures) in the user prompt, so
+    we trigger on the prompt's structural marker instead of an instruction phrase.
+    The rewrite prompt embeds the CURRENT INSTRUCTION block; the critique prompt does
+    not, so this returns GOOD_PROMPT only for rewrites.
+    """
+    if "CURRENT INSTRUCTION" in prompt or "Rewrite the instruction" in prompt:
         return GOOD_PROMPT
-    if "Explain concisely" in prompt:
-        return "It produced the wrong answer."
-    return "ok"
+    return "It produced the wrong answer."
 
 
 def test_coordinate_ascent_improves_via_llm_judge():
@@ -445,7 +450,7 @@ def test_make_default_optimizer_returns_pipeline_and_runs():
     state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
     opt = make_default_optimizer(harness(), max_evals=30)
     assert isinstance(opt, PipelineOptimizer)
-    assert len(opt.stages) == 3
+    assert len(opt.stages) == 4
     res = opt.optimize(agent, dataset())
     assert res.best_score == 1.0
     assert state["prompt"] == GOOD_PROMPT
@@ -460,6 +465,142 @@ def test_make_default_optimizer_with_judge_drives_llm_rewrite():
     res = opt.optimize(agent, dataset())
     assert res.best_score == 1.0
     assert GOOD_PROMPT in str(state["prompt"])
+
+
+# -- min_improvement default --------------------------------------------------
+
+
+def test_min_improvement_default_is_1e_3():
+    # Documented default: avoid chasing judge noise (was 1e-9).
+    assert Optimizer(harness()).min_improvement == pytest.approx(1e-3)
+    assert CoordinateAscentOptimizer(harness()).min_improvement == pytest.approx(1e-3)
+
+
+# -- tool/skill recommendations -----------------------------------------------
+
+
+class _FakeToolJudge:
+    """A judge stub: suggest_tools returns fixed items regardless of input."""
+
+    def __init__(self, items):
+        self._items = items
+        self.calls = []
+
+    def suggest_tools(self, component, failures, current_tools, *, n=3):
+        self.calls.append((component, list(failures), list(current_tools)))
+        return list(self._items)
+
+
+def build_tool_agent(*, tools=("search",)):
+    """Toy agent with a TOOL parameter backed by simple in-memory state.
+
+    The runner always answers WRONG so every example fails (giving the judge a
+    non-empty failure pool), and the tool param is optimizable but inert.
+    """
+    state = {"tools": list(tools)}
+
+    def runner(question):
+        return "WRONG"
+
+    param = Parameter(
+        name="tools",
+        kind=ParameterKind.TOOL,
+        component="agent",
+        candidates=[["search"], ["search", "calc"]],
+        getter=lambda: state["tools"],
+        setter=lambda v: state.__setitem__("tools", list(v)),
+    )
+    agent = OptimizableAgent.from_callable(runner, parameters=[param], name="tool_toy")
+    return state, agent
+
+
+def test_suggest_tools_populates_recommendations():
+    state, agent = build_tool_agent()
+    judge = _FakeToolJudge(
+        [
+            {"name": "calculator", "description": "do math", "rationale": "math fails"},
+            {"name": "wiki", "description": "lookup facts"},
+        ]
+    )
+    opt = CoordinateAscentOptimizer(
+        harness(),
+        seed=0,
+        judge=judge,
+        suggest_tools=True,
+        kinds=(ParameterKind.TOOL,),
+    )
+    res = opt.optimize(agent, dataset())
+    assert res.recommendations  # non-empty
+    joined = " ".join(res.recommendations)
+    assert "calculator" in joined
+    assert "wiki" in joined
+    assert all(r.startswith("[agent]") for r in res.recommendations)
+    # to_dict carries them.
+    assert res.to_dict()["recommendations"] == res.recommendations
+    # The judge saw the component name, failure records and current tools. The
+    # optimizer's post-search call (the last one) passes input/output/expected
+    # records derived from state.best_report.failures().
+    assert judge.calls
+    component, failures, current = judge.calls[-1]
+    assert component == "agent"
+    assert current == ["search"]
+    assert failures and set(failures[0]) == {"input", "output", "expected"}
+
+
+def test_suggest_tools_off_by_default():
+    # Isolate the optimizer's post-search suggestion from the proposer set: with
+    # only a CandidateProposer (no llm_tool proposer) and suggest_tools left at its
+    # default (False), the optimizer never calls the judge for tool ideas.
+    from adapt_agent.optimization.proposers import CandidateProposer
+
+    state, agent = build_tool_agent()
+    judge = _FakeToolJudge([{"name": "x", "description": "y"}])
+    opt = CoordinateAscentOptimizer(
+        harness(),
+        seed=0,
+        judge=judge,
+        kinds=(ParameterKind.TOOL,),
+        proposers=[CandidateProposer()],
+    )
+    assert opt.suggest_tools is False  # default
+    res = opt.optimize(agent, dataset())
+    assert res.recommendations == []
+    assert judge.calls == []
+
+
+def test_make_default_optimizer_has_four_stages_and_tool_stage():
+    opt = make_default_optimizer(harness(), max_evals=40)
+    assert isinstance(opt, PipelineOptimizer)
+    assert len(opt.stages) == 4
+    tool_stage = opt.stages[-1]
+    assert tool_stage.kinds == (ParameterKind.TOOL, ParameterKind.SKILL)
+
+
+def test_make_default_optimizer_enables_suggest_tools_with_judge():
+    judge = _FakeToolJudge([])
+    opt = make_default_optimizer(harness(), judge=judge, max_evals=40)
+    assert opt.suggest_tools is True
+    assert opt.stages[-1].suggest_tools is True
+    # Without a judge, suggest_tools stays off.
+    plain = make_default_optimizer(harness(), max_evals=40)
+    assert plain.suggest_tools is False
+    assert plain.stages[-1].suggest_tools is False
+
+
+def test_pipeline_merges_child_recommendations():
+    state, agent = build_tool_agent()
+    judge = _FakeToolJudge([{"name": "calculator", "description": "do math"}])
+    stages = [
+        CoordinateAscentOptimizer(
+            harness(),
+            seed=0,
+            judge=judge,
+            suggest_tools=True,
+            kinds=(ParameterKind.TOOL,),
+        )
+    ]
+    res = PipelineOptimizer(harness(), stages, seed=0).optimize(agent, dataset())
+    assert any("calculator" in r for r in res.recommendations)
 
 
 # -- _dedup -------------------------------------------------------------------

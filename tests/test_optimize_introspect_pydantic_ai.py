@@ -57,6 +57,62 @@ def test_predicate_rejects_unrelated_object() -> None:
     assert _predicate(object()) is False
 
 
+def test_predicate_rejects_microsoft_chat_agent_like_object() -> None:
+    # A Microsoft Agent Framework ``ChatAgent`` carries ``instructions`` +
+    # ``chat_client`` + callable ``run``; the pydantic_ai introspector (registered
+    # earlier) must never hijack it.
+    class FakeChatAgent:
+        model = "x"
+        _system_prompts = ("hi",)
+
+        def __init__(self) -> None:
+            self.instructions = "be helpful"
+            self.chat_client = object()
+
+        def run_sync(self, prompt: str) -> str:  # pragma: no cover
+            return prompt
+
+        def run(self, *a, **k):  # pragma: no cover
+            return None
+
+    assert _predicate(FakeChatAgent()) is False
+    assert detect(FakeChatAgent()) != "pydantic_ai"
+
+
+def test_tools_param_is_optimizable_with_drop_one_candidates() -> None:
+    class AgentWithTools:
+        def __init__(self) -> None:
+            self.model = "openai:gpt-4o"
+            self._system_prompts = ("be helpful",)
+            self.tools = ["search", "calculator", "wiki"]
+
+        def run_sync(self, prompt: str) -> str:  # pragma: no cover
+            return prompt
+
+    params = {p.name: p for p in introspect(AgentWithTools())}
+    tools = params["agent.tools"]
+    assert tools.kind is ParameterKind.TOOL
+    assert tools.candidates[0] == ["search", "calculator", "wiki"]
+    assert ["calculator", "wiki"] in tools.candidates
+    assert ["search", "wiki"] in tools.candidates
+    assert ["search", "calculator"] in tools.candidates
+    assert len(tools.candidates) == 4
+
+
+def test_tools_param_not_searchable_with_single_tool() -> None:
+    class AgentWithOneTool:
+        def __init__(self) -> None:
+            self.model = "openai:gpt-4o"
+            self._system_prompts = ("be helpful",)
+            self.tools = ["search"]
+
+        def run_sync(self, prompt: str) -> str:  # pragma: no cover
+            return prompt
+
+    params = {p.name: p for p in introspect(AgentWithOneTool())}
+    assert params["agent.tools"].candidates == []
+
+
 def test_predicate_rejects_multi_agent_object() -> None:
     class Orchestrator:
         model = "x"
