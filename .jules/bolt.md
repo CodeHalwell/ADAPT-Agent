@@ -64,3 +64,7 @@
 ## 2024-06-15 - Enum identity comparison optimization
 **Learning:** In performance-critical tight loops, comparing Python Enums using equality (`==`) introduces overhead from `__eq__` method dispatch.
 **Action:** Always prefer identity checks (`is`) over equality checks (`==`) when comparing Python Enums, as Enum members are singletons and identity checks bypass method overhead.
+
+## 2024-06-25 - Skip redundant object copying via optional parameters
+**Learning:** In object-oriented pipelines (like `adapt_agent/core/middleware.py`), helper methods (e.g., `process_input`) may copy input objects to ensure immutability by default. However, when the caller is creating brand-new, single-use objects specifically to pass them to these helpers (e.g., in wrapper functions), the `copy()` operation becomes a redundant performance bottleneck. Inlining the helper logic breaks subclass polymorphism.
+**Action:** Extend helper method signatures with an optional flag (e.g., `copy=True`), allowing internal callers that construct fresh objects to safely bypass the expensive copy operation (`copy=False`) while maintaining the original API for external callers and preserving subclass overrides.

@@ -116,11 +116,12 @@ class Middleware:
         del self._middleware_metadata[name]
         return True
 
-    def process_input(self, data: dict[str, Any]) -> dict[str, Any]:
+    def process_input(self, data: dict[str, Any], copy: bool = True) -> dict[str, Any]:
         """Process data through pre-middleware pipeline.
 
         Args:
             data: Input data to process
+            copy: Whether to copy the input data before processing (default: True)
 
         Returns:
             Processed data
@@ -128,7 +129,8 @@ class Middleware:
         if not self._pre_middleware:
             return data
 
-        result = data.copy()
+        # ⚡ Bolt: Only copy data if requested, bypassing redundant allocations when called internally with freshly constructed dictionaries
+        result = data.copy() if copy else data
 
         for middleware in self._pre_middleware:
             try:
@@ -139,11 +141,12 @@ class Middleware:
 
         return result
 
-    def process_output(self, data: dict[str, Any]) -> dict[str, Any]:
+    def process_output(self, data: dict[str, Any], copy: bool = True) -> dict[str, Any]:
         """Process data through post-middleware pipeline.
 
         Args:
             data: Output data to process
+            copy: Whether to copy the output data before processing (default: True)
 
         Returns:
             Processed data
@@ -151,7 +154,8 @@ class Middleware:
         if not self._post_middleware:
             return data
 
-        result = data.copy()
+        # ⚡ Bolt: Only copy data if requested, bypassing redundant allocations when called internally with freshly constructed dictionaries
+        result = data.copy() if copy else data
 
         for middleware in self._post_middleware:
             try:
@@ -181,7 +185,8 @@ class Middleware:
             input_data = {"args": args, "kwargs": kwargs}
 
             # Pre-process
-            processed_input = self.process_input(input_data)
+            # ⚡ Bolt: Pass copy=False since input_data was just created here
+            processed_input = self.process_input(input_data, copy=False)
 
             # Execute function
             result = func(
@@ -191,7 +196,8 @@ class Middleware:
 
             # Post-process
             output_data = {"result": result}
-            processed_output = self.process_output(output_data)
+            # ⚡ Bolt: Pass copy=False since output_data was just created here
+            processed_output = self.process_output(output_data, copy=False)
 
             return processed_output["result"]
 
