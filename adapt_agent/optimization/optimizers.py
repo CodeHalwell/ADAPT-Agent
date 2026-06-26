@@ -684,7 +684,17 @@ class PipelineOptimizer(Optimizer):
         best_report: EvaluationReport | None = None
 
         for stage in self.stages:
-            stage_result = stage.optimize(target, dataset)  # applies stage best in place
+            # Enforce a shared budget so the pipeline never exceeds the documented
+            # max_evals hard cap, regardless of each stage's own max_evals.
+            remaining = self.max_evals - len(combined_history)
+            if remaining <= 0:
+                break
+            original_max = stage.max_evals
+            stage.max_evals = min(original_max, remaining)
+            try:
+                stage_result = stage.optimize(target, dataset)  # applies stage best in place
+            finally:
+                stage.max_evals = original_max
             combined_history.extend(stage_result.history)
             combined_recommendations.extend(stage_result.recommendations)
             # The live target now carries this stage's best; accumulate the diff.

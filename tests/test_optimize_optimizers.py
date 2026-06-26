@@ -429,6 +429,18 @@ def test_pipeline_threads_best_across_stages():
     assert agent.run("q0") == "a0"
 
 
+def test_pipeline_enforces_shared_max_evals_budget():
+    # Two prompt stages that could each run many trials; the pipeline-wide
+    # max_evals must cap the TOTAL number of trials across stages (hard cap).
+    state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
+    stages = [
+        CoordinateAscentOptimizer(harness(), seed=0, kinds=(ParameterKind.PROMPT,), max_evals=50),
+        CoordinateAscentOptimizer(harness(), seed=0, kinds=(ParameterKind.PROMPT,), max_evals=50),
+    ]
+    res = PipelineOptimizer(harness(), stages, seed=0, max_evals=3).optimize(agent, small_dataset())
+    assert len(res.history) <= 3
+
+
 def test_pipeline_search_not_implemented():
     opt = PipelineOptimizer(harness(), [GridSearchOptimizer(harness())])
     with pytest.raises(NotImplementedError):

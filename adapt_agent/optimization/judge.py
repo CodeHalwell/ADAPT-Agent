@@ -535,13 +535,25 @@ def _stringify(value: Any) -> str:
         return str(value)
 
 
+#: Fence tag names used to delimit untrusted data. A payload that contains one of
+#: these tags (e.g. a closing ``</response>``) could otherwise break out of its
+#: fence, so :func:`_fence` neutralizes them in the content.
+_FENCE_LABELS = ("input", "response", "response_a", "response_b", "reference")
+_FENCE_TAG_RE = re.compile(rf"<(/?)({'|'.join(_FENCE_LABELS)})>", re.IGNORECASE)
+
+
 def _fence(label: str, text: str) -> str:
     """Wrap untrusted ``text`` in delimited ``<label>...</label>`` fences.
 
     The surrounding system prompt declares that fenced content is data, never
     instructions; this is the structural half of the prompt-injection defense.
+
+    Any fence tag occurring *inside* the payload (e.g. a literal ``</response>``)
+    is neutralized by HTML-escaping its angle brackets, so untrusted content cannot
+    close the fence early and smuggle text out of the data block.
     """
-    return f"\n<{label}>\n{text}\n</{label}>\n"
+    safe = _FENCE_TAG_RE.sub(lambda m: f"&lt;{m.group(1)}{m.group(2)}&gt;", text)
+    return f"\n<{label}>\n{safe}\n</{label}>\n"
 
 
 def _reference_block(expected: Any) -> str:
