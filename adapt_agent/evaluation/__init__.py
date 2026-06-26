@@ -3,6 +3,32 @@
 import logging
 from typing import Any, Callable, Optional
 
+# -- Dataset-driven evaluation (re-exported for discoverability) --------------
+#
+# Evaluation belongs in every production agent codebase, so the golden-dataset
+# evaluation engine that lives in :mod:`adapt_agent.optimization` is also exposed
+# here under the "eval" namespace. These imports pull in no third-party agent
+# framework or LLM SDK.
+from adapt_agent.optimization.dataset import Example, GoldenDataset
+from adapt_agent.optimization.evaluation import (
+    EvaluationHarness,
+    EvaluationReport,
+    ExampleResult,
+)
+from adapt_agent.optimization.judge import JudgeVerdict, LLMJudge
+from adapt_agent.optimization.metrics import (
+    Metric,
+    contains,
+    exact_match,
+    get_metric,
+    jaccard,
+    json_subset,
+    levenshtein_ratio,
+    numeric_close,
+    regex_match,
+    token_f1,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -142,4 +168,24 @@ class AgentEvaluator:
         return list(self._evaluation_results)
 
 
-__all__ = ["AgentEvaluator"]
+__all__ = [
+    "AgentEvaluator",
+    # dataset-driven evaluation
+    "GoldenDataset",
+    "Example",
+    "EvaluationHarness",
+    "EvaluationReport",
+    "ExampleResult",
+    "LLMJudge",
+    "JudgeVerdict",
+    "Metric",
+    "exact_match",
+    "contains",
+    "regex_match",
+    "token_f1",
+    "jaccard",
+    "numeric_close",
+    "json_subset",
+    "levenshtein_ratio",
+    "get_metric",
+]

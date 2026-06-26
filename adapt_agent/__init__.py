@@ -31,7 +31,20 @@ from adapt_agent.core.types import (
 # Evaluation, observability, optimization
 from adapt_agent.evaluation import AgentEvaluator
 from adapt_agent.observability import AgentObserver
-from adapt_agent.optimization import AgentOptimizer
+from adapt_agent.optimization import (
+    AgentOptimizer,
+    CoordinateAscentOptimizer,
+    EvaluationHarness,
+    Example,
+    GoldenDataset,
+    LLMJudge,
+    ModelProvider,
+    OptimizableAgent,
+    Parameter,
+    ParameterKind,
+    get_provider,
+    make_default_optimizer,
+)
 
 # Patches
 from adapt_agent.patches import PatchManager
@@ -69,6 +82,18 @@ __all__ = [
     "AgentEvaluator",
     "AgentObserver",
     "AgentOptimizer",
+    # Dataset-driven optimization & evaluation
+    "GoldenDataset",
+    "Example",
+    "EvaluationHarness",
+    "LLMJudge",
+    "ModelProvider",
+    "get_provider",
+    "OptimizableAgent",
+    "Parameter",
+    "ParameterKind",
+    "CoordinateAscentOptimizer",
+    "make_default_optimizer",
     # Patches & adapters
     "PatchManager",
     "BaseAdapter",
