@@ -63,7 +63,7 @@ class AgentOptimizer:
         Returns:
             List of optimization suggestions
         """
-        suggestions = []
+        suggestions: list[dict[str, Any]] = []
 
         # ⚡ Bolt: Single O(N) pass to collect metrics and avoid repeated array traversals
         count = 0

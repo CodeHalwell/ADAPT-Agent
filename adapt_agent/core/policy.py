@@ -5,7 +5,7 @@ import logging
 import operator
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 from adapt_agent.core.types import AgentMessage, AgentState, PolicyRule
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1024)
-def _parse_condition(condition: str) -> ast.AST:
+def _parse_condition(condition: str) -> ast.Expression:
     """Cache AST parsing for policy conditions."""
     return ast.parse(condition, mode="eval")
 
@@ -225,27 +225,37 @@ class PolicyEnforcer:
     def _eval_node(self, node: ast.AST, context: dict[str, Any], depth: int = 0) -> Any:
         if depth > 50:
             raise ValueError("Maximum evaluation depth exceeded (DoS protection)")
+        # NOTE: ``type(node) is X`` dispatch is intentionally used instead of
+        # ``isinstance`` for speed in this hot path. mypy cannot narrow on
+        # identity checks, so each branch uses ``cast`` (a zero-cost, runtime
+        # no-op) to access the concrete node's attributes.
         node_type = type(node)
         if node_type is ast.Constant:
-            return node.value
+            return cast(ast.Constant, node).value
         elif node_type is ast.Name:
-            if node.id in context:
-                return context[node.id]
-            raise ValueError(f"Unknown variable: {node.id}")
+            name_node = cast(ast.Name, node)
+            if name_node.id in context:
+                return context[name_node.id]
+            raise ValueError(f"Unknown variable: {name_node.id}")
         elif node_type is ast.List:
-            return [self._eval_node(elt, context, depth + 1) for elt in node.elts]
+            return [self._eval_node(elt, context, depth + 1) for elt in cast(ast.List, node).elts]
         elif node_type is ast.Tuple:
-            return tuple(self._eval_node(elt, context, depth + 1) for elt in node.elts)
+            return tuple(
+                self._eval_node(elt, context, depth + 1) for elt in cast(ast.Tuple, node).elts
+            )
         elif node_type is ast.Set:
-            return {self._eval_node(elt, context, depth + 1) for elt in node.elts}
+            return {self._eval_node(elt, context, depth + 1) for elt in cast(ast.Set, node).elts}
         elif node_type is ast.Dict:
+            dict_node = cast(ast.Dict, node)
             return {
                 self._eval_node(k, context, depth + 1): self._eval_node(v, context, depth + 1)
-                for k, v in zip(node.keys, node.values)
+                for k, v in zip(dict_node.keys, dict_node.values)
+                if k is not None
             }
         elif node_type is ast.Compare:
-            left = self._eval_node(node.left, context, depth + 1)
-            for op, comp in zip(node.ops, node.comparators):
+            cmp_node = cast(ast.Compare, node)
+            left = self._eval_node(cmp_node.left, context, depth + 1)
+            for op, comp in zip(cmp_node.ops, cmp_node.comparators):
                 right = self._eval_node(comp, context, depth + 1)
                 op_type = type(op)
                 if op_type not in self._OPERATORS:
@@ -255,31 +265,34 @@ class PolicyEnforcer:
                 left = right
             return True
         elif node_type is ast.BoolOp:
-            op_type = type(node.op)
-            if op_type is ast.And:
-                for value in node.values:
+            bool_node = cast(ast.BoolOp, node)
+            bool_op_type = type(bool_node.op)
+            if bool_op_type is ast.And:
+                for value in bool_node.values:
                     if not self._eval_node(value, context, depth + 1):
                         return False
                 return True
-            elif op_type is ast.Or:
-                for value in node.values:
+            elif bool_op_type is ast.Or:
+                for value in bool_node.values:
                     if self._eval_node(value, context, depth + 1):
                         return True
                 return False
-            raise ValueError(f"Unsupported boolean operator: {op_type}")
+            raise ValueError(f"Unsupported boolean operator: {bool_op_type}")
         elif node_type is ast.BinOp:
-            left = self._eval_node(node.left, context, depth + 1)
-            right = self._eval_node(node.right, context, depth + 1)
-            op_type = type(node.op)
-            if op_type not in self._BINOPS:
-                raise ValueError(f"Unsupported binary operator: {op_type}")
-            return self._BINOPS[op_type](left, right)
+            bin_node = cast(ast.BinOp, node)
+            left = self._eval_node(bin_node.left, context, depth + 1)
+            right = self._eval_node(bin_node.right, context, depth + 1)
+            bin_op_type = type(bin_node.op)
+            if bin_op_type not in self._BINOPS:
+                raise ValueError(f"Unsupported binary operator: {bin_op_type}")
+            return self._BINOPS[bin_op_type](left, right)
         elif node_type is ast.Subscript:
-            val = self._eval_node(node.value, context, depth + 1)
-            slice_type = type(node.slice)
+            sub_node = cast(ast.Subscript, node)
+            val = self._eval_node(sub_node.value, context, depth + 1)
+            slice_type = type(sub_node.slice)
             if slice_type is ast.Slice:
                 raise ValueError("Slices are not supported")
-            slice_val = self._eval_node(node.slice, context, depth + 1)
+            slice_val = self._eval_node(sub_node.slice, context, depth + 1)
             try:
                 return val[slice_val]
             except (KeyError, IndexError, TypeError):

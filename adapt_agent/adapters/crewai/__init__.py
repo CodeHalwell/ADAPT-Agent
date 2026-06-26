@@ -1,62 +1,46 @@
-"""CrewAI adapter for ADAPT-Agent."""
+"""CrewAI adapter for ADAPT-Agent.
+
+.. warning::
+   **Experimental / planned.** This adapter is a placeholder defining the
+   intended interface. Its methods raise :class:`NotImplementedError`. For a
+   fully implemented integration today, use
+   :class:`~adapt_agent.adapters.LangGraphAdapter`. Track progress in the
+   project's issue tracker.
+"""
 
 from typing import Any
 
 from adapt_agent.adapters.base import BaseAdapter
 from adapt_agent.core.types import Agent, AgentState
 
+_PLANNED_MESSAGE = (
+    "The CrewAI adapter is experimental and not yet implemented. "
+    "Use adapt_agent.adapters.LangGraphAdapter for a supported integration, "
+    "or follow https://github.com/CodeHalwell/ADAPT-Agent/issues for status."
+)
+
 
 class CrewAIAdapter(BaseAdapter):
-    """Adapter for integrating with CrewAI agents.
+    """Planned adapter for integrating with CrewAI agents.
 
-    Provides seamless integration between ADAPT-Agent and CrewAI,
-    enabling trust management, policy enforcement, and security features
-    for CrewAI-based agents.
+    This class defines the target interface but does not yet provide a working
+    implementation. All operations raise :class:`NotImplementedError`.
     """
 
+    #: Marks this adapter as not production-ready.
+    __experimental__ = True
+
     def wrap_agent(self, agent: Any) -> Agent:
-        """Wrap a CrewAI agent with ADAPT-Agent capabilities.
-
-        Args:
-            agent: CrewAI agent instance
-
-        Returns:
-            Wrapped agent implementing the Agent protocol
-        """
-        # Implementation would wrap the CrewAI agent
-        # This is a placeholder showing the structure
-        raise NotImplementedError(
-            "CrewAI integration requires crewai package. "
-            "Install with: pip install adapt-agent[crewai]"
-        )
+        """Not implemented. See class docstring."""
+        raise NotImplementedError(_PLANNED_MESSAGE)
 
     def extract_state(self, agent: Any) -> AgentState:
-        """Extract the current state from a CrewAI agent.
-
-        Args:
-            agent: CrewAI agent instance
-
-        Returns:
-            AgentState representing the current state
-        """
-        # Placeholder implementation
-        raise NotImplementedError(
-            "CrewAI integration requires crewai package. "
-            "Install with: pip install adapt-agent[crewai]"
-        )
+        """Not implemented. See class docstring."""
+        raise NotImplementedError(_PLANNED_MESSAGE)
 
     def inject_middleware(self, agent: Any, middleware: Any) -> Any:
-        """Inject ADAPT-Agent middleware into a CrewAI agent.
+        """Not implemented. See class docstring."""
+        raise NotImplementedError(_PLANNED_MESSAGE)
 
-        Args:
-            agent: CrewAI agent instance
-            middleware: Middleware to inject
 
-        Returns:
-            Modified agent with middleware
-        """
-        # Placeholder implementation
-        raise NotImplementedError(
-            "CrewAI integration requires crewai package. "
-            "Install with: pip install adapt-agent[crewai]"
-        )
+__all__ = ["CrewAIAdapter"]

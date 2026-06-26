@@ -240,11 +240,18 @@ class TaintTracker:
         Returns:
             Dictionary of statistics
         """
-        taint_level_counts = {}
+        # Count each distinct source once by its level. A source that taints
+        # multiple data items must not be counted multiple times.
+        taint_level_counts: dict[str, int] = {}
+        seen_sources: set[str] = set()
         for sources in self._tainted_data.values():
             for source_id in sources:
-                if source_id in self._taint_sources:
-                    level = self._taint_sources[source_id].level.value
+                if source_id in seen_sources:
+                    continue
+                seen_sources.add(source_id)
+                source = self._taint_sources.get(source_id)
+                if source is not None:
+                    level = source.level.value
                     taint_level_counts[level] = taint_level_counts.get(level, 0) + 1
 
         return {
