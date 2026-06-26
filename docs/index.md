@@ -64,9 +64,14 @@ pip install adapt-agent
 Optional framework extras:
 
 ```bash
-pip install "adapt-agent[langgraph]"          # LangGraph adapter (supported)
-pip install "adapt-agent[semantic-kernel]"    # experimental
-pip install "adapt-agent[crewai]"             # experimental
+pip install "adapt-agent[langgraph]"                   # LangGraph
+pip install "adapt-agent[microsoft-agent-framework]"   # Microsoft Agent Framework
+pip install "adapt-agent[google-adk]"                  # Google ADK
+pip install "adapt-agent[pydantic-ai]"                 # Pydantic AI
+pip install "adapt-agent[crewai]"                      # CrewAI
+pip install "adapt-agent[openai-agents]"               # OpenAI Agents SDK
+pip install "adapt-agent[claude-agent]"                # Claude Agent SDK
+pip install "adapt-agent[all]"                         # all of the above
 ```
 
 To build these docs locally:

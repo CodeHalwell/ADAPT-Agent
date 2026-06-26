@@ -8,26 +8,105 @@ installed.
 
 ## Support matrix
 
-| Framework | Status | Class | Extra |
-|-----------|--------|-------|-------|
-| LangGraph | **Supported** | `LangGraphAdapter` | `adapt-agent[langgraph]` |
-| Semantic Kernel | Experimental / planned | `SemanticKernelAdapter` | `adapt-agent[semantic-kernel]` |
-| CrewAI | Experimental / planned | `CrewAIAdapter` | `adapt-agent[crewai]` |
+| Framework | Class | Extra | Wrap target |
+|-----------|-------|-------|-------------|
+| LangGraph | `LangGraphAdapter` | `adapt-agent[langgraph]` | compiled graph (`.invoke`) |
+| Microsoft Agent Framework | `MicrosoftAgentFrameworkAdapter` | `adapt-agent[microsoft-agent-framework]` | `ChatAgent` (`.run`) |
+| Google ADK | `GoogleADKAdapter` | `adapt-agent[google-adk]` | callable driving a `Runner` |
+| Pydantic AI | `PydanticAIAdapter` | `adapt-agent[pydantic-ai]` | `Agent` (`.run_sync` / `.run`) |
+| CrewAI | `CrewAIAdapter` | `adapt-agent[crewai]` | `Crew` (`.kickoff`) |
+| OpenAI Agents SDK | `OpenAIAgentsAdapter` | `adapt-agent[openai-agents]` | `Agent` (driven via `Runner`) |
+| Claude Agent SDK | `ClaudeAgentSDKAdapter` | `adapt-agent[claude-agent]` | `query` function |
 
 ```python
 from adapt_agent.adapters import (
     BaseAdapter,
+    GovernedAdapter,
     LangGraphAdapter,
-    SemanticKernelAdapter,
+    MicrosoftAgentFrameworkAdapter,
+    GoogleADKAdapter,
+    PydanticAIAdapter,
     CrewAIAdapter,
+    OpenAIAgentsAdapter,
+    ClaudeAgentSDKAdapter,
 )
 ```
 
-!!! warning "Experimental adapters"
-    `SemanticKernelAdapter` and `CrewAIAdapter` are placeholders that define the
-    intended interface. Every method raises `NotImplementedError` with a message
-    pointing you to `LangGraphAdapter`. They also set `__experimental__ = True`.
-    Use LangGraph for a working integration today.
+Every adapter shares one governance pipeline (see
+[The unified pipeline](#the-unified-pipeline)) and the same keyword-only
+constructor. Importing an adapter never imports its framework — the framework is
+only needed at runtime when you build and run the agent you wrap. Async-only
+frameworks (Microsoft Agent Framework, Google ADK, Claude Agent SDK) are driven
+synchronously: coroutines are awaited and async event streams are drained to a
+list, so `execute` stays synchronous and the firewall can scan every result.
+
+---
+
+## The unified pipeline
+
+All adapters extend `GovernedAdapter`, which applies the same six steps on every
+`execute` call, regardless of framework:
+
+1. **Input screening** — `Firewall` + `AdversarialDefense` scan every string in
+   the payload.
+2. **Policy enforcement** — `PolicyEnforcer` is evaluated against the extracted
+   `AgentState`; only `action == "block"` rules block.
+3. **Pre-middleware** — an optional `Middleware` pipeline may rewrite the input.
+4. **Traced execution** — the framework agent runs, optionally traced by an
+   `AgentObserver`.
+5. **Post-middleware** — the pipeline may rewrite the result.
+6. **Output screening** — the firewall scans every string in the result.
+
+The constructor is identical for every adapter and all controls are optional and
+keyword-only:
+
+```python
+from adapt_agent import Firewall, AdversarialDefense, PolicyEnforcer, AgentObserver, Middleware
+from adapt_agent.adapters import PydanticAIAdapter
+
+adapter = PydanticAIAdapter(
+    firewall=Firewall(max_content_length=10_000),
+    defense=AdversarialDefense(),
+    policy_enforcer=PolicyEnforcer(),
+    observer=AgentObserver(),
+    middleware=None,              # can be added later via inject_middleware
+    agent_id="support-bot",       # defaults to "<framework>-agent"
+    block_on_violation=True,      # default
+)
+```
+
+### Per-framework wrap targets
+
+The only thing that differs between frameworks is the object you pass to
+`wrap_agent` and how the input is shaped:
+
+```python
+# LangGraph — wrap a compiled graph; the payload dict is passed to .invoke()
+LangGraphAdapter().wrap_agent(compiled_graph)
+
+# Microsoft Agent Framework — wrap a ChatAgent; .run() is awaited
+MicrosoftAgentFrameworkAdapter().wrap_agent(chat_agent)
+
+# Pydantic AI — wrap an Agent; .run_sync()/.run() receive a prompt string
+PydanticAIAdapter().wrap_agent(pydantic_agent)
+
+# CrewAI — wrap a Crew; the payload's non-"messages" keys become kickoff(inputs=...)
+CrewAIAdapter().wrap_agent(crew)
+
+# OpenAI Agents SDK — wrap an Agent (driven via a lazily-imported Runner)
+OpenAIAgentsAdapter().wrap_agent(openai_agent)
+
+# Claude Agent SDK — wrap the query function; the async stream is drained
+from claude_agent_sdk import query
+ClaudeAgentSDKAdapter().wrap_agent(query)
+
+# Google ADK — wrap a callable that drives a Runner (needs session/user args)
+GoogleADKAdapter().wrap_agent(lambda payload: runner.run(user_id="u", session_id="s", new_message=...))
+```
+
+For prompt-based frameworks (Microsoft Agent Framework, Pydantic AI, OpenAI
+Agents, Claude Agent SDK) the adapter derives the prompt from the payload's
+latest user message, so the same `{"messages": [...]}` shape works everywhere.
 
 ---
 
@@ -194,15 +273,30 @@ guarded = adapter.inject_middleware(compiled_graph, mw)
 
 ---
 
-## Experimental adapters
+## Other frameworks
+
+Every adapter is a thin subclass of `GovernedAdapter`. The base wraps anything
+exposing a recognized "run" method (or a plain callable) and applies the full
+pipeline, so adding a new framework is usually a few lines:
 
 ```python
-from adapt_agent.adapters import CrewAIAdapter, SemanticKernelAdapter
+from adapt_agent.adapters import GovernedAdapter
 
-adapter = CrewAIAdapter()
-adapter.wrap_agent(some_agent)
-# NotImplementedError: The CrewAI adapter is experimental and not yet implemented...
+class MyFrameworkAdapter(GovernedAdapter):
+    framework_name = "MyFramework"
+    run_method_names = ("run", "invoke")   # tried in order; callable fallback otherwise
+    operation = "myframework.run"
 
-print(CrewAIAdapter.__experimental__)        # True
-print(SemanticKernelAdapter().get_framework_name())  # "SemanticKernel"
+    def _prepare_input(self, payload):     # optional: shape the runner's argument
+        return payload
+```
+
+Because the base accepts any callable, you can also wrap an arbitrary
+`run(input) -> output` function for frameworks not listed above without writing a
+subclass at all:
+
+```python
+from adapt_agent.adapters import GovernedAdapter
+
+guarded = GovernedAdapter(firewall=fw).wrap_agent(lambda payload: my_runtime(payload))
 ```

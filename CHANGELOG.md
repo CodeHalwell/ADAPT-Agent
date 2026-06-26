@@ -9,8 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Shared `GovernedAdapter` base** (`adapt_agent.adapters._governed`) factoring
+  out the framework-agnostic governance pipeline (input screening, policy,
+  middleware, traced execution, output screening) with transparent handling of
+  sync results, async coroutines, and async event streams.
+- **Six new framework adapters**, all built on `GovernedAdapter`:
+  `MicrosoftAgentFrameworkAdapter`, `GoogleADKAdapter`, `PydanticAIAdapter`,
+  `CrewAIAdapter` (now fully implemented), `OpenAIAgentsAdapter`, and
+  `ClaudeAgentSDKAdapter`. Each ships with its own optional extra
+  (e.g. `adapt-agent[pydantic-ai]`).
 - Full `monitor` command output streaming for live observability sessions (planned).
-- Production-ready Semantic Kernel and CrewAI adapters (currently experimental/planned).
+
+### Changed
+
+- `LangGraphAdapter` now subclasses `GovernedAdapter` (behaviour unchanged).
+
+### Removed
+
+- The placeholder `SemanticKernelAdapter` and the `semantic-kernel` extra have
+  been removed.
 
 ### Fixed
 

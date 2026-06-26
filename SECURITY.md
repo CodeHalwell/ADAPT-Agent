@@ -63,16 +63,18 @@ In scope:
 - Vulnerabilities in ADAPT-Agent's own code that allow security controls to be
   bypassed — for example, defeating policy enforcement, the firewall, taint
   tracking, or trust evaluation.
-- Issues in the framework adapters (LangGraph and the experimental Semantic Kernel
-  and CrewAI adapters) where ADAPT-Agent fails to apply its protections.
+- Issues in the framework adapters (LangGraph, Microsoft Agent Framework, Google
+  ADK, Pydantic AI, CrewAI, OpenAI Agents SDK, Claude Agent SDK) where ADAPT-Agent
+  fails to apply its protections.
 - Supply-chain or packaging issues in the distributed wheel/sdist.
 - Code-execution, injection, or path-traversal issues reachable through the public
   API or the `adapt-agent` CLI (`info`, `validate`, `monitor`).
 
 Out of scope:
 
-- Vulnerabilities in third-party frameworks (LangGraph, Semantic Kernel, CrewAI) or
-  the underlying LLMs themselves, unless ADAPT-Agent's mitigations fail to behave as
+- Vulnerabilities in third-party frameworks (LangGraph, Microsoft Agent Framework,
+  Google ADK, Pydantic AI, CrewAI, OpenAI Agents SDK, Claude Agent SDK) or the
+  underlying LLMs themselves, unless ADAPT-Agent's mitigations fail to behave as
   documented.
 - Misconfiguration in a user's own deployment that is not caused by an insecure
   default in ADAPT-Agent.
