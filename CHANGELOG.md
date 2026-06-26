@@ -45,8 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`adapt_agent.optimization.introspection`).
   - The evaluation engine is re-exported from `adapt_agent.evaluation` so it is
     discoverable in the "eval" namespace, and key symbols from the package root.
-  - Docs (`docs/optimization.md`) and a runnable, offline example
-    (`examples/06_optimize_with_golden_dataset.py`).
+  - **CLI commands** `adapt-agent evaluate` and `adapt-agent optimize` that load
+    an agent (``module:attribute``, with ``()`` to call a factory) and a golden
+    dataset (``.json``/``.jsonl``/``.csv``), score it with built-in metrics
+    and/or an LLM judge (``--judge claude|openai|gemini|...``), and optimize it
+    (``--optimizer``, ``--component NAME=module:attr`` for multi-agent systems,
+    ``--save-config``, ``--val-data``, ``--json``).
+  - Docs (`docs/optimization.md`, expanded `docs/cli.md`) and a runnable, offline
+    example (`examples/06_optimize_with_golden_dataset.py`).
 - **Shared `GovernedAdapter` base** (`adapt_agent.adapters._governed`) factoring
   out the framework-agnostic governance pipeline (input screening, policy,
   middleware, traced execution, output screening) with transparent handling of

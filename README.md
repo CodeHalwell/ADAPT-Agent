@@ -195,6 +195,20 @@ adapt-agent validate config.json --json
 # Initialise monitoring for an agent and print a readiness snapshot
 adapt-agent monitor --agent-id my-agent
 adapt-agent monitor --agent-id my-agent --config config.json --json
+
+# Evaluate an agent against a golden dataset (target is module:attribute)
+adapt-agent evaluate myapp.agents:agent --data golden.jsonl --metric exact_match
+adapt-agent evaluate "myapp.agents:build()" --data golden.jsonl --judge claude --primary judge
+
+# Optimize an agent (prompts/few-shot/models/hyperparams/routing/tools) in place
+adapt-agent optimize "myapp.agents:build()" --data golden.jsonl --metric token_f1 \
+    --judge openai --optimizer default --max-evals 60 --save-config best.json
+
+# Optimize a multi-agent system: target is the entrypoint, components are tunable
+adapt-agent optimize myapp.app:orchestrate \
+    --component researcher=myapp.agents:researcher \
+    --component writer=myapp.agents:writer \
+    --data golden.jsonl --metric exact_match --judge gemini
 ```
 
 ### Configuration file schema (JSON)

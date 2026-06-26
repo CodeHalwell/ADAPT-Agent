@@ -1,7 +1,7 @@
 # Command-Line Interface
 
 Installing ADAPT-Agent provides the `adapt-agent` console script
-(`adapt_agent.cli:main`). It exposes three commands plus a global `--version`.
+(`adapt_agent.cli:main`). It exposes five commands plus a global `--version`.
 
 ```bash
 adapt-agent --version
@@ -81,6 +81,83 @@ JSON output shape:
   "timestamp": "2026-06-26T00:00:00+00:00"
 }
 ```
+
+---
+
+## `adapt-agent evaluate`
+
+Evaluates an agent against a golden dataset and prints the metric scores.
+
+The `target` is your agent, given as `module:attribute` — append `()` to call a
+zero-argument factory. It may resolve to an `OptimizableAgent`, a framework
+object (CrewAI `Crew`, Pydantic AI `Agent`, …), or a plain runner callable. The
+current working directory is added to `sys.path`, so a target in your project
+(e.g. `src/agents.py`) is importable as `src.agents:build_agent()`.
+
+```bash
+# A built-in metric:
+adapt-agent evaluate myapp.agents:agent --data golden.jsonl --metric exact_match
+
+# Score with an LLM-as-judge (provider-agnostic) plus a built-in metric:
+adapt-agent evaluate "myapp.agents:build()" --data golden.jsonl \
+    --metric token_f1 --judge claude --judge-model claude-opus-4-8 --primary judge
+
+# Machine-readable:
+adapt-agent evaluate myapp.agents:agent --data golden.jsonl --metric exact_match --json
+```
+
+Dataset files are dispatched by extension: `.json`, `.jsonl`, `.csv`. Metrics
+(`--metric`, repeatable) are any built-in: `exact_match`, `contains`,
+`regex_match`, `token_f1`, `jaccard`, `numeric_close`, `json_subset`,
+`levenshtein_ratio`. Adding `--judge PROVIDER` appends an LLM-judge metric named
+`judge` (providers include `claude`, `openai`, `gemini`, `mistral`, `cohere`,
+`groq`, `together`, `ollama`, `bedrock`, `huggingface`). `--primary` selects the
+headline metric (defaults to the first). Exit code is `0` on success, `1` on any
+error (printed as text, or `{"status": "error", ...}` with `--json`).
+
+---
+
+## `adapt-agent optimize`
+
+Optimizes an agent against a golden dataset — tuning prompts, few-shot examples,
+models, hyperparameters, routing, and tools — then applies the best
+configuration to the live agent and reports the improvement.
+
+```bash
+# Single agent, default "do everything" pipeline:
+adapt-agent optimize "myapp.agents:build()" --data golden.jsonl \
+    --metric exact_match --judge openai --optimizer default --max-evals 60
+
+# A multi-agent system: the target is the entrypoint, components are tunable:
+adapt-agent optimize myapp.app:orchestrate \
+    --component researcher=myapp.agents:researcher \
+    --component writer=myapp.agents:writer \
+    --data golden.jsonl --metric token_f1 --judge claude \
+    --optimizer coordinate_ascent --val-data holdout.jsonl \
+    --save-config best_config.json
+```
+
+Shares all of `evaluate`'s options, plus:
+
+| Option | Description |
+|--------|-------------|
+| `--optimizer` | `default` (pipeline), `coordinate_ascent`, `bootstrap_few_shot`, `grid`, `random`, `evolutionary`. |
+| `--max-evals` | Evaluation budget (default 60). |
+| `--seed` | RNG seed for reproducible search (default 0). |
+| `--component NAME=module:attr` | Register a framework component to introspect for tunable knobs (repeatable). With components, `target`/`--runner` is the system entrypoint. |
+| `--runner module:attr` | Explicit runner callable driving the whole system. |
+| `--val-data FILE` | Held-out dataset; its score is reported as `validation`. |
+| `--save-config FILE` | Write the winning configuration to a JSON file. |
+| `--verbose` | Log each trial. |
+
+`--json` emits the `OptimizationResult` summary (`improved`, `baseline_score`,
+`best_score`, `improvement`, `validation_score`, `n_evals`, `best_config`).
+
+!!! note "The target executes"
+    `evaluate`/`optimize` import and run your agent code, which executes it.
+    Point them at your own modules. An LLM judge or a live framework agent will
+    make real model/API calls (and may require credentials), so start with a
+    small dataset.
 
 ---
 
