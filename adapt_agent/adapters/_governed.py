@@ -42,6 +42,7 @@ caller at the framework's native async API.
 import asyncio
 import inspect
 import uuid
+from collections.abc import AsyncIterable
 from typing import Any, Callable, Optional, cast
 
 from adapt_agent.adapters.base import BaseAdapter
@@ -83,6 +84,19 @@ _RECURSE_ATTRS = (
 )
 
 
+def _safe_getattr(obj: Any, attr: str) -> Any:
+    """``getattr(obj, attr, None)`` that never propagates.
+
+    Framework result objects may expose attributes via descriptors/properties
+    that raise. Since text extraction feeds the security pipeline, a raising
+    attribute must not crash the whole execution -- treat it as absent.
+    """
+    try:
+        return getattr(obj, attr, None)
+    except Exception:
+        return None
+
+
 def _extract_texts(data: Any) -> list[str]:
     """Best-effort extraction of human-readable text from an arbitrary payload.
 
@@ -98,6 +112,10 @@ def _extract_texts(data: Any) -> list[str]:
             return
         if isinstance(value, str):
             texts.append(value)
+        elif value is None or isinstance(value, (int, float, bool)):
+            # Primitives carry no text and have no attributes worth probing;
+            # returning early avoids pointless getattr lookups on large payloads.
+            return
         elif isinstance(value, dict):
             for v in value.values():
                 _walk(v, depth + 1)
@@ -108,7 +126,7 @@ def _extract_texts(data: Any) -> list[str]:
             # Framework message / result objects expose their text via one of a
             # handful of well-known attributes. Recurse into anything walkable.
             for attr in _TEXT_ATTRS:
-                inner = getattr(value, attr, None)
+                inner = _safe_getattr(value, attr)
                 if isinstance(inner, str):
                     texts.append(inner)
                 elif isinstance(inner, (dict, list, tuple)):
@@ -116,7 +134,7 @@ def _extract_texts(data: Any) -> list[str]:
             # Structured content containers (e.g. genai ``Content.parts``) hold
             # further objects whose text we still want to scan.
             for attr in _RECURSE_ATTRS:
-                inner = getattr(value, attr, None)
+                inner = _safe_getattr(value, attr)
                 if inner is not None and not isinstance(inner, (str, int, float, bool)):
                     _walk(inner, depth + 1)
 
@@ -130,27 +148,37 @@ def _extract_prompt(payload: Any) -> str:
     Many frameworks (Pydantic AI, OpenAI Agents, Microsoft Agent Framework,
     Claude Agent SDK) run from a string prompt rather than a state dict. This
     helper picks the most plausible prompt: the latest user message, then a
-    common prompt-like key, then a string fallback.
+    common prompt-like key, then a string fallback. It accepts a state dict, a
+    bare list/tuple of messages, or a plain string.
     """
     if isinstance(payload, str):
         return payload
+
     if isinstance(payload, dict):
-        messages = payload.get("messages")
-        if isinstance(messages, list) and messages:
-            for message in reversed(messages):
-                if isinstance(message, dict):
-                    role, content = message.get("role"), message.get("content")
-                else:
-                    role = getattr(message, "role", None)
-                    content = getattr(message, "content", None)
-                if isinstance(content, str) and (role == "user" or role is None):
-                    return content
-            last = messages[-1]
-            last_content = (
-                last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
-            )
-            if isinstance(last_content, str):
-                return last_content
+        messages: Any = payload.get("messages")
+    elif isinstance(payload, (list, tuple)):
+        messages = payload
+    else:
+        messages = None
+
+    if isinstance(messages, (list, tuple)) and messages:
+        for message in reversed(messages):
+            if isinstance(message, dict):
+                role, content = message.get("role"), message.get("content")
+            else:
+                role = _safe_getattr(message, "role")
+                content = _safe_getattr(message, "content")
+            role_str = role.lower() if isinstance(role, str) else None
+            if isinstance(content, str) and (role_str == "user" or role is None):
+                return content
+        last = messages[-1]
+        last_content = (
+            last.get("content") if isinstance(last, dict) else _safe_getattr(last, "content")
+        )
+        if isinstance(last_content, str):
+            return last_content
+
+    if isinstance(payload, dict):
         for key in ("prompt", "input", "query", "text"):
             value = payload.get(key)
             if isinstance(value, str):
@@ -169,7 +197,9 @@ def _resolve_result(value: Any) -> Any:
         AdapterError: If an awaitable is produced while an event loop is already
             running on this thread (where blocking is unsafe).
     """
-    if inspect.isasyncgen(value):
+    # ``AsyncIterable`` covers both ``async def`` generators and custom async
+    # iterators (``__aiter__``/``__anext__``), which streaming SDKs often return.
+    if isinstance(value, AsyncIterable):
         return _run_coro(_drain_async_gen(value))
     if inspect.isawaitable(value):
         return _run_coro(_await(value))
@@ -451,9 +481,12 @@ class _GovernedAgent:
         if out_threats and adapter.block_on_violation:
             raise SecurityBlockedError("Output blocked by security controls", out_threats)
 
-        if isinstance(result, dict):
-            self._last_state = adapter.extract_state(result)
-        return result if isinstance(result, dict) else {"result": result}
+        # Track state from the actual returned payload. Non-dict framework
+        # results (AgentRunResult, CrewOutput, ...) are wrapped in {"result": ...}
+        # so get_state() reflects the latest execution rather than stale input.
+        output_payload = result if isinstance(result, dict) else {"result": result}
+        self._last_state = adapter.extract_state(output_payload)
+        return output_payload
 
     def get_state(self) -> AgentState:
         """Return the most recently observed agent state."""

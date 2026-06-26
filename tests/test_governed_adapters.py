@@ -362,3 +362,59 @@ def test_extract_texts_reaches_nested_object_attrs():
 
     event = ADKEvent("part text")
     assert "part text" in _extract_texts([event])
+
+
+def test_extract_prompt_accepts_bare_message_list():
+    # Payload is a list of messages, not wrapped in a dict.
+    assert _extract_prompt([{"role": "user", "content": "from a list"}]) == "from a list"
+
+
+def test_extract_prompt_role_is_case_insensitive():
+    assert _extract_prompt({"messages": [{"role": "USER", "content": "shout"}]}) == "shout"
+
+
+def test_extract_texts_ignores_primitives_and_raising_attrs():
+    class Raises:
+        @property
+        def content(self):
+            raise RuntimeError("boom")
+
+    # Primitives must not crash or be probed; a raising property is swallowed.
+    assert _extract_texts({"a": 1, "b": None, "c": True, "d": 3.5}) == []
+    assert _extract_texts({"obj": Raises()}) == []
+
+
+def test_resolve_result_drains_custom_async_iterator():
+    """A custom async iterator (not an async-def generator) is still drained."""
+
+    class StreamingResult:
+        def __init__(self, items):
+            self._items = items
+
+        def __aiter__(self):
+            self._it = iter(self._items)
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._it)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    def run(prompt):
+        return StreamingResult([TextBlock("streamed one"), TextBlock("streamed two")])
+
+    adapter = ClaudeAgentSDKAdapter()
+    wrapped = adapter.wrap_agent(run)
+    result = wrapped.execute(_payload("hello"))
+    assert [b.text for b in result["result"]] == ["streamed one", "streamed two"]
+
+
+def test_get_state_reflects_non_dict_result():
+    agent = FakePydanticAgent("the answer")
+    adapter = PydanticAIAdapter()
+    wrapped = adapter.wrap_agent(agent)
+    wrapped.execute(_payload("question"))
+    state = wrapped.get_state()
+    # The custom result object is tracked in context, not the stale input.
+    assert state["context"].get("result").output == "the answer"
