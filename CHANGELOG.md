@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Declarative YAML/JSON training config** (`adapt_agent.optimization.config`):
+  `load_training_config()` / `run_training()` and the `adapt-agent train CONFIG.yaml`
+  CLI command wire a whole optimization run (target, dataset, judge, metrics,
+  optimizer, explicit parameters) from one file. Temperature/`top_p` bounds that
+  exceed a provider's allowable range are clamped with a warning instead of
+  crashing; unknown metric/provider/optimizer/kind names raise a clear
+  `TrainingConfigError`. See `examples/07_train_from_yaml.py` and
+  `examples/train.example.yaml`.
+- **Tool & skill optimization**: introspection now discovers `tools`/`skills` as
+  searchable knobs (drop-one ablation candidates), a new `ParameterKind.SKILL`,
+  and `ToolAblationProposer`. The LLM judge can act as an **adversary**
+  (`LLMJudge(adversarial=True)`) and propose *new* tools/skills from observed
+  failures (`LLMJudge.suggest_tools`, `LLMJudge.red_team`, `LLMToolProposer`);
+  `OptimizationResult.recommendations` surfaces those advisory suggestions.
+- `OptimizableAgent.add_tool_parameter()` convenience for declaring tool/skill knobs.
+
+### Changed / Fixed
+
+- **Judge robustness**: brace-depth JSON parsing, labeled-score extraction with
+  out-of-range rejection, `score_is_normalized`, position-swap debiasing in
+  `compare`, rubric moved to the provider `system` prompt with fenced untrusted
+  content (prompt-injection / reward-hacking hardening), and auth errors are
+  re-raised (not silently scored 0.0).
+- **Provider sampling safety**: omit `temperature`/`top_p` for models that reject
+  them (e.g. Anthropic Opus 4.8/4.7, Fable 5), clamp to each provider's
+  `max_temperature`, and retry once without sampling params on a 400.
+- **Security defaults**: firewall checks blocked patterns before any allow-list
+  short-circuit (allow no longer nullifies block; opt back in with
+  `whitelist_mode=True`); adversarial detection normalizes input (NFKC /
+  zero-width / whitespace) and records each attack once; `PolicyEnforcer(fail_closed=True)`
+  and a node-count cap; `TrustManager` LRU eviction with a distrust floor;
+  `TaintTracker` fails closed on evicted sources; `Middleware(fail_closed=True)`
+  and duplicate-name rejection.
+- Introspection predicate hardening so a Microsoft Agent Framework `ChatAgent` /
+  magentic orchestrator is never mis-claimed by another framework's introspector.
+- `min_improvement` default raised to `1e-3` (avoid chasing judge noise);
+  `EvaluationHarness(failure_threshold=...)`; dataset loaders gain explicit
+  `input_key`/`expected_key` overrides and no longer treat an `output` column as
+  ground truth.
+- `pyyaml` is now a runtime dependency; the "dependency-free" framing is dropped
+  in favour of "install what the job needs" (agent-framework SDKs stay lazy).
+
 - **Dataset-driven optimization & evaluation subsystem** (`adapt_agent.optimization`).
   Evaluate any agent against a golden dataset and automatically optimize it --
   tuning prompts, few-shot examples, models, hyperparameters, routing/topology,

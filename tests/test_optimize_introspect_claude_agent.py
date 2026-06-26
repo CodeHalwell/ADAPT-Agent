@@ -108,3 +108,44 @@ def test_optional_attrs_present_when_set() -> None:
     by_name = {p.name: p for p in introspect(opts)}
     assert by_name["agent.disallowed_tools"].kind is ParameterKind.TOOL
     assert by_name["agent.permission_mode"].kind is ParameterKind.ROUTING
+
+
+def test_permission_mode_has_real_candidates() -> None:
+    opts = types.SimpleNamespace(
+        system_prompt="hi",
+        model="claude-sonnet-4-5",
+        allowed_tools=["Read"],
+        max_turns=10,
+        permission_mode="default",
+    )
+    by_name = {p.name: p for p in introspect(opts)}
+    pm = by_name["agent.permission_mode"]
+    assert pm.candidates == ["default", "acceptEdits", "plan", "bypassPermissions"]
+    # With candidates the knob is actually optimizable/searchable.
+    assert pm.optimizable
+    assert pm.enumerate_candidates() == ["default", "acceptEdits", "plan", "bypassPermissions"]
+
+
+def test_allowed_tools_optimizable_with_drop_one_candidates() -> None:
+    # Two-plus allowed tools -> drop-one ablation candidates.
+    opts = _make_options()  # allowed_tools=["Read", "Grep"]
+    by_name = {p.name: p for p in introspect(opts)}
+    tools = by_name["agent.allowed_tools"]
+
+    assert tools.kind is ParameterKind.TOOL
+    assert tools.candidates is not None
+    assert tools.candidates[0] == ["Read", "Grep"]
+    assert ["Grep"] in tools.candidates
+    assert ["Read"] in tools.candidates
+    assert tools.optimizable
+
+
+def test_allowed_tools_single_has_no_candidates() -> None:
+    opts = types.SimpleNamespace(
+        system_prompt="hi",
+        model="claude-sonnet-4-5",
+        allowed_tools=["Read"],
+        max_turns=10,
+    )
+    by_name = {p.name: p for p in introspect(opts)}
+    assert by_name["agent.allowed_tools"].candidates is None

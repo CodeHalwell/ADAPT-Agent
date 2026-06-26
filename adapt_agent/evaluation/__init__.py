@@ -1,7 +1,8 @@
 """Evaluation frameworks for LLM agents."""
 
 import logging
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any, Optional
 
 # -- Dataset-driven evaluation (re-exported for discoverability) --------------
 #
@@ -67,7 +68,7 @@ class AgentEvaluator:
         agent_id: str,
         input_data: Any,
         output_data: Any,
-        expected_output: Optional[Any] = None,
+        expected_output: Any | None = None,
     ) -> dict[str, Any]:
         """Evaluate an agent's response.
 
@@ -107,7 +108,7 @@ class AgentEvaluator:
 
     def compute_aggregate_metrics(
         self,
-        agent_id: Optional[str] = None,
+        agent_id: str | None = None,
     ) -> dict[str, float]:
         """Compute aggregate metrics across evaluations.
 
@@ -137,8 +138,8 @@ class AgentEvaluator:
 
     def get_evaluation_results(
         self,
-        agent_id: Optional[str] = None,
-        limit: Optional[int] = None,
+        agent_id: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Get evaluation results.
 

@@ -81,7 +81,7 @@ def _builtin_metric_names() -> list[str]:
     return list(_BUILTIN_METRIC_NAMES)
 
 
-def main(args: Optional[list[str]] = None) -> int:
+def main(args: list[str] | None = None) -> int:
     """Main entry point for the CLI.
 
     Args:
@@ -107,6 +107,14 @@ def main(args: Optional[list[str]] = None) -> int:
     validate_parser = subparsers.add_parser("validate", help="Validate a configuration file")
     validate_parser.add_argument("config_file", help="Path to a JSON configuration file")
     validate_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON output"
+    )
+
+    train_parser = subparsers.add_parser(
+        "train", help="Run a full optimization pass from a YAML/JSON training config"
+    )
+    train_parser.add_argument("config_file", help="Path to a YAML or JSON training config")
+    train_parser.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON output"
     )
 
@@ -186,6 +194,8 @@ def main(args: Optional[list[str]] = None) -> int:
         return _cmd_evaluate(parsed_args)
     if parsed_args.command == "optimize":
         return _cmd_optimize(parsed_args)
+    if parsed_args.command == "train":
+        return _cmd_train(parsed_args)
 
     return 0
 
@@ -341,7 +351,7 @@ def _cmd_validate(config_file: str, as_json: bool = False) -> int:
     return 1 if errors else 0
 
 
-def _cmd_monitor(agent_id: str, config_file: Optional[str] = None, as_json: bool = False) -> int:
+def _cmd_monitor(agent_id: str, config_file: str | None = None, as_json: bool = False) -> int:
     """Initialise the observability stack for an agent and report readiness."""
     # Imported lazily to keep `info`/`validate` fast and dependency-light.
     from adapt_agent.observability import AgentObserver
@@ -424,9 +434,13 @@ def _load_object(spec: str) -> Any:
     if not sep or not module_name or not attr_path:
         raise ValueError(f"Expected 'module:attribute', got {spec!r}")
 
+    # Make the user's project importable, but APPEND the working directory so an
+    # installed/stdlib package always wins over a same-named file in the CWD
+    # (prepending invites a CWD-import hijack: a local os.py / requests.py could
+    # shadow the real module and run on import).
     cwd = os.getcwd()
     if cwd not in sys.path:
-        sys.path.insert(0, cwd)
+        sys.path.append(cwd)
 
     obj: Any = importlib.import_module(module_name)
     for part in attr_path.split("."):
@@ -456,11 +470,13 @@ def _build_components(specs: list[str]) -> dict[str, Any]:
         name = name.strip()
         if not sep or not name or not spec:
             raise ValueError(f"--component expects NAME=module:attr, got {item!r}")
+        if name in components:
+            raise ValueError(f"Duplicate --component name {name!r}")
         components[name] = _load_object(spec)
     return components
 
 
-def _build_judge(provider: Optional[str], model: Optional[str]) -> Any:
+def _build_judge(provider: str | None, model: str | None) -> Any:
     """Construct an LLM judge for a provider name, or ``None`` when unset."""
     if not provider:
         return None
@@ -469,7 +485,7 @@ def _build_judge(provider: Optional[str], model: Optional[str]) -> Any:
     return get_judge(provider, model=model)
 
 
-def _build_metrics(names: list[str], judge: Any, primary: Optional[str]) -> tuple[list[Any], str]:
+def _build_metrics(names: list[str], judge: Any, primary: str | None) -> tuple[list[Any], str]:
     """Build the metric list (built-ins + optional judge) and the primary name."""
     from adapt_agent.optimization import get_metric
 
@@ -607,6 +623,51 @@ def _cmd_optimize(args: Any) -> int:
             print("  no improving configuration found (agent left unchanged).")
         if args.save_config:
             print(f"  saved best config to: {args.save_config}")
+    return 0
+
+
+def _cmd_train(args: Any) -> int:
+    """Run an end-to-end training/optimization pass from a declarative config."""
+    import os
+
+    from adapt_agent.optimization.config import load_training_config, run_training
+
+    # Same project-importability seam as `_load_object`, appended so it can't
+    # shadow installed/stdlib modules.
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.append(cwd)
+
+    try:
+        config = load_training_config(args.config_file)
+        result = run_training(config)
+    except Exception as exc:
+        return _fail(exc, args.json)
+
+    if args.json:
+        payload = result.to_dict()
+        payload["recommendations"] = list(result.recommendations)
+        print(json.dumps(payload, indent=2, default=str))
+    else:
+        print(f"Trained from '{args.config_file}':")
+        print(f"  baseline   : {result.baseline_score:.4f}")
+        print(f"  best       : {result.best_score:.4f}  (improvement {result.improvement:+.4f})")
+        if result.validation_score is not None:
+            print(f"  validation : {result.validation_score:.4f}")
+        print(f"  evaluations: {result.n_evals}")
+        if result.best_config:
+            print("  best config:")
+            for key, value in result.best_config.items():
+                preview = repr(value)
+                if len(preview) > 80:
+                    preview = preview[:77] + "..."
+                print(f"    - {key} = {preview}")
+        else:
+            print("  no improving configuration found (agent left unchanged).")
+        if result.recommendations:
+            print("  judge recommendations (advisory):")
+            for tip in result.recommendations:
+                print(f"    - {tip}")
     return 0
 
 

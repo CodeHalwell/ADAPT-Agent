@@ -15,7 +15,8 @@ All built-ins are pure-Python and dependency-free.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 #: A bare metric function. Either ``(output, expected)`` or, for example-aware
 #: metrics wrapped in :class:`Metric`, ``(output, expected, example)``.

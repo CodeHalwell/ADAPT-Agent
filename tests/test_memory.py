@@ -101,6 +101,41 @@ def test_consolidate_keeps_below_threshold():
     assert len(mem._long_term_memory) == 0
 
 
+def test_long_term_upsert_dedupes_by_key():
+    """Storing the same key in long-term updates in place, no duplicates."""
+    mem = MemorySystem()
+    mem.store_long_term("k", "v1")
+    mem.store_long_term("k", "v2")
+
+    assert len(mem._long_term_memory) == 1
+    assert mem.retrieve("k", from_long_term=True) == "v2"
+
+
+def test_consolidate_carries_access_count_and_upserts():
+    """Consolidation carries the access count and dedupes across runs."""
+    mem = MemorySystem()
+    mem.store_short_term("hot", "h")
+
+    # Access "hot" 4 times -> access_count = 4 (>= threshold 3).
+    for _ in range(4):
+        mem.retrieve("hot")
+
+    assert mem.consolidate() == 1
+
+    long_item = mem._long_term_memory[0]
+    assert long_item["key"] == "hot"
+    # The count that earned consolidation is carried over, not reset to 0.
+    assert long_item["access_count"] == 4
+
+    # Re-consolidating the same key does not create a duplicate entry.
+    mem.store_short_term("hot", "h2")
+    for _ in range(3):
+        mem.retrieve("hot")
+    assert mem.consolidate() == 1
+    assert len(mem._long_term_memory) == 1
+    assert mem.retrieve("hot", from_long_term=True) == "h2"
+
+
 def test_clear_short_and_long_term():
     mem = MemorySystem()
     mem.store_short_term("a", 1)

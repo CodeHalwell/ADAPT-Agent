@@ -34,6 +34,12 @@ Quick start::
     print(result)   # baseline vs best, with the best config applied in place
 """
 
+from adapt_agent.optimization.config import (
+    TrainingConfig,
+    TrainingConfigError,
+    load_training_config,
+    run_training,
+)
 from adapt_agent.optimization.dataset import Example, GoldenDataset
 from adapt_agent.optimization.evaluation import (
     EvaluationHarness,
@@ -73,10 +79,12 @@ from adapt_agent.optimization.proposers import (
     CandidateProposer,
     FewShotProposer,
     LLMProposer,
+    LLMToolProposer,
     NumericProposer,
     PromptMutationProposer,
     ProposalContext,
     Proposer,
+    ToolAblationProposer,
     default_proposers,
 )
 from adapt_agent.optimization.providers import (
@@ -144,6 +152,8 @@ __all__ = [
     "PromptMutationProposer",
     "FewShotProposer",
     "LLMProposer",
+    "ToolAblationProposer",
+    "LLMToolProposer",
     "default_proposers",
     # optimizers
     "Optimizer",
@@ -156,4 +166,9 @@ __all__ = [
     "EvolutionaryOptimizer",
     "PipelineOptimizer",
     "make_default_optimizer",
+    # declarative training config
+    "TrainingConfig",
+    "TrainingConfigError",
+    "load_training_config",
+    "run_training",
 ]

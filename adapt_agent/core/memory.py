@@ -1,7 +1,10 @@
 """Memory systems for LLM agents."""
 
+from __future__ import annotations
+
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 
 class MemorySystem:
@@ -25,7 +28,9 @@ class MemorySystem:
         self.short_term_capacity = short_term_capacity
         self.long_term_capacity = long_term_capacity
 
-        self._short_term_memory: list[dict[str, Any]] = []
+        # Short-term memory is a FIFO ring buffer: a deque with maxlen evicts
+        # the oldest item in O(1) on append instead of the O(N) ``list.pop(0)``.
+        self._short_term_memory: deque[dict[str, Any]] = deque(maxlen=short_term_capacity)
         self._long_term_memory: list[dict[str, Any]] = []
         self._metadata: dict[str, Any] = {}
 
@@ -33,7 +38,7 @@ class MemorySystem:
         self,
         key: str,
         value: Any,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Store an item in short-term memory.
 
@@ -50,38 +55,54 @@ class MemorySystem:
             "access_count": 0,
         }
 
+        # deque(maxlen=...) evicts the oldest item automatically on overflow.
         self._short_term_memory.append(memory_item)
-
-        # Maintain capacity
-        if len(self._short_term_memory) > self.short_term_capacity:
-            self._short_term_memory.pop(0)
 
     def store_long_term(
         self,
         key: str,
         value: Any,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
+        access_count: int = 0,
     ) -> None:
         """Store an item in long-term memory.
+
+        Long-term storage is upsert-by-key: storing an existing key updates
+        the stored value/metadata in place (and keeps the higher access count)
+        rather than appending a duplicate entry. This prevents the same key
+        accumulating across repeated consolidations.
 
         Args:
             key: Key for the memory item
             value: Value to store
             metadata: Optional metadata
+            access_count: Initial access count to seed the item with. Used when
+                consolidating a short-term item so the count that earned
+                consolidation is carried over instead of reset to 0.
         """
+        # Upsert: if the key already exists, update it in place.
+        for existing in self._long_term_memory:
+            if existing["key"] == key:
+                existing["value"] = value
+                if metadata is not None:
+                    existing["metadata"] = metadata
+                # Preserve the strongest signal of importance.
+                existing["access_count"] = max(existing["access_count"], access_count)
+                existing["timestamp"] = datetime.now(timezone.utc).isoformat()
+                return
+
         memory_item = {
             "key": key,
             "value": value,
             "metadata": metadata or {},
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "access_count": 0,
+            "access_count": access_count,
         }
 
         self._long_term_memory.append(memory_item)
 
-        # Maintain capacity
+        # Maintain capacity by evicting the least-accessed item.
         if len(self._long_term_memory) > self.long_term_capacity:
-            # Remove least accessed items: O(N) manual loop to minimize overhead
             min_idx = 0
             min_access = self._long_term_memory[0]["access_count"]
             for i in range(1, len(self._long_term_memory)):
@@ -95,7 +116,7 @@ class MemorySystem:
         self,
         key: str,
         from_long_term: bool = False,
-    ) -> Optional[Any]:
+    ) -> Any | None:
         """Retrieve an item from memory.
 
         Args:
@@ -149,7 +170,9 @@ class MemorySystem:
     def consolidate(self) -> int:
         """Consolidate short-term memory into long-term memory.
 
-        Moves frequently accessed short-term memories to long-term storage.
+        Moves frequently accessed short-term memories to long-term storage,
+        carrying over each item's access count so the signal that earned
+        consolidation is preserved (and upsert-by-key avoids duplicates).
 
         Returns:
             Number of items consolidated
@@ -157,13 +180,18 @@ class MemorySystem:
         # Find frequently accessed items
         threshold = 3  # Access count threshold
         consolidated = 0
-        new_short_term = []
+        new_short_term: deque[dict[str, Any]] = deque(maxlen=self.short_term_capacity)
 
         # ⚡ Bolt: Replace O(N²) list.remove() in a loop with O(N) list comprehension/rebuilding
         for item in self._short_term_memory:
             if item["access_count"] >= threshold:
                 # SECURITY: Use store_long_term instead of append to enforce capacity limits (DoS prevention)
-                self.store_long_term(item["key"], item["value"], item.get("metadata"))
+                self.store_long_term(
+                    item["key"],
+                    item["value"],
+                    item.get("metadata"),
+                    access_count=item["access_count"],
+                )
                 consolidated += 1
             else:
                 new_short_term.append(item)

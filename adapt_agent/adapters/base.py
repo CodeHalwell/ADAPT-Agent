@@ -1,7 +1,7 @@
 """Base adapter interface for framework integrations."""
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any
 
 from adapt_agent.core.types import Agent, AgentState
 
@@ -13,7 +13,7 @@ class BaseAdapter(ABC):
     converting framework-specific APIs to ADAPT-Agent's unified interface.
     """
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the adapter.
 
         Args:

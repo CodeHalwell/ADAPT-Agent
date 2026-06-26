@@ -23,7 +23,12 @@ from typing import Any
 #: Keys recognised as the *input* field when loading from records/files.
 _INPUT_KEYS = ("inputs", "input", "question", "prompt", "query", "request")
 #: Keys recognised as the *expected output* field when loading from records.
-_EXPECTED_KEYS = ("expected", "expected_output", "answer", "output", "label", "target", "gold")
+#:
+#: ``"output"`` is deliberately **not** here: it is the conventional name for an
+#: agent's *produced* output, so auto-mapping it to ``expected`` would silently
+#: treat a model's own answer as ground truth. Pass ``expected_key="output"``
+#: explicitly if a particular file really stores the gold answer under that name.
+_EXPECTED_KEYS = ("expected", "expected_output", "answer", "label", "target", "gold")
 
 
 @dataclass
@@ -44,16 +49,36 @@ class Example:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_record(cls, record: dict[str, Any]) -> Example:
+    def from_record(
+        cls,
+        record: dict[str, Any],
+        *,
+        input_key: str | None = None,
+        expected_key: str | None = None,
+    ) -> Example:
         """Build an :class:`Example` from a loosely-structured dict.
 
         The input and expected fields are located by trying the well-known key
         names in :data:`_INPUT_KEYS` / :data:`_EXPECTED_KEYS`. Any remaining keys
         become metadata, so extra columns survive the round-trip.
+
+        Args:
+            record: The source mapping.
+            input_key: Explicit column name for the input field. When given it
+                takes priority over auto-detection (and the named column is
+                always consumed, even if its value is ``None``/absent).
+            expected_key: Explicit column name for the expected/gold field.
+                Takes priority over auto-detection.
         """
         record = dict(record)
-        inputs = _pop_first(record, _INPUT_KEYS)
-        expected = _pop_first(record, _EXPECTED_KEYS)
+        if input_key is not None:
+            inputs = record.pop(input_key, None)
+        else:
+            inputs = _pop_first(record, _INPUT_KEYS)
+        if expected_key is not None:
+            expected = record.pop(expected_key, None)
+        else:
+            expected = _pop_first(record, _EXPECTED_KEYS)
         # An explicit metadata mapping is merged with leftover columns.
         meta = record.pop("metadata", None)
         metadata: dict[str, Any] = dict(meta) if isinstance(meta, dict) else {}
@@ -84,44 +109,93 @@ class GoldenDataset:
     # -- construction ----------------------------------------------------------
 
     @classmethod
-    def from_list(cls, records: Iterable[Example | dict[str, Any]]) -> GoldenDataset:
-        """Build a dataset from a list of :class:`Example` or plain dicts."""
+    def from_list(
+        cls,
+        records: Iterable[Example | dict[str, Any]],
+        *,
+        input_key: str | None = None,
+        expected_key: str | None = None,
+    ) -> GoldenDataset:
+        """Build a dataset from a list of :class:`Example` or plain dicts.
+
+        ``input_key``/``expected_key`` override the auto-detected column names
+        for dict records (see :meth:`Example.from_record`). They are ignored for
+        records that are already :class:`Example` instances.
+        """
         examples: list[Example] = []
         for record in records:
             if isinstance(record, Example):
                 examples.append(record)
             elif isinstance(record, dict):
-                examples.append(Example.from_record(record))
+                examples.append(
+                    Example.from_record(record, input_key=input_key, expected_key=expected_key)
+                )
             else:
                 raise TypeError(f"Cannot build Example from {type(record)!r}")
         return cls(examples)
 
     @classmethod
-    def from_json(cls, path: str | Path) -> GoldenDataset:
-        """Load from a JSON file containing a list of records (or ``{"examples": [...]}``)."""
+    def from_json(
+        cls,
+        path: str | Path,
+        *,
+        input_key: str | None = None,
+        expected_key: str | None = None,
+    ) -> GoldenDataset:
+        """Load from a JSON file containing a list of records (or ``{"examples": [...]}``).
+
+        ``input_key``/``expected_key`` override auto-detected column names.
+        """
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         if isinstance(data, dict) and "examples" in data:
             data = data["examples"]
         if not isinstance(data, list):
             raise ValueError("JSON dataset must be a list or an object with an 'examples' list")
-        return cls.from_list(data)
+        return cls.from_list(data, input_key=input_key, expected_key=expected_key)
 
     @classmethod
-    def from_jsonl(cls, path: str | Path) -> GoldenDataset:
-        """Load from a JSON Lines file (one JSON object per line)."""
+    def from_jsonl(
+        cls,
+        path: str | Path,
+        *,
+        input_key: str | None = None,
+        expected_key: str | None = None,
+    ) -> GoldenDataset:
+        """Load from a JSON Lines file (one JSON object per line).
+
+        ``input_key``/``expected_key`` override auto-detected column names.
+        """
         examples: list[Example] = []
         for line in Path(path).read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
-            examples.append(Example.from_record(json.loads(line)))
+            examples.append(
+                Example.from_record(
+                    json.loads(line), input_key=input_key, expected_key=expected_key
+                )
+            )
         return cls(examples)
 
     @classmethod
-    def from_csv(cls, path: str | Path) -> GoldenDataset:
-        """Load from a CSV file with a header row."""
+    def from_csv(
+        cls,
+        path: str | Path,
+        *,
+        input_key: str | None = None,
+        expected_key: str | None = None,
+    ) -> GoldenDataset:
+        """Load from a CSV file with a header row.
+
+        Empty cells are mapped to ``None`` so an unfilled expected column yields
+        an unlabeled example (rather than a stray empty string read as the gold
+        answer). ``input_key``/``expected_key`` override auto-detected columns.
+        """
         with Path(path).open(newline="", encoding="utf-8") as fh:
-            return cls.from_list(list(csv.DictReader(fh)))
+            rows = [
+                {k: (None if v == "" else v) for k, v in row.items()} for row in csv.DictReader(fh)
+            ]
+        return cls.from_list(rows, input_key=input_key, expected_key=expected_key)
 
     # -- sequence protocol -----------------------------------------------------
 

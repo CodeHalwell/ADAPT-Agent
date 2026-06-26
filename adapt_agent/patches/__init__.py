@@ -25,7 +25,7 @@ class PatchManager:
         framework: str,
         description: str,
         patch_func: Any,
-        version_requirement: Optional[str] = None,
+        version_requirement: str | None = None,
     ) -> None:
         """Register a patch.
 
@@ -72,7 +72,7 @@ class PatchManager:
 
     def list_patches(
         self,
-        framework: Optional[str] = None,
+        framework: str | None = None,
     ) -> list[dict[str, Any]]:
         """List available patches.
 

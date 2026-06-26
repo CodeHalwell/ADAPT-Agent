@@ -45,8 +45,19 @@ from adapt_agent.optimization.providers import (
 )
 
 # Judge-level keyword arguments (everything except ``complete``), shared by the
-# provider-specific constructors so their signatures stay consistent.
-_JUDGE_KW = ("rubric", "pass_threshold", "scale", "max_failures", "on_error")
+# provider-specific constructors so their signatures stay consistent. These are
+# forwarded verbatim to :class:`LLMJudge`; ``adversarial`` and
+# ``score_is_normalized`` are the adversarial-grading / pre-normalized-score knobs
+# defined on the ``LLMJudge`` base.
+_JUDGE_KW = (
+    "rubric",
+    "pass_threshold",
+    "scale",
+    "max_failures",
+    "on_error",
+    "adversarial",
+    "score_is_normalized",
+)
 
 
 def _split_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -60,9 +71,12 @@ class ProviderJudge(LLMJudge):
 
     Subclasses set :attr:`provider_cls`; the constructor instantiates it with the
     given model/credentials and hands it to :class:`LLMJudge`. Judge-level options
-    (``rubric``, ``pass_threshold``, ``scale``, ``max_failures``, ``on_error``)
-    and provider options (``api_key``, ``temperature``, ``client``, ...) may be
-    mixed freely as keyword arguments.
+    (``rubric``, ``pass_threshold``, ``scale``, ``max_failures``, ``on_error``,
+    ``adversarial``, ``score_is_normalized``) and provider options (``api_key``,
+    ``temperature``, ``client``, ...) may be mixed freely as keyword arguments.
+
+    Model precedence: an explicit ``model`` argument (positional or keyword) wins
+    over the class :attr:`default_model`.
     """
 
     # Concrete subclasses set this to a concrete provider class. Declared
@@ -72,9 +86,16 @@ class ProviderJudge(LLMJudge):
 
     def __init__(self, model: str | None = None, **kwargs: Any):
         judge_kw, provider_kw = _split_kwargs(dict(kwargs))
-        chosen = model or self.default_model
+        # Model precedence (explicit): the positional/explicit ``model`` argument
+        # wins over a ``model=`` passed inside ``**kwargs``, which in turn wins
+        # over the class :attr:`default_model`. Passing ``model=`` both
+        # positionally and via kwargs is therefore unambiguous -- the positional
+        # value is used and the kwargs one is dropped.
+        chosen = model if model is not None else provider_kw.get("model")
+        if chosen is None:
+            chosen = self.default_model
         if chosen is not None:
-            provider_kw.setdefault("model", chosen)
+            provider_kw["model"] = chosen
         provider = self.provider_cls(**provider_kw)
         super().__init__(provider, **judge_kw)
 

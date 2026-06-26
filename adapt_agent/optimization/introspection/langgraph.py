@@ -29,12 +29,14 @@ from typing import Any
 from adapt_agent.optimization.introspection import (
     bind_attr,
     register,
+    tool_subset_candidates,
 )
 from adapt_agent.optimization.parameters import Parameter, ParameterKind
 
 #: Attribute names that, if present, signal the object belongs to *another*
 #: framework's introspector. We refuse to match anything carrying these so we do
-#: not steal CrewAI crews, OpenAI/Pydantic agents, Claude SDK options, etc.
+#: not steal CrewAI crews, OpenAI/Pydantic agents, Claude SDK options, or a
+#: Microsoft Agent Framework ``ChatAgent`` (``instructions`` + ``chat_client``).
 _FOREIGN_MARKERS = (
     "agents",
     "handoffs",
@@ -42,6 +44,7 @@ _FOREIGN_MARKERS = (
     "kickoff",
     "instructions",
     "allowed_tools",
+    "chat_client",
 )
 
 
@@ -51,7 +54,9 @@ def _predicate(obj: Any) -> bool:
     A compiled graph has a callable ``invoke`` and either a ``nodes`` attribute
     or a callable ``get_graph``. We reject objects carrying other frameworks'
     markers (``agents``/``handoffs``/``sub_agents``/``kickoff``/``instructions``/
-    ``allowed_tools``) to avoid false positives.
+    ``allowed_tools``/``chat_client``) to avoid false positives -- in particular a
+    Microsoft Agent Framework ``ChatAgent`` (``instructions`` + ``chat_client``)
+    must never be hijacked here.
     """
     try:
         if not callable(getattr(obj, "invoke", None)):
@@ -165,10 +170,21 @@ def _model_params(runnable: Any, component: str) -> list[Parameter]:
 
 
 def _tool_param(runnable: Any, component: str) -> Parameter | None:
-    """Expose a TOOL parameter bound to the runnable's ``tools`` list, if present."""
-    if isinstance(getattr(runnable, "tools", None), (list, tuple)):
+    """Expose a TOOL parameter bound to the runnable's ``tools`` list, if present.
+
+    When the list holds two or more tools the parameter is made *optimizable* by
+    attaching drop-one ablation ``candidates`` so the optimizer can search tool
+    subsets.
+    """
+    current = getattr(runnable, "tools", None)
+    if isinstance(current, (list, tuple)):
         return bind_attr(
-            runnable, "tools", f"{component}.tools", ParameterKind.TOOL, component=component
+            runnable,
+            "tools",
+            f"{component}.tools",
+            ParameterKind.TOOL,
+            component=component,
+            candidates=tool_subset_candidates(current),
         )
     return None
 

@@ -285,6 +285,98 @@ def test_search_space_property():
     assert agent.search_space["x"].name == "x"
 
 
+# -- add_tool_parameter -------------------------------------------------------
+
+
+def test_add_tool_parameter_explicit_candidates():
+    store = {"tools": ["search", "calc"]}
+    agent = OptimizableAgent.from_callable(lambda x: x)
+    param = agent.add_tool_parameter(
+        "agent.tools",
+        getter=lambda: store["tools"],
+        setter=lambda v: store.__setitem__("tools", v),
+        candidates=[["search", "calc"], ["search"]],
+        component="agent",
+    )
+    assert param.kind is ParameterKind.TOOL
+    assert param.optimizable is True
+    assert param.component == "agent"
+    assert param.value == ["search", "calc"]
+    assert agent.search_space["agent.tools"] is param
+    assert param.candidates == [["search", "calc"], ["search"]]
+
+
+def test_add_tool_parameter_drop_one_candidates(monkeypatch):
+    import adapt_agent.optimization.introspection as introspection
+
+    def fake_tool_subset_candidates(tools, *, max_candidates=8):
+        full = list(tools)
+        out = [full]
+        for i in range(len(full)):
+            out.append([t for j, t in enumerate(full) if j != i])
+        return out[:max_candidates]
+
+    monkeypatch.setattr(
+        introspection, "tool_subset_candidates", fake_tool_subset_candidates, raising=False
+    )
+
+    store = {"tools": ["a", "b", "c"]}
+    agent = OptimizableAgent.from_callable(lambda x: x)
+    param = agent.add_tool_parameter(
+        "agent.tools",
+        getter=lambda: store["tools"],
+        setter=lambda v: store.__setitem__("tools", v),
+        candidate_tools=["a", "b", "c"],
+    )
+    # Full set first, then each drop-one subset (ablation).
+    assert param.candidates[0] == ["a", "b", "c"]
+    assert ["b", "c"] in param.candidates
+    assert ["a", "c"] in param.candidates
+    assert ["a", "b"] in param.candidates
+    assert len(param.candidates) == 4
+
+    # And it is a real, searchable, optimizable TOOL parameter.
+    agent.apply({"agent.tools": ["a", "c"]})
+    assert store["tools"] == ["a", "c"]
+
+
+def test_add_tool_parameter_skill_kind_and_fallback(monkeypatch):
+    # When the helper is unavailable, fall back to the full set as a single
+    # candidate; the parameter is still well-formed.
+    import adapt_agent.optimization.introspection as introspection
+
+    monkeypatch.delattr(introspection, "tool_subset_candidates", raising=False)
+
+    store = {"skills": ["writer"]}
+    agent = OptimizableAgent.from_callable(lambda x: x)
+    param = agent.add_tool_parameter(
+        "agent.skills",
+        kind=ParameterKind.SKILL,
+        getter=lambda: store["skills"],
+        setter=lambda v: store.__setitem__("skills", v),
+        candidate_tools=["writer"],
+    )
+    assert param.kind is ParameterKind.SKILL
+    assert param.candidates == [["writer"]]
+
+
+def test_add_tool_parameter_duplicate_name_raises():
+    agent = OptimizableAgent.from_callable(lambda x: x)
+    agent.add_tool_parameter(
+        "agent.tools",
+        getter=lambda: [],
+        setter=lambda v: None,
+        candidates=[[]],
+    )
+    with pytest.raises(ValueError):
+        agent.add_tool_parameter(
+            "agent.tools",
+            getter=lambda: [],
+            setter=lambda v: None,
+            candidates=[[]],
+        )
+
+
 # -- wrap ---------------------------------------------------------------------
 
 

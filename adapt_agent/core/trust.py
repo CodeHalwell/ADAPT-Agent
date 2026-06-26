@@ -1,7 +1,9 @@
 """Trust management for LLM agents."""
 
+from __future__ import annotations
+
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
-from typing import Optional
 
 from adapt_agent.core.types import AgentState, TrustScore
 
@@ -11,6 +13,15 @@ class TrustManager:
 
     The TrustManager evaluates agent behavior, interactions, and outputs
     to assign and update trust scores dynamically.
+
+    Eviction is least-recently-used (LRU): when ``max_agents`` is exceeded the
+    least-recently-accessed agent is dropped. This defends against a
+    "trust-reset attack" where an adversary churns many throwaway agent IDs to
+    push a specifically distrusted agent out of the cache and back to default
+    trust. As an additional safeguard, an agent whose score is below
+    ``distrust_floor`` is preferentially retained: a more-recently-used but
+    higher-scored candidate is evicted instead, so a distrusted agent cannot be
+    cheaply flushed.
     """
 
     def __init__(
@@ -20,6 +31,7 @@ class TrustManager:
         max_trust: float = 1.0,
         max_history: int = 1000,
         max_agents: int = 1000,
+        distrust_floor: float = 0.25,
     ):
         """Initialize the TrustManager.
 
@@ -29,17 +41,24 @@ class TrustManager:
             max_trust: Maximum allowed trust score
             max_history: Maximum number of trust history entries to store per agent
             max_agents: Maximum number of agents to track in memory
+            distrust_floor: Scores strictly below this value are treated as
+                "distrusted" and are preferentially retained during eviction so
+                they cannot be flushed back to default trust by churning IDs.
         """
         self.initial_trust = initial_trust
         self.min_trust = min_trust
         self.max_trust = max_trust
         self.max_history = max_history
         self.max_agents = max_agents
-        self._trust_scores: dict[str, float] = {}
-        self._trust_history: dict[str, list[TrustScore]] = {}
+        self.distrust_floor = distrust_floor
+        # OrderedDict gives O(1) LRU ordering via move_to_end.
+        self._trust_scores: OrderedDict[str, float] = OrderedDict()
+        self._trust_history: dict[str, deque[TrustScore]] = {}
 
     def get_trust_score(self, agent_id: str) -> float:
         """Get the current trust score for an agent.
+
+        Accessing an agent marks it as recently used for LRU eviction.
 
         Args:
             agent_id: Unique identifier for the agent
@@ -47,14 +66,17 @@ class TrustManager:
         Returns:
             Current trust score (between min_trust and max_trust)
         """
-        return self._trust_scores.get(agent_id, self.initial_trust)
+        if agent_id in self._trust_scores:
+            self._trust_scores.move_to_end(agent_id)
+            return self._trust_scores[agent_id]
+        return self.initial_trust
 
     def update_trust_score(
         self,
         agent_id: str,
         delta: float,
         reason: str = "",
-        factors: Optional[dict[str, float]] = None,
+        factors: dict[str, float] | None = None,
     ) -> float:
         """Update the trust score for an agent.
 
@@ -70,7 +92,9 @@ class TrustManager:
         current_score = self.get_trust_score(agent_id)
         new_score = max(self.min_trust, min(self.max_trust, current_score + delta))
 
+        # Insert/update and mark as most-recently-used.
         self._trust_scores[agent_id] = new_score
+        self._trust_scores.move_to_end(agent_id)
 
         # Record trust score history
         trust_record: TrustScore = {
@@ -80,22 +104,39 @@ class TrustManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        if agent_id not in self._trust_history:
-            self._trust_history[agent_id] = []
-        self._trust_history[agent_id].append(trust_record)
+        # deque(maxlen) bounds history in O(1) without list.pop(0).
+        history = self._trust_history.get(agent_id)
+        if history is None:
+            history = deque(maxlen=self.max_history)
+            self._trust_history[agent_id] = history
+        history.append(trust_record)
 
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._trust_history[agent_id]) > self.max_history:
-            self._trust_history[agent_id].pop(0)
-
-        # SECURITY: Prevent memory exhaustion from unbounded unique agents
+        # SECURITY: Prevent memory exhaustion from unbounded unique agents.
         if len(self._trust_scores) > self.max_agents:
-            oldest_agent = next(iter(self._trust_scores))
-            del self._trust_scores[oldest_agent]
-            if oldest_agent in self._trust_history:
-                del self._trust_history[oldest_agent]
+            self._evict_one()
 
         return new_score
+
+    def _evict_one(self) -> None:
+        """Evict a single agent using LRU, protecting distrusted agents.
+
+        Scans candidates from least- to most-recently-used and evicts the first
+        one whose score is at or above ``distrust_floor``. Only if every tracked
+        agent is below the floor does it fall back to evicting the strict LRU
+        entry (so eviction always makes progress and stays bounded).
+        """
+        victim: str | None = None
+        for agent_id, score in self._trust_scores.items():
+            if score >= self.distrust_floor:
+                victim = agent_id
+                break
+
+        if victim is None:
+            # Every agent is distrusted; fall back to strict LRU to stay bounded.
+            victim = next(iter(self._trust_scores))
+
+        del self._trust_scores[victim]
+        self._trust_history.pop(victim, None)
 
     def evaluate_agent_state(self, agent_id: str, state: AgentState) -> TrustScore:
         """Evaluate an agent's state and calculate a trust score.
@@ -153,4 +194,7 @@ class TrustManager:
         Returns:
             List of historical trust scores
         """
-        return self._trust_history.get(agent_id, [])
+        history = self._trust_history.get(agent_id)
+        if history is None:
+            return []
+        return list(history)

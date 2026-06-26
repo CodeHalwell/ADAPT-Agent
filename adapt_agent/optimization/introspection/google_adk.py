@@ -28,6 +28,7 @@ from typing import Any
 from adapt_agent.optimization.introspection import (
     bind_attr,
     register,
+    tool_subset_candidates,
 )
 from adapt_agent.optimization.parameters import Parameter, ParameterKind
 
@@ -99,6 +100,7 @@ def _introspect_generate_config(config: Any, component: str) -> list[Parameter]:
             f"{component}.max_output_tokens",
             ParameterKind.HYPERPARAM,
             component=component,
+            bounds=(1, 32000),
         ),
     ]
     return [p for p in candidates if p is not None]
@@ -110,7 +112,9 @@ def _introspect_agent(agent: Any, index: int, visited: set[int]) -> list[Paramet
         return []
     visited.add(id(agent))
 
-    component = _slug(getattr(agent, "name", None)) or "agent"
+    # Use the positional index in the fallback so two name-less sub-agents do
+    # not both collapse to "agent" and produce colliding parameter names.
+    component = _slug(getattr(agent, "name", None)) or f"agent_{index}"
     params: list[Parameter] = []
 
     # Prompts: only emit when the value is a plain string (an instruction may be
@@ -155,8 +159,21 @@ def _introspect_agent(agent: Any, index: int, visited: set[int]) -> list[Paramet
     if config is not None:
         params.extend(_introspect_generate_config(config, component))
 
-    # Tools allow-list.
-    tools = bind_attr(agent, "tools", f"{component}.tools", ParameterKind.TOOL, component=component)
+    # Tools allow-list. When the agent carries two or more tools, expose
+    # drop-one ablation candidates so tool *selection* becomes a real search
+    # space the optimizer can explore.
+    current_tools = getattr(agent, "tools", None)
+    tool_candidates = (
+        tool_subset_candidates(current_tools) if isinstance(current_tools, (list, tuple)) else None
+    )
+    tools = bind_attr(
+        agent,
+        "tools",
+        f"{component}.tools",
+        ParameterKind.TOOL,
+        component=component,
+        candidates=tool_candidates or None,
+    )
     if tools is not None:
         params.append(tools)
 
@@ -167,12 +184,21 @@ def _introspect_agent(agent: Any, index: int, visited: set[int]) -> list[Paramet
     if routing is not None:
         params.append(routing)
 
-    # Recurse into sub-agents, namespacing each under its own component name.
+    # Recurse into sub-agents, namespacing each under this agent's component
+    # name. A sub-agent already in ``visited`` (a cycle or a shared/diamond
+    # child reachable by two parents) returns ``[]`` and is skipped silently, so
+    # we never crash on shared topologies. We additionally de-duplicate emitted
+    # names: re-prefixing nested parameters can otherwise collide, and a
+    # duplicate name would make ``SearchSpace.add`` raise downstream.
+    seen = {p.name for p in params}
     sub_agents = getattr(agent, "sub_agents", None) or []
     for i, sub in enumerate(sub_agents):
         for param in _introspect_agent(sub, i, visited):
             if not param.name.startswith(f"{component}."):
                 param.name = f"{component}.{param.name}"
+            if param.name in seen:
+                continue
+            seen.add(param.name)
             params.append(param)
 
     return params

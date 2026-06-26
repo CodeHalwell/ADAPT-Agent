@@ -26,17 +26,46 @@ def test_add_blocked_pattern_blocks_and_records_redacted_event():
     assert "[REDACTED]" in snippet
 
 
-def test_add_allowed_pattern_uses_fullmatch_whitelist():
-    """An allowed pattern whitelists only on fullmatch, not partial match."""
+def test_block_first_allowed_pattern_cannot_override_block():
+    """Default mode is block-first: an allowed fullmatch cannot nullify a block."""
     firewall = Firewall()
     firewall.add_blocked_pattern(r"password")
     firewall.add_allowed_pattern(r"password")
 
-    # Exact full match -> whitelisted, allowed despite blocked pattern.
+    # Block-first default: the blocked pattern wins even on an exact allowed
+    # fullmatch. A broad allow pattern must never silently nullify the blocklist.
+    assert firewall.check_input("password") is False
+    assert firewall.check_input("my password is here") is False
+
+    # The block was recorded as a security event.
+    events = firewall.get_security_events()
+    assert len(events) == 2
+    assert all(e["event_type"] == "blocked_input" for e in events)
+
+
+def test_allowed_pattern_whitelists_clean_content_in_default_mode():
+    """In block-first mode an allowed fullmatch still whitelists content that
+    passes every block check (it just cannot override a block)."""
+    firewall = Firewall()
+    firewall.add_blocked_pattern(r"danger")
+    firewall.add_allowed_pattern(r"hello world")
+
+    # Fullmatch of an allowed pattern, no block match -> allowed.
+    assert firewall.check_input("hello world") is True
+
+
+def test_whitelist_mode_preserves_allow_short_circuit():
+    """whitelist_mode=True restores the legacy allow-fullmatch short-circuit."""
+    firewall = Firewall(whitelist_mode=True)
+    firewall.add_blocked_pattern(r"password")
+    firewall.add_allowed_pattern(r"password")
+
+    # Strict allowlist: an exact allowed fullmatch short-circuits to allowed,
+    # before block checks run.
     assert firewall.check_input("password") is True
 
-    # Merely containing the allowed substring is NOT a fullmatch,
-    # so it remains subject to block rules.
+    # Merely containing the allowed substring is NOT a fullmatch, so it remains
+    # subject to block rules and is blocked.
     assert firewall.check_input("my password is here") is False
 
 
@@ -51,7 +80,7 @@ def test_custom_filter_returning_true_blocks():
     events = firewall.get_security_events()
     assert len(events) == 1
     assert events[0]["severity"] == "medium"
-    assert events[0]["description"] == "Input blocked by custom filter"
+    assert events[0]["description"] == "Content blocked by custom filter"
 
 
 def test_custom_filter_raising_fails_closed_with_generic_error():
@@ -107,13 +136,40 @@ def test_sanitize_redacts_blocked_patterns():
     assert firewall.sanitize("APIKEY-xyz", replacement="<X>") == "<X>"
 
 
-def test_check_output_delegates_to_check_input():
-    """check_output applies the same blocking logic as check_input."""
+def test_check_output_applies_block_logic_with_output_event_type():
+    """check_output applies the same blocking logic but labels events as output."""
     firewall = Firewall()
     firewall.add_blocked_pattern(r"forbidden")
 
     assert firewall.check_output("forbidden content") is False
     assert firewall.check_output("fine content") is True
+
+    events = firewall.get_security_events()
+    assert len(events) == 1
+    # Output checks must be labeled distinctly, not as blocked_input.
+    assert events[0]["event_type"] == "blocked_output"
+
+
+def test_add_pattern_rejects_catastrophic_regex():
+    """Obviously catastrophic (nested-quantifier) patterns are rejected."""
+    import pytest
+
+    firewall = Firewall()
+    with pytest.raises(ValueError):
+        firewall.add_blocked_pattern(r"(a+)+")
+    with pytest.raises(ValueError):
+        firewall.add_allowed_pattern(r"(a*)*")
+
+
+def test_redacted_snippet_does_not_leak_raw_content():
+    """Length-cap events store a hashed/masked snippet, not raw content."""
+    firewall = Firewall(max_content_length=10)
+    secret = "TOPSECRETpayloadvalue123"
+    assert firewall.check_input(secret) is False
+
+    snippet = firewall.get_security_events()[0]["metadata"]["content_snippet"]
+    assert secret not in snippet
+    assert "sha256:" in snippet
 
 
 def test_check_message_delegates_to_check_input():

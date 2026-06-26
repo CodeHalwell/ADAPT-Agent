@@ -189,3 +189,85 @@ def test_max_violations_bounding():
     for _ in range(5):
         enforcer.check_state({"messages": [], "context": {}})
     assert len(enforcer.get_violations()) == 2
+
+
+# --- A14: fail-open vs fail-closed on evaluation errors -----------------------
+
+
+def test_evaluation_error_default_fails_open_but_logs(caplog):
+    """Default behaviour: an evaluation error is logged and is NOT a violation."""
+    enforcer = PolicyEnforcer()  # fail_closed defaults to False
+    assert enforcer.fail_closed is False
+    # ``missing_var`` is not in the context -> unknown variable -> eval error.
+    with caplog.at_level("WARNING"):
+        result = enforcer._evaluate_condition("missing_var == 1", {}, rule_name="r")
+    assert result is False
+    assert any("missing_var" in rec.getMessage() for rec in caplog.records)
+    assert any("r" in rec.getMessage() for rec in caplog.records)
+
+
+def test_evaluation_error_fail_closed_is_violation(caplog):
+    """fail_closed=True turns an evaluation error into a violation (still logged)."""
+    enforcer = PolicyEnforcer(fail_closed=True)
+    assert enforcer.fail_closed is True
+    with caplog.at_level("WARNING"):
+        result = enforcer._evaluate_condition("missing_var == 1", {}, rule_name="r")
+    assert result is True
+    assert any("missing_var" in rec.getMessage() for rec in caplog.records)
+
+
+def test_fail_closed_block_rule_fires_on_malformed_input():
+    """A block rule referencing a missing key fires under fail_closed."""
+    enforcer = PolicyEnforcer(fail_closed=True)
+    enforcer.add_rule(
+        name="needs_field",
+        description="d",
+        condition="state['trust_score'] < 0.5",
+        action="block",
+        severity="high",
+    )
+    # No 'trust_score' key -> subscript returns None -> None < 0.5 raises
+    # TypeError -> evaluation error -> violation because fail_closed.
+    state = {"messages": [], "context": {}}
+    violations = enforcer.check_state(state)
+    assert violations == ["needs_field"]
+
+
+def test_fail_open_block_rule_does_not_fire_on_malformed_input():
+    """The same malformed input is silently allowed under the default fail-open."""
+    enforcer = PolicyEnforcer()  # fail-open
+    enforcer.add_rule(
+        name="needs_field",
+        description="d",
+        condition="state['trust_score'] < 0.5",
+        action="block",
+        severity="high",
+    )
+    state = {"messages": [], "context": {}}
+    assert enforcer.check_state(state) == []
+    assert enforcer.get_violations() == []
+
+
+# --- A14: node-count cap ------------------------------------------------------
+
+
+def test_node_count_cap_rejects_oversized_condition():
+    """A flat-but-large literal is rejected at add time even though it is shallow."""
+    enforcer = PolicyEnforcer()
+    # Flat 250-element list literal: shallow (depth 1) but many nodes.
+    big_list = "[" + ", ".join(["1"] * 250) + "] == []"
+    with pytest.raises(ValueError, match="node count"):
+        enforcer.add_rule(name="big", description="d", condition=big_list)
+    # The rule must not have been registered.
+    assert enforcer.get_rule("big") is None
+
+
+def test_node_count_cap_allows_normal_condition():
+    """A normal, small condition is accepted."""
+    enforcer = PolicyEnforcer()
+    enforcer.add_rule(
+        name="ok",
+        description="d",
+        condition="state['trust_score'] < 0.5",
+    )
+    assert enforcer.get_rule("ok") is not None

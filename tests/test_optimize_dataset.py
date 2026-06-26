@@ -49,9 +49,46 @@ def test_from_record_leftover_becomes_metadata():
 
 
 def test_from_record_explicit_metadata_merged_with_leftovers():
-    rec = {"input": "i", "output": "o", "metadata": {"a": 1}, "extra": 2}
+    # "output" is no longer an expected key, so it falls through to metadata.
+    rec = {"input": "i", "gold": "g", "metadata": {"a": 1}, "extra": 2}
     ex = Example.from_record(rec)
+    assert ex.expected == "g"
     assert ex.metadata == {"a": 1, "extra": 2}
+
+
+def test_from_record_output_not_treated_as_expected():
+    # A produced-output column must NOT be read as ground truth.
+    rec = {"input": "i", "output": "model-said-this"}
+    ex = Example.from_record(rec)
+    assert ex.inputs == "i"
+    assert ex.expected is None
+    # It survives as metadata instead of masquerading as the gold answer.
+    assert ex.metadata == {"output": "model-said-this"}
+
+
+def test_from_record_explicit_input_and_expected_keys():
+    rec = {"q": "the question", "gold_answer": "42", "note": "x"}
+    ex = Example.from_record(rec, input_key="q", expected_key="gold_answer")
+    assert ex.inputs == "the question"
+    assert ex.expected == "42"
+    assert ex.metadata == {"note": "x"}
+
+
+def test_from_record_explicit_keys_override_autodetection():
+    # Explicit keys win even when conventional keys are also present.
+    rec = {"input": "auto-in", "expected": "auto-exp", "real_in": "in", "real_exp": "exp"}
+    ex = Example.from_record(rec, input_key="real_in", expected_key="real_exp")
+    assert ex.inputs == "in"
+    assert ex.expected == "exp"
+    # The unused conventional columns survive as metadata.
+    assert ex.metadata == {"input": "auto-in", "expected": "auto-exp"}
+
+
+def test_from_record_explicit_key_missing_yields_none():
+    rec = {"input": "i"}
+    ex = Example.from_record(rec, expected_key="not_here")
+    assert ex.inputs == "i"
+    assert ex.expected is None
 
 
 def test_from_record_non_dict_metadata_ignored():
@@ -97,6 +134,22 @@ def test_from_list_rejects_bad_type():
         GoldenDataset.from_list([42])
 
 
+def test_from_list_explicit_keys():
+    ds = GoldenDataset.from_list(
+        [{"q": "x", "gold": "y", "tag": "t"}], input_key="q", expected_key="gold"
+    )
+    assert ds[0].inputs == "x"
+    assert ds[0].expected == "y"
+    assert ds[0].metadata == {"tag": "t"}
+
+
+def test_from_list_explicit_keys_ignored_for_example_instances():
+    ex = Example(inputs="a", expected="A")
+    ds = GoldenDataset.from_list([ex], input_key="q", expected_key="gold")
+    assert ds[0].inputs == "a"
+    assert ds[0].expected == "A"
+
+
 # -- from_json ----------------------------------------------------------------
 
 
@@ -133,6 +186,14 @@ def test_from_json_accepts_string_path(tmp_path):
     assert len(ds) == 1
 
 
+def test_from_json_explicit_keys(tmp_path):
+    path = tmp_path / "d.json"
+    path.write_text(json.dumps([{"q": "x", "gold": "y"}]), encoding="utf-8")
+    ds = GoldenDataset.from_json(path, input_key="q", expected_key="gold")
+    assert ds[0].inputs == "x"
+    assert ds[0].expected == "y"
+
+
 # -- from_jsonl ---------------------------------------------------------------
 
 
@@ -151,6 +212,14 @@ def test_from_jsonl(tmp_path):
     assert ds[1].metadata == {"tag": "t"}
 
 
+def test_from_jsonl_explicit_keys(tmp_path):
+    path = tmp_path / "d.jsonl"
+    path.write_text(json.dumps({"q": "a", "gold": "A"}), encoding="utf-8")
+    ds = GoldenDataset.from_jsonl(path, input_key="q", expected_key="gold")
+    assert ds[0].inputs == "a"
+    assert ds[0].expected == "A"
+
+
 # -- from_csv -----------------------------------------------------------------
 
 
@@ -166,6 +235,43 @@ def test_from_csv(tmp_path):
     assert ds[0].expected == "4"
     assert ds[0].metadata == {"difficulty": "easy"}
     assert ds[1].expected == "Paris"
+
+
+def test_from_csv_empty_cell_maps_to_none(tmp_path):
+    path = tmp_path / "d.csv"
+    # Second row leaves the expected (answer) cell empty.
+    path.write_text(
+        "question,answer\n" "labeled,yes\n" "unlabeled,\n",
+        encoding="utf-8",
+    )
+    ds = GoldenDataset.from_csv(path)
+    assert ds[0].expected == "yes"
+    # Empty string becomes None rather than a stray "" gold answer.
+    assert ds[1].expected is None
+
+
+def test_from_csv_explicit_keys(tmp_path):
+    path = tmp_path / "d.csv"
+    path.write_text(
+        "q,gold,note\n" "hi,HI,n1\n",
+        encoding="utf-8",
+    )
+    ds = GoldenDataset.from_csv(path, input_key="q", expected_key="gold")
+    assert ds[0].inputs == "hi"
+    assert ds[0].expected == "HI"
+    assert ds[0].metadata == {"note": "n1"}
+
+
+def test_from_csv_output_column_is_not_expected(tmp_path):
+    path = tmp_path / "d.csv"
+    path.write_text(
+        "input,output\n" "i,produced\n",
+        encoding="utf-8",
+    )
+    ds = GoldenDataset.from_csv(path)
+    assert ds[0].inputs == "i"
+    assert ds[0].expected is None
+    assert ds[0].metadata == {"output": "produced"}
 
 
 # -- sequence protocol --------------------------------------------------------

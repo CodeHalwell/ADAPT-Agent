@@ -113,10 +113,41 @@ def test_max_suggestions_bounding():
     """Stored suggestions are bounded by max_suggestions, keeping newest."""
     optimizer = AgentOptimizer(max_suggestions=2)
 
-    # Each call produces 2 suggestions (slow + high tokens).
+    # Each call produces 2 suggestions (slow + high tokens). Because suggestions
+    # are now stored per agent and replaced (not appended) on each call, the
+    # buffer for a single agent never grows past the latest 2.
     for _ in range(3):
         optimizer.analyze_performance("agent_a", execution_time=10.0, token_usage=5000)
         optimizer.suggest_optimizations("agent_a")
 
-    # 3 calls * 2 suggestions = 6 generated, but bounded to 2.
     assert len(optimizer._optimization_suggestions) == 2
+
+
+def test_suggestions_deduped_per_agent_not_appended():
+    """Repeated suggest_optimizations for one agent does not accumulate dupes."""
+    optimizer = AgentOptimizer()
+    optimizer.analyze_performance("agent_a", execution_time=10.0, token_usage=5000)
+
+    # Call many times; the stored buffer should reflect only the latest set,
+    # not 10x duplicates.
+    for _ in range(10):
+        optimizer.suggest_optimizations("agent_a")
+
+    stored = optimizer._optimization_suggestions
+    assert len(stored) == 2
+    assert {s["metric"] for s in stored} == {"execution_time", "token_usage"}
+
+
+def test_suggestions_stored_separately_per_agent():
+    """Suggestions for different agents are kept independently."""
+    optimizer = AgentOptimizer()
+    optimizer.analyze_performance("agent_a", execution_time=10.0, token_usage=5000)
+    optimizer.analyze_performance("agent_b", execution_time=10.0)
+
+    optimizer.suggest_optimizations("agent_a")
+    optimizer.suggest_optimizations("agent_a")  # replace, not append
+    optimizer.suggest_optimizations("agent_b")
+
+    stored = optimizer._optimization_suggestions
+    # agent_a: 2 (slow + tokens), agent_b: 1 (slow only) = 3 total, no dupes.
+    assert len(stored) == 3

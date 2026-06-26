@@ -121,6 +121,34 @@ def test_write_read_only_raises():
         p.write(1)
 
 
+def test_write_failing_setter_is_caught_and_marks_non_optimizable():
+    def boom(_):
+        raise RuntimeError("frozen attribute")
+
+    p = make_param(setter=boom, value="orig")
+    assert p.optimizable is True
+    # The failing setter must not propagate out of write().
+    p.write("new")
+    # Value is left unchanged and the parameter is now non-optimizable so the
+    # optimizer stops retrying it.
+    assert p.value == "orig"
+    assert p._write_failed is True
+    assert p.optimizable is False
+
+
+def test_parameter_write_failed_defaults_false():
+    p = make_param(setter=lambda v: None)
+    assert p._write_failed is False
+
+
+# -- ParameterKind ------------------------------------------------------------
+
+
+def test_skill_kind_exists():
+    assert ParameterKind.SKILL.value == "skill"
+    assert Parameter(name="s", kind="skill").kind is ParameterKind.SKILL
+
+
 # -- enumerate_candidates -----------------------------------------------------
 
 
@@ -361,15 +389,38 @@ def test_restore_skips_params_without_setter():
     assert s["no_setter"].value == "keep"
 
 
-def test_restore_failing_setter_falls_back_to_value_assignment():
+def test_apply_does_not_propagate_failing_setter():
+    cell = Cell("ok")
+
+    def boom(_):
+        raise RuntimeError("frozen attribute")
+
+    bad = make_param("bad", setter=boom, value="orig")
+    s = SearchSpace(
+        [
+            make_param("good", getter=cell.get, setter=cell.set),
+            bad,
+        ]
+    )
+    # The frozen "bad" knob must not crash apply(); the good knob still applies.
+    s.apply({"good": "new", "bad": "whatever"})
+    assert cell.value == "new"
+    assert bad.value == "orig"
+    assert bad.optimizable is False
+
+
+def test_restore_failing_setter_does_not_raise():
     def boom(_):
         raise RuntimeError("cannot write")
 
     p = make_param("p", setter=boom, value="orig")
     s = SearchSpace([p])
+    # restore() must never raise mid-cleanup. write() now swallows the setter
+    # error itself (leaving the cached value untouched and marking the parameter
+    # non-optimizable), so restore's own fallback never fires.
     s.restore({"p": "fallback"})
-    # write() raised, restore caught it and assigned .value directly.
-    assert p.value == "fallback"
+    assert p.value == "orig"
+    assert p._write_failed is True
 
 
 # -- grid ---------------------------------------------------------------------

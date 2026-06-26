@@ -43,7 +43,7 @@ class AgentObserver:
         trace_id: str,
         agent_id: str,
         operation: str,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Start a new trace.
 
@@ -78,7 +78,7 @@ class AgentObserver:
         self,
         trace_id: str,
         status: str = "completed",
-        result: Optional[Any] = None,
+        result: Any | None = None,
     ) -> None:
         """End a trace.
 
@@ -99,7 +99,7 @@ class AgentObserver:
         trace_id: str,
         event_type: str,
         description: str,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Log an event within a trace.
 
@@ -127,8 +127,8 @@ class AgentObserver:
         self,
         level: str,
         message: str,
-        agent_id: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
+        agent_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Log a message.
 
@@ -177,9 +177,9 @@ class AgentObserver:
 
     def get_traces(
         self,
-        agent_id: Optional[str] = None,
-        status: Optional[str] = None,
-        limit: Optional[int] = None,
+        agent_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Get traces.
 
@@ -221,9 +221,9 @@ class AgentObserver:
 
     def get_logs(
         self,
-        level: Optional[str] = None,
-        agent_id: Optional[str] = None,
-        limit: Optional[int] = None,
+        level: str | None = None,
+        agent_id: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Get logs.
 

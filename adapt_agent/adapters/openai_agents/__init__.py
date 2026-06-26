@@ -40,7 +40,7 @@ class OpenAIAgentsAdapter(GovernedAdapter):
     run_method_names = ("run_sync", "run")
     operation = "openai_agents.run"
 
-    def _resolve_runner(self, agent: Any) -> Optional[Runner]:
+    def _resolve_runner(self, agent: Any) -> Runner | None:
         # An object exposing run_sync/run (e.g. a custom runner) or a plain
         # callable is used as-is.
         runner = super()._resolve_runner(agent)

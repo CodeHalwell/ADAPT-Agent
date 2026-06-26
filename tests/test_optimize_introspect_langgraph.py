@@ -18,9 +18,11 @@ class FakeModel:
 
 
 class FakeRunnable:
-    def __init__(self, system_prompt: str, model: FakeModel) -> None:
+    def __init__(self, system_prompt: str, model: FakeModel, tools=None) -> None:
         self.system_prompt = system_prompt
         self.model = model
+        if tools is not None:
+            self.tools = tools
 
 
 class FakeNode:
@@ -71,6 +73,26 @@ def test_predicate_false_for_crewai_like_object() -> None:
     assert detect(FakeCrew()) != "langgraph"
 
 
+def test_predicate_false_for_microsoft_chat_agent_like_object() -> None:
+    # A Microsoft Agent Framework ``ChatAgent`` carries ``instructions`` +
+    # ``chat_client`` + a callable ``run``; the langgraph introspector (registered
+    # earlier) must never hijack it via its ``invoke``/``nodes`` shape.
+    class FakeChatAgent:
+        def __init__(self) -> None:
+            self.instructions = "be helpful"
+            self.chat_client = object()
+            self.nodes = {}
+
+        def invoke(self, state):  # pragma: no cover - never called
+            return state
+
+        def run(self, *a, **k):  # pragma: no cover - never called
+            return None
+
+    assert _predicate(FakeChatAgent()) is False
+    assert detect(FakeChatAgent()) != "langgraph"
+
+
 def test_introspect_emits_expected_params() -> None:
     params = {p.name: p for p in introspect(_make_graph())}
 
@@ -101,6 +123,41 @@ def test_prompt_setter_round_trips() -> None:
     # A fresh introspection observes the mutated value too.
     refreshed = {p.name: p for p in introspect(graph)}
     assert refreshed["researcher.system_prompt"].read() == "You are a meticulous fact-checker."
+
+
+def test_tools_param_is_optimizable_with_drop_one_candidates() -> None:
+    node = FakeNode(
+        FakeRunnable(
+            system_prompt="You are a careful researcher.",
+            model=FakeModel(model_name="gpt-4o", temperature=0.4),
+            tools=["search", "calculator", "wiki"],
+        )
+    )
+    graph = FakeCompiledGraph(nodes={"researcher": node})
+    params = {p.name: p for p in introspect(graph)}
+
+    tools = params["researcher.tools"]
+    assert tools.kind is ParameterKind.TOOL
+    # Full set first, then each drop-one subset.
+    assert tools.candidates[0] == ["search", "calculator", "wiki"]
+    assert ["calculator", "wiki"] in tools.candidates
+    assert ["search", "wiki"] in tools.candidates
+    assert ["search", "calculator"] in tools.candidates
+    assert len(tools.candidates) == 4
+
+
+def test_tools_param_not_searchable_with_single_tool() -> None:
+    node = FakeNode(
+        FakeRunnable(
+            system_prompt="You are a careful researcher.",
+            model=FakeModel(model_name="gpt-4o", temperature=0.4),
+            tools=["search"],
+        )
+    )
+    graph = FakeCompiledGraph(nodes={"researcher": node})
+    params = {p.name: p for p in introspect(graph)}
+    # A single tool yields no meaningful subset to search.
+    assert params["researcher.tools"].candidates == []
 
 
 def test_introspect_reads_nodes_via_get_graph() -> None:

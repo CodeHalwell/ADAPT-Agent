@@ -81,6 +81,25 @@ def test_predicate_false_for_other_framework() -> None:
     assert detect(HandoffAgent()) is None
 
 
+def test_predicate_false_for_microsoft_chat_agent_like_object() -> None:
+    # A Microsoft Agent Framework ``ChatAgent`` (``chat_client`` + callable
+    # ``run``) might expose an ``agents`` list; the crewai introspector (registered
+    # earlier) must never hijack it.
+    class FakeChatAgent:
+        def __init__(self) -> None:
+            self.agents = []
+            self.instructions = "be helpful"
+            self.chat_client = object()
+
+        def kickoff(self):  # pragma: no cover - never called
+            return None
+
+        def run(self, *a, **k):  # pragma: no cover - never called
+            return None
+
+    assert detect(FakeChatAgent()) != "crewai"
+
+
 def test_introspect_param_names_and_kinds() -> None:
     params = introspect(_make_crew())
     by_name = {p.name: p for p in params}
@@ -125,6 +144,38 @@ def test_string_llm_setter_round_trip() -> None:
 
     by_name["writer.model"].write("gpt-4.1")
     assert crew.agents[1].llm == "gpt-4.1"
+
+
+def test_agent_tools_param_is_optimizable_with_drop_one_candidates() -> None:
+    agent = FakeAgent(
+        role="Senior Researcher",
+        goal="Find facts",
+        backstory="A seasoned analyst",
+        llm="gpt-4o-mini",
+        tools=["search", "calculator", "wiki"],
+        max_iter=10,
+    )
+    crew = FakeCrew(agents=[agent], tasks=[])
+    by_name = {p.name: p for p in introspect(crew)}
+
+    tools = by_name["senior_researcher.tools"]
+    assert tools.kind is ParameterKind.TOOL
+    assert tools.candidates[0] == ["search", "calculator", "wiki"]
+    assert ["calculator", "wiki"] in tools.candidates
+    assert ["search", "wiki"] in tools.candidates
+    assert ["search", "calculator"] in tools.candidates
+    assert len(tools.candidates) == 4
+
+
+def test_agent_tools_param_not_searchable_with_single_tool() -> None:
+    # The default researcher in ``_make_crew`` has a single tool.
+    by_name = {p.name: p for p in introspect(_make_crew())}
+    assert by_name["senior_researcher.tools"].candidates == []
+
+
+def test_max_tokens_bounds_present() -> None:
+    by_name = {p.name: p for p in introspect(_make_crew())}
+    assert by_name["senior_researcher.max_tokens"].bounds == (1, 32000)
 
 
 def test_fallback_component_name_without_role() -> None:

@@ -310,6 +310,71 @@ def test_anthropic_provider_default_model():
     assert p.model == "claude-opus-4-8"
 
 
+def test_anthropic_opus_4_8_omits_sampling_params():
+    # The default model (opus-4-8) rejects user-set sampling -> omit entirely.
+    client = FakeAnthropicClient("x")
+    p = AnthropicProvider(client=client, temperature=0.7)
+    p.complete("prompt", top_p=0.5)
+    kw = client.messages.last_kwargs
+    assert "temperature" not in kw
+    assert "top_p" not in kw
+    assert "top_k" not in kw
+
+
+def test_anthropic_opus_4_7_omits_sampling_params():
+    client = FakeAnthropicClient("x")
+    p = AnthropicProvider(client=client, model="claude-opus-4-7", temperature=0.9)
+    p.complete("prompt")
+    assert "temperature" not in client.messages.last_kwargs
+
+
+def test_anthropic_fable_5_omits_sampling_params():
+    client = FakeAnthropicClient("x")
+    p = AnthropicProvider(client=client, model="claude-fable-5", temperature=1.0)
+    p.complete("prompt")
+    assert "temperature" not in client.messages.last_kwargs
+
+
+def test_anthropic_legacy_model_sends_clamped_temperature():
+    # A model NOT in the no-sampling family still gets a (clamped) temperature.
+    client = FakeAnthropicClient("x")
+    p = AnthropicProvider(client=client, model="claude-3-5-sonnet-20241022", temperature=0.5)
+    p.complete("prompt")
+    assert client.messages.last_kwargs["temperature"] == 0.5
+
+
+def test_anthropic_over_range_temperature_clamped_and_warns(caplog):
+    # Anthropic max_temperature is 1.0; a request of 1.7 must clamp to 1.0 + warn.
+    client = FakeAnthropicClient("x")
+    p = AnthropicProvider(client=client, model="claude-3-5-sonnet-20241022")
+    with caplog.at_level("WARNING", logger="adapt_agent.optimization.providers"):
+        p.complete("prompt", temperature=1.7)
+    assert client.messages.last_kwargs["temperature"] == 1.0
+    assert any("exceeds max" in rec.message for rec in caplog.records)
+
+
+def test_openai_over_range_temperature_clamped():
+    # OpenAI max_temperature is 2.0; 3.5 clamps to 2.0.
+    client = FakeOpenAIClient("x")
+    p = OpenAIProvider(client=client)
+    p.complete("prompt", temperature=3.5)
+    assert client.chat.completions.last_kwargs["temperature"] == 2.0
+
+
+def test_openai_top_p_clamped_into_unit_interval():
+    client = FakeOpenAIClient("x")
+    p = OpenAIProvider(client=client)
+    p.complete("prompt", top_p=1.9)
+    assert client.chat.completions.last_kwargs["top_p"] == 1.0
+
+
+def test_negative_temperature_clamped_to_zero():
+    client = FakeOpenAIClient("x")
+    p = OpenAIProvider(client=client)
+    p.complete("prompt", temperature=-0.5)
+    assert client.chat.completions.last_kwargs["temperature"] == 0.0
+
+
 # OpenAI-style fakes ----------------------------------------------------------
 
 
@@ -635,6 +700,80 @@ def test_huggingface_none_content_returns_empty():
 
 
 # -- Every vendor provider is registered and constructs offline ----------------
+
+
+# -- Sampling-param retry fallback ---------------------------------------------
+
+
+class _SamplingRejectMessages:
+    """Fake messages API that 400s once on any sampling param, then succeeds."""
+
+    def __init__(self, text="ok"):
+        self._text = text
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if any(k in kwargs for k in ("temperature", "top_p", "top_k")):
+            raise ValueError(
+                "Error code: 400 - invalid_request_error: temperature is not supported"
+            )
+        return FakeAnthropicMessage(self._text)
+
+
+class _SamplingRejectAnthropicClient:
+    def __init__(self, text="ok"):
+        self.messages = _SamplingRejectMessages(text)
+
+
+def test_anthropic_retries_without_sampling_on_400(caplog):
+    # A model that DOES accept sampling locally, but whose SDK rejects it at
+    # runtime -> the call retries once without temperature/top_p/top_k.
+    client = _SamplingRejectAnthropicClient("recovered")
+    p = AnthropicProvider(client=client, model="claude-3-5-sonnet-20241022", temperature=0.5)
+    with caplog.at_level("WARNING", logger="adapt_agent.optimization.providers"):
+        result = p.complete("prompt")
+    assert result == "recovered"
+    # Two attempts: first with temperature, second stripped.
+    assert len(client.messages.calls) == 2
+    assert "temperature" in client.messages.calls[0]
+    assert "temperature" not in client.messages.calls[1]
+    assert any("retrying without" in rec.message for rec in caplog.records)
+
+
+def test_non_sampling_error_is_not_retried():
+    # An unrelated error must propagate without a retry.
+    class _Boom:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            raise RuntimeError("network down")
+
+    class _Client:
+        def __init__(self):
+            self.messages = _Boom()
+
+    client = _Client()
+    p = AnthropicProvider(client=client, model="claude-3-5-sonnet-20241022")
+    with pytest.raises(RuntimeError, match="network down"):
+        p.complete("prompt")
+    assert client.messages.calls == 1
+
+
+def test_call_with_sampling_retry_helper_strips_only_sampling_keys():
+    seen = []
+
+    def fn(**kwargs):
+        seen.append(kwargs)
+        if "temperature" in kwargs:
+            raise ValueError("400 invalid_request: temperature unsupported")
+        return "done"
+
+    result = P._call_with_sampling_retry(fn, {"model": "m", "temperature": 0.3, "max_tokens": 5})
+    assert result == "done"
+    assert seen[1] == {"model": "m", "max_tokens": 5}
 
 
 def test_get_provider_constructs_all_vendor_classes():

@@ -31,7 +31,8 @@ Example -- an orchestrator with two specialist sub-agents::
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from adapt_agent.optimization.evaluation import _RUN_METHOD_NAMES, resolve_runner
 from adapt_agent.optimization.introspection import introspect_components
@@ -164,6 +165,77 @@ class OptimizableAgent:
     def add_parameter(self, parameter: Parameter) -> None:
         """Declare an extra parameter after construction."""
         self._space.add(parameter)
+
+    def add_tool_parameter(
+        self,
+        name: str,
+        *,
+        kind: ParameterKind = ParameterKind.TOOL,
+        getter: Callable[[], Any],
+        setter: Callable[[Any], None],
+        candidates: list[Any] | None = None,
+        candidate_tools: list[Any] | None = None,
+        component: str | None = None,
+    ) -> Parameter:
+        """Register a tool/skill selection knob as a real search space.
+
+        This is the one-call convenience for making the set of tools (or
+        higher-level skills/plugins) an agent has access to *optimizable*. The
+        ``getter``/``setter`` bind to wherever the live tool list lives (e.g. an
+        agent's ``tools`` attribute), so the optimizer can swap the active set in
+        place between runs.
+
+        The candidate search space is resolved in priority order:
+
+        1. Explicit ``candidates`` (a list of tool-list values) if supplied.
+        2. Otherwise, if ``candidate_tools`` (the full pool of available tool
+           objects/names) is given, *drop-one ablation* subsets are derived via
+           :func:`adapt_agent.optimization.introspection.tool_subset_candidates`
+           -- the full set first, then each subset missing one tool. This makes
+           tool/skill *selection* a genuine search space rather than a fixed list.
+
+        Args:
+            name: Unique parameter name, conventionally ``"<component>.tools"``.
+            kind: :attr:`ParameterKind.TOOL` (default) or
+                :attr:`ParameterKind.SKILL` for higher-level named skills.
+            getter: Zero-arg callable returning the live tool/skill collection.
+            setter: One-arg callable writing a new collection onto the component.
+            candidates: Optional explicit list of candidate collections.
+            candidate_tools: Optional pool of available tools to derive drop-one
+                ablation subsets from when ``candidates`` is not supplied.
+            component: Optional owning sub-agent / node name.
+
+        Returns:
+            The :class:`Parameter` that was added to the search space.
+        """
+        if candidates is None and candidate_tools is not None:
+            tools = list(candidate_tools)
+            try:
+                from adapt_agent.optimization.introspection import (
+                    tool_subset_candidates,
+                )
+
+                candidates = tool_subset_candidates(tools)
+            except ImportError:
+                # Helper not available yet; fall back to the full set as the
+                # single candidate so the parameter is still well-formed.
+                candidates = [tools]
+            if not candidates:
+                # ``tool_subset_candidates`` returns [] for <2 tools; keep the
+                # current set as the sole candidate.
+                candidates = [tools]
+
+        param = Parameter(
+            name=name,
+            kind=kind,
+            value=getter(),
+            candidates=candidates,
+            getter=getter,
+            setter=setter,
+            component=component,
+        )
+        self._space.add(param)
+        return param
 
     def snapshot(self) -> dict[str, Any]:
         """Capture current values of all parameters (for restore)."""

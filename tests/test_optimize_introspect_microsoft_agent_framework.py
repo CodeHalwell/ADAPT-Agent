@@ -99,3 +99,49 @@ def test_top_p_and_max_tokens_on_agent() -> None:
     assert by_name["support_bot.top_p"].kind is ParameterKind.HYPERPARAM
     assert by_name["support_bot.top_p"].bounds == (0.0, 1.0)
     assert by_name["support_bot.max_tokens"].kind is ParameterKind.HYPERPARAM
+    assert by_name["support_bot.max_tokens"].bounds == (1, 32000)
+
+
+def test_tools_are_optimizable_with_drop_one_candidates() -> None:
+    agent = FakeChatAgent(
+        name="Magentic Worker",
+        instructions="Do work.",
+        chat_client=FakeChatClient("gpt-4o", 0.3),
+        tools=["search", "calc", "lookup"],
+    )
+    params = introspect(agent)
+    by_name = {p.name: p for p in params}
+
+    tools = by_name["magentic_worker.tools"]
+    assert tools.kind is ParameterKind.TOOL
+    assert tools.candidates is not None
+    # Full set first, then each drop-one ablation subset.
+    assert tools.candidates[0] == ["search", "calc", "lookup"]
+    assert ["calc", "lookup"] in tools.candidates
+    # More than one candidate makes it a real search space (optimizable).
+    assert len(tools.candidates) > 1
+
+
+def test_single_tool_has_no_ablation_candidates() -> None:
+    # The shared _make_agent has a single tool: bound for visibility but no
+    # drop-one candidates (nothing to ablate to).
+    params = introspect(_make_agent())
+    by_name = {p.name: p for p in params}
+    assert by_name["support_bot.tools"].kind is ParameterKind.TOOL
+    assert by_name["support_bot.tools"].candidates is None
+
+
+def test_skills_are_introspected_as_skill_kind() -> None:
+    agent = FakeChatAgent(
+        name="Skilled Bot",
+        instructions="Help out.",
+        chat_client=FakeChatClient("gpt-4o", 0.1),
+    )
+    agent.skills = ["summarize", "translate"]
+    params = introspect(agent)
+    by_name = {p.name: p for p in params}
+
+    skills = by_name["skilled_bot.skills"]
+    assert skills.kind is ParameterKind.SKILL
+    assert skills.candidates is not None
+    assert skills.candidates[0] == ["summarize", "translate"]

@@ -123,6 +123,57 @@ def test_predicate_rejects_unrelated_object():
     assert detect(object()) != "openai_agents"
 
 
+def test_predicate_rejects_foreign_chat_client():
+    # A Microsoft-ChatAgent-shaped object carrying chat_client must NOT be claimed
+    # by the OpenAI introspector, even if it also happens to expose handoffs/tools.
+    class FakeChatAgent:
+        def __init__(self):
+            self.instructions = "You orchestrate."
+            self.tools = []
+            self.handoffs = []
+            self.chat_client = object()
+
+    assert module._predicate(FakeChatAgent()) is False
+
+
+def test_predicate_rejects_kickoff_and_sub_agents():
+    class CrewLike:
+        instructions = "x"
+        tools: list = []
+        handoffs: list = []
+
+        def kickoff(self):  # CrewAI marker
+            return None
+
+    class AdkLike:
+        instructions = "x"
+        tools: list = []
+        handoffs: list = []
+        sub_agents: list = []  # Google ADK marker
+
+    assert module._predicate(CrewLike()) is False
+    assert module._predicate(AdkLike()) is False
+
+
+def test_predicate_requires_handoffs_to_be_a_sequence():
+    class NotASequence:
+        instructions = "x"
+        tools: list = []
+        handoffs = None  # present but not a list/tuple
+
+    assert module._predicate(NotASequence()) is False
+
+
+def test_tools_carry_drop_one_candidates():
+    root = FakeAgent("Tooled Agent", "Hi.", tools=["a", "b", "c"])
+    params = introspect(root)
+    by_name = {p.name: p for p in params}
+    tools = by_name["tooled_agent.tools"]
+    assert tools.candidates is not None
+    assert tools.candidates[0] == ["a", "b", "c"]
+    assert ["b", "c"] in tools.candidates
+
+
 def test_recursion_guards_against_cycles():
     a = FakeAgent("A Agent", "a")
     b = FakeAgent("B Agent", "b")

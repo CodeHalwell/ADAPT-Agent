@@ -16,13 +16,16 @@ from adapt_agent.optimization.proposers import (
     CandidateProposer,
     FewShotProposer,
     LLMProposer,
+    LLMToolProposer,
     NumericProposer,
     PromptMutationProposer,
     ProposalContext,
     Proposer,
+    ToolAblationProposer,
     default_proposers,
     proposers_for,
 )
+from adapt_agent.optimization.providers import CallableProvider
 from adapt_agent.optimization.target import OptimizableAgent
 
 # -- shared fixtures / helpers ------------------------------------------------
@@ -246,7 +249,7 @@ def test_prompt_mutation_appends_directives():
     # each candidate is base + one of the known directives
     from adapt_agent.optimization.proposers import _PROMPT_DIRECTIVES
 
-    for v, d in zip(out, _PROMPT_DIRECTIVES):
+    for v, d in zip(out, _PROMPT_DIRECTIVES, strict=False):
         assert v.endswith(d)
 
 
@@ -390,12 +393,17 @@ def test_few_shot_errored_results_not_counted_correct():
 
 def fake_complete_factory(rewrite="REWRITTEN INSTRUCTION"):
     """Deterministic completion fn: returns a rewrite for improve prompts,
-    a critique for critique prompts, and a generic answer otherwise."""
+    a critique for critique prompts, and a generic answer otherwise.
 
-    def _complete(prompt: str) -> str:
-        if "Rewrite the instruction" in prompt:
+    The judge now passes its instructions via the ``system`` argument (and the
+    untrusted input/output in the user ``prompt``), so we inspect both.
+    """
+
+    def _complete(prompt: str, *, system: str | None = None, **_kw) -> str:
+        haystack = f"{system or ''}\n{prompt}"
+        if "Rewrite the instruction" in haystack:
             return rewrite
-        if "Explain concisely" in prompt:
+        if "Explain concisely" in haystack:
             return "The answer was wrong; be more precise."
         return "ok"
 
@@ -515,14 +523,29 @@ def test_default_proposers_without_judge_excludes_llm():
     proposers = default_proposers(judge=None)
     names = [p.name for p in proposers]
     assert "llm" not in names
-    assert names == ["prompt_mutation", "few_shot", "candidates", "numeric"]
+    assert "llm_tool" not in names
+    assert names == [
+        "prompt_mutation",
+        "few_shot",
+        "candidates",
+        "numeric",
+        "tool_ablation",
+    ]
 
 
 def test_default_proposers_with_judge_includes_llm_first():
     proposers = default_proposers(judge=make_judge())
     names = [p.name for p in proposers]
     assert names[0] == "llm"
-    assert set(names) == {"llm", "prompt_mutation", "few_shot", "candidates", "numeric"}
+    assert set(names) == {
+        "llm",
+        "prompt_mutation",
+        "few_shot",
+        "candidates",
+        "numeric",
+        "tool_ablation",
+        "llm_tool",
+    }
 
 
 def test_proposers_for_filters_by_kind_prompt():
@@ -545,3 +568,170 @@ def test_proposers_for_filters_few_shot():
     fs, _ = few_shot_param()
     supporting = {x.name for x in proposers_for(fs, proposers)}
     assert supporting == {"few_shot"}
+
+
+# -- ToolAblationProposer -----------------------------------------------------
+
+
+def tool_param(value, candidates, *, kind=ParameterKind.TOOL):
+    box = Box(value)
+    return (
+        Parameter(
+            name="tools",
+            kind=kind,
+            candidates=candidates,
+            getter=box.get,
+            setter=box.set,
+        ),
+        box,
+    )
+
+
+def test_tool_ablation_supports_tool_and_skill():
+    tp = ToolAblationProposer()
+    tool, _ = tool_param(["a", "b"], [["a", "b"], ["b"], ["a"]])
+    skill, _ = tool_param(["a"], [["a"]], kind=ParameterKind.SKILL)
+    prompt, _ = prompt_param()
+    assert tp.supports(tool) is True
+    assert tp.supports(skill) is True
+    assert tp.supports(prompt) is False
+
+
+def test_tool_ablation_proposes_drop_one_subsets_excluding_current():
+    # Full set is the current value; candidates include drop-one subsets.
+    full = ["a", "b", "c"]
+    candidates = [["a", "b", "c"], ["b", "c"], ["a", "c"], ["a", "b"]]
+    param, box = tool_param(full, candidates)
+    box.set(full)
+    out = ToolAblationProposer().propose(ctx_for(param))
+    # current full set excluded; the three drop-one subsets remain.
+    assert out == [["b", "c"], ["a", "c"], ["a", "b"]]
+    assert full not in out
+
+
+def test_tool_ablation_skill_kind_works():
+    full = ["search", "calc"]
+    candidates = [["search", "calc"], ["calc"], ["search"]]
+    param, box = tool_param(full, candidates, kind=ParameterKind.SKILL)
+    box.set(full)
+    out = ToolAblationProposer().propose(ctx_for(param))
+    assert out == [["calc"], ["search"]]
+
+
+# -- LLMToolProposer ----------------------------------------------------------
+
+
+class StubToolJudge(LLMJudge):
+    """A CallableProvider-backed judge whose suggest_tools returns a fixed list."""
+
+    def __init__(self, suggestions):
+        super().__init__(CallableProvider(lambda prompt, **kw: "ok"))
+        self._suggestions = suggestions
+        self.calls = []
+
+    def suggest_tools(self, component, failures, current_tools, *, n=3):
+        self.calls.append((component, failures, current_tools, n))
+        return list(self._suggestions)
+
+
+def tool_failures_report():
+    return make_report(
+        [
+            result(0, score=0.0, inputs="q0", output="wrong", expected="right"),
+            result(1, score=1.0, inputs="q1", output="right", expected="right"),
+        ]
+    )
+
+
+def test_llm_tool_supports_tool_and_skill():
+    lp = LLMToolProposer()
+    tool, _ = tool_param(["a"], [["a"]])
+    skill, _ = tool_param(["a"], [["a"]], kind=ParameterKind.SKILL)
+    prompt, _ = prompt_param()
+    assert lp.supports(tool) is True
+    assert lp.supports(skill) is True
+    assert lp.supports(prompt) is False
+
+
+def test_llm_tool_returns_empty_without_judge():
+    param, _ = tool_param(["a"], [["a"]])
+    ctx = ctx_for(param, report=tool_failures_report(), judge=None)
+    assert LLMToolProposer(judge=None).propose(ctx) == []
+    assert ctx.recommendations == []
+
+
+def test_llm_tool_writes_recommendations_and_returns_no_values():
+    suggestions = [
+        {"name": "web_search", "description": "search the web", "rationale": "needs facts"},
+        {"name": "calculator", "description": "do math"},
+    ]
+    judge = StubToolJudge(suggestions)
+    box = Box(["existing"])
+    param = Parameter(
+        name="tools",
+        kind=ParameterKind.TOOL,
+        component="retriever",
+        candidates=[["existing"]],
+        getter=box.get,
+        setter=box.set,
+    )
+    ctx = ctx_for(param, report=tool_failures_report(), judge=judge)
+    out = LLMToolProposer().propose(ctx)
+    # Advisory only: never returns candidate values.
+    assert out == []
+    # Suggestions recorded as human-readable strings into ctx.recommendations.
+    assert ctx.recommendations == [
+        "[retriever] consider tool: web_search -- search the web (needs facts)",
+        "[retriever] consider tool: calculator -- do math",
+    ]
+    # Judge invoked with component, failure dicts, and current tool names.
+    component, failures, current_tools, n = judge.calls[0]
+    assert component == "retriever"
+    assert current_tools == ["existing"]
+    assert all(set(f) >= {"input", "output", "expected", "critique"} for f in failures)
+    # Only the failing example is passed (the passing one is excluded).
+    assert [f["input"] for f in failures] == ["q0"]
+
+
+def test_llm_tool_uses_context_judge_as_fallback():
+    judge = StubToolJudge([{"name": "t", "description": "d", "rationale": "r"}])
+    param, box = tool_param(["x"], [["x"]])
+    box.set(["x"])
+    ctx = ctx_for(param, report=tool_failures_report(), judge=judge)
+    out = LLMToolProposer(judge=None).propose(ctx)
+    assert out == []
+    assert ctx.recommendations == ["consider tool: t -- d (r)"]
+
+
+def test_llm_tool_dedupes_recommendations():
+    judge = StubToolJudge([{"name": "t", "description": "d"}])
+    param, box = tool_param(["x"], [["x"]])
+    box.set(["x"])
+    ctx = ctx_for(param, report=tool_failures_report(), judge=judge)
+    LLMToolProposer().propose(ctx)
+    LLMToolProposer().propose(ctx)
+    assert ctx.recommendations == ["consider tool: t -- d"]
+
+
+# -- default_proposers tool/skill coverage ------------------------------------
+
+
+def test_default_proposers_include_tool_ablation_always():
+    names = [p.name for p in default_proposers(judge=None)]
+    assert "tool_ablation" in names
+    assert "llm_tool" not in names
+
+
+def test_default_proposers_include_llm_tool_with_judge():
+    names = [p.name for p in default_proposers(judge=make_judge())]
+    assert "tool_ablation" in names
+    assert "llm_tool" in names
+
+
+def test_proposers_for_filters_tool_kind():
+    proposers = default_proposers(judge=make_judge())
+    tool, _ = tool_param(["a", "b"], [["a", "b"], ["b"], ["a"]])
+    supporting = {x.name for x in proposers_for(tool, proposers)}
+    # CandidateProposer also supports a TOOL param that carries explicit
+    # candidates (it gates on candidates/bounds, not kind).
+    assert supporting == {"tool_ablation", "llm_tool", "candidates"}
