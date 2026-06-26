@@ -76,8 +76,10 @@ def _ensure_loaded() -> None:
     for module in _FRAMEWORK_MODULES:
         try:
             importlib.import_module(module)
-        except Exception:
-            # A malformed optional module must not break introspection of others.
+        except ImportError:
+            # A genuinely missing/unimportable optional module is skipped; other
+            # exceptions (e.g. a real bug in a first-party introspector) propagate
+            # so they are visible rather than silently swallowed.
             continue
 
 

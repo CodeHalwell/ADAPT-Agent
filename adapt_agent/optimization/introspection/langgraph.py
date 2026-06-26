@@ -206,6 +206,14 @@ def _introspect(obj: Any) -> list[Parameter]:
     try:
         nodes = getattr(obj, "nodes", None)
         if not isinstance(nodes, dict):
+            # Some compiled graphs expose nodes only via ``get_graph().nodes``.
+            get_graph = getattr(obj, "get_graph", None)
+            if callable(get_graph):
+                try:
+                    nodes = getattr(get_graph(), "nodes", None)
+                except Exception:
+                    nodes = None
+        if not isinstance(nodes, dict):
             return []
         params: list[Parameter] = []
         for name, node in nodes.items():

@@ -70,6 +70,46 @@ def test_resolve_runner_invalid_raises_typeerror():
         resolve_runner(NoRun())
 
 
+def test_resolve_runner_framework_methods():
+    # LangGraph (invoke), CrewAI (kickoff), Pydantic AI (run_sync) work directly.
+    class Graph:
+        def invoke(self, x):
+            return {"state": x}
+
+    class Crew:
+        def kickoff(self, x):
+            return f"crew:{x}"
+
+    class PydanticAgent:
+        def run_sync(self, x):
+            return f"sync:{x}"
+
+    assert resolve_runner(Graph())("q") == {"state": "q"}
+    assert resolve_runner(Crew())("q") == "crew:q"
+    assert resolve_runner(PydanticAgent())("q") == "sync:q"
+
+
+def test_resolve_runner_prefers_run_sync_over_async_run():
+    # An object exposing both run_sync (sync) and run (async) uses run_sync.
+    class Dual:
+        def run_sync(self, x):
+            return f"sync:{x}"
+
+        async def run(self, x):  # pragma: no cover - must not be chosen
+            return f"async:{x}"
+
+    assert resolve_runner(Dual())("q") == "sync:q"
+
+
+def test_resolve_runner_resolves_async_run_method():
+    # An async-only run method is driven synchronously (coroutine awaited).
+    class AsyncAgent:
+        async def run(self, x):
+            return f"async:{x}"
+
+    assert resolve_runner(AsyncAgent())("q") == "async:q"
+
+
 # -- metric helpers -----------------------------------------------------------
 
 

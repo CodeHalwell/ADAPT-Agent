@@ -410,8 +410,11 @@ def _normalize_score(raw: Any, scale: int, default: float) -> float:
         value = num
     else:
         return default
-    # Values already in [0, 1] are taken as-is; larger values are on the scale.
-    if 0.0 <= value <= 1.0 and scale > 1:
+    # Values strictly between 0 and 1 (exclusive) are taken as already
+    # normalized; integral endpoints like 1 are on the scale (1 of `scale`), so
+    # a "1" on a 0-10 scale becomes 0.1, not 1.0. A genuine 0..1 judge sets
+    # scale=1, where `scale > 1` is False and the value passes through unscaled.
+    if 0.0 < value < 1.0 and scale > 1:
         return value
     return max(0.0, min(1.0, value / scale))
 

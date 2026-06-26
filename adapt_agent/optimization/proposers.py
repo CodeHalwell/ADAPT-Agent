@@ -272,7 +272,9 @@ class LLMProposer(Proposer):
         failing = ctx.report.failures()
         if not failing:
             return []
-        sample = failing[: self.critique_samples]
+        # Sample (seeded) across the whole failure pool rather than always taking
+        # the first few, so later-failing examples are not systematically ignored.
+        sample = ctx.rng.sample(failing, min(len(failing), self.critique_samples))
         records: list[dict[str, Any]] = []
         for r in sample:
             critique = ""

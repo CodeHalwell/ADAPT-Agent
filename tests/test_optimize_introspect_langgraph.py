@@ -101,3 +101,33 @@ def test_prompt_setter_round_trips() -> None:
     # A fresh introspection observes the mutated value too.
     refreshed = {p.name: p for p in introspect(graph)}
     assert refreshed["researcher.system_prompt"].read() == "You are a meticulous fact-checker."
+
+
+def test_introspect_reads_nodes_via_get_graph() -> None:
+    # Some compiled graphs expose nodes only through ``get_graph().nodes``.
+    class GraphView:
+        def __init__(self, nodes) -> None:
+            self.nodes = nodes
+
+    class GraphWithGetGraph:
+        def __init__(self, nodes) -> None:
+            self._nodes = nodes
+
+        def invoke(self, state):  # pragma: no cover - never called
+            return state
+
+        def get_graph(self):
+            return GraphView(self._nodes)
+
+    node = FakeNode(
+        FakeRunnable(
+            system_prompt="You are a careful researcher.",
+            model=FakeModel(model_name="gpt-4o", temperature=0.3),
+        )
+    )
+    graph = GraphWithGetGraph(nodes={"researcher": node})
+
+    assert detect(graph) == "langgraph"
+    params = {p.name: p for p in introspect(graph)}
+    assert "researcher.system_prompt" in params
+    assert params["researcher.system_prompt"].kind is ParameterKind.PROMPT

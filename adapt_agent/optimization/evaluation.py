@@ -25,26 +25,50 @@ from adapt_agent.optimization.metrics import Metric, MetricFn, coerce_metric
 logger = logging.getLogger(__name__)
 
 
+# Framework-native "run" methods, sync entrypoints first so frameworks that
+# expose both (e.g. Pydantic AI ``run_sync`` + async ``run``) use the sync one.
+# Covers LangGraph (``invoke``), CrewAI (``kickoff``), Pydantic AI (``run_sync``),
+# the OptimizableAgent / Microsoft Agent Framework (``run``).
+_RUN_METHOD_NAMES = ("run_sync", "invoke", "kickoff", "run")
+
+
 def resolve_runner(agent: Any) -> Callable[[Any], Any]:
     """Return a ``Callable[[input], output]`` from a variety of agent shapes.
 
-    Accepts, in priority order: an object exposing a callable ``run`` (the
-    :class:`~adapt_agent.optimization.target.OptimizableAgent` contract), a plain
-    callable, or an object exposing ``execute`` (the ADAPT-Agent governed-agent
-    protocol). Raises :class:`TypeError` otherwise.
+    Resolution order: a recognized framework run method (``run_sync``, ``invoke``,
+    ``kickoff``, ``run`` -- so a raw LangGraph graph, CrewAI ``Crew`` or Pydantic
+    AI ``Agent`` works directly), then a plain callable, then a governed agent's
+    ``execute``. Method-driven runners have their result *resolved* -- coroutines
+    are awaited and async/sync generators are drained -- so async-native agents
+    can be driven synchronously. A plain callable is returned unwrapped. Raises
+    :class:`TypeError` when nothing runnable is found.
     """
-    run = getattr(agent, "run", None)
-    if callable(run):
-        return cast("Callable[[Any], Any]", run)
+    for name in _RUN_METHOD_NAMES:
+        method = getattr(agent, name, None)
+        if callable(method):
+            return _resolving_runner(method)
     if callable(agent):
         return cast("Callable[[Any], Any]", agent)
     execute = getattr(agent, "execute", None)
     if callable(execute):
-        return cast("Callable[[Any], Any]", execute)
+        return _resolving_runner(execute)
     raise TypeError(
         "Cannot evaluate object: expected a callable, an object with a callable "
-        "`run`, or a governed agent with `execute`."
+        "run method (run_sync/invoke/kickoff/run), or a governed agent with "
+        "`execute`. Pass an explicit runner if your framework differs."
     )
+
+
+def _resolving_runner(method: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    """Wrap a framework run method so sync/async results are materialized."""
+    # Imported lazily; reuses the adapters' result resolver (coroutines awaited,
+    # async/sync generators drained). Importing it pulls in no framework SDK.
+    from adapt_agent.adapters._governed import _resolve_result
+
+    def _runner(input_data: Any) -> Any:
+        return _resolve_result(method(input_data))
+
+    return _runner
 
 
 @dataclass

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from adapt_agent.optimization.evaluation import resolve_runner
+from adapt_agent.optimization.evaluation import _RUN_METHOD_NAMES, resolve_runner
 from adapt_agent.optimization.introspection import introspect_components
 from adapt_agent.optimization.parameters import Parameter, ParameterKind, SearchSpace
 
@@ -209,7 +209,10 @@ class OptimizableAgent:
 def _is_runnable(obj: Any) -> bool:
     if callable(obj):
         return True
-    return callable(getattr(obj, "run", None)) or callable(getattr(obj, "execute", None))
+    # Recognize the same entrypoints as ``resolve_runner`` (framework-native run
+    # methods + the governed ``execute``) so a single framework component can be
+    # inferred as the runner.
+    return any(callable(getattr(obj, name, None)) for name in (*_RUN_METHOD_NAMES, "execute"))
 
 
 def wrap(
