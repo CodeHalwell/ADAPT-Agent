@@ -72,12 +72,16 @@ class Firewall:
         """
         # SECURITY: DoS protection by limiting input length
         if self.max_content_length is not None and len(content) > self.max_content_length:
+            # SECURITY: Prevent log poisoning by escaping newline and carriage return characters.
+            safe_snippet = (
+                self.sanitize(content[:256])[:100].replace("\n", "\\n").replace("\r", "\\r")
+            )
             self._record_security_event(
                 event_type="blocked_input",
                 severity="high",
                 description=f"Input length {len(content)} exceeds maximum allowed {self.max_content_length}",
                 metadata={
-                    "content_snippet": self.sanitize(content[:256])[:100],
+                    "content_snippet": safe_snippet,
                     "length": len(content),
                 },
             )
@@ -92,11 +96,15 @@ class Firewall:
         # Check blocked patterns
         for pattern in self._blocked_patterns:
             if pattern.search(content):
+                # SECURITY: Prevent log poisoning by escaping newline and carriage return characters.
+                safe_snippet = (
+                    self.sanitize(content[:256])[:100].replace("\n", "\\n").replace("\r", "\\r")
+                )
                 self._record_security_event(
                     event_type="blocked_input",
                     severity="high",
                     description=f"Input matched blocked pattern: {pattern.pattern}",
-                    metadata={"content_snippet": self.sanitize(content[:256])[:100]},
+                    metadata={"content_snippet": safe_snippet},
                 )
                 self._blocked_count += 1
                 return False
@@ -105,23 +113,31 @@ class Firewall:
         for filter_func in self._custom_filters:
             try:
                 if filter_func(content):
+                    # SECURITY: Prevent log poisoning by escaping newline and carriage return characters.
+                    safe_snippet = (
+                        self.sanitize(content[:256])[:100].replace("\n", "\\n").replace("\r", "\\r")
+                    )
                     self._record_security_event(
                         event_type="blocked_input",
                         severity="medium",
                         description="Input blocked by custom filter",
-                        metadata={"content_snippet": self.sanitize(content[:256])[:100]},
+                        metadata={"content_snippet": safe_snippet},
                     )
                     self._blocked_count += 1
                     return False
             except Exception as e:
                 # Log error and block on filter failure (fail-closed)
                 logger.error(f"Error in custom filter: {e}")
+                # SECURITY: Prevent log poisoning by escaping newline and carriage return characters.
+                safe_snippet = (
+                    self.sanitize(content[:256])[:100].replace("\n", "\\n").replace("\r", "\\r")
+                )
                 self._record_security_event(
                     event_type="blocked_input",
                     severity="high",
                     description="Input blocked due to custom filter error",
                     metadata={
-                        "content_snippet": self.sanitize(content[:256])[:100],
+                        "content_snippet": safe_snippet,
                         "error": "An error occurred",
                     },
                 )
