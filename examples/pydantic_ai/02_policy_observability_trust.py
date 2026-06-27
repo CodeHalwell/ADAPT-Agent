@@ -98,8 +98,16 @@ def build_middleware() -> Middleware:
         return payload
 
     def stamp_output(payload: dict[str, Any]) -> dict[str, Any]:
-        if isinstance(payload.get("result"), str):
-            payload["result"] = payload["result"] + " [reviewed]"
+        # The adapter wraps a non-dict framework result as {"result": <AgentRunResult>},
+        # so handle both a plain string and a Pydantic AI result object (.output).
+        result = payload.get("result")
+        if isinstance(result, str):
+            payload["result"] = result + " [reviewed]"
+        elif hasattr(result, "output") and isinstance(result.output, str):
+            try:
+                result.output = result.output + " [reviewed]"
+            except AttributeError:
+                pass  # frozen result object; leave it unchanged
         return payload
 
     mw.add_pre_middleware(tag_input, name="tag_input")

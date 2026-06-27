@@ -29,6 +29,7 @@ Run it with:
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -120,8 +121,9 @@ def make_runner(coordinator: SimpleNamespace):
 
 
 def _two_numbers(text: str) -> tuple[int, int]:
-    nums = [int(tok) for tok in text.replace("+", " ").replace("*", " ").split() if tok.isdigit()]
-    return (nums + [0, 0])[:2]
+    # Pull the first two integers regardless of operator spacing ("10-4" or "10 - 4").
+    nums = [int(n) for n in re.findall(r"\d+", text)] + [0, 0]
+    return (nums[0], nums[1])
 
 
 def deterministic_judge_stub(prompt: str, system: str | None = None) -> str:
