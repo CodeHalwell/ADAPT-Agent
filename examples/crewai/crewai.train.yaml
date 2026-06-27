@@ -1,0 +1,66 @@
+# ADAPT-Agent training config for a CrewAI crew (offline, no network).
+#
+# Run it with the parallel YAML path shown in 04_multi_agent_and_training.py:
+#
+#     from adapt_agent.optimization.config import run_training
+#     result = run_training("examples/crewai/crewai.train.yaml")
+#
+# or via the CLI:
+#
+#     adapt-agent train examples/crewai/crewai.train.yaml
+#
+# This file declares the SAME run that 04_multi_agent_and_training.py builds in
+# Python, but declaratively. It points at the live crew defined in that module
+# (resolved as `module:attribute`), so the optimizer introspects and rewrites the
+# real CrewAI Agent/Task objects in place.
+
+target:
+  # A callable `input -> output` that drives the whole crew. In example 04 this
+  # is the module-level `run` function that calls `crew.kickoff(...)`.
+  entrypoint: "examples.crewai.04_multi_agent_and_training:run"
+  # The live components to introspect for tunable knobs. The CrewAI introspector
+  # walks the Crew and exposes per-agent role/goal/backstory, llm model+temp+
+  # max_tokens, tools, max_iter, and per-task description/expected_output.
+  components:
+    crew: "examples.crewai.04_multi_agent_and_training:CREW"
+
+dataset:
+  # A tiny golden dataset written to disk by the example before running.
+  path: "examples/crewai/_golden.jsonl"
+  format: jsonl
+
+judge:
+  # The example registers an offline "stub" provider so this runs with NO API
+  # key. For a real run use provider: anthropic / openai / gemini and a model.
+  provider: stub
+  adversarial: true # grade as a harsh critic and propose new tools/skills
+  metric_name: quality
+  pass_threshold: 0.6
+
+metrics: [exact_match, token_f1]
+primary_metric: quality
+
+optimizer:
+  type: default # few-shot -> prompts -> models/hparams -> tools/skills
+  max_evals: 20
+  min_improvement: 0.001
+  seed: 0
+  suggest_tools: true # let the judge propose NEW tools/skills from failures
+
+# No explicit `parameters` block is needed here: the CrewAI introspector walks
+# the live crew and auto-discovers every per-agent prompt (role/goal/backstory),
+# the llm model/temperature/max_tokens, the tools allow-list, max_iter, and each
+# task's description/expected_output. To add a knob the framework does NOT expose
+# (e.g. a routing threshold held on a plain object), declare it here with a
+# component + a dotted `attr_path` that resolves via attribute access, e.g.:
+#
+#   parameters:
+#     - name: cfg.threshold
+#       kind: routing
+#       component: cfg          # must be listed under target.components
+#       attr_path: threshold    # getattr-able path on that component
+#       bounds: [0.0, 1.0]
+#       step: 0.1
+#
+# (attr_path uses attribute access only -- it cannot index into a list, so target
+# a concrete object attribute rather than e.g. `agents.0.max_iter`.)

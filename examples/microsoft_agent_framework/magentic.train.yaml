@@ -1,0 +1,65 @@
+# ADAPT-Agent training config for the Magentic team (example 04, Part D).
+#
+# This declares the SAME optimization run as the in-code path, but declaratively.
+# Run it with:
+#
+#     from adapt_agent.optimization.config import run_training
+#     result = run_training("magentic.train.yaml")
+#
+# In example 04 the entrypoint/components below are resolved from a small module
+# (`magentic_team_app`) that the example registers in sys.modules before calling
+# run_training, so the whole thing stays offline. In a real project these would
+# be ordinary "package.module:attribute" references, e.g. "myapp.app:run" and
+# "myapp.agents:writer".
+
+target:
+  # A callable input -> output that drives the whole team (the workflow agent).
+  entrypoint: "magentic_team_app:run"
+  # The five live ChatAgents to introspect for tunable knobs (prompts/models/
+  # tools/skills). They are the SAME objects the entrypoint runs, so applying a
+  # candidate config changes the next run.
+  components:
+    researcher: "magentic_team_app:researcher"
+    writer:     "magentic_team_app:writer"
+    coder:      "magentic_team_app:coder"
+    reviewer:   "magentic_team_app:reviewer"
+    manager:    "magentic_team_app:manager"
+
+dataset:
+  path: "golden.jsonl"        # written next to this file by example 04, Part D
+  format: jsonl
+
+judge:
+  # "offline_stub" is a deterministic provider the example registers before the
+  # run (no network). For real training use: provider: anthropic / openai / ...
+  provider: offline_stub
+  adversarial: true           # grade as a harsh critic AND propose new tools/skills
+  metric_name: quality
+
+metrics: [exact_match]
+primary_metric: exact_match
+
+optimizer:
+  type: default               # few-shot -> prompts -> models/hparams/routing -> tools
+  max_evals: 40
+  min_improvement: 0.001
+  seed: 0
+  suggest_tools: true         # let the judge propose NEW tools/skills from failures
+
+# Knobs no framework auto-exposes: the Magentic routing limits live on the
+# manager config, not on an agent attribute, so we declare them explicitly here.
+# Each binds live to an attribute on the resolved `manager` component object
+# (the example exposes them there and rebuilds the workflow in its setter).
+parameters:
+  - name: manager.max_round_count
+    kind: routing
+    component: manager
+    attr: max_round_count
+    bounds: [4, 10]
+    step: 1
+  - name: manager.max_stall_count
+    kind: routing
+    component: manager
+    attr: max_stall_count
+    bounds: [1, 5]
+    step: 1

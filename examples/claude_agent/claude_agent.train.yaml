@@ -1,0 +1,83 @@
+# ADAPT-Agent training config for a Claude Agent SDK multi-agent system.
+#
+# Run with:   adapt-agent train examples/claude_agent/claude_agent.train.yaml
+#   or:        python -c "from adapt_agent.optimization.config import run_training; \
+#                          print(run_training('examples/claude_agent/claude_agent.train.yaml'))"
+#
+# This is the real-world counterpart to `04_multi_agent_and_training.py` (Path B).
+# It tunes a researcher -> writer -> reviewer pipeline -- each agent a
+# `ClaudeAgentOptions` object -- against a golden dataset, scored by an LLM judge
+# that can also act as a critical adversary and propose new tools/skills.
+#
+# Unlike the example file (which keeps everything offline), this config names a
+# real `anthropic` judge and a file dataset, so running it needs ANTHROPIC_API_KEY
+# and a `golden.jsonl`. To dry-run offline, swap `judge.provider` to `echo` and
+# drop the judge-driven prompt rewriting (metric-only search still works).
+
+target:
+  # The entrypoint that drives the whole pipeline: a callable `input -> output`.
+  # In your project this is the orchestrator that runs query() three times.
+  entrypoint: "myapp.team:orchestrator"
+  # The live ClaudeAgentOptions objects to introspect for tunable knobs. Each is
+  # a "module:attribute" reference, and the SAME object the entrypoint runs, so
+  # applying a winning config changes the next run. The introspector pulls
+  # system_prompt (PROMPT), model (MODEL), allowed_tools/disallowed_tools (TOOL),
+  # max_turns (HYPERPARAM) and permission_mode (ROUTING) off each one.
+  components:
+    researcher: "myapp.team:RESEARCHER"
+    writer:     "myapp.team:WRITER"
+    reviewer:   "myapp.team:REVIEWER"
+
+dataset:
+  path: "golden.jsonl"          # .jsonl / .json / .csv
+  format: jsonl                 # optional; inferred from the extension otherwise
+  # input_key: question         # optional explicit column overrides
+  # expected_key: answer
+  # val_path: holdout.jsonl     # optional held-out validation split
+
+judge:
+  provider: anthropic           # anthropic/claude, openai, gemini, ... (or "echo" offline)
+  model: claude-opus-4-8
+  adversarial: true             # grade as a harsh critic AND propose new tools/skills
+  scale: 10
+  pass_threshold: 0.6
+  criteria: "correct, concise, faithful to the research, and on-task"
+  metric_name: quality          # the judge metric's reporting name
+
+metrics: [exact_match, token_f1]
+primary_metric: quality         # default: the judge metric when a judge is set
+
+optimizer:
+  type: default                 # default | coordinate_ascent | grid | random | evolutionary | bootstrap_few_shot
+  max_evals: 60
+  min_improvement: 0.001        # don't accept candidates that only won on judge noise
+  seed: 0
+  suggest_tools: true           # let the judge propose NEW tools/skills from failures
+  # kinds: [prompt, tool, skill]  # optional: restrict what gets tuned
+
+# Knobs to declare explicitly. The Claude Agent SDK fields above are
+# auto-introspected, so list here only what introspection cannot reach -- e.g.
+# turning a sub-agent's tool allow-list into a drop-one ablation search space, or
+# pinning a model pool. Each binds live to a resolved component attribute.
+parameters:
+  - name: researcher.allowed_tools
+    kind: tool
+    component: researcher
+    attr: allowed_tools
+    # Candidate tool-lists to search over (the optimizer can learn to drop the
+    # distracting "scratchpad" tool). Omit `candidates` to let drop-one ablation
+    # derive subsets automatically from the live list.
+    candidates:
+      - ["web_search", "scratchpad"]
+      - ["web_search"]
+  - name: writer.model
+    kind: model
+    component: writer
+    attr: model
+    candidates: ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"]
+  - name: researcher.max_turns
+    kind: hyperparam
+    component: researcher
+    attr: max_turns
+    bounds: [1, 6]
+    step: 1

@@ -1,0 +1,66 @@
+# ADAPT-Agent training config for a Google ADK multi-agent system.
+#
+# Run it with:   adapt-agent train examples/google_adk/google_adk.train.yaml
+# (or in code:    from adapt_agent.optimization.config import run_training
+#                 run_training("examples/google_adk/google_adk.train.yaml"))
+#
+# This is the declarative twin of the "code path" in 04_multi_agent_and_training.py.
+# It tunes a coordinator LlmAgent + two specialist sub_agents against a golden
+# dataset, scored by an LLM-as-judge that can act as a harsh adversary and propose
+# brand-new tools/skills from the failures it sees.
+#
+# NOTE: the module/attribute references below ("mypackage...") are placeholders for
+# YOUR project. The entrypoint is a callable `input -> output` that drives the whole
+# ADK system (it builds/holds a Runner and calls runner.run; see example 01). Each
+# component is a *live* LlmAgent the entrypoint actually runs, so applying a candidate
+# config mutates the next run. Point dataset.path at your golden data and pick a real
+# judge provider to train for real.
+
+target:
+  # A callable input -> output that drives the whole ADK system through a Runner.
+  entrypoint: "mypackage.app:run"
+  # The live LlmAgents to introspect. ADK sub_agents are also walked recursively,
+  # but registering them explicitly lets you target their knobs by a stable name.
+  components:
+    coordinator: "mypackage.agents:coordinator"
+    math_agent:  "mypackage.agents:math_agent"
+    geo_agent:   "mypackage.agents:geo_agent"
+
+dataset:
+  path: "golden.jsonl"          # .jsonl / .json / .csv
+  format: jsonl                 # optional; inferred from the extension otherwise
+  # input_key: question         # optional explicit column overrides
+  # expected_key: answer
+
+judge:
+  provider: anthropic           # anthropic/claude, openai, gemini, mistral, ...
+  model: claude-opus-4-8
+  adversarial: true             # grade as a harsh critic; resists reward-hacking
+  scale: 10
+  pass_threshold: 0.6
+  criteria: "correct, concise, and on-task"
+  metric_name: quality          # the judge metric's reporting name
+
+metrics: [exact_match, token_f1]
+primary_metric: exact_match     # or `quality` to optimize against the judge
+
+optimizer:
+  type: default                 # default | coordinate_ascent | grid | random | evolutionary | bootstrap_few_shot
+  max_evals: 60
+  min_improvement: 0.001        # don't accept candidates that only won on judge noise
+  seed: 0
+  suggest_tools: true           # let the adversarial judge propose NEW tools/skills
+  # kinds: [prompt, tool, skill]   # optional: restrict what gets tuned
+
+# Knobs no framework auto-exposes. For Google ADK, instruction / model /
+# generate_content_config (temperature, top_p, max_output_tokens) / tools /
+# sub_agents ARE auto-discovered, so you rarely need this block. Use it for
+# higher-level skills or any custom attribute. Each binds live to a component.
+parameters:
+  - name: math_agent.skills
+    kind: skill
+    component: math_agent
+    attr: skills                # a list attribute holding skill identifiers
+    candidates:
+      - ["arithmetic", "word_problems"]
+      - ["arithmetic"]

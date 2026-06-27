@@ -1,0 +1,79 @@
+# ADAPT-Agent training config for the Pydantic AI multi-agent example.
+#
+# Run it indirectly via example 04 (which writes the dataset and calls
+# run_training), or directly once your code is importable:
+#
+#     from adapt_agent.optimization.config import run_training
+#     result = run_training("examples/pydantic_ai/pydantic_ai.train.yaml")
+#
+# This file is intentionally offline-friendly: it scores with the deterministic
+# `exact_match` metric and declares NO judge, so it needs no API key. To train
+# for real, add a `judge:` block (see the commented example at the bottom) and
+# point `dataset.path` at your own golden data.
+
+target:
+  # A callable `input -> output` that drives the whole multi-agent system. Here
+  # it is the orchestrator function exposed as a module attribute in example 04.
+  entrypoint: "__main__:yaml_run"
+  # The live specialist agents to introspect for tunable knobs (their system
+  # prompts, models, temperatures, tools). They are the SAME objects the
+  # entrypoint runs, so applying a candidate config changes the next run.
+  components:
+    researcher: "__main__:researcher"
+    writer:     "__main__:writer"
+    writer_cfg: "__main__:writer_cfg"   # holds the YAML-tuned writer instruction
+  name: research-team
+
+dataset:
+  # Written next to this file by example 04 before run_training is called.
+  path: "_golden.jsonl"
+  format: jsonl
+  # input_key: input        # optional explicit column overrides
+  # expected_key: expected
+
+# Deterministic, offline scoring. `exact_match` needs no model and no network.
+metrics: [exact_match]
+primary_metric: exact_match
+
+optimizer:
+  type: grid                 # grid-search the declared prompt candidates below
+  max_evals: 40
+  min_improvement: 0.001     # don't accept candidates that only won on noise
+  seed: 0
+  suggest_tools: false       # no judge here, so no new-tool suggestions
+
+# Explicit knobs. The writer's working instruction lives on the module-level
+# `writer_cfg` object, so it binds cleanly via `component` + `attr_path` and we
+# can grid-search a small candidate list -- all offline, no judge required.
+parameters:
+  - name: writer.instruction
+    kind: prompt
+    component: writer_cfg
+    attr_path: instruction
+    candidates:
+      - "Write an answer using the facts."
+      - "Answer with ONLY the capital city name, nothing else."
+
+# The researcher's and writer's Pydantic AI system prompts are ALSO discovered
+# automatically by introspecting those components, so a judge-driven run would
+# tune them too. A YAML parameter binds to an *attribute* on a resolved
+# component; knobs that live in a free-standing dict (like ROUTING["n_facts"] in
+# example 04) must instead be declared in Python with an explicit getter/setter
+# (see `target.add_parameter(...)`). An attribute-bound hyperparameter looks like:
+#
+#   - name: writer.temperature
+#     kind: hyperparam
+#     component: writer
+#     attr_path: model_settings.temperature
+#     bounds: [0.0, 1.0]
+
+# --- Real (online) judge: uncomment and set provider credentials ------------ #
+# judge:
+#   provider: anthropic        # anthropic/claude, openai, gemini, mistral, ...
+#   model: claude-opus-4-8
+#   adversarial: true          # grade as a harsh critic; resist reward hacking
+#   criteria: "correct, concise, and exactly the capital city name"
+#   metric_name: quality
+# primary_metric: quality
+# optimizer:
+#   suggest_tools: true        # let the judge propose NEW tools/skills from failures
