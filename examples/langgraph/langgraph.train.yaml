@@ -1,0 +1,65 @@
+# ADAPT-Agent declarative training config for a LangGraph app.
+#
+# This is a real-world TEMPLATE: point `entrypoint` at your own module. Run it with:
+#
+#     from adapt_agent.optimization.config import run_training
+#     result = run_training("examples/langgraph/langgraph.train.yaml")
+#     print(result.improvement, result.best_config)
+#     for tip in result.recommendations:
+#         print(tip)
+#
+# Because LangGraph node prompts usually live in closures (not auto-introspectable),
+# keep them on a live config object and bind explicit `parameters` to it via `attr`.
+
+target:
+  # A callable input -> output that drives your compiled graph, e.g.:
+  #   def run(question): return APP.invoke({"question": question})["answer"]
+  entrypoint: "myapp.graph:run"
+  components:
+    # An object whose attributes are your tunable prompts / tool lists.
+    knobs: "myapp.graph:KNOBS"
+
+dataset:
+  path: "golden.jsonl"        # input/expected per row (jsonl/json/csv)
+  format: jsonl
+
+# The LLM-as-judge. `adversarial: true` makes it a harsh critic that also proposes
+# new tools/skills (surfaced on result.recommendations). Omit the whole `judge`
+# block to optimize with metrics only (fully offline).
+judge:
+  provider: anthropic         # anthropic | openai | gemini | ... (SDK imported lazily)
+  model: claude-opus-4-8      # ANTHROPIC_API_KEY from the environment
+  adversarial: true
+
+metrics: [exact_match, token_f1]
+primary_metric: token_f1
+
+optimizer:
+  type: default               # few-shot -> prompts -> models/hparams -> tools/skills
+  max_evals: 60               # a hard cap across all pipeline stages
+  min_improvement: 0.01       # ignore gains smaller than this (avoid judge noise)
+  suggest_tools: true         # let the judge propose new tools/skills
+
+# Explicit knobs the framework does not expose. Each binds to an attribute on a
+# resolved component (here the `knobs` object).
+parameters:
+  - name: geo.prompt
+    kind: prompt
+    component: knobs
+    attr: geo_prompt
+    candidates:
+      - "Answer the geography question."
+      - "Answer with ONLY the city name, nothing else."
+  - name: math.prompt
+    kind: prompt
+    component: knobs
+    attr: math_prompt
+    candidates:
+      - "Answer the math question."
+      - "Answer with ONLY the final number."
+  # A temperature knob is clamped to the provider's max automatically (with a warning):
+  - name: math.temperature
+    kind: hyperparam
+    component: knobs
+    attr: temperature
+    bounds: [0.0, 1.0]

@@ -79,6 +79,30 @@ improves the baseline and applies the winning configuration back onto the live
 agent. Swap the stub for `ClaudeJudge` / `OpenAIJudge` / `GeminiJudge` for real
 optimization.
 
+## Per-framework example ladders
+
+Each supported framework has its own folder with a 3–4 step ladder that climbs
+from a tiny guarded agent to a governed, optimized multi-agent system, plus a
+`train.yaml` and a README. Install the matching extra (e.g.
+`pip install 'adapt-agent[langgraph]'`) and run any script directly; each guards
+its framework import with a friendly hint and runs offline (no API key) where it
+exercises ADAPT-Agent itself.
+
+| Framework | Folder | Extra |
+|-----------|--------|-------|
+| LangGraph | [`langgraph/`](langgraph/) | `adapt-agent[langgraph]` |
+| Microsoft Agent Framework | [`microsoft_agent_framework/`](microsoft_agent_framework/) | `adapt-agent[microsoft-agent-framework]` |
+| Google ADK | [`google_adk/`](google_adk/) | `adapt-agent[google-adk]` |
+| Pydantic AI | [`pydantic_ai/`](pydantic_ai/) | `adapt-agent[pydantic-ai]` |
+| CrewAI | [`crewai/`](crewai/) | `adapt-agent[crewai]` |
+| OpenAI Agents SDK | [`openai_agents/`](openai_agents/) | `adapt-agent[openai-agents]` |
+| Claude Agent SDK | [`claude_agent/`](claude_agent/) | `adapt-agent[claude-agent]` |
+
+Each ladder follows the same shape: `01` basic guarded agent → `02` policy /
+observability / trust → `03` evaluate & optimize a single agent → `04` multi-agent
+system + declarative YAML training. The verbose per-framework guides live in
+[`docs/frameworks/`](../docs/frameworks/).
+
 ## Configuration file
 
 ### `config.example.json`
