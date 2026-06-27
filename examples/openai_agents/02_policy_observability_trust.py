@@ -109,11 +109,11 @@ def build_guard() -> tuple[Any, AgentObserver, PolicyEnforcer, TrustManager]:
     # TrustManager is a side-car: it is not part of the adapter pipeline, you
     # consult/update it yourself around runs (see main()).
     trust = TrustManager(initial_trust=0.5)
-    return guarded, observer, policy, trust
+    return guarded, observer, policy, trust, adapter
 
 
 def main() -> None:
-    guarded, observer, policy, trust = build_guard()
+    guarded, observer, policy, trust, adapter = build_guard()
     agent_id = "demo-openai-agent"
 
     print("=== Clean request (monitor mode) ===")
@@ -139,10 +139,13 @@ def main() -> None:
             }
         ]
     }
-    # In monitor mode the run proceeds; the threats are attached to the trace and
-    # we lower trust ourselves in response.
+    # In monitor mode the run proceeds; the firewall/defense record the threat on
+    # the CONTROL objects (the observer trace only carries status), and we lower
+    # trust ourselves in response.
     result = guarded.execute(sneaky)
     print("  Result:", result)
+    print("  firewall events:", len(adapter.firewall.get_security_events()))
+    print("  detected attacks:", adapter.defense.get_detected_attacks())
     trust.update_trust_score(agent_id, -0.3, reason="adversarial input detected")
     print("  Trust after adversarial input:", trust.get_trust_score(agent_id))
 

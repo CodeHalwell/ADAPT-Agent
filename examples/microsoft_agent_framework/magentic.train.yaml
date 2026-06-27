@@ -46,9 +46,13 @@ optimizer:
   suggest_tools: false        # no judge here, so no new-tool suggestions
 
 # Knobs no framework auto-exposes: the Magentic routing limits are not on an
-# agent attribute, so declare them explicitly. Each binds live to an attribute on
-# the resolved `manager` component (expose them there and rebuild the workflow in
-# the setter so a routing change actually takes effect).
+# agent attribute, so declare them explicitly. The YAML's generic setter only
+# WRITES the attribute (e.g. `manager.max_round_count`); for that to change
+# behaviour your `entrypoint` (`run`) must REBUILD the Magentic workflow from
+# these attributes on every call -- the example's `run` does exactly that.
+# (Alternatively, bind them to a config object whose property setter rebuilds the
+# workflow.) Without one of these, the optimizer would score routing candidates
+# that never actually take effect.
 parameters:
   - name: manager.max_round_count
     kind: routing

@@ -153,9 +153,12 @@ def main() -> None:
     result = monitored.execute(secret)
     print("Completed despite the policy hit ->", result)
 
+    # Monitor-mode threats live on the CONTROL objects, not the observer trace.
     policy = mon_adapter.policy_enforcer
     print("Recorded policy violations:")
     pprint(policy.get_violations())
+    print("Recorded firewall events:", len(mon_adapter.firewall.get_security_events()))
+    print("Recorded attacks:", mon_adapter.defense.get_detected_attacks())
 
     # -- Observability: dump traces from the monitored run. ------------------ #
     print("\n=== Observer traces ===")

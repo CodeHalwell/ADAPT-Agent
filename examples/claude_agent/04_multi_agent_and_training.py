@@ -165,16 +165,18 @@ def optimize_in_code() -> None:
         name="claude-research-team",
     )
 
-    # Make the researcher's tool allow-list a real search space: the full set
-    # first, then drop-one ablation subsets (so dropping "scratchpad" is on the
-    # table). The getter/setter bind to the live object so a winning subset is
-    # applied in place.
+    # Introspection ALREADY made the researcher's `allowed_tools` a drop-one
+    # ablation search space, so we don't redeclare it (that would bind the same
+    # list twice). To show declaring a knob the framework does NOT expose, add a
+    # higher-level SKILL allow-list we maintain ourselves -- candidates are the
+    # full set first, then each drop-one subset.
+    skills = {"researcher": ["web_search", "summarize"]}
     agent.add_tool_parameter(
-        "researcher.tools",
-        kind=ParameterKind.TOOL,
-        getter=lambda: list(RESEARCHER.allowed_tools),
-        setter=lambda tools: setattr(RESEARCHER, "allowed_tools", list(tools)),
-        candidate_tools=["web_search", "scratchpad"],
+        "researcher.skills",
+        kind=ParameterKind.SKILL,
+        getter=lambda: skills["researcher"],
+        setter=lambda v: skills.__setitem__("researcher", v),
+        candidate_tools=["web_search", "summarize"],
     )
 
     print("Parameters in the search space:")

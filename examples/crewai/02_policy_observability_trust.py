@@ -148,6 +148,13 @@ def main() -> None:
     )
     print("  output (still produced):", getattr(out, "raw", out))
 
+    # Monitor-mode threats live on the CONTROL objects, not the trace (which
+    # carries only status); a monitoring pipeline inspects these to alert.
+    print("\n=== Recorded threats (monitor mode) ===")
+    print("  firewall events:", len(adapter.firewall.get_security_events()))
+    print("  detected attacks:", adapter.defense.get_detected_attacks())
+    print("  policy violations:", adapter.policy_enforcer.get_violations())
+
     print("\n=== Observer traces ===")
     for trace in observer.get_traces():
         print(
