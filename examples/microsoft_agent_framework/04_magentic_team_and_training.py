@@ -461,11 +461,16 @@ def _register_yaml_app() -> None:
 
 
 def train_from_yaml() -> None:
-    print("\n=== Part D: the YAML-config training path (run_training) ===")
-    # Register a deterministic offline provider so the YAML judge needs no network.
+    print("\n=== Part D: the declarative training path ===")
+    # Register a deterministic offline provider so the judge needs no network.
     # A provider is a ModelProvider subclass; get_provider(name, **kw) instantiates
     # it, so our subclass hardcodes the offline stub and accepts (and ignores) the
     # usual provider kwargs like ``model``.
+    from adapt_agent.optimization.config import (
+        load_training_config,
+        parse_training_config,
+        run_training,
+    )
     from adapt_agent.optimization.providers import CallableProvider, register_provider
 
     class OfflineStubProvider(CallableProvider):
@@ -475,35 +480,73 @@ def train_from_yaml() -> None:
     register_provider("offline_stub", OfflineStubProvider)
     _register_yaml_app()
 
-    # The YAML uses dataset.path "golden.jsonl" (resolved relative to the cwd) and
-    # the offline "offline_stub" provider. To avoid writing into the source tree,
-    # we run from a temp dir into which we copy the real magentic.train.yaml and
-    # write the golden data. In a real project you would just run the YAML in place.
-    import os
-    import shutil
+    # The shipped magentic.train.yaml is a REAL-WORLD TEMPLATE pointing at an
+    # importable module (myapp.team:...). We load it only to validate its
+    # structure -- load_training_config parses without importing the target:
+    template = Path(__file__).with_name("magentic.train.yaml")
+    parsed = load_training_config(template)
+    print(f"  template parses OK (optimizer={parsed.optimizer.type}, metrics={parsed.metrics})")
+
+    # To RUN it offline here we build the equivalent config in-process, targeting
+    # the synthesized `magentic_team_app` module + the registered offline_stub
+    # judge provider, with the golden data written to a temp file.
     import tempfile
 
-    yaml_path = Path(__file__).with_name("magentic.train.yaml")
     rows = [
         '{"input": "Capital of France?", "expected": "Paris"}',
         '{"input": "Capital of Japan?", "expected": "Tokyo"}',
         '{"input": "Capital of Italy?", "expected": "Rome"}',
         '{"input": "Capital of Egypt?", "expected": "Cairo"}',
     ]
-
-    from adapt_agent.optimization.config import run_training
-
-    print(f"  running: run_training({yaml_path.name})")
-    cwd = os.getcwd()
     with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        (tmp_path / "golden.jsonl").write_text("\n".join(rows), encoding="utf-8")
-        shutil.copy(yaml_path, tmp_path / "magentic.train.yaml")
-        try:
-            os.chdir(tmp_path)
-            result = run_training("magentic.train.yaml")
-        finally:
-            os.chdir(cwd)
+        golden = Path(tmp) / "golden.jsonl"
+        golden.write_text("\n".join(rows), encoding="utf-8")
+        config = parse_training_config(
+            {
+                "target": {
+                    "entrypoint": "magentic_team_app:run",
+                    "components": {
+                        n: f"magentic_team_app:{n}"
+                        for n in ("researcher", "writer", "coder", "reviewer", "manager")
+                    },
+                    "name": "research-team",
+                },
+                "dataset": {"path": str(golden), "format": "jsonl"},
+                "judge": {
+                    "provider": "offline_stub",
+                    "adversarial": True,
+                    "metric_name": "quality",
+                },
+                "metrics": ["exact_match"],
+                "primary_metric": "exact_match",
+                "optimizer": {
+                    "type": "default",
+                    "max_evals": 40,
+                    "min_improvement": 0.001,
+                    "seed": 0,
+                    "suggest_tools": True,
+                },
+                "parameters": [
+                    {
+                        "name": "manager.max_round_count",
+                        "kind": "routing",
+                        "component": "manager",
+                        "attr": "max_round_count",
+                        "bounds": [4, 10],
+                        "step": 1,
+                    },
+                    {
+                        "name": "manager.max_stall_count",
+                        "kind": "routing",
+                        "component": "manager",
+                        "attr": "max_stall_count",
+                        "bounds": [1, 5],
+                        "step": 1,
+                    },
+                ],
+            }
+        )
+        result = run_training(config)
     print(
         f"  baseline={result.baseline_score:.3f}  best={result.best_score:.3f}  "
         f"improvement={result.improvement:+.3f}"

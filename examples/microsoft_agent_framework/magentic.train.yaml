@@ -1,42 +1,41 @@
-# ADAPT-Agent training config for the Magentic team (example 04, Part D).
+# ADAPT-Agent declarative training config for a Magentic team.
 #
-# This declares the SAME optimization run as the in-code path, but declaratively.
-# Run it with:
+# This is a real-world TEMPLATE: point `entrypoint`/`components` at YOUR own
+# importable module, then run it directly:
 #
 #     from adapt_agent.optimization.config import run_training
-#     result = run_training("magentic.train.yaml")
+#     result = run_training("examples/microsoft_agent_framework/magentic.train.yaml")
 #
-# In example 04 the entrypoint/components below are resolved from a small module
-# (`magentic_team_app`) that the example registers in sys.modules before calling
-# run_training, so the whole thing stays offline. In a real project these would
-# be ordinary "package.module:attribute" references, e.g. "myapp.app:run" and
-# "myapp.agents:writer".
+# (Do not point a checked-in config at an example module or an example-registered
+# provider — those only exist while that example runs. Use a real importable
+# module path and a built-in provider, as below.
+# `04_magentic_team_and_training.py` Part D shows the equivalent run in-process.)
+#
+# As shipped it is offline-friendly: the deterministic `exact_match` metric and
+# NO judge, so it needs no API key. Uncomment the `judge:` block for an
+# LLM-as-judge run (and new-tool/skill suggestions).
 
 target:
-  # A callable input -> output that drives the whole team (the workflow agent).
-  entrypoint: "magentic_team_app:run"
+  # A callable input -> output that drives the whole team (the workflow agent),
+  # e.g. a `run` that builds the Magentic workflow and calls
+  # `workflow.as_agent(...).run(question)`.
+  entrypoint: "myapp.team:run"
   # The five live ChatAgents to introspect for tunable knobs (prompts/models/
   # tools/skills). They are the SAME objects the entrypoint runs, so applying a
   # candidate config changes the next run.
   components:
-    researcher: "magentic_team_app:researcher"
-    writer:     "magentic_team_app:writer"
-    coder:      "magentic_team_app:coder"
-    reviewer:   "magentic_team_app:reviewer"
-    manager:    "magentic_team_app:manager"
+    researcher: "myapp.team:researcher"
+    writer:     "myapp.team:writer"
+    coder:      "myapp.team:coder"
+    reviewer:   "myapp.team:reviewer"
+    manager:    "myapp.team:manager"
+  name: research-team
 
 dataset:
-  path: "golden.jsonl"        # written next to this file by example 04, Part D
+  path: "golden.jsonl"        # input/expected per row; paths are relative to CWD
   format: jsonl
 
-judge:
-  # "offline_stub" is a deterministic provider the example registers before the
-  # run (no network). For real training use: provider: anthropic / openai / ...
-  provider: offline_stub
-  adversarial: true           # grade as a harsh critic AND propose new tools/skills
-  metric_name: quality
-
-metrics: [exact_match]
+metrics: [exact_match]        # deterministic, offline (no model/network)
 primary_metric: exact_match
 
 optimizer:
@@ -44,12 +43,12 @@ optimizer:
   max_evals: 40
   min_improvement: 0.001
   seed: 0
-  suggest_tools: true         # let the judge propose NEW tools/skills from failures
+  suggest_tools: false        # no judge here, so no new-tool suggestions
 
-# Knobs no framework auto-exposes: the Magentic routing limits live on the
-# manager config, not on an agent attribute, so we declare them explicitly here.
-# Each binds live to an attribute on the resolved `manager` component object
-# (the example exposes them there and rebuilds the workflow in its setter).
+# Knobs no framework auto-exposes: the Magentic routing limits are not on an
+# agent attribute, so declare them explicitly. Each binds live to an attribute on
+# the resolved `manager` component (expose them there and rebuild the workflow in
+# the setter so a routing change actually takes effect).
 parameters:
   - name: manager.max_round_count
     kind: routing
@@ -63,3 +62,14 @@ parameters:
     attr: max_stall_count
     bounds: [1, 5]
     step: 1
+
+# --- Real (online) judge: uncomment and set provider credentials ------------ #
+# judge:
+#   provider: anthropic        # anthropic | openai | gemini | mistral | ...
+#   model: claude-opus-4-8
+#   adversarial: true          # grade as a harsh critic; propose new tools/skills
+#   metric_name: quality
+# primary_metric: quality
+# optimizer:
+#   type: default
+#   suggest_tools: true        # let the judge propose NEW tools/skills from failures

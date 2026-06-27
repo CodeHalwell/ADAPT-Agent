@@ -280,12 +280,28 @@ def main() -> None:
         for tip in result.recommendations:
             print("  -", tip)
 
-    # === Part C: the SAME run via the declarative YAML config ============== #
-    print("\n=== Optimize via crewai.train.yaml (run_training) ===")
-    # Reset the crew so the YAML path starts from the loose baseline again.
+    # === Part C: the SAME run as a declarative config ====================== #
+    print("\n=== Optimize via a declarative training config ===")
+    # Reset the crew so the declarative path starts from the loose baseline again.
     _reset_crew()
 
+    from adapt_agent.optimization.config import (
+        load_training_config,
+        parse_training_config,
+        run_training,
+    )
+
     here = Path(__file__).resolve().parent
+    # The shipped crewai.train.yaml is a REAL-WORLD TEMPLATE pointing at an
+    # importable module (myapp.crew:...). We load it only to validate its
+    # structure -- load_training_config parses without importing the target:
+    template = here / "crewai.train.yaml"
+    parsed = load_training_config(template)
+    print(f"Template parses OK (optimizer={parsed.optimizer.type}, metrics={parsed.metrics}).")
+
+    # To RUN it offline here we build the equivalent config in-process, targeting
+    # this example's module-level objects (valid because the script is __main__)
+    # and the offline "stub" judge provider registered at import time above.
     golden = here / "_golden.jsonl"
     golden.write_text(
         "\n".join(
@@ -300,10 +316,33 @@ def main() -> None:
         encoding="utf-8",
     )
     try:
-        from adapt_agent.optimization.config import run_training
-
-        yaml_result = run_training(str(here / "crewai.train.yaml"))
-        print("YAML result:", yaml_result)
+        config = parse_training_config(
+            {
+                "target": {
+                    "entrypoint": "__main__:run",
+                    "components": {"crew": "__main__:CREW"},
+                    "name": "research-crew",
+                },
+                "dataset": {"path": str(golden), "format": "jsonl"},
+                "judge": {
+                    "provider": "stub",  # registered at module import (offline, no key)
+                    "adversarial": True,
+                    "metric_name": "quality",
+                    "pass_threshold": 0.6,
+                },
+                "metrics": ["exact_match", "token_f1"],
+                "primary_metric": "quality",
+                "optimizer": {
+                    "type": "default",
+                    "max_evals": 20,
+                    "min_improvement": 0.001,
+                    "seed": 0,
+                    "suggest_tools": True,
+                },
+            }
+        )
+        yaml_result = run_training(config)
+        print("Declarative result:", yaml_result)
         print("Improvement:", yaml_result.improvement)
     finally:
         golden.unlink(missing_ok=True)
