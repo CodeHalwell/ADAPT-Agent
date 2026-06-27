@@ -57,7 +57,11 @@ from adapt_agent.optimization import (
     exact_match,
     make_default_optimizer,
 )
-from adapt_agent.optimization.config import load_training_config, run_training
+from adapt_agent.optimization.config import (
+    load_training_config,
+    parse_training_config,
+    run_training,
+)
 
 # --------------------------------------------------------------------------- #
 # A tiny offline "knowledge base" the researcher draws on.                    #
@@ -351,12 +355,22 @@ def yaml_run(question: str) -> str:
 
 
 def demo_yaml() -> None:
-    print("\n=== Part C: run the same training from pydantic_ai.train.yaml ===")
+    print("\n=== Part C: the same training as a declarative config ===")
     logging.getLogger("adapt_agent.optimization.parameters").setLevel(logging.ERROR)
 
-    yaml_path = Path(__file__).with_name("pydantic_ai.train.yaml")
-    # The YAML references a golden dataset on disk; write a tiny one next to it.
-    data_path = yaml_path.with_name("_golden.jsonl")
+    # The shipped pydantic_ai.train.yaml is a REAL-WORLD TEMPLATE that points at
+    # YOUR importable module (myapp.agents:...). We load it only to validate its
+    # structure -- load_training_config parses without importing the target, so it
+    # never tries to resolve `myapp`:
+    template = Path(__file__).with_name("pydantic_ai.train.yaml")
+    parsed = load_training_config(template)
+    print(f"Template parses OK (optimizer={parsed.optimizer.type}, metrics={parsed.metrics}).")
+
+    # To actually RUN it offline here, we build the equivalent config in-process,
+    # pointing at THIS example's module-level objects. This is valid because the
+    # script runs as `__main__`; a checked-in config should instead target an
+    # importable module path (as the template above does).
+    data_path = template.with_name("_golden.jsonl")
     data_path.write_text(
         "\n".join(
             f'{{"input": "What is the capital of {c}?", "expected": "{cap}"}}'
@@ -364,13 +378,34 @@ def demo_yaml() -> None:
         ),
         encoding="utf-8",
     )
-
-    # Load the YAML into a TrainingConfig, then run it. (For an in-process dict
-    # instead of a file, use config.parse_training_config -- see the docs.)
-    config = load_training_config(yaml_path)
-    # Dataset paths in the YAML are relative to the process CWD, not the file, so
-    # point it at the absolute path we just wrote next to the config.
-    config.dataset.path = str(data_path)
+    config = parse_training_config(
+        {
+            "target": {
+                "entrypoint": "__main__:yaml_run",
+                "components": {
+                    "researcher": "__main__:researcher",
+                    "writer": "__main__:writer",
+                    "writer_cfg": "__main__:writer_cfg",
+                },
+                "name": "research-team",
+            },
+            "dataset": {"path": str(data_path), "format": "jsonl"},
+            "metrics": ["exact_match"],
+            "optimizer": {"type": "grid", "max_evals": 40, "min_improvement": 0.001, "seed": 0},
+            "parameters": [
+                {
+                    "name": "writer.instruction",
+                    "kind": "prompt",
+                    "component": "writer_cfg",
+                    "attr_path": "instruction",
+                    "candidates": [
+                        "Write an answer using the facts.",
+                        "Answer with ONLY the capital city name, nothing else.",
+                    ],
+                }
+            ],
+        }
+    )
     print("Baseline answer:", yaml_run("What is the capital of France?"))
     result = run_training(config)
     print("Result:", result)
