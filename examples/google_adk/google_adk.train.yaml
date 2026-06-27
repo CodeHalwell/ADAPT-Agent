@@ -19,12 +19,12 @@
 target:
   # A callable input -> output that drives the whole ADK system through a Runner.
   entrypoint: "mypackage.app:run"
-  # The live LlmAgents to introspect. ADK sub_agents are also walked recursively,
-  # but registering them explicitly lets you target their knobs by a stable name.
+  # Register ONLY the coordinator. The ADK introspector walks its `sub_agents`
+  # recursively, so each specialist's prompt/model/tools are discovered
+  # (namespaced under the coordinator). Registering a child again would bind the
+  # same live object twice -- a duplicated search space.
   components:
     coordinator: "mypackage.agents:coordinator"
-    math_agent:  "mypackage.agents:math_agent"
-    geo_agent:   "mypackage.agents:geo_agent"
 
 dataset:
   path: "golden.jsonl"          # .jsonl / .json / .csv
@@ -54,13 +54,16 @@ optimizer:
 
 # Knobs no framework auto-exposes. For Google ADK, instruction / model /
 # generate_content_config (temperature, top_p, max_output_tokens) / tools /
-# sub_agents ARE auto-discovered, so you rarely need this block. Use it for
-# higher-level skills or any custom attribute. Each binds live to a component.
-parameters:
-  - name: math_agent.skills
-    kind: skill
-    component: math_agent
-    attr: skills                # a list attribute holding skill identifiers
-    candidates:
-      - ["arithmetic", "word_problems"]
-      - ["arithmetic"]
+# sub_agents ARE auto-discovered, so you rarely need this block. Declare ONLY
+# knobs introspection cannot reach, bound to a component you list above (only the
+# `coordinator` is registered, so a sub-agent attribute isn't directly bindable by
+# attr -- expose such a knob on your own config object instead), e.g.:
+#
+# parameters:
+#   - name: math.skills            # a higher-level skill allow-list you maintain
+#     kind: skill
+#     component: coordinator       # must be listed under target.components
+#     attr_path: skills_config.math
+#     candidates:
+#       - ["arithmetic", "word_problems"]
+#       - ["arithmetic"]

@@ -186,12 +186,12 @@ def optimize_in_process() -> None:
 
     # Register all three agents as components so each is tuned individually, and
     # provide the runner that drives the whole system end to end.
+    # Register ONLY the triage agent: the OpenAI introspector recurses through its
+    # `handoffs` graph, so each specialist's instructions/model/tools are already
+    # discovered (namespaced under triage). Registering the specialists again would
+    # bind the same live objects twice (a duplicated search space).
     target = OptimizableAgent.from_components(
-        components={
-            "triage": triage_agent,
-            "geography": geography_agent,
-            "demographics": demographics_agent,
-        },
+        components={"triage": triage_agent},
         runner=run_system,
         name="triage-team",
     )

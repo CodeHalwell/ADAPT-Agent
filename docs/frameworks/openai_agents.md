@@ -198,7 +198,9 @@ deployment where you want to measure detections before you start enforcing:
 adapter = OpenAIAgentsAdapter(firewall=firewall, observer=AgentObserver(),
                               block_on_violation=False)
 guarded = adapter.wrap_agent(my_agent)
-guarded.execute(sneaky_payload)        # runs anyway; the trace records the threat
+guarded.execute(sneaky_payload)        # runs anyway; threats recorded on the controls
+# Monitor-mode threats live on the control objects (the trace only carries status):
+#   firewall.get_security_events(), defense.get_detected_attacks(), policy.get_violations()
 ```
 
 See `examples/openai_agents/01_basic_guarded.py` (blocking) and

@@ -19,12 +19,12 @@ target:
   # Agents SDK app this typically wraps `Runner.run_sync(triage, prompt).final_output`.
   entrypoint: "myapp.app:run_system"
   # The live Agents to introspect for tunable knobs. introspect() recurses through
-  # the triage agent's `handoffs`, so registering the specialists too lets the
-  # optimizer tune each one individually as well as the system as a whole.
+  # Register ONLY the triage agent. The OpenAI introspector recurses through its
+  # `handoffs` graph, so each specialist's instructions/model/tools are discovered
+  # (namespaced under triage). Registering a specialist again would bind the same
+  # live object twice -- a duplicated search space.
   components:
-    triage:       "myapp.agents:triage_agent"
-    geography:    "myapp.agents:geography_agent"
-    demographics: "myapp.agents:demographics_agent"
+    triage: "myapp.agents:triage_agent"
 
 dataset:
   path: "golden.jsonl"          # .jsonl / .json / .csv

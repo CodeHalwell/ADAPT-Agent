@@ -172,12 +172,12 @@ def run_code_path() -> None:
 
     # Wrap the whole system as ONE optimizable unit. We pass all live agents as
     # components (so their knobs are tunable) and one runner that drives the tree.
+    # Register ONLY the coordinator: the ADK introspector recurses into its
+    # sub_agents, so each specialist's prompt/model/tools are already discovered
+    # (namespaced under the coordinator). Registering the children again would
+    # bind the same live objects twice (a duplicated search space).
     target = OptimizableAgent.from_components(
-        components={
-            "coordinator": coordinator,
-            "math_agent": coordinator.sub_agents[0],
-            "geo_agent": coordinator.sub_agents[1],
-        },
+        components={"coordinator": coordinator},
         runner=make_runner(coordinator),
         name="adk-team",
     )
