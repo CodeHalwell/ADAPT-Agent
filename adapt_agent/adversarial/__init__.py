@@ -64,6 +64,7 @@ class AdversarialDefense:
             max_content_length: Optional maximum allowed length for input content.
         """
         self._attack_patterns: list[str] = []
+        self._attack_patterns_tuple: list[tuple[str, str]] = []
         self._detected_attacks: list[dict[str, Any]] = []
         self._defense_strategies: dict[str, Any] = {}
         self.max_attacks = max_attacks
@@ -126,8 +127,9 @@ class AdversarialDefense:
     ) -> str | None:
         """Return the original (un-normalized) custom pattern that matched, or None."""
         normalized = prompt_normalized if prompt_normalized is not None else _normalize(prompt)
-        for pattern in self._attack_patterns:
-            if _normalize(pattern) in normalized:
+        # ⚡ Bolt: Pre-computed lowercased patterns in _attack_patterns_tuple avoid O(N) string manipulation inside this hot loop
+        for pattern, norm_pattern in self._attack_patterns_tuple:
+            if norm_pattern in normalized:
                 return pattern
         return None
 
@@ -190,6 +192,7 @@ class AdversarialDefense:
             pattern: Attack pattern string.
         """
         self._attack_patterns.append(pattern)
+        self._attack_patterns_tuple.append((pattern, _normalize(pattern)))
 
     def get_detected_attacks(
         self,

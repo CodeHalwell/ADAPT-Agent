@@ -64,3 +64,7 @@
 ## 2024-06-15 - Enum identity comparison optimization
 **Learning:** In performance-critical tight loops, comparing Python Enums using equality (`==`) introduces overhead from `__eq__` method dispatch.
 **Action:** Always prefer identity checks (`is`) over equality checks (`==`) when comparing Python Enums, as Enum members are singletons and identity checks bypass method overhead.
+
+## 2024-05-18 - Avoid String Manipulations in Hot Loops
+**Learning:** Pre-computing normalized representations for matching targets instead of continuously computing string manipulations inside a hot evaluation loop drastically reduces O(N) evaluation overhead.
+**Action:** When searching a list of static strings, compute properties like lowercased versions at insertion time instead of evaluation time.
