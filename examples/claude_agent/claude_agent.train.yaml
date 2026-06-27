@@ -55,29 +55,19 @@ optimizer:
   suggest_tools: true           # let the judge propose NEW tools/skills from failures
   # kinds: [prompt, tool, skill]  # optional: restrict what gets tuned
 
-# Knobs to declare explicitly. The Claude Agent SDK fields above are
-# auto-introspected, so list here only what introspection cannot reach -- e.g.
-# turning a sub-agent's tool allow-list into a drop-one ablation search space, or
-# pinning a model pool. Each binds live to a resolved component attribute.
-parameters:
-  - name: researcher.allowed_tools
-    kind: tool
-    component: researcher
-    attr: allowed_tools
-    # Candidate tool-lists to search over (the optimizer can learn to drop the
-    # distracting "scratchpad" tool). Omit `candidates` to let drop-one ablation
-    # derive subsets automatically from the live list.
-    candidates:
-      - ["web_search", "scratchpad"]
-      - ["web_search"]
-  - name: writer.model
-    kind: model
-    component: writer
-    attr: model
-    candidates: ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"]
-  - name: researcher.max_turns
-    kind: hyperparam
-    component: researcher
-    attr: max_turns
-    bounds: [1, 6]
-    step: 1
+# The Claude Agent SDK fields above (system_prompt / model / allowed_tools /
+# disallowed_tools / max_turns / permission_mode) are ALL auto-introspected, so
+# you usually need NO `parameters:` block -- declaring one the introspector also
+# finds (e.g. `researcher.allowed_tools` or `writer.model`) collides and raises
+# TrainingConfigError. The optimizer already turns the discovered allowed-tools
+# list into a drop-one ablation search space on its own. Declare ONLY knobs
+# introspection cannot reach, bound to one of YOUR own objects listed under
+# target.components, e.g.:
+#
+# parameters:
+#   - name: pipeline.max_rounds     # a loop cap you enforce in your runner
+#     kind: routing
+#     component: pipeline_cfg       # a plain object you also list under components
+#     attr_path: max_rounds
+#     bounds: [1, 3]
+#     step: 1

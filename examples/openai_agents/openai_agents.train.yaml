@@ -53,18 +53,17 @@ optimizer:
   suggest_tools: true           # let the judge propose NEW tools/skills from failures
   # kinds: [prompt, tool, skill]  # optional: restrict what gets tuned
 
-# Explicit knobs no framework auto-exposes. The OpenAI Agents SDK exposes
-# instructions/model/model_settings/tools/handoffs via introspection, so you only
-# need to declare things it does NOT surface (here: a routing cap you enforce in
-# your runner, and a model candidate pool for the triage agent).
-parameters:
-  - name: triage.model
-    kind: model
-    component: triage
-    attr: model                 # Agent.model (a string id, or use attr_path for a Model obj)
-    candidates: ["gpt-4o", "gpt-4o-mini"]
-  - name: geography.temperature
-    kind: hyperparam
-    component: geography
-    attr_path: model_settings.temperature
-    bounds: [0.0, 1.5]          # clamped to the provider's max with a warning if needed
+# The OpenAI Agents SDK already exposes instructions/model/model_settings/tools/
+# handoffs via introspection, so you usually need NO `parameters:` block here.
+# Declaring a knob the introspector ALSO finds (e.g. `triage.model` or
+# `geography.temperature`) collides and raises TrainingConfigError. Declare ONLY
+# knobs the framework does not surface, bound to one of YOUR own objects listed
+# under target.components, e.g.:
+#
+# parameters:
+#   - name: router.max_handoffs     # a routing cap you enforce in your runner
+#     kind: routing
+#     component: router_cfg         # a plain object you also list under components
+#     attr_path: max_handoffs
+#     bounds: [1, 4]
+#     step: 1
