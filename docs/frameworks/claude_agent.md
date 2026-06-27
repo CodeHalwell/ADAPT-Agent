@@ -85,7 +85,7 @@ the optimizer can tune (§5).
 ## 2. Installing the extra and the import-safety guarantee
 
 ```bash
-pip install 'adapt-agent[claude_agent]'
+pip install 'adapt-agent[claude-agent]'
 # or just the SDK alongside adapt-agent:
 pip install claude-agent-sdk
 ```
@@ -99,7 +99,7 @@ try:
     import claude_agent_sdk  # noqa: F401
 except ImportError:
     raise SystemExit(
-        "This example needs the framework: pip install 'adapt-agent[claude_agent]'"
+        "This example needs the framework: pip install 'adapt-agent[claude-agent]'"
     )
 ```
 

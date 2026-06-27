@@ -91,7 +91,7 @@ swap to a real model is a single line: `Agent("openai:gpt-4o", ...)` or
 ## 2. Installing the extra and the import-safety guarantee
 
 ```bash
-pip install 'adapt-agent[pydantic_ai]'
+pip install 'adapt-agent[pydantic-ai]'
 # or just the framework:  pip install pydantic-ai
 ```
 
@@ -104,7 +104,7 @@ call `wrap_agent(...)` / `execute(...)`. The examples make this friendly:
 try:
     from pydantic_ai import Agent
 except ImportError:
-    raise SystemExit("This example needs: pip install 'adapt-agent[pydantic_ai]'")
+    raise SystemExit("This example needs: pip install 'adapt-agent[pydantic-ai]'")
 ```
 
 ---

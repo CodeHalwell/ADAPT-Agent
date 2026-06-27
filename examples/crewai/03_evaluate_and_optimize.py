@@ -105,11 +105,22 @@ def build_crew() -> tuple[Crew, PromptSensitiveLLM, Agent]:
     return crew, llm, geographer
 
 
+def _extract_fence(text: str, label: str) -> str:
+    start, end = text.find(f"<{label}>"), text.find(f"</{label}>")
+    return "" if start == -1 or end == -1 else text[start + len(label) + 2 : end].strip()
+
+
 def deterministic_judge_stub(prompt: str) -> str:
-    """Offline judge: high score for a single clean word, plus prompt rewrites."""
-    if "Rewrite" in prompt:
+    """Offline judge matching LLMJudge's prompt format (no network, no key).
+
+    LLMJudge's prompt-rewrite request puts ``CURRENT INSTRUCTION:`` in the user
+    prompt, and its grading request wraps the answer in a ``<response>`` fence, so
+    we branch on those (not the old ``Rewrite``/``RESPONSE:`` strings, which now
+    live in the system prompt the provider passes separately).
+    """
+    if "CURRENT INSTRUCTION:" in prompt:
         return "Answer with ONLY the capital city name, nothing else."
-    response = prompt.split("RESPONSE:")[-1].split("REFERENCE")[0].strip()
+    response = _extract_fence(prompt, "response")
     score = 9 if response and " " not in response else 2
     return f'{{"score": {score}, "pass": {str(score >= 6).lower()}, "reasoning": "auto"}}'
 

@@ -230,9 +230,12 @@ except SecurityBlockedError as exc:
     print(exc.reason, exc.threats)   # blocked BEFORE the model is ever called
 ```
 
-With `block_on_violation=False`, the same input is **not** raised; the threat is
-recorded on the observer trace so a monitoring pipeline can alert without breaking
-the user experience. This is the right mode for shadow deployments.
+With `block_on_violation=False`, the same input is **not** raised; execution
+proceeds and the threat is recorded on the **control objects** — not the observer
+trace, which only carries status. A monitoring pipeline inspects them to alert
+without breaking the user experience:
+`firewall.get_security_events()`, `defense.get_detected_attacks()`,
+`policy.get_violations()`. This is the right mode for shadow deployments.
 
 See [`examples/google_adk/01_basic_guarded.py`](../../examples/google_adk/01_basic_guarded.py).
 

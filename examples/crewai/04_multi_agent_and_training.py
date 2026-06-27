@@ -181,13 +181,29 @@ def run(question: str) -> str:
 # --------------------------------------------------------------------------- #
 # Offline judge: a deterministic stub usable both directly and via the YAML.   #
 # --------------------------------------------------------------------------- #
+def _extract_fence(text: str, label: str) -> str:
+    start, end = text.find(f"<{label}>"), text.find(f"</{label}>")
+    return "" if start == -1 or end == -1 else text[start + len(label) + 2 : end].strip()
+
+
 def judge_stub(prompt: str) -> str:
-    """Grade terse 'Country: City' answers highly; also rewrite prompts/propose tools."""
-    if "Rewrite" in prompt:
+    """Offline judge matching LLMJudge's prompt format (rewrite / grade / suggest).
+
+    LLMJudge puts the task cues in the USER prompt: a rewrite request contains
+    ``CURRENT INSTRUCTION:``, a new-tool request contains ``COMPONENT:`` (and must
+    return ``{"tools": [...]}``), and a grading request wraps the answer in a
+    ``<response>`` fence. (The older ``Rewrite``/``propose``/``RESPONSE:`` strings
+    are in the system prompt now, which the provider passes separately.)
+    """
+    if "CURRENT INSTRUCTION:" in prompt:
         return "Write ONLY 'Country: City' with no extra words."
-    if "propose" in prompt.lower() or "new tool" in prompt.lower():
-        return "Consider adding a citation-checking tool to verify each fact."
-    response = prompt.split("RESPONSE:")[-1].split("REFERENCE")[0].strip()
+    if "COMPONENT:" in prompt:
+        return (
+            '{"tools": [{"name": "citation_checker", "description": "verify each '
+            'fact against a source", "rationale": "several failures cited the '
+            'wrong capital"}]}'
+        )
+    response = _extract_fence(prompt, "response")
     score = 9 if ":" in response and len(response.split()) <= 4 else 3
     return f'{{"score": {score}, "pass": {str(score >= 6).lower()}, "reasoning": "auto"}}'
 

@@ -71,7 +71,7 @@ print(response.text)                                          # -> "Paris"
 ## 2. Installing the extra and the import-safety guarantee
 
 ```bash
-pip install 'adapt-agent[microsoft]'    # or: pip install agent-framework
+pip install 'adapt-agent[microsoft-agent-framework]'    # or: pip install agent-framework
 ```
 
 ADAPT-Agent's adapter (`MicrosoftAgentFrameworkAdapter`) and introspector both
@@ -91,7 +91,7 @@ try:
     import agent_framework  # noqa: F401
 except ImportError:
     raise SystemExit(
-        "This example needs the framework: pip install 'adapt-agent[microsoft]'"
+        "This example needs the framework: pip install 'adapt-agent[microsoft-agent-framework]'"
     )
 ```
 
