@@ -170,11 +170,16 @@ class Firewall:
         # patterns in the default, non-whitelist mode).
         for pattern in self._blocked_patterns:
             if pattern.search(content):
+                # SECURITY: Prevent sensitive secret leakage and log poisoning.
                 self._record_security_event(
                     event_type=event_type,
                     severity="high",
                     description=f"Content matched blocked pattern: {pattern.pattern}",
-                    metadata={"content_snippet": self.sanitize(content[:256])},
+                    metadata={
+                        "content_snippet": self.sanitize(content[:256])[:100]
+                        .replace("\n", "\\n")
+                        .replace("\r", "\\r")
+                    },
                 )
                 self._blocked_count += 1
                 return False
