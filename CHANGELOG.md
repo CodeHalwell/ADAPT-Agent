@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Per-framework guides and example ladders** for all seven supported frameworks
+  (LangGraph, Microsoft Agent Framework, Google ADK, Pydantic AI, CrewAI, OpenAI
+  Agents SDK, Claude Agent SDK). Each framework gains a verbose
+  `docs/frameworks/<framework>.md` guide plus an `examples/<framework>/` folder
+  with a 3–4 step ladder (basic guarded agent → policy/observability/trust →
+  evaluate & optimize → multi-agent system + declarative YAML training), a
+  `train.yaml` template, and a README. Added a `docs/frameworks/` index hub, a new
+  "Framework Guides" section in the MkDocs nav, and a per-framework table in
+  `examples/README.md`. Examples guard their optional-framework import and run
+  offline (deterministic judge stubs, no API key) where they exercise ADAPT-Agent.
+
 ### Added
 
 - **Declarative YAML/JSON training config** (`adapt_agent.optimization.config`):

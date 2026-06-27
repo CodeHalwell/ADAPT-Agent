@@ -47,6 +47,15 @@ nav:
   - Security Model: security.md
   - Policy Enforcement: policy.md
   - Framework Adapters: adapters.md
+  - Framework Guides:
+      - Overview: frameworks/index.md
+      - LangGraph: frameworks/langgraph.md
+      - Microsoft Agent Framework: frameworks/microsoft_agent_framework.md
+      - Google ADK: frameworks/google_adk.md
+      - Pydantic AI: frameworks/pydantic_ai.md
+      - CrewAI: frameworks/crewai.md
+      - OpenAI Agents SDK: frameworks/openai_agents.md
+      - Claude Agent SDK: frameworks/claude_agent.md
   - Optimization & Evaluation: optimization.md
   - Observability: observability.md
   - CLI: cli.md

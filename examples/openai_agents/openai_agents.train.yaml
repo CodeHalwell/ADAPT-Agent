@@ -1,0 +1,69 @@
+# ADAPT-Agent training config for an OpenAI Agents SDK multi-agent system.
+#
+# Run with:   adapt-agent train examples/openai_agents/openai_agents.train.yaml
+# (or in Python:  from adapt_agent.optimization.config import run_training
+#                 result = run_training("examples/openai_agents/openai_agents.train.yaml"))
+#
+# This declarative file encodes the SAME optimization run as
+# 04_multi_agent_and_training.py: it tunes a triage Agent that hands off to two
+# specialist Agents -- their instructions, models, hyperparameters, routing, and
+# tool allow-lists -- against a golden dataset, scored by an LLM-as-judge that can
+# also act as a harsh adversary and propose new tools/skills.
+#
+# Point the `module:attribute` references below at YOUR project. The objects in
+# `components` must be the SAME live Agent instances the `entrypoint` runs, so a
+# tuned candidate config changes the next run.
+
+target:
+  # A callable `input -> output` that drives the whole system. For a real OpenAI
+  # Agents SDK app this typically wraps `Runner.run_sync(triage, prompt).final_output`.
+  entrypoint: "myapp.app:run_system"
+  # The live Agents to introspect for tunable knobs. introspect() recurses through
+  # Register ONLY the triage agent. The OpenAI introspector recurses through its
+  # `handoffs` graph, so each specialist's instructions/model/tools are discovered
+  # (namespaced under triage). Registering a specialist again would bind the same
+  # live object twice -- a duplicated search space.
+  components:
+    triage: "myapp.agents:triage_agent"
+
+dataset:
+  path: "golden.jsonl"          # .jsonl / .json / .csv
+  format: jsonl                 # optional; inferred from the extension otherwise
+  # input_key: question         # optional explicit column overrides
+  # expected_key: answer
+  # val_path: holdout.jsonl     # optional held-out validation split
+
+judge:
+  provider: anthropic           # anthropic/claude, openai, gemini, mistral, ...
+  model: claude-opus-4-8
+  adversarial: true             # grade as a harsh critic/adversary (reward-hack resistant)
+  scale: 10
+  pass_threshold: 0.6
+  criteria: "correct, concise, routed to the right specialist, and safe"
+  metric_name: quality          # the judge metric's reporting name
+
+metrics: [exact_match, token_f1]
+primary_metric: quality         # default: the judge metric when a judge is set
+
+optimizer:
+  type: default                 # default | coordinate_ascent | grid | random | evolutionary | bootstrap_few_shot
+  max_evals: 40
+  min_improvement: 0.001        # don't accept candidates that only won on judge noise
+  seed: 0
+  suggest_tools: true           # let the judge propose NEW tools/skills from failures
+  # kinds: [prompt, tool, skill]  # optional: restrict what gets tuned
+
+# The OpenAI Agents SDK already exposes instructions/model/model_settings/tools/
+# handoffs via introspection, so you usually need NO `parameters:` block here.
+# Declaring a knob the introspector ALSO finds (e.g. `triage.model` or
+# `geography.temperature`) collides and raises TrainingConfigError. Declare ONLY
+# knobs the framework does not surface, bound to one of YOUR own objects listed
+# under target.components, e.g.:
+#
+# parameters:
+#   - name: router.max_handoffs     # a routing cap you enforce in your runner
+#     kind: routing
+#     component: router_cfg         # a plain object you also list under components
+#     attr_path: max_handoffs
+#     bounds: [1, 4]
+#     step: 1

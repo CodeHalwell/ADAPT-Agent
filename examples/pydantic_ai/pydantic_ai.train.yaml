@@ -1,0 +1,76 @@
+# ADAPT-Agent declarative training config for a Pydantic AI multi-agent system.
+#
+# This is a real-world TEMPLATE: point `entrypoint`/`components` at YOUR own
+# importable module, then run it directly:
+#
+#     from adapt_agent.optimization.config import run_training
+#     result = run_training("examples/pydantic_ai/pydantic_ai.train.yaml")
+#     print(result.improvement, result.best_config)
+#
+# (Do not point a checked-in config at "__main__" — that resolves to whatever
+# process imports it, not your agents. Use a real module path as below.
+# `examples/pydantic_ai/04_multi_agent_and_training.py` Part C demonstrates the
+# equivalent run in-process.)
+#
+# It is offline-friendly: it scores with the deterministic `exact_match` metric
+# and declares NO judge, so it needs no API key. Add a `judge:` block (see the
+# commented example at the bottom) to optimize with an LLM-as-judge.
+
+target:
+  # A callable `input -> output` that drives the whole multi-agent system, e.g.
+  # an orchestrator function that routes a query to your specialist agents.
+  entrypoint: "myapp.agents:run"
+  # The live specialist agents/config objects to introspect for tunable knobs
+  # (system prompts, models, temperatures, tools). They must be the SAME objects
+  # the entrypoint runs, so applying a candidate config changes the next run.
+  components:
+    researcher: "myapp.agents:researcher"
+    writer: "myapp.agents:writer"
+    writer_cfg: "myapp.agents:writer_cfg"   # holds the YAML-tuned writer instruction
+  name: research-team
+
+dataset:
+  path: "golden.jsonl"        # input/expected per row; paths are relative to CWD
+  format: jsonl
+  # input_key: input          # optional explicit column overrides
+  # expected_key: expected
+
+metrics: [exact_match]        # deterministic, offline scoring (no model/network)
+primary_metric: exact_match
+
+optimizer:
+  type: grid                  # grid-search the declared prompt candidates below
+  max_evals: 40
+  min_improvement: 0.001      # don't accept candidates that only won on noise
+  seed: 0
+  suggest_tools: false        # no judge here, so no new-tool suggestions
+
+# Explicit knobs bind to an attribute on a resolved component. The writer's
+# working instruction lives on the `writer_cfg` object, so it binds via
+# `component` + `attr_path` and we grid-search a small candidate list offline.
+parameters:
+  - name: writer.instruction
+    kind: prompt
+    component: writer_cfg
+    attr_path: instruction
+    candidates:
+      - "Write an answer using the facts."
+      - "Answer with ONLY the capital city name, nothing else."
+  # An attribute-bound hyperparameter (clamped to the provider max with a warning):
+  # - name: writer.temperature
+  #   kind: hyperparam
+  #   component: writer
+  #   attr_path: model_settings.temperature
+  #   bounds: [0.0, 1.0]
+
+# --- Real (online) judge: uncomment and set provider credentials ------------ #
+# judge:
+#   provider: anthropic        # anthropic | openai | gemini | mistral | ...
+#   model: claude-opus-4-8
+#   adversarial: true          # grade as a harsh critic; resist reward hacking
+#   criteria: "correct, concise, and exactly the capital city name"
+#   metric_name: quality
+# primary_metric: quality
+# optimizer:
+#   type: default              # few-shot -> prompts -> models/hparams -> tools
+#   suggest_tools: true        # let the judge propose NEW tools/skills from failures
