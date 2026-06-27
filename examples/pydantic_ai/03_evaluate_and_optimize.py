@@ -35,7 +35,7 @@ try:
     from pydantic_ai.models.function import AgentInfo, FunctionModel
 except ImportError:
     raise SystemExit(
-        "This example needs Pydantic AI: pip install 'adapt-agent[pydantic_ai]'\n"
+        "This example needs Pydantic AI: pip install 'adapt-agent[pydantic-ai]'\n"
         "(or: pip install pydantic-ai)"
     ) from None
 

@@ -41,7 +41,7 @@ try:
 except ImportError:
     # Not fatal here -- this example ships a fake. The guard documents the extra
     # and matches the other examples; the real-SDK comment at the bottom relies
-    # on `pip install 'adapt-agent[claude_agent]'` (or `claude-agent-sdk`).
+    # on `pip install 'adapt-agent[claude-agent]'` (or `claude-agent-sdk`).
     claude_agent_sdk = None  # type: ignore[assignment]
 
 from adapt_agent import AdversarialDefense, AgentObserver, Firewall
@@ -132,7 +132,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Using the REAL Claude Agent SDK instead of fake_query:
     #
-    #     pip install 'adapt-agent[claude_agent]'   # or: pip install claude-agent-sdk
+    #     pip install 'adapt-agent[claude-agent]'   # or: pip install claude-agent-sdk
     #
     #     from claude_agent_sdk import query, ClaudeAgentOptions
     #

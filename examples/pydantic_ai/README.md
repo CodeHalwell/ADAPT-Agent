@@ -13,7 +13,7 @@ prints a friendly install hint if it is missing.
 ## Install
 
 ```bash
-pip install 'adapt-agent[pydantic_ai]'
+pip install 'adapt-agent[pydantic-ai]'
 # or just the framework:  pip install pydantic-ai
 ```
 

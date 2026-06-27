@@ -28,6 +28,7 @@ Run it with:
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from pathlib import Path
 
@@ -171,7 +172,7 @@ def optimize_in_process() -> None:
     """Optimize the whole multi-agent system (and every agent within it)."""
     print("=== Guard the whole system as ONE unit ===")
     firewall = Firewall(max_content_length=10_000)
-    firewall.add_blocked_pattern(r"ignore (all|previous) instructions", flags=2)  # re.IGNORECASE
+    firewall.add_blocked_pattern(r"ignore (all|previous) instructions", flags=re.IGNORECASE)
     adapter = OpenAIAgentsAdapter(firewall=firewall, agent_id="triage-system")
     # Wrapping the triage agent governs every handoff path behind it.
     guarded = adapter.wrap_agent(run_system)  # offline runner; swap in triage_agent live

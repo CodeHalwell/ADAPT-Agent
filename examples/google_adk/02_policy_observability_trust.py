@@ -97,7 +97,7 @@ def build_adapter(*, block: bool) -> tuple[GoogleADKAdapter, AgentObserver]:
     # Policy rules use a SAFE expression language (no eval). In the adapter
     # pipeline the rule is checked against the extracted *state*, which exposes
     # ``state['messages']`` (the message list) and ``state['context']``. Only
-    # action="block" blocks; "warn"/"flag" just record a violation.
+    # action="block" blocks; "warn"/"modify" just record a violation.
     policy = PolicyEnforcer()
     policy.add_rule(
         name="no_credentials",

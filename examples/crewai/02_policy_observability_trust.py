@@ -83,7 +83,13 @@ def build_policy() -> PolicyEnforcer:
     policy.add_rule(
         name="no_credential_requests",
         description="Block messages asking for passwords or credentials.",
-        condition="'password' in message['content'] or 'credentials' in message['content']",
+        # The governed adapter evaluates rules with check_state, so conditions
+        # reference `state` (NOT `message`); `state['messages'][0]` is the first
+        # message. The safe evaluator allows indexing but not negative indices.
+        condition=(
+            "'password' in state['messages'][0]['content'] "
+            "or 'credentials' in state['messages'][0]['content']"
+        ),
         action="block",  # only action='block' actually blocks; others are advisory
         severity="high",
     )

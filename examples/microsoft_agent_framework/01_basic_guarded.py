@@ -46,7 +46,7 @@ from dataclasses import dataclass
 #     import agent_framework  # noqa: F401
 # except ImportError:
 #     raise SystemExit(
-#         "This example needs the framework: pip install 'adapt-agent[microsoft]'\n"
+#         "This example needs the framework: pip install 'adapt-agent[microsoft-agent-framework]'\n"
 #         "(or: pip install agent-framework)"
 #     )
 from adapt_agent import AdversarialDefense, AgentObserver, Firewall

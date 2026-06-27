@@ -25,8 +25,9 @@ Run it with:
 
 Without an API key the live model call will fail at the network boundary; the
 point of this example is the *wrapping and screening*, which happens before the
-model is ever reached for the malicious case. See ``05_...`` style notes for how
-the adapter screens output regardless of provider.
+model is ever reached for the malicious case. See the Google ADK guide in
+``docs/frameworks/google_adk.md`` for how the adapter screens output regardless of
+provider.
 """
 
 from __future__ import annotations

@@ -44,7 +44,7 @@ introspects.
 ## Install
 
 ```bash
-pip install 'adapt-agent[claude_agent]'   # or: pip install claude-agent-sdk
+pip install 'adapt-agent[claude-agent]'   # or: pip install claude-agent-sdk
 ```
 
 (The examples ship stand-ins, so you can run them before installing the SDK.)

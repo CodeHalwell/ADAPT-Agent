@@ -16,7 +16,7 @@ so swapping in the real classes is a one-line change (shown in each file).
 ## Install
 
 ```bash
-pip install 'adapt-agent[microsoft]'   # or: pip install agent-framework
+pip install 'adapt-agent[microsoft-agent-framework]'   # or: pip install agent-framework
 ```
 
 `adapt_agent` itself never imports `agent_framework` -- the adapter and the
