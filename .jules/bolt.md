@@ -64,3 +64,6 @@
 ## 2024-06-15 - Enum identity comparison optimization
 **Learning:** In performance-critical tight loops, comparing Python Enums using equality (`==`) introduces overhead from `__eq__` method dispatch.
 **Action:** Always prefer identity checks (`is`) over equality checks (`==`) when comparing Python Enums, as Enum members are singletons and identity checks bypass method overhead.
+## 2024-05-24 - Preserving Polymorphism in Middleware
+**Learning:** Inlining class methods like process_input to bypass redundant allocations breaks subclass polymorphism.
+**Action:** Extend method signatures with optional flags (e.g., copy=False) to safely skip expensive operations without hardcoding the logic.
