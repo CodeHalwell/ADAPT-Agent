@@ -82,3 +82,8 @@
 **Vulnerability:** The `AgentObserver` class tracked event descriptions (`description`) and log messages (`message`) without explicitly escaping newlines (`\n`) and carriage returns (`\r`). Although the strings were truncated to a maximum length (e.g., 10000 characters) to prevent memory exhaustion DoS, this lack of sanitization opened the observability system to a Log Poisoning Vulnerability. An attacker could inject multiline payloads to forge log entries or conceal malicious activities.
 **Learning:** Limiting the length of logged strings to mitigate DoS is insufficient if control characters are not sanitized. Such characters can still corrupt the log structure, disrupting auditing and monitoring pipelines.
 **Prevention:** Always escape multiline control characters (e.g., transforming `\n` to `\\n` and `\r` to `\\r`) in dynamically generated log messages and event descriptions prior to storing them in internal or external records. This ensures that a single log event cannot spawn multiple lines when exported or viewed.
+
+## 2024-06-30 - Firewall Log Poisoning via Unescaped Snippets
+**Vulnerability:** Blocked input snippets were recorded in `_security_events` metadata without escaping newline (`\n`) and carriage return (`\r`) characters, enabling log poisoning.
+**Learning:** Even when inputs are truncated and sanitized against patterns, unescaped control characters can still corrupt downstream logs or observability systems.
+**Prevention:** Blocked input snippets must be explicitly sanitized and have newline/carriage return characters escaped (e.g., `self.sanitize(content[:256])[:100].replace('\n', '\\n').replace('\r', '\\r')`) before being recorded in `_security_events` metadata to prevent sensitive secret leakage and log poisoning.

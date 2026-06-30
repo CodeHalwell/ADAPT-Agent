@@ -174,7 +174,11 @@ class Firewall:
                     event_type=event_type,
                     severity="high",
                     description=f"Content matched blocked pattern: {pattern.pattern}",
-                    metadata={"content_snippet": self.sanitize(content[:256])},
+                    metadata={
+                        "content_snippet": self.sanitize(content[:256])[:100]
+                        .replace("\n", "\\n")
+                        .replace("\r", "\\r")
+                    },  # SECURITY: Explicitly sanitize snippets to prevent log poisoning
                 )
                 self._blocked_count += 1
                 return False
