@@ -64,3 +64,7 @@
 ## 2024-06-15 - Enum identity comparison optimization
 **Learning:** In performance-critical tight loops, comparing Python Enums using equality (`==`) introduces overhead from `__eq__` method dispatch.
 **Action:** Always prefer identity checks (`is`) over equality checks (`==`) when comparing Python Enums, as Enum members are singletons and identity checks bypass method overhead.
+
+## 2024-06-16 - Middleware redundant allocation avoidance
+**Learning:** In object-oriented execution pipelines like `adapt_agent/core/middleware.py`, `wrap_function` passes newly created dictionary objects to `process_input` and `process_output`. These methods defensively `copy()` the data before modifying it, adding unnecessary allocation overhead.
+**Action:** Extend method signatures with an optional flag (e.g., `copy=False`) so callers that provide fresh, unshared objects can safely bypass the redundant copy operation without breaking subclass polymorphism.

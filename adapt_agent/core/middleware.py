@@ -162,11 +162,12 @@ class Middleware:
         del self._middleware_metadata[name]
         return True
 
-    def process_input(self, data: dict[str, Any]) -> dict[str, Any]:
+    def process_input(self, data: dict[str, Any], copy: bool = True) -> dict[str, Any]:
         """Process data through pre-middleware pipeline.
 
         Args:
             data: Input data to process
+            copy: Whether to copy the input data dictionary before processing
 
         Returns:
             Processed data
@@ -178,7 +179,8 @@ class Middleware:
         if not self._pre_middleware:
             return data
 
-        result = data.copy()
+        # ⚡ Bolt: Use optional copy flag to bypass redundant dict allocations
+        result = data.copy() if copy else data
 
         for middleware in self._pre_middleware:
             try:
@@ -201,11 +203,12 @@ class Middleware:
 
         return result
 
-    def process_output(self, data: dict[str, Any]) -> dict[str, Any]:
+    def process_output(self, data: dict[str, Any], copy: bool = True) -> dict[str, Any]:
         """Process data through post-middleware pipeline.
 
         Args:
             data: Output data to process
+            copy: Whether to copy the output data dictionary before processing
 
         Returns:
             Processed data
@@ -217,7 +220,8 @@ class Middleware:
         if not self._post_middleware:
             return data
 
-        result = data.copy()
+        # ⚡ Bolt: Use optional copy flag to bypass redundant dict allocations
+        result = data.copy() if copy else data
 
         for middleware in self._post_middleware:
             try:
@@ -259,7 +263,7 @@ class Middleware:
             input_data = {"args": args, "kwargs": kwargs}
 
             # Pre-process
-            processed_input = self.process_input(input_data)
+            processed_input = self.process_input(input_data, copy=False)
 
             # Execute function
             result = func(
@@ -269,7 +273,7 @@ class Middleware:
 
             # Post-process
             output_data = {"result": result}
-            processed_output = self.process_output(output_data)
+            processed_output = self.process_output(output_data, copy=False)
 
             return processed_output["result"]
 
