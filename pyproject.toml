@@ -128,6 +128,9 @@ ignore = [
 # Examples guard optional-framework imports with `try: import X / except ImportError:
 # raise SystemExit(...)`; chaining the ImportError there adds noise, not signal.
 "examples/**" = ["B904"]
+# Notebooks commonly use semicolons between statements, mid-cell imports, and
+# unsorted imports inside magic-command cells — suppress rules that don't apply.
+"*.ipynb" = ["E402", "E702", "I001", "B905"]
 
 [tool.mypy]
 python_version = "3.10"
