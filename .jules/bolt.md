@@ -68,3 +68,7 @@
 ## 2024-05-18 - Avoid String Manipulations in Hot Loops
 **Learning:** Pre-computing normalized representations for matching targets instead of continuously computing string manipulations inside a hot evaluation loop drastically reduces O(N) evaluation overhead.
 **Action:** When searching a list of static strings, compute properties like lowercased versions at insertion time instead of evaluation time.
+
+## 2023-10-27 - [Middleware Dictionary Allocation Optimization]
+**Learning:** In `adapt_agent/core/middleware.py`, the `wrap_function` constructs temporary argument dictionaries on every invocation, but `process_input` and `process_output` blindly copied them again via `.copy()`.
+**Action:** Extend method signatures with optional flags (e.g., `copy=True`) to safely skip expensive, redundant copy operations on freshly constructed objects without breaking subclass polymorphism.
