@@ -130,7 +130,9 @@ class Firewall:
         remaining useful for correlation/debugging.
         """
         digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
-        return f"{content[:12]}…(sha256:{digest})"
+        # SECURITY: Escaping newlines and carriage returns prevents log poisoning
+        safe_prefix = content[:12].replace("\n", "\\n").replace("\r", "\\r")
+        return f'{safe_prefix}…(sha256:{digest})'
 
     def _check(self, content: str, event_type: str) -> bool:
         """Core block-first check shared by check_input/check_output.
