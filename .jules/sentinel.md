@@ -87,3 +87,7 @@
 **Vulnerability:** Blocked input snippets in `firewall.py` did not escape newlines and carriage returns.
 **Learning:** Even sanitized output for blocked patterns can be manipulated to break log formatting and inject fake entries if newlines are not escaped.
 **Prevention:** Explicitly sanitize and escape newline/carriage return characters before recording snippets in `_security_events` metadata.
+## 2024-05-18 - Hardcoded API Key Fallback
+**Vulnerability:** A hardcoded API key fallback ('ollama') was present in `OllamaProvider` which poses a security risk of leaking default secrets or hardcoded assumptions.
+**Learning:** Hardcoded credentials or default keys should never be present in the source code even if the default backend ignores authentication, as it sets a poor security precedent.
+**Prevention:** Always use environment variables or safe dummy values ('ollama-local') with explicit `# SECURITY:` comments to explain the fallback logic for local development.
