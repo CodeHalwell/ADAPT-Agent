@@ -87,3 +87,8 @@
 **Vulnerability:** Blocked input snippets in `firewall.py` did not escape newlines and carriage returns.
 **Learning:** Even sanitized output for blocked patterns can be manipulated to break log formatting and inject fake entries if newlines are not escaped.
 **Prevention:** Explicitly sanitize and escape newline/carriage return characters before recording snippets in `_security_events` metadata.
+
+## 2026-07-06 - [Log Poisoning Vulnerability in Firewall Event Snippets]
+**Vulnerability:** Blocked input snippets recorded by `Firewall._redact_snippet` did not escape newlines and carriage returns. This allowed a multiline payload to break log formatting and potentially inject forged entries into security logs or events.
+**Learning:** Even sanitized or shortened snippets can be manipulated to break log formatting if control characters like newlines are not explicitly escaped before storage.
+**Prevention:** Explicitly escape newline and carriage return characters when preparing truncated snippets for recording in security events metadata.
