@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 # Best-effort guard against the most common catastrophic-backtracking shapes,
 # e.g. nested quantifiers like ``(a+)+``, ``(a*)*`` or ``(a+)*``. This is a
 # heuristic, not a complete ReDoS analysis.
-_CATASTROPHIC_RE = re.compile(r"\([^)]*[+*]\)[+*]")
+# SECURITY: Use [^)(] instead of [^)] to prevent O(N^2) ReDoS on repeated '(' chars
+_CATASTROPHIC_RE = re.compile(r"\([^)(]*[+*]\)[+*]")
 
 
 class Firewall:
@@ -130,7 +131,8 @@ class Firewall:
         remaining useful for correlation/debugging.
         """
         digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
-        return f"{content[:12]}…(sha256:{digest})"
+        safe_snippet = content[:12].replace("\n", "\\n").replace("\r", "\\r")
+        return f"{safe_snippet}…(sha256:{digest})"
 
     def _check(self, content: str, event_type: str) -> bool:
         """Core block-first check shared by check_input/check_output.

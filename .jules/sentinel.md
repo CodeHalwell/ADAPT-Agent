@@ -87,3 +87,7 @@
 **Vulnerability:** Blocked input snippets in `firewall.py` did not escape newlines and carriage returns.
 **Learning:** Even sanitized output for blocked patterns can be manipulated to break log formatting and inject fake entries if newlines are not escaped.
 **Prevention:** Explicitly sanitize and escape newline/carriage return characters before recording snippets in `_security_events` metadata.
+## 2024-05-23 - Fix ReDoS in catastrophic backtracking guard
+**Vulnerability:** The heuristic regex for detecting nested quantifiers was vulnerable to an O(N^2) ReDoS attack when parsing long strings of repeated '(' characters.
+**Learning:** Even internal security guards can introduce DoS vulnerabilities if they use inefficient regex patterns without restricting character classes.
+**Prevention:** Always make the contents of repeating groups mutually exclusive with the starting character of the pattern to prevent overlapping matches from causing catastrophic backtracking.
