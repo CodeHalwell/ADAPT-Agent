@@ -72,3 +72,7 @@
 ## 2023-10-27 - [Middleware Dictionary Allocation Optimization]
 **Learning:** In `adapt_agent/core/middleware.py`, the `wrap_function` constructs temporary argument dictionaries on every invocation, but `process_input` and `process_output` blindly copied them again via `.copy()`.
 **Action:** Extend method signatures with optional flags (e.g., `copy=True`) to safely skip expensive, redundant copy operations on freshly constructed objects without breaking subclass polymorphism.
+
+## 2024-06-25 - Avoid O(N) recalculations for bounded cache eviction loops
+**Learning:** In adapt_agent/optimization/performance.py, maintaining a bounded cache limit by continuously recalculating the total item count using sum(len(v)...) inside a while loop creates an O(N) bottleneck.
+**Action:** Track a running total counter (e.g., _total_suggestions) that increments on insertion and decrements on eviction for O(1) complexity.
