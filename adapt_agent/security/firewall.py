@@ -25,9 +25,10 @@ from adapt_agent.core.types import AgentMessage, SecurityEvent
 logger = logging.getLogger(__name__)
 
 # Best-effort guard against the most common catastrophic-backtracking shapes,
+# SECURITY: Fix ReDoS vulnerability by using mutually exclusive character class
 # e.g. nested quantifiers like ``(a+)+``, ``(a*)*`` or ``(a+)*``. This is a
 # heuristic, not a complete ReDoS analysis.
-_CATASTROPHIC_RE = re.compile(r"\([^)]*[+*]\)[+*]")
+_CATASTROPHIC_RE = re.compile(r"\([^)(]*[+*]\)[+*]")
 
 
 class Firewall:
