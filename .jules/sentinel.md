@@ -87,3 +87,7 @@
 **Vulnerability:** Blocked input snippets in `firewall.py` did not escape newlines and carriage returns.
 **Learning:** Even sanitized output for blocked patterns can be manipulated to break log formatting and inject fake entries if newlines are not escaped.
 **Prevention:** Explicitly sanitize and escape newline/carriage return characters before recording snippets in `_security_events` metadata.
+## 2024-05-23 - ReDoS in Heuristic Regex Guard
+**Vulnerability:** The heuristic regex guard `_CATASTROPHIC_RE` used to prevent ReDoS contained its own catastrophic backtracking vulnerability. A string with many repeating open parentheses `(` followed by `+` causes O(N^2) evaluation time due to the `[^)]*` repeating group not mutually excluding `(`.
+**Learning:** Even regexes designed to prevent ReDoS can introduce it if repeating groups do not mutually exclude starting characters.
+**Prevention:** To prevent ReDoS vulnerabilities in heuristic regex guards, ensure the contents of repeating groups are mutually exclusive with the starting character of the pattern.
