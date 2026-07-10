@@ -38,6 +38,8 @@ class AgentOptimizer:
         # same agent was analyzed repeatedly.
         self._suggestions_by_agent: dict[str, list[dict[str, Any]]] = {}
         self._suggestion_order: deque[str] = deque()
+        # ⚡ Bolt: Track running total for O(1) eviction
+        self._total_suggestions: int = 0
 
     @property
     def _optimization_suggestions(self) -> list[dict[str, Any]]:
@@ -149,19 +151,25 @@ class AgentOptimizer:
             agent_id: Unique identifier for the agent.
             suggestions: The suggestions produced for this agent.
         """
+        # ⚡ Bolt: Maintain running total instead of O(N) sum recalculation
         if agent_id in self._suggestions_by_agent:
             self._suggestion_order.remove(agent_id)
+            self._total_suggestions -= len(self._suggestions_by_agent[agent_id])
+
         self._suggestions_by_agent[agent_id] = list(suggestions)
         self._suggestion_order.append(agent_id)
+        self._total_suggestions += len(self._suggestions_by_agent[agent_id])
 
         # SECURITY: Prevent unbounded memory growth. Evict whole agents (oldest
         # first) until the total stored suggestion count fits the budget.
         while (
-            sum(len(v) for v in self._suggestions_by_agent.values()) > self.max_suggestions
+            self._total_suggestions > self.max_suggestions
             and self._suggestion_order
         ):
             oldest = self._suggestion_order.popleft()
-            self._suggestions_by_agent.pop(oldest, None)
+            evicted = self._suggestions_by_agent.pop(oldest, None)
+            if evicted is not None:
+                self._total_suggestions -= len(evicted)
 
     def _compute_statistics(self, agent_id: str) -> dict[str, Any]:
         """Compute statistics for an agent.

@@ -72,3 +72,6 @@
 ## 2023-10-27 - [Middleware Dictionary Allocation Optimization]
 **Learning:** In `adapt_agent/core/middleware.py`, the `wrap_function` constructs temporary argument dictionaries on every invocation, but `process_input` and `process_output` blindly copied them again via `.copy()`.
 **Action:** Extend method signatures with optional flags (e.g., `copy=True`) to safely skip expensive, redundant copy operations on freshly constructed objects without breaking subclass polymorphism.
+## 2024-05-24 - O(N) sum in eviction loop
+**Learning:** Using `sum(len(v) for v in cache.values())` inside an eviction `while` loop creates an O(N) bottleneck, as it repeatedly traverses the dictionary for every evicted item.
+**Action:** Maintain a running total counter (`_total_suggestions`) that increments on insertion and decrements on eviction to achieve O(1) complexity.
