@@ -129,8 +129,10 @@ class Firewall:
         raw (possibly dangerous) content is never persisted verbatim while
         remaining useful for correlation/debugging.
         """
+        # SECURITY: Prevent log poisoning by escaping newlines and carriage returns
         digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
-        return f"{content[:12]}…(sha256:{digest})"
+        redacted = content[:12].replace("\n", "\\n").replace("\r", "\\r")
+        return f"{redacted}…(sha256:{digest})"
 
     def _check(self, content: str, event_type: str) -> bool:
         """Core block-first check shared by check_input/check_output.
