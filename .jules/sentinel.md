@@ -87,3 +87,7 @@
 **Vulnerability:** Blocked input snippets in `firewall.py` did not escape newlines and carriage returns.
 **Learning:** Even sanitized output for blocked patterns can be manipulated to break log formatting and inject fake entries if newlines are not escaped.
 **Prevention:** Explicitly sanitize and escape newline/carriage return characters before recording snippets in `_security_events` metadata.
+## 2024-07-02 - Prevent Partial Secret Leakage via Early Truncation
+**Vulnerability:** The firewall truncated input snippets to 256 characters before applying pattern sanitization, causing secrets spanning the boundary to be leaked in logs since regex matching failed on the partial secret.
+**Learning:** Security sanitization algorithms (like regex replacements) must operate on the complete context or full string. Pre-truncating text for performance or storage optimization fundamentally breaks pattern-matching logic.
+**Prevention:** Apply data sanitization to the complete untrusted string first, and only truncate the sanitized string before logging or storage.

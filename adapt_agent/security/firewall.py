@@ -175,7 +175,8 @@ class Firewall:
                     severity="high",
                     description=f"Content matched blocked pattern: {pattern.pattern}",
                     metadata={
-                        "content_snippet": self.sanitize(content[:256])[:100]
+                        # SECURITY: Sanitize complete content before truncation to prevent partial secret leakage
+                        "content_snippet": self.sanitize(content)[:100]
                         .replace("\n", "\\n")
                         .replace("\r", "\\r")
                     },
