@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Best-effort guard against the most common catastrophic-backtracking shapes,
 # e.g. nested quantifiers like ``(a+)+``, ``(a*)*`` or ``(a+)*``. This is a
 # heuristic, not a complete ReDoS analysis.
-_CATASTROPHIC_RE = re.compile(r"\([^)]*[+*]\)[+*]")
+_CATASTROPHIC_RE = re.compile(r"\([^)(]*[+*]\)[+*]")
 
 
 class Firewall:
