@@ -130,7 +130,7 @@ class Firewall:
         remaining useful for correlation/debugging.
         """
         digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
-        safe_snippet = content[:12].replace("\n", "\\n").replace("\r", "\\r")
+        safe_snippet = content.replace("\n", "\\n").replace("\r", "\\r")[:12]
         return f"{safe_snippet}…(sha256:{digest})"
 
     def _check(self, content: str, event_type: str) -> bool:
@@ -177,9 +177,7 @@ class Firewall:
                     description=f"Content matched blocked pattern: {pattern.pattern}",
                     metadata={
                         # SECURITY: Sanitize complete content before truncation to prevent partial secret leakage
-                        "content_snippet": self.sanitize(content)[:100]
-                        .replace("\n", "\\n")
-                        .replace("\r", "\\r")
+                        "content_snippet": self.sanitize(content).replace("\n", "\\n").replace("\r", "\\r")[:100]
                     },
                 )
                 self._blocked_count += 1
