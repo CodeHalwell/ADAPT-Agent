@@ -1,6 +1,7 @@
 """Evaluation frameworks for LLM agents."""
 
 import logging
+from collections import deque
 from collections.abc import Callable
 from typing import Any, Optional
 
@@ -47,7 +48,7 @@ class AgentEvaluator:
             max_results: Maximum number of evaluation results to store in memory.
         """
         self.max_results = max_results
-        self._evaluation_results: list[dict[str, Any]] = []
+        self._evaluation_results: deque[dict[str, Any]] = deque(maxlen=max_results)
         self._custom_metrics: dict[str, Callable] = {}
 
     def register_metric(
@@ -100,9 +101,6 @@ class AgentEvaluator:
 
         self._evaluation_results.append(results)
 
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._evaluation_results) > self.max_results:
-            self._evaluation_results.pop(0)
 
         return results
 

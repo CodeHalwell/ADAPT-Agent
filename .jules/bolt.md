@@ -75,3 +75,6 @@
 ## 2024-07-13 - O(N) recalculations bounded cache limit in `AgentOptimizer._store_suggestions`
 **Learning:** In `adapt_agent/optimization/performance.py`, maintaining a bounded cache limit by continuously recalculating the total item count (e.g., `sum(len(v) for v in cache.values())`) inside an eviction loop creates an O(N) bottleneck.
 **Action:** Optimize this by tracking a running total counter (e.g., `_total_suggestions`) that increments on insertion and decrements on eviction for O(1) complexity.
+## 2024-07-28 - Replace list.pop(0) with bounded deque for O(1) eviction
+**Learning:** In `adapt_agent/evaluation/__init__.py`, maintaining a bounded history using `list.pop(0)` creates an O(N) performance bottleneck because it requires shifting all subsequent elements in the array.
+**Action:** Use `collections.deque(maxlen=...)` instead of a list when maintaining a fixed-size ring buffer, as it automatically evicts the oldest item in O(1) time when appended to.
