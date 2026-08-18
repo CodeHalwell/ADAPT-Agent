@@ -122,6 +122,18 @@ class Firewall:
         self._custom_filters.append(filter_func)
 
     @staticmethod
+    def _truncate_escaped(text: str, max_length: int) -> str:
+        """Safely truncate text to max_length after escaping to prevent partial escapes."""
+        truncated = text[:max_length]
+        escaped = truncated.replace("\n", "\\n").replace("\r", "\\r")
+        if len(escaped) <= max_length:
+            return escaped
+        safe = escaped[:max_length]
+        if safe.endswith("\\") and escaped[max_length] in ("n", "r"):
+            safe = safe[:-1]
+        return safe
+
+    @staticmethod
     def _redact_snippet(content: str) -> str:
         """Return a non-sensitive snippet for storage in a security event.
 
@@ -130,7 +142,7 @@ class Firewall:
         remaining useful for correlation/debugging.
         """
         digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
-        safe_snippet = content[:12].replace("\n", "\\n").replace("\r", "\\r")
+        safe_snippet = Firewall._truncate_escaped(content, 12)
         return f"{safe_snippet}…(sha256:{digest})"
 
     def _check(self, content: str, event_type: str) -> bool:
@@ -177,9 +189,7 @@ class Firewall:
                     description=f"Content matched blocked pattern: {pattern.pattern}",
                     metadata={
                         # SECURITY: Sanitize complete content before truncation to prevent partial secret leakage
-                        "content_snippet": self.sanitize(content)[:100]
-                        .replace("\n", "\\n")
-                        .replace("\r", "\\r")
+                        "content_snippet": self._truncate_escaped(self.sanitize(content), 100)
                     },
                 )
                 self._blocked_count += 1
