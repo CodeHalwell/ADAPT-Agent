@@ -56,6 +56,7 @@ nav:
       - CrewAI: frameworks/crewai.md
       - OpenAI Agents SDK: frameworks/openai_agents.md
       - Claude Agent SDK: frameworks/claude_agent.md
+  - Running Evals: evals.md
   - Optimization & Evaluation: optimization.md
   - Observability: observability.md
   - CLI: cli.md

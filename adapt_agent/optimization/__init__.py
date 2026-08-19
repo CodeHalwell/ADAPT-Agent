@@ -41,16 +41,23 @@ from adapt_agent.optimization.config import (
     run_training,
 )
 from adapt_agent.optimization.dataset import Example, GoldenDataset
+from adapt_agent.optimization.evals import evaluate_agent
 from adapt_agent.optimization.evaluation import (
     EvaluationHarness,
     EvaluationReport,
     ExampleResult,
     resolve_runner,
 )
+from adapt_agent.optimization.extractors import (
+    available_extractors,
+    extract_output_text,
+    register_extractor,
+)
 from adapt_agent.optimization.judge import CompletionFn, JudgeVerdict, LLMJudge
 from adapt_agent.optimization.metrics import (
     BUILTIN_METRICS,
     Metric,
+    checks,
     contains,
     exact_match,
     get_metric,
@@ -98,6 +105,7 @@ from adapt_agent.optimization.providers import (
     get_provider,
     register_provider,
 )
+from adapt_agent.optimization.runners import adk_runner, framework_runner, langgraph_inputs
 from adapt_agent.optimization.target import OptimizableAgent, wrap
 
 __all__ = [
@@ -134,6 +142,7 @@ __all__ = [
     "numeric_close",
     "json_subset",
     "levenshtein_ratio",
+    "checks",
     "get_metric",
     "BUILTIN_METRICS",
     # evaluation
@@ -141,6 +150,14 @@ __all__ = [
     "EvaluationReport",
     "ExampleResult",
     "resolve_runner",
+    "evaluate_agent",
+    # framework output extraction / runners
+    "extract_output_text",
+    "register_extractor",
+    "available_extractors",
+    "framework_runner",
+    "langgraph_inputs",
+    "adk_runner",
     # target
     "OptimizableAgent",
     "wrap",

@@ -5,6 +5,7 @@ import pytest
 from adapt_agent.optimization import metrics as M
 from adapt_agent.optimization.metrics import (
     Metric,
+    checks,
     coerce_metric,
     contains,
     exact_match,
@@ -393,5 +394,129 @@ def test_builtin_metrics_keys_complete():
         "numeric_close",
         "json_subset",
         "levenshtein_ratio",
+        "checks",
     }
     assert set(M.BUILTIN_METRICS) == expected
+
+
+# -- checks (per-example dispatch) ---------------------------------------------
+
+
+def _example(check=None, **metadata):
+    from adapt_agent.optimization.dataset import Example
+
+    if check is not None:
+        metadata["check"] = check
+    return Example(inputs="q", expected=None, metadata=metadata)
+
+
+def test_checks_default_applies_without_declaration():
+    m = checks()
+    assert m("Paris", "Paris", _example()) == 1.0
+    assert m("London", "Paris", _example()) == 0.0
+
+
+def test_checks_named_builtin_per_row():
+    m = checks()
+    assert m("about 4 apples", "4", _example(check="numeric_close")) == 1.0
+    assert m("about 4 apples", "4", _example(check="exact_match")) == 0.0
+
+
+def test_checks_parameterised_mapping():
+    m = checks()
+    ex = _example(check={"name": "numeric_close", "tolerance": 0.5})
+    assert m("answer: 4.4", "4", ex) == 1.0
+    tight = _example(check={"name": "numeric_close", "tolerance": 0.1})
+    assert m("answer: 4.4", "4", tight) == 0.0
+
+
+def test_checks_list_min_aggregation():
+    m = checks()
+    ex = _example(check=["contains", "numeric_close"])
+    assert m("the answer is 4", "4", ex) == 1.0
+    # numeric passes but contains fails -> min is 0.
+    ex2 = _example(check=["contains", "numeric_close"])
+    assert m("the answer is four (4)", "5", ex2) == 0.0
+
+
+def test_checks_list_mean_aggregation():
+    m = checks(aggregate="mean")
+    ex = _example(check=["exact_match", "contains"])
+    assert m("Paris is nice", "Paris", ex) == approx(0.5)
+
+
+def test_checks_invalid_aggregate_rejected():
+    with pytest.raises(ValueError):
+        checks(aggregate="max")
+
+
+def test_checks_judge_routing():
+    class StubJudge:
+        def as_metric(self, name="judge"):
+            return Metric(name, lambda o, e, ex=None: 0.75, needs_example=True)
+
+    m = checks(judge=StubJudge())
+    assert m("anything", None, _example(check="judge")) == 0.75
+    assert m("anything", None, _example(check="llm_judge")) == 0.75
+
+
+def test_checks_judge_without_judge_raises():
+    m = checks()
+    with pytest.raises(ValueError):
+        m("anything", None, _example(check="judge"))
+
+
+def test_checks_default_none_requires_declaration():
+    m = checks(default=None)
+    with pytest.raises(ValueError):
+        m("Paris", "Paris", _example())
+    assert m("Paris", "Paris", _example(check="exact_match")) == 1.0
+
+
+def test_checks_metric_and_callable_specs():
+    custom = Metric("always_half", lambda o, e: 0.5)
+    m = checks()
+    assert m("x", "y", _example(check=custom)) == 0.5
+
+    def scorer(output, expected):
+        return 1.0 if output == expected else 0.0
+
+    assert m("x", "x", _example(check=scorer)) == 1.0
+
+
+def test_checks_plural_metadata_key():
+    m = checks()
+    from adapt_agent.optimization.dataset import Example
+
+    ex = Example(inputs="q", metadata={"checks": ["contains"]})
+    assert m("well, Paris", "Paris", ex) == 1.0
+
+
+def test_checks_unknown_name_raises():
+    m = checks()
+    with pytest.raises(KeyError):
+        m("x", "y", _example(check="nope"))
+
+
+def test_checks_empty_list_raises():
+    m = checks()
+    with pytest.raises(ValueError):
+        m("x", "y", _example(check=[]))
+
+
+def test_checks_bad_spec_type_raises():
+    m = checks()
+    with pytest.raises(TypeError):
+        m("x", "y", _example(check=123))
+
+
+def test_checks_mapping_without_name_raises():
+    m = checks()
+    with pytest.raises(ValueError):
+        m("x", "y", _example(check={"tolerance": 0.5}))
+
+
+def test_checks_without_example_uses_default():
+    # Metric.__call__ passes example=None when a harness lacks example context.
+    m = checks()
+    assert m("Paris", "Paris") == 1.0

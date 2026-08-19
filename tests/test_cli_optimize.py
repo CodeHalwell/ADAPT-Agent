@@ -217,3 +217,102 @@ def orchestrate(q):
     import sys
 
     sys.modules.pop(module_name, None)
+
+
+# -- --extract-output / --metric checks ----------------------------------------
+
+_WRAPPED_AGENT_MODULE = '''
+class _RunResult:
+    """Pydantic-AI-shaped wrapper around the answer text."""
+
+    def __init__(self, output):
+        self.output = output
+
+    def all_messages(self):
+        return []
+
+
+_CAP = {"France": "Paris", "Japan": "Tokyo", "Italy": "Rome"}
+
+
+def run(q):
+    country = q.replace("What is the capital of", "").strip(" ?")
+    return _RunResult(_CAP.get(country, "unknown"))
+'''
+
+
+@pytest.fixture()
+def wrapped_agent_env(tmp_path, monkeypatch):
+    """An agent returning framework-native (wrapped) outputs plus a dataset."""
+    module_name = f"_cli_wrapped_{tmp_path.name.replace('-', '_')}"
+    (tmp_path / f"{module_name}.py").write_text(_WRAPPED_AGENT_MODULE, encoding="utf-8")
+    data_path = tmp_path / "data.jsonl"
+    data_path.write_text("\n".join(json.dumps(r) for r in _DATA), encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    yield module_name, str(data_path)
+    import sys
+
+    sys.modules.pop(module_name, None)
+
+
+def test_evaluate_wrapped_output_scores_zero_without_flag(wrapped_agent_env, capsys):
+    module_name, data = wrapped_agent_env
+    code = main(
+        ["evaluate", f"{module_name}:run", "--data", data, "--metric", "exact_match", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["aggregate"]["exact_match"] == 0.0
+
+
+def test_evaluate_extract_output_flag_unwraps(wrapped_agent_env, capsys):
+    module_name, data = wrapped_agent_env
+    code = main(
+        [
+            "evaluate",
+            f"{module_name}:run",
+            "--data",
+            data,
+            "--metric",
+            "exact_match",
+            "--extract-output",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["aggregate"]["exact_match"] == 1.0
+
+
+def test_evaluate_checks_metric_with_per_row_declarations(tmp_path, monkeypatch, capsys):
+    module_name = f"_cli_checks_{tmp_path.name.replace('-', '_')}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "def run(q):\n    return 'Paris' if 'France' in q else 'roughly 42'\n",
+        encoding="utf-8",
+    )
+    rows = [
+        {"input": "What is the capital of France?", "expected": "Paris"},
+        {"input": "What is 6*7?", "expected": "42", "check": "numeric_close"},
+    ]
+    data_path = tmp_path / "data.jsonl"
+    data_path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        code = main(
+            [
+                "evaluate",
+                f"{module_name}:run",
+                "--data",
+                str(data_path),
+                "--metric",
+                "checks",
+                "--json",
+            ]
+        )
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["aggregate"]["checks"] == 1.0
+    finally:
+        import sys
+
+        sys.modules.pop(module_name, None)

@@ -10,6 +10,7 @@ python examples/03_langgraph_guarded_agent.py
 python examples/04_observability.py
 python examples/05_multi_framework_adapters.py
 python examples/06_optimize_with_golden_dataset.py
+python examples/08_agent_evals.py
 ```
 
 None of these examples require any optional dependencies (including
@@ -78,6 +79,17 @@ and to rewrite the prompt from failures, and a `CoordinateAscentOptimizer` that
 improves the baseline and applies the winning configuration back onto the live
 agent. Swap the stub for `ClaudeJudge` / `OpenAIJudge` / `GeminiJudge` for real
 optimization.
+
+### `08_agent_evals.py`
+Runs **one-call evals** (`evaluate_agent`) against agents shaped like each of
+the four major frameworks — Pydantic AI, Microsoft Agent Framework, LangGraph,
+and Google ADK (via `adk_runner`) — entirely offline. The golden dataset mixes
+**per-row checks**: exact text match, a number-within-tolerance check that
+passes on "The answer is 42.", a parameterised tolerance, and an LLM-judge row
+graded against per-row criteria by a deterministic offline judge stub.
+Framework-native results (an `AgentRunResult`, a LangGraph state dict, an ADK
+event stream) are unwrapped to final response text automatically. See
+[docs/evals.md](../docs/evals.md).
 
 ## Per-framework example ladders
 

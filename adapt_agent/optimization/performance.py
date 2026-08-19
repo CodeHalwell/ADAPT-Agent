@@ -162,10 +162,7 @@ class AgentOptimizer:
         # SECURITY: Prevent unbounded memory growth. Evict whole agents (oldest
         # first) until the total stored suggestion count fits the budget.
         # ⚡ Bolt: O(1) condition check using running total
-        while (
-            self._total_suggestions_count > self.max_suggestions
-            and self._suggestion_order
-        ):
+        while self._total_suggestions_count > self.max_suggestions and self._suggestion_order:
             oldest = self._suggestion_order.popleft()
             evicted = self._suggestions_by_agent.pop(oldest, [])
             self._total_suggestions_count -= len(evicted)

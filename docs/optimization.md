@@ -12,6 +12,11 @@ FastAPI backend, ...). Each LLM SDK and agent framework is imported **lazily** -
 only when you actually use one -- so you install just the providers and frameworks
 your system needs.
 
+> **Just want to score an agent?** [Running Evals](evals.md) covers the
+> one-call `evaluate_agent(...)` API: deterministic text/number checks,
+> per-row check selection, LLM-as-judge, and automatic unwrapping of
+> framework-native outputs. The optimizers below reuse exactly those pieces.
+
 ## The pieces
 
 | Concept | Class | Role |

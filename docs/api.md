@@ -174,6 +174,36 @@ Key methods:
 - `compute_aggregate_metrics(agent_id=None) -> dict[str, float]`
 - `get_evaluation_results(agent_id=None, limit=None) -> list[dict]`
 
+### evaluate_agent and the eval toolkit
+
+`evaluate_agent(agent, data, *, metrics=None, judge=None, judge_criteria=None, judge_rubric=None, primary_metric=None, input_adapter="auto", output_extractor=extract_output_text, input_key=None, expected_key=None, capture_output=True, max_results=10_000, failure_threshold=1.0) -> EvaluationReport`
+
+One-call golden-dataset evals for any supported framework agent (or callable):
+loads the dataset, discovers the framework run method, adapts inputs
+(LangGraph), unwraps framework-native outputs, and scores with deterministic
+checks, the per-row `checks` dispatcher, and/or an LLM-as-judge. See
+[Running Evals](evals.md).
+
+Companion utilities (importable from `adapt_agent.evaluation` and
+`adapt_agent.optimization`):
+
+- `extract_output_text(value)` — best-effort, dependency-free unwrapping of
+  framework results (`AgentRunResult`, `AgentRunResponse`, LangGraph state,
+  ADK events, `CrewOutput`, `RunResult`, message streams) to final text;
+  unrecognised values pass through unchanged.
+- `register_extractor(name, predicate, unwrap)` / `available_extractors()` —
+  extend extraction for custom result types.
+- `framework_runner(agent, *, input_adapter="auto", output_extractor=...)` —
+  wrap any supported agent as a plain `input -> text` callable.
+- `langgraph_inputs(value)` — the string → message-state input adapter.
+- `adk_runner(target, *, app_name=..., user_id=..., message_factory=None, output_extractor=...)`
+  — drive a Google ADK agent (or prebuilt `Runner`) synchronously with a fresh
+  session per call.
+- `checks(default="exact_match", judge=None, aggregate="min")` — the per-row
+  check dispatcher metric (rows declare `{"check": ...}` in metadata).
+- `EvaluationHarness(metrics, ..., output_extractor=None)` — the underlying
+  measurement engine; see [Optimization & Evaluation](optimization.md).
+
 ### AgentObserver
 
 `AgentObserver(max_logs=1000, max_traces=1000, max_metrics=1000, max_events_per_trace=1000, max_metric_names=1000)`

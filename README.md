@@ -28,10 +28,19 @@ The library keeps its core install light and imports each agent framework **lazi
 - **`AgentObserver`** — tracing (`start_trace`/`end_trace`) and structured logging for agent executions.
 
 ### Evaluation
+- **`evaluate_agent`** — one-call evals for agents built with **LangGraph,
+  Microsoft Agent Framework, Google ADK, Pydantic AI**, CrewAI, the OpenAI
+  Agents SDK, or the Claude Agent SDK: deterministic checks against specific
+  outputs (`exact_match`, `contains`, `regex_match`, `numeric_close`, …),
+  **per-row checks** (each dataset row declares how it is scored via a
+  `"check"` field), and/or an **LLM-as-judge** — with framework-native results
+  (an `AgentRunResult`, LangGraph state, ADK events, …) unwrapped to final
+  response text automatically. See [docs/evals.md](docs/evals.md) and
+  [examples/08_agent_evals.py](examples/08_agent_evals.py).
+- **`GoldenDataset` / `EvaluationHarness`** — the underlying engine: load
+  golden data from lists / JSON / JSONL / CSV and score with any mix of
+  metrics. Re-exported from `adapt_agent.evaluation`.
 - **`AgentEvaluator`** — runtime evaluation utilities for agent behaviour.
-- **`GoldenDataset` / `EvaluationHarness`** — evaluate any agent against a golden
-  dataset with built-in metrics (`exact_match`, `token_f1`, `numeric_close`, …)
-  or an **LLM-as-judge**. Re-exported from `adapt_agent.evaluation`.
 
 ### Optimization
 - **`AgentOptimizer`** — runtime performance-metrics collector + tuning hints.
@@ -196,9 +205,12 @@ adapt-agent validate config.json --json
 adapt-agent monitor --agent-id my-agent
 adapt-agent monitor --agent-id my-agent --config config.json --json
 
-# Evaluate an agent against a golden dataset (target is module:attribute)
-adapt-agent evaluate myapp.agents:agent --data golden.jsonl --metric exact_match
-adapt-agent evaluate "myapp.agents:build()" --data golden.jsonl --judge claude --primary judge
+# Evaluate an agent against a golden dataset (target is module:attribute).
+# --extract-output unwraps framework-native results to final response text;
+# --metric checks lets each dataset row declare its own check (text match,
+# numeric tolerance, LLM-judge, ...).
+adapt-agent evaluate myapp.agents:agent --data golden.jsonl --metric exact_match --extract-output
+adapt-agent evaluate "myapp.agents:build()" --data golden.jsonl --metric checks --judge claude
 
 # Optimize an agent (prompts/few-shot/models/hyperparams/routing/tools) in place
 adapt-agent optimize "myapp.agents:build()" --data golden.jsonl --metric token_f1 \

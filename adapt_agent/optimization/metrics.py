@@ -215,6 +215,121 @@ def levenshtein_ratio() -> Metric:
     return Metric("levenshtein_ratio", _fn)
 
 
+def checks(
+    *,
+    default: Metric | MetricFn | str | None = "exact_match",
+    judge: Any = None,
+    aggregate: str = "min",
+) -> Metric:
+    """Per-example check dispatch: each dataset row declares how it is scored.
+
+    Golden datasets often mix answer types -- one row wants an exact text match,
+    the next a number within tolerance, another an LLM-judge grade. This metric
+    reads the check specification from ``example.metadata["check"]`` (or
+    ``"checks"``) and applies the matching scorer to that row:
+
+    * a built-in name -- ``"exact_match"``, ``"numeric_close"``, ...
+    * a parameterised form -- ``{"name": "numeric_close", "tolerance": 0.5}``
+      (extra keys are passed to the metric factory)
+    * ``"judge"`` / ``"llm_judge"`` -- routed to the supplied ``judge`` (its
+      per-example ``criteria`` metadata is honoured as usual)
+    * a list of any of the above -- combined per ``aggregate``
+
+    Rows without a declaration fall back to ``default``.
+
+    Args:
+        default: Check applied when a row declares none. A built-in name, a
+            :class:`Metric`, or a bare callable. ``None`` makes an undeclared
+            row an error (scored ``0.0`` by the harness).
+        judge: An :class:`~adapt_agent.optimization.judge.LLMJudge` (anything
+            with ``as_metric()``) backing rows that declare a judge check.
+        aggregate: How multiple checks on one row combine: ``"min"`` (default;
+            every check must pass for a perfect score) or ``"mean"``.
+    """
+    if aggregate not in ("min", "mean"):
+        raise ValueError(f"aggregate must be 'min' or 'mean', got {aggregate!r}")
+    judge_metric = _judge_check_metric(judge)
+    resolved_default = None if default is None else _resolve_check(default, judge_metric, {})
+    cache: dict[Any, Metric] = {}
+
+    def _fn(output: Any, expected: Any, example: Any = None) -> float:
+        spec: Any = None
+        if example is not None:
+            meta = getattr(example, "metadata", None) or {}
+            spec = meta.get("check", meta.get("checks"))
+        if spec is None:
+            if resolved_default is None:
+                raise ValueError("example declares no check and checks(default=None) was set")
+            metric_list = [resolved_default]
+        else:
+            spec_list = list(spec) if isinstance(spec, (list, tuple)) else [spec]
+            metric_list = [_resolve_check(item, judge_metric, cache) for item in spec_list]
+        scores = [m(output, expected, example) for m in metric_list]
+        if not scores:
+            raise ValueError("example declares an empty check list")
+        return min(scores) if aggregate == "min" else sum(scores) / len(scores)
+
+    return Metric("checks", _fn, needs_example=True)
+
+
+_JUDGE_CHECK_NAMES = ("judge", "llm_judge")
+
+
+def _judge_check_metric(judge: Any) -> Metric | None:
+    """Coerce the ``judge`` argument of :func:`checks` into a Metric (or None)."""
+    if judge is None:
+        return None
+    as_metric = getattr(judge, "as_metric", None)
+    if callable(as_metric):
+        return coerce_metric(as_metric("judge"))
+    return coerce_metric(judge, default_name="judge")
+
+
+def _resolve_check(spec: Any, judge_metric: Metric | None, cache: dict[Any, Metric]) -> Metric:
+    """Resolve one check specification into a :class:`Metric`."""
+    if isinstance(spec, Metric):
+        return spec
+    if callable(spec):
+        return coerce_metric(spec)
+    if isinstance(spec, str):
+        if spec in _JUDGE_CHECK_NAMES:
+            if judge_metric is None:
+                raise ValueError(
+                    f"example declares check {spec!r} but checks() was built without a judge"
+                )
+            return judge_metric
+        key: Any = spec
+        params: dict[str, Any] = {}
+    elif isinstance(spec, dict):
+        params = dict(spec)
+        name = params.pop("name", None) or params.pop("check", None)
+        if not isinstance(name, str):
+            raise ValueError(f"check mapping needs a 'name' string, got {spec!r}")
+        if name in _JUDGE_CHECK_NAMES:
+            if judge_metric is None:
+                raise ValueError(
+                    f"example declares check {name!r} but checks() was built without a judge"
+                )
+            return judge_metric
+        spec = name
+        try:
+            key = (name, tuple(sorted(params.items())))
+        except TypeError:  # unhashable parameter values: skip the cache
+            key = None
+    else:
+        raise TypeError(f"Unsupported check specification: {spec!r}")
+
+    if key is not None and key in cache:
+        return cache[key]
+    factory = BUILTIN_METRICS.get(spec)
+    if factory is None:
+        raise KeyError(f"Unknown check {spec!r}. Available: {sorted(BUILTIN_METRICS)}")
+    metric = factory(**params)
+    if key is not None:
+        cache[key] = metric
+    return metric
+
+
 # -- registry of zero-arg built-ins for config-driven use ---------------------
 
 BUILTIN_METRICS: dict[str, Callable[[], Metric]] = {
@@ -226,6 +341,7 @@ BUILTIN_METRICS: dict[str, Callable[[], Metric]] = {
     "numeric_close": numeric_close,
     "json_subset": json_subset,
     "levenshtein_ratio": levenshtein_ratio,
+    "checks": checks,
 }
 
 
@@ -298,6 +414,7 @@ __all__ = [
     "numeric_close",
     "json_subset",
     "levenshtein_ratio",
+    "checks",
     "BUILTIN_METRICS",
     "get_metric",
 ]
