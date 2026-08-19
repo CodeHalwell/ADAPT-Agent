@@ -11,14 +11,21 @@ from typing import Any, Optional
 # here under the "eval" namespace. These imports pull in no third-party agent
 # framework or LLM SDK.
 from adapt_agent.optimization.dataset import Example, GoldenDataset
+from adapt_agent.optimization.evals import evaluate_agent
 from adapt_agent.optimization.evaluation import (
     EvaluationHarness,
     EvaluationReport,
     ExampleResult,
 )
+from adapt_agent.optimization.extractors import (
+    available_extractors,
+    extract_output_text,
+    register_extractor,
+)
 from adapt_agent.optimization.judge import JudgeVerdict, LLMJudge
 from adapt_agent.optimization.metrics import (
     Metric,
+    checks,
     contains,
     exact_match,
     get_metric,
@@ -29,6 +36,7 @@ from adapt_agent.optimization.metrics import (
     regex_match,
     token_f1,
 )
+from adapt_agent.optimization.runners import adk_runner, framework_runner, langgraph_inputs
 
 logger = logging.getLogger(__name__)
 
@@ -188,5 +196,14 @@ __all__ = [
     "numeric_close",
     "json_subset",
     "levenshtein_ratio",
+    "checks",
     "get_metric",
+    # one-call framework evals
+    "evaluate_agent",
+    "extract_output_text",
+    "register_extractor",
+    "available_extractors",
+    "framework_runner",
+    "langgraph_inputs",
+    "adk_runner",
 ]

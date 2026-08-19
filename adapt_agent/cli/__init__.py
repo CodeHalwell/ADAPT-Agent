@@ -14,7 +14,12 @@ Commands
 
 ``adapt-agent evaluate <target> --data <file> [--metric NAME ...] [--judge PROVIDER]``
     Evaluate an agent against a golden dataset and print the scores. ``<target>``
-    is ``module:attribute`` (append ``()`` to call a factory).
+    is ``module:attribute`` (append ``()`` to call a factory). Pass
+    ``--extract-output`` to unwrap framework-native results (an
+    ``AgentRunResult``, LangGraph state, ADK events, ...) to final response
+    text before scoring, and ``--metric checks`` to let each dataset row
+    declare its own check via ``metadata`` (text match, numeric tolerance,
+    LLM-judge, ...).
 
 ``adapt-agent optimize <target> --data <file> [--optimizer S] [--judge PROVIDER] ...``
     Optimize an agent against a golden dataset (prompts, few-shot, models,
@@ -66,6 +71,7 @@ _BUILTIN_METRIC_NAMES = (
     "numeric_close",
     "json_subset",
     "levenshtein_ratio",
+    "checks",
 )
 _OPTIMIZER_CHOICES = (
     "default",
@@ -155,11 +161,18 @@ def main(args: list[str] | None = None) -> int:
             action="append",
             default=[],
             metavar="NAME",
-            help=f"Built-in metric to apply (repeatable): {sorted(_builtin_metric_names())}.",
+            help=f"Built-in metric to apply (repeatable): {sorted(_builtin_metric_names())}, "
+            'plus "judge" to grade every row with the --judge provider explicitly.',
         )
         sub.add_argument("--judge", help="LLM-judge provider (e.g. claude, openai, gemini).")
         sub.add_argument("--judge-model", help="Model id for the judge provider.")
         sub.add_argument("--primary", help="Name of the primary (headline) metric.")
+        sub.add_argument(
+            "--extract-output",
+            action="store_true",
+            help="Unwrap framework-native results (AgentRunResult, LangGraph "
+            "state, ADK events, ...) to final response text before scoring.",
+        )
         sub.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
         if name == "optimize":
             sub.add_argument(
@@ -476,6 +489,15 @@ def _build_components(specs: list[str]) -> dict[str, Any]:
     return components
 
 
+def _output_extractor(args: Any) -> Any:
+    """Return the framework output extractor when ``--extract-output`` is set."""
+    if not getattr(args, "extract_output", False):
+        return None
+    from adapt_agent.optimization import extract_output_text
+
+    return extract_output_text
+
+
 def _build_judge(provider: str | None, model: str | None) -> Any:
     """Construct an LLM judge for a provider name, or ``None`` when unset."""
     if not provider:
@@ -487,10 +509,24 @@ def _build_judge(provider: str | None, model: str | None) -> Any:
 
 def _build_metrics(names: list[str], judge: Any, primary: str | None) -> tuple[list[Any], str]:
     """Build the metric list (built-ins + optional judge) and the primary name."""
-    from adapt_agent.optimization import get_metric
+    from adapt_agent.optimization import checks, get_metric
 
-    metrics: list[Any] = [get_metric(name) for name in names]
-    if judge is not None:
+    metrics: list[Any] = []
+    for name in names:
+        if name == "checks":
+            # Judge-aware so dataset rows may declare {"check": "judge"}.
+            metrics.append(checks(judge=judge))
+        elif name in ("judge", "llm_judge"):
+            if judge is None:
+                raise ValueError(f"--metric {name} requires --judge PROVIDER.")
+            metrics.append(judge.as_metric("judge"))
+        else:
+            metrics.append(get_metric(name))
+    # A supplied judge also grades every row -- unless a metric already routes
+    # it: an explicit "judge" entry, or a "checks" dispatcher (which judges
+    # exactly the rows that declare a judge check; grading every row anyway
+    # would burn judge calls the dataset opted out of).
+    if judge is not None and not any(m.name in ("judge", "checks") for m in metrics):
         metrics.append(judge.as_metric("judge"))
     if not metrics:
         raise ValueError(
@@ -562,7 +598,9 @@ def _cmd_evaluate(args: Any) -> int:
         dataset = _load_dataset(args.data)
         judge = _build_judge(args.judge, args.judge_model)
         metrics, primary = _build_metrics(args.metric, judge, args.primary)
-        harness = EvaluationHarness(metrics, primary_metric=primary)
+        harness = EvaluationHarness(
+            metrics, primary_metric=primary, output_extractor=_output_extractor(args)
+        )
         report = harness.evaluate(target, dataset)
     except Exception as exc:
         return _fail(exc, args.json)
@@ -588,7 +626,9 @@ def _cmd_optimize(args: Any) -> int:
         val_dataset = _load_dataset(args.val_data) if args.val_data else None
         judge = _build_judge(args.judge, args.judge_model)
         metrics, primary = _build_metrics(args.metric, judge, args.primary)
-        harness = EvaluationHarness(metrics, primary_metric=primary)
+        harness = EvaluationHarness(
+            metrics, primary_metric=primary, output_extractor=_output_extractor(args)
+        )
         optimizer = _build_optimizer(
             args.optimizer, harness, judge, args.max_evals, args.seed, args.verbose
         )

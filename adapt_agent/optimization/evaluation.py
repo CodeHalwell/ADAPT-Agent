@@ -195,6 +195,14 @@ class EvaluationHarness:
             ``evaluate`` always re-runs the agent so results stay correct even
             for stateful/impure agents. Kept so callers can opt in later without
             a signature change; setting it does **not** enable any caching today.
+        output_extractor: Optional post-processor applied to each raw agent
+            output before scoring (and before storing on the result record).
+            Pass :func:`adapt_agent.optimization.extractors.extract_output_text`
+            to unwrap framework-native results (Pydantic AI ``AgentRunResult``,
+            LangGraph state, ADK events, ...) into final response text so
+            text/number metrics compare against the answer rather than a
+            ``repr``. ``None`` (the default) keeps raw outputs. Extractor
+            errors are non-fatal: the raw output is scored instead.
     """
 
     def __init__(
@@ -206,6 +214,7 @@ class EvaluationHarness:
         max_results: int = 10_000,
         failure_threshold: float = 1.0,
         cache: bool = False,
+        output_extractor: Callable[[Any], Any] | None = None,
     ):
         self.metrics: list[Metric] = self._normalize_metrics(metrics)
         if not self.metrics:
@@ -221,6 +230,7 @@ class EvaluationHarness:
         self.failure_threshold = failure_threshold
         # Reserved: no caching is performed today (see class docstring).
         self.cache = cache
+        self.output_extractor = output_extractor
 
     @staticmethod
     def _normalize_metrics(metrics: Any) -> list[Metric]:
@@ -291,6 +301,12 @@ class EvaluationHarness:
                 latency=latency,
                 error=str(exc),
             )
+
+        if self.output_extractor is not None:
+            try:
+                output = self.output_extractor(output)
+            except Exception as exc:  # non-fatal: score the raw output instead
+                logger.warning("Output extractor raised on example %d: %s", index, exc)
 
         scores: dict[str, float] = {}
         for metric in self.metrics:

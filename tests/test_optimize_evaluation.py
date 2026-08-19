@@ -450,3 +450,78 @@ def test_report_repr_contains_key_fields():
     assert "EvaluationReport" in text
     assert "echo" in text
     assert "n=2" in text
+
+
+# -- output_extractor ----------------------------------------------------------
+
+
+def test_harness_output_extractor_unwraps_before_scoring():
+    from adapt_agent.optimization.extractors import extract_output_text
+    from adapt_agent.optimization.metrics import exact_match
+
+    class WrappedResult:
+        def __init__(self, output):
+            self.output = output
+
+        def all_messages(self):  # Pydantic-AI-shaped
+            return []
+
+    harness = EvaluationHarness(exact_match(), output_extractor=extract_output_text)
+    data = GoldenDataset([Example(inputs="q", expected="Paris")])
+    report = harness.evaluate(lambda q: WrappedResult("Paris"), data)
+    assert report.score == 1.0
+    # The stored output is the extracted text, not the wrapper object.
+    assert report.results[0].output == "Paris"
+
+
+def test_harness_without_extractor_scores_raw_output():
+    from adapt_agent.optimization.metrics import exact_match
+
+    class WrappedResult:
+        def __init__(self, output):
+            self.output = output
+
+        def all_messages(self):
+            return []
+
+    harness = EvaluationHarness(exact_match())
+    data = GoldenDataset([Example(inputs="q", expected="Paris")])
+    report = harness.evaluate(lambda q: WrappedResult("Paris"), data)
+    assert report.score == 0.0  # repr(WrappedResult) never equals "Paris"
+
+
+def test_harness_output_extractor_errors_are_non_fatal():
+    from adapt_agent.optimization.metrics import contains
+
+    def broken_extractor(value):
+        raise RuntimeError("boom")
+
+    harness = EvaluationHarness(contains(), output_extractor=broken_extractor)
+    data = GoldenDataset([Example(inputs="q", expected="Paris")])
+    report = harness.evaluate(lambda q: "Paris is the capital", data)
+    # The raw output is scored instead of crashing the evaluation.
+    assert report.n_errors == 0
+    assert report.score == 1.0
+
+
+def test_harness_output_extractor_applies_per_example_checks():
+    from adapt_agent.optimization.extractors import extract_output_text
+    from adapt_agent.optimization.metrics import checks
+
+    harness = EvaluationHarness(checks(), output_extractor=extract_output_text)
+    data = GoldenDataset(
+        [
+            Example(inputs="capital of France?", expected="Paris"),
+            Example(
+                inputs="2+2?",
+                expected="4",
+                metadata={"check": "numeric_close"},
+            ),
+        ]
+    )
+
+    def agent(question):
+        return {"output": "Paris" if "France" in question else "the answer is 4"}
+
+    report = harness.evaluate(agent, data)
+    assert report.aggregate["checks"] == 1.0

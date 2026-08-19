@@ -7,7 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **One-call framework evals** (`adapt_agent.optimization.evals`, re-exported
+  from `adapt_agent.evaluation`): `evaluate_agent(agent, data, metrics=...,
+  judge=...)` scores an agent built with any supported framework (LangGraph,
+  Microsoft Agent Framework, Google ADK, Pydantic AI, CrewAI, OpenAI Agents
+  SDK, Claude Agent SDK) or a plain callable against a golden dataset —
+  deterministic checks against specific outputs (text / number / regex / JSON),
+  per-row checks, and/or an LLM-as-judge — returning the standard
+  `EvaluationReport`. See `docs/evals.md` and `examples/08_agent_evals.py`.
+- **Framework-native output extraction**
+  (`adapt_agent.optimization.extractors`): `extract_output_text()` unwraps run
+  results — Pydantic AI `AgentRunResult`, Microsoft `AgentRunResponse` /
+  `ChatMessage`, LangGraph final state, Google ADK / GenAI event streams and
+  `Content` parts, CrewAI `CrewOutput`, OpenAI Agents `RunResult`, Claude Agent
+  SDK `ResultMessage` / content blocks, conventional mappings/attributes, and
+  message/event streams — to final response text so text- and number-level
+  metrics compare answers rather than `repr()`s. Structural and
+  dependency-free (no framework imports); unrecognised values pass through
+  unchanged; extensible via `register_extractor()`. The `EvaluationHarness`
+  gains an `output_extractor=` option, and the CLI `evaluate` / `optimize`
+  commands gain `--extract-output`.
+- **Framework runners** (`adapt_agent.optimization.runners`):
+  `framework_runner()` wraps any supported agent as a plain `input -> text`
+  callable (auto-adapting plain-string inputs for LangGraph message-state
+  graphs via `langgraph_inputs()`), and `adk_runner()` drives a Google ADK
+  agent or prebuilt `Runner` synchronously — sessions created per call so eval
+  examples stay independent, `google.adk` / `google.genai` imported lazily.
+- **Per-row checks metric** (`adapt_agent.optimization.metrics.checks`): each
+  dataset row declares how it is scored via `metadata["check"]` — a built-in
+  name (`"numeric_close"`), a parameterised form (`{"name": "numeric_close",
+  "tolerance": 0.5}`), `"judge"` for LLM-judge rows, or a list combined with
+  `min`/`mean` — with undeclared rows falling back to a default (
+  `exact_match`). Registered as the `checks` built-in, so `--metric checks`
+  works from the CLI (judge-aware when `--judge` is also passed, and routing
+  judge calls only to rows that declare a judge check; `--metric judge` grades
+  every row explicitly).
+
 ### Documentation
+
+- **Running Evals guide** (`docs/evals.md`): quick start, built-in check
+  table, per-row checks, LLM-as-judge, framework-by-framework notes (LangGraph
+  / Microsoft Agent Framework / Google ADK / Pydantic AI / CrewAI / OpenAI
+  Agents / Claude Agent SDK), output extraction, direct-harness usage, and CLI
+  examples. Added `examples/08_agent_evals.py` (offline, no framework or API
+  key required) and new API reference entries.
 
 - **Per-framework guides and example ladders** for all seven supported frameworks
   (LangGraph, Microsoft Agent Framework, Google ADK, Pydantic AI, CrewAI, OpenAI
