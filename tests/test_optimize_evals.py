@@ -366,3 +366,40 @@ def test_evaluate_agent_checks_metric_does_not_double_judge():
     # the row that declared a judge check spent a judge call.
     assert set(report.aggregate) == {"checks"}
     assert len(calls) == 1
+
+
+def test_evaluate_agent_renamed_checks_does_not_double_judge():
+    calls = []
+
+    def counting_judge(prompt, system=None):
+        calls.append(prompt)
+        return '{"score": 8, "pass": true, "reasoning": "ok"}'
+
+    report = evaluate_agent(
+        lambda q: "Paris",
+        [
+            {"input": "capital?", "expected": "Paris"},
+            {"input": "describe France", "check": "judge"},
+        ],
+        metrics={"accuracy": "checks"},  # renamed dispatcher still routes the judge
+        judge=counting_judge,
+    )
+    assert set(report.aggregate) == {"accuracy"}
+    assert len(calls) == 1  # only the judge-declared row spent a judge call
+
+
+def test_evaluate_agent_renamed_judge_spec_not_duplicated():
+    calls = []
+
+    def counting_judge(prompt, system=None):
+        calls.append(prompt)
+        return '{"score": 8, "pass": true, "reasoning": "ok"}'
+
+    report = evaluate_agent(
+        lambda q: "Paris",
+        [{"input": "capital?", "expected": "Paris"}],
+        metrics={"quality": "judge"},
+        judge=counting_judge,
+    )
+    assert set(report.aggregate) == {"quality"}
+    assert len(calls) == 1

@@ -41,7 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "tolerance": 0.5}`), `"judge"` for LLM-judge rows, or a list combined with
   `min`/`mean` — with undeclared rows falling back to a default (
   `exact_match`). Registered as the `checks` built-in, so `--metric checks`
-  works from the CLI (judge-aware when `--judge` is also passed).
+  works from the CLI (judge-aware when `--judge` is also passed, and routing
+  judge calls only to rows that declare a judge check; `--metric judge` grades
+  every row explicitly).
 
 ### Documentation
 

@@ -330,9 +330,13 @@ def _resolve_check(spec: Any, judge_metric: Metric | None, cache: dict[Any, Metr
     return metric
 
 
-# -- registry of zero-arg built-ins for config-driven use ---------------------
+# -- registry of built-in metric factories for config-driven use --------------
+#
+# Every factory is callable with no arguments (how :func:`get_metric` uses it);
+# most also accept keyword options (how :func:`checks` builds parameterised
+# per-row checks such as ``{"name": "numeric_close", "tolerance": 0.5}``).
 
-BUILTIN_METRICS: dict[str, Callable[[], Metric]] = {
+BUILTIN_METRICS: dict[str, Callable[..., Metric]] = {
     "exact_match": exact_match,
     "contains": contains,
     "regex_match": regex_match,

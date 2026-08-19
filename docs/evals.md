@@ -277,6 +277,9 @@ adapt-agent evaluate "myapp.agents:build()" --data golden.jsonl \
 ```
 
 `--extract-output` applies the same extraction as `evaluate_agent`; the target
-is `module:attribute` (append `()` to call a factory). The identical flags work
-on `adapt-agent optimize`, so the eval that gates your agent is the same eval
+is `module:attribute` (append `()` to call a factory). Judge routing matches
+`evaluate_agent`: with `--metric checks`, only rows declaring
+`{"check": "judge"}` spend judge calls -- add `--metric judge` to also grade
+every row with the `--judge` provider. The identical flags work on
+`adapt-agent optimize`, so the eval that gates your agent is the same eval
 that trains it -- see [Optimization & Evaluation](optimization.md).

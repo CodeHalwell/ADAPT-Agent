@@ -316,3 +316,46 @@ def test_evaluate_checks_metric_with_per_row_declarations(tmp_path, monkeypatch,
         import sys
 
         sys.modules.pop(module_name, None)
+
+
+def test_evaluate_checks_with_judge_does_not_grade_every_row(tmp_path, monkeypatch, capsys):
+    """--metric checks --judge X must not auto-append a judge over every row."""
+    module_name = f"_cli_checksjudge_{tmp_path.name.replace('-', '_')}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "def run(q):\n    return 'Paris'\n", encoding="utf-8"
+    )
+    # No row declares a judge check, so no judge call is ever made.
+    rows = [{"input": "capital of France?", "expected": "Paris"}]
+    data_path = tmp_path / "data.jsonl"
+    data_path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        code = main(
+            [
+                "evaluate",
+                f"{module_name}:run",
+                "--data",
+                str(data_path),
+                "--metric",
+                "checks",
+                "--judge",
+                "claude",
+                "--json",
+            ]
+        )
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        # The checks dispatcher routes judging per-row; no extra "judge" metric.
+        assert set(payload["aggregate"]) == {"checks"}
+        assert payload["aggregate"]["checks"] == 1.0
+    finally:
+        import sys
+
+        sys.modules.pop(module_name, None)
+
+
+def test_evaluate_metric_judge_requires_judge_flag(agent_env, capsys):
+    module_name, data, _ = agent_env
+    code = main(["evaluate", f"{module_name}:build()", "--data", data, "--metric", "judge"])
+    assert code == 1
+    assert "--judge" in capsys.readouterr().out

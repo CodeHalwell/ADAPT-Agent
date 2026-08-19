@@ -218,6 +218,18 @@ def _resolve_metrics(
             return coerce_metric(spec)
         raise TypeError(f"Unsupported metric specification: {spec!r}")
 
+    def _routes_judge(spec: Any) -> bool:
+        """Whether a raw spec already involves the judge (or routes it per-row).
+
+        Decided on the *specification*, before any mapping-key renaming, so
+        ``metrics={"accuracy": "checks"}`` still counts as judge-routing.
+        """
+        if isinstance(spec, Metric):
+            return spec.name in (*_JUDGE_NAMES, "checks")
+        if isinstance(spec, str):
+            return spec in _JUDGE_NAMES or spec == "checks"
+        return False
+
     if metrics is None:
         # Judge-only evals grade every row with the judge; otherwise default to
         # the per-example checks dispatcher (rows fall back to exact_match).
@@ -225,18 +237,19 @@ def _resolve_metrics(
 
     if isinstance(metrics, dict):
         # A mapping renames each metric after its key (harness convention).
+        raw_specs: list[Any] = list(metrics.values())
         resolved = []
         for name, spec in metrics.items():
             metric = _resolve_one(spec)
             resolved.append(Metric(name, metric.fn, needs_example=metric.needs_example))
     else:
-        specs = metrics if isinstance(metrics, (list, tuple)) else [metrics]
-        resolved = [_resolve_one(spec) for spec in specs]
+        raw_specs = list(metrics) if isinstance(metrics, (list, tuple)) else [metrics]
+        resolved = [_resolve_one(spec) for spec in raw_specs]
     # A supplied judge also grades every row -- unless a metric already routes
     # it: an explicit "judge" entry, or a "checks" dispatcher (which judges
     # exactly the rows that declare a judge check; grading every row anyway
     # would burn judge calls the dataset opted out of).
-    if judge_obj is not None and not any(m.name in ("judge", "checks") for m in resolved):
+    if judge_obj is not None and not any(_routes_judge(spec) for spec in raw_specs):
         resolved.append(_judge_metric())
     return resolved
 

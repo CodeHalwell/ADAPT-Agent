@@ -161,7 +161,8 @@ def main(args: list[str] | None = None) -> int:
             action="append",
             default=[],
             metavar="NAME",
-            help=f"Built-in metric to apply (repeatable): {sorted(_builtin_metric_names())}.",
+            help=f"Built-in metric to apply (repeatable): {sorted(_builtin_metric_names())}, "
+            'plus "judge" to grade every row with the --judge provider explicitly.',
         )
         sub.add_argument("--judge", help="LLM-judge provider (e.g. claude, openai, gemini).")
         sub.add_argument("--judge-model", help="Model id for the judge provider.")
@@ -510,11 +511,22 @@ def _build_metrics(names: list[str], judge: Any, primary: str | None) -> tuple[l
     """Build the metric list (built-ins + optional judge) and the primary name."""
     from adapt_agent.optimization import checks, get_metric
 
-    # "checks" is built judge-aware so dataset rows may declare {"check": "judge"}.
-    metrics: list[Any] = [
-        checks(judge=judge) if name == "checks" else get_metric(name) for name in names
-    ]
-    if judge is not None:
+    metrics: list[Any] = []
+    for name in names:
+        if name == "checks":
+            # Judge-aware so dataset rows may declare {"check": "judge"}.
+            metrics.append(checks(judge=judge))
+        elif name in ("judge", "llm_judge"):
+            if judge is None:
+                raise ValueError(f"--metric {name} requires --judge PROVIDER.")
+            metrics.append(judge.as_metric("judge"))
+        else:
+            metrics.append(get_metric(name))
+    # A supplied judge also grades every row -- unless a metric already routes
+    # it: an explicit "judge" entry, or a "checks" dispatcher (which judges
+    # exactly the rows that declare a judge check; grading every row anyway
+    # would burn judge calls the dataset opted out of).
+    if judge is not None and not any(m.name in ("judge", "checks") for m in metrics):
         metrics.append(judge.as_metric("judge"))
     if not metrics:
         raise ValueError(
