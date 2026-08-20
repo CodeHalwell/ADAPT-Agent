@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adapt-agent"
-version = "0.2.0"
+# Single-sourced from adapt_agent.__version__ (see [tool.setuptools.dynamic]),
+# so the package and the distribution can never disagree.
+dynamic = ["version"]
 description = "ADAPT-Agent: Adversarial Defense & Policy Training for LLM Agents - A comprehensive library for LLM agent optimization and security"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,6 +20,10 @@ maintainers = [
 keywords = [
     "llm",
     "agents",
+    "evals",
+    "evaluation",
+    "llm-as-judge",
+    "agent-skills",
     "security",
     "optimization",
     "adversarial",
@@ -93,12 +99,25 @@ Issues = "https://github.com/CodeHalwell/ADAPT-Agent/issues"
 
 [project.scripts]
 adapt-agent = "adapt_agent.cli:main"
+# Short alias, so `uv run adapt install skill` works straight after `uv add adapt-agent`.
+adapt = "adapt_agent.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "adapt_agent.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["adapt_agent*"]
 
 [tool.setuptools.package-data]
-adapt_agent = ["py.typed"]
+# The bundled agent skills are data, not modules: ship every file in each
+# skill directory (SKILL.md plus its references/) inside the wheel and sdist.
+adapt_agent = [
+    "py.typed",
+    "skills/*/SKILL.md",
+    "skills/*/*.md",
+    "skills/*/references/*.md",
+    "skills/*/scripts/*",
+]
 
 [tool.black]
 line-length = 100

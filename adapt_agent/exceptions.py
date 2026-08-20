@@ -23,6 +23,10 @@ class SecurityBlockedError(AdaptError):
         super().__init__(reason)
 
 
+class SkillError(AdaptError):
+    """Raised for problems installing or reading a bundled agent skill."""
+
+
 class AdapterError(AdaptError):
     """Base class for framework-adapter errors."""
 
@@ -42,6 +46,7 @@ class MissingDependencyError(AdapterError):
 __all__ = [
     "AdaptError",
     "SecurityBlockedError",
+    "SkillError",
     "AdapterError",
     "MissingDependencyError",
 ]

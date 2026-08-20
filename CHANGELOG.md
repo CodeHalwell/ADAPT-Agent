@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bundled agent skill** (`adapt_agent/skills/adapt-agent/`): the wheel now
+  ships a `SKILL.md` plus reference files (`evals.md`, `guardrails.md`,
+  `optimization.md`) that teach a coding agent to use this library. Install it
+  with `adapt install skill` (`./.claude/skills/` by default, `--target user`
+  for `~/.claude/skills`, `--dir PATH` for anywhere else, `--force` to replace);
+  `adapt skills` lists what is bundled. Frontmatter stays within the portable
+  Agent Skills field set so the skill remains valid for a claude.ai upload or
+  the Skills API.
+- **Skills registry API** (`adapt_agent.skills`): `available_skills()`,
+  `get_skill()`, `install_skill()` / `install_all()`, `default_destination()`,
+  `parse_frontmatter()` and `validate_skill()`, reading files through
+  `importlib.resources` so they work from a wheel, an editable checkout, or a
+  zipped distribution. Adds `SkillError` to the exception hierarchy. Importing
+  the registry pulls in no agent framework or LLM SDK.
+- **`adapt` console script**, a short alias for `adapt-agent` (both map to
+  `adapt_agent.cli:main`), so `uv run adapt install skill` works straight after
+  `uv add adapt-agent`. Help output echoes whichever name was invoked.
+
 - **One-call framework evals** (`adapt_agent.optimization.evals`, re-exported
   from `adapt_agent.evaluation`): `evaluate_agent(agent, data, metrics=...,
   judge=...)` scores an agent built with any supported framework (LangGraph,
@@ -45,8 +63,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   judge calls only to rows that declare a judge check; `--metric judge` grades
   every row explicitly).
 
+### Packaging
+
+- Bundled skill files are declared as `package-data` and ship in **both** the
+  wheel and the sdist; a test asserts every skill file is covered by a
+  `package-data` glob, so a new file can't silently go missing from the wheel.
+- Added `MANIFEST.in`, so the sdist also carries `docs/`, `examples/`,
+  `CHANGELOG.md` and the other project docs for downstream packagers.
+- The distribution version is now single-sourced from `adapt_agent.__version__`
+  via `[tool.setuptools.dynamic]`, so the package and the distribution can no
+  longer disagree. Both artifacts pass `twine check`.
+
 ### Documentation
 
+- **Agent skill guide** (`docs/skill.md`): what a skill is, install targets,
+  the Python registry API, and the rules for bundling your own. Linked from the
+  MkDocs nav, the README, and `docs/cli.md` (which now documents both console
+  scripts and the `install` / `skills` commands).
 - **Running Evals guide** (`docs/evals.md`): quick start, built-in check
   table, per-row checks, LLM-as-judge, framework-by-framework notes (LangGraph
   / Microsoft Agent Framework / Google ADK / Pydantic AI / CrewAI / OpenAI
