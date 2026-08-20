@@ -33,12 +33,22 @@ from __future__ import annotations
 
 import re
 import shutil
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib import resources
-from importlib.abc import Traversable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # Annotation-only: this module has `from __future__ import annotations`, so
+    # nothing here is evaluated at runtime. The import is version-gated because
+    # `importlib.abc.Traversable` was deprecated in 3.12 and REMOVED in 3.14,
+    # while its replacement `importlib.resources.abc` only exists from 3.11.
+    if sys.version_info >= (3, 11):
+        from importlib.resources.abc import Traversable
+    else:
+        from importlib.abc import Traversable
 
 from adapt_agent.exceptions import SkillError
 
