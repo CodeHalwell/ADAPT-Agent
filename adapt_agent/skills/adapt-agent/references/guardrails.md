@@ -69,7 +69,15 @@ from adapt_agent.security import Firewall
 
 firewall = Firewall(max_content_length=10_000)
 firewall.add_blocked_pattern(r"(?i)ignore previous instructions")
-firewall.add_allowed_pattern(r"^[\w\s.,?!-]+$")     # allow-list mode
+
+# Allow-list mode is OPT-IN. `add_allowed_pattern` on a default Firewall
+# (whitelist_mode=False) never rejects anything -- content that matches no
+# blocked pattern is allowed regardless. Pass whitelist_mode=True to make
+# "must match an allowed pattern" actually enforced.
+strict = Firewall(whitelist_mode=True)
+strict.add_allowed_pattern(r"^[\w\s.,?!-]+$")
+strict.check_input("hello there")   # -> True
+strict.check_input("!!!@@@###")     # -> False (matches no allowed pattern)
 
 # A custom filter returns True when the content should be BLOCKED.
 firewall.add_custom_filter(lambda content: "internal-only" in content.lower())
@@ -102,10 +110,53 @@ policy.check_message({"role": "user", "content": "my password is hunter2"})  # -
 policy.check_state({"messages": [], "context": {}, "trust_score": 0.2})
 ```
 
+### Scope: `message` vs `state`
+
+A condition may reference **either** `message` or `state`, and which one is
+available depends on how the rule is evaluated:
+
+| Evaluated by | Variable in scope |
+| --- | --- |
+| `policy.check_message(msg)` — you call it | `message` |
+| `policy.check_state(state)` — you call it | `state` |
+| **A governed adapter's `execute()`** | `state` **only** |
+
+This matters because it fails *silently*. An adapter only ever calls
+`check_state()`, so a rule written against `message` hits an unknown variable
+and — with the default `fail_closed=False` — is logged and treated as **no
+violation**. The agent then runs unguarded while the rule looks installed:
+
+```python
+# WRONG under an adapter: `message` is not in scope, so this never fires.
+policy.add_rule(name="no_secrets", description="…",
+                condition="'password' in message['content']", action="block", severity="high")
+
+# Right for adapter enforcement: gate on state.
+policy.add_rule(name="low_trust", description="Block low-trust callers",
+                condition="state['trust_score'] < 0.5", action="block", severity="high")
+```
+
+Two ways to protect yourself:
+
+* **`PolicyEnforcer(fail_closed=True)`** turns an unevaluable condition into a
+  violation instead of a silent pass — strongly preferred for security rules.
+* **Screen content with the `Firewall`, not with policy rules.** The firewall
+  scans the whole input and blocks through an adapter (verified); policy rules
+  are for state-level gating like trust scores.
+
+### Condition syntax
+
 Conditions are Python expressions evaluated by a **sandboxed AST evaluator**,
-not `eval` — only comparisons, boolean ops, membership tests, literals and
-indexing into the provided `message` / `state` names are allowed. Rules that
-reference `state` gate on agent context (e.g. `state['trust_score'] < 0.5`).
+not `eval`. The grammar is deliberately small: comparisons, boolean ops,
+membership tests, literals, and subscripting `message` / `state`. Notably
+**not** supported — each is treated as an unevaluable condition:
+
+* function calls — `any(...)`, `len(...)`, `str(...)`
+* negative indexes — `state['messages'][-1]` (unary minus is not allowed)
+
+So `state['messages'][0]['content']` works, but "the most recent message"
+cannot be expressed. That is another reason content screening belongs to the
+firewall.
 
 ## AdversarialDefense
 
@@ -233,9 +284,10 @@ for pattern in fw_config.get("blocked_patterns", []):
 for pattern in fw_config.get("allowed_patterns", []):
     firewall.add_allowed_pattern(pattern)
 
-policy = PolicyEnforcer()
+# fail_closed so a rule that cannot be evaluated blocks rather than passing.
+policy = PolicyEnforcer(fail_closed=True)
 for rule in config.get("policy_rules", []):
-    policy.add_rule(**rule)
+    policy.add_rule(**rule)   # see "Scope" above: adapters evaluate `state`
 
 defense = AdversarialDefense()
 for pattern in config.get("adversarial", {}).get("attack_patterns", []):

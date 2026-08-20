@@ -145,14 +145,18 @@ from adapt_agent.security import Firewall
 from adapt_agent.core import PolicyEnforcer
 from adapt_agent.exceptions import SecurityBlockedError
 
+# Content screening belongs to the firewall: it scans the whole input.
 firewall = Firewall(max_content_length=10_000)
 firewall.add_blocked_pattern(r"(?i)ignore previous instructions")
+firewall.add_blocked_pattern(r"(?i)\bpassword\b")
 
-policy = PolicyEnforcer()
+# Policy rules gate on agent *state*. Under an adapter only `state` is in
+# scope -- a rule written against `message` silently never fires.
+policy = PolicyEnforcer(fail_closed=True)
 policy.add_rule(
-    name="no_secrets",
-    description="Block messages that mention a password",
-    condition="'password' in message['content']",
+    name="low_trust",
+    description="Block callers whose trust score is too low",
+    condition="state['trust_score'] < 0.5",
     action="block",
     severity="high",
 )
@@ -165,9 +169,18 @@ except SecurityBlockedError as exc:
     print(exc.reason, exc.threats)
 ```
 
-Policy conditions are evaluated in a sandbox (no `eval`). Adapters exist for
-every supported framework and share this constructor —
-see `references/guardrails.md`.
+Two things worth getting right, because both fail silently:
+
+* **Use the firewall for content, policy rules for state.** An adapter's
+  `execute()` evaluates policy conditions with `check_state()`, so only `state`
+  is in scope; a condition referencing `message` is unevaluable and, by
+  default, treated as *no violation* while the agent runs on.
+* **`fail_closed=True`** makes such a rule block instead of passing quietly.
+
+Policy conditions are evaluated in a sandbox (no `eval`), which also rules out
+function calls and negative indexes. Adapters exist for every supported
+framework and share this constructor — see
+[references/guardrails.md](references/guardrails.md).
 
 ## Optimizing an agent
 

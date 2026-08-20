@@ -365,6 +365,7 @@ def test_skills_module_imports_no_heavy_dependencies():
 #: Example variable name -> the first-party class it stands for.
 _EXAMPLE_OBJECTS = {
     "firewall": "adapt_agent.security:Firewall",
+    "strict": "adapt_agent.security:Firewall",  # the whitelist_mode example
     "policy": "adapt_agent.core:PolicyEnforcer",
     "defense": "adapt_agent.adversarial:AdversarialDefense",
     "trust": "adapt_agent.core:TrustManager",
@@ -635,3 +636,69 @@ def test_documented_get_judge_providers_resolve():
         code = "\n".join(_code_blocks(skill.read(source), "python"))
         for name in re.findall(r'get_judge\(\s*"([^"]+)"', code):
             assert name in JUDGE_REGISTRY, f"{source}: unknown judge provider {name!r}"
+
+
+def test_documented_policy_conditions_are_evaluable(caplog):
+    """Every documented policy condition must survive the sandboxed evaluator.
+
+    An unevaluable condition (a function call, a negative index, an unknown
+    variable) is logged and — with the default `fail_closed=False` — treated as
+    *no violation*, so a rule that looks installed silently guards nothing.
+    """
+    import logging
+
+    from adapt_agent.core import PolicyEnforcer
+
+    skill = get_skill(SKILL_NAME)
+    conditions: list[tuple[str, str]] = []
+    for source in skill.files:
+        if not source.endswith(".md"):
+            continue
+        code = "\n".join(_code_blocks(skill.read(source), "python"))
+        for cond in re.findall(r'condition="([^"]+)"', code):
+            conditions.append((source, cond))
+    assert conditions, "expected documented policy conditions in the skill"
+
+    message = {"role": "user", "content": "my password is hunter2"}
+    state = {"messages": [message], "context": {}, "trust_score": 0.2}
+
+    for source, cond in conditions:
+        policy = PolicyEnforcer()
+        policy.add_rule(
+            name="probe", description="d", condition=cond, action="block", severity="high"
+        )
+        # The enforcer logs this at WARNING, and LogRecord.message only exists
+        # once a record has been formatted -- getMessage() is the reliable read.
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            # Evaluate in the scope the condition actually names.
+            if "state[" in cond:
+                policy.check_state(state)
+            else:
+                policy.check_message(message)
+        unevaluable = [
+            r for r in caplog.records if "Error evaluating policy condition" in r.getMessage()
+        ]
+        assert not unevaluable, (
+            f"{source} documents an unevaluable condition {cond!r}: "
+            f"{unevaluable[0].getMessage()}. The sandbox allows comparisons, boolean "
+            f"ops, membership tests, literals and subscripting only — no calls "
+            f"and no negative indexes."
+        )
+
+
+def test_adapter_recipe_uses_state_scoped_policy_conditions():
+    """The headline guarded-agent recipe must gate on `state`, not `message`.
+
+    A governed adapter's execute() evaluates rules with check_state(), so a
+    `message`-scoped condition never fires there.
+    """
+    skill = get_skill(SKILL_NAME)
+    for block in _code_blocks(skill.read(), "python"):
+        if "wrap_agent(" not in block:
+            continue
+        for cond in re.findall(r'condition="([^"]+)"', block):
+            assert "state[" in cond and "message[" not in cond, (
+                f"SKILL.md wraps an agent with a rule conditioned on {cond!r}; "
+                f"adapters only expose `state`, so this would silently never fire."
+            )

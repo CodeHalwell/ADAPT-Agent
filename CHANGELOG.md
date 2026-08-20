@@ -110,6 +110,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via `[tool.setuptools.dynamic]`, so the package and the distribution can no
   longer disagree. Both artifacts pass `twine check`.
 
+### Security
+
+- The bundled skill's guardrail recipes previously demonstrated two controls
+  that **silently enforce nothing**, both now corrected and covered by tests:
+  a policy rule conditioned on `message[...]` never fires under a governed
+  adapter (adapters evaluate `check_state()`, so `message` is out of scope and
+  the default `fail_closed=False` treats it as no violation), and
+  `add_allowed_pattern()` on a default `Firewall` never rejects, because
+  allow-list enforcement requires `whitelist_mode=True`. The skill now screens
+  content with the firewall, gates state with policy rules, recommends
+  `PolicyEnforcer(fail_closed=True)` for security rules, and documents the
+  sandbox's real grammar (no function calls, no negative indexes).
+
 ### Documentation
 
 - **Release guide** (`docs/releasing.md`): the one-time PyPI trusted-publisher
