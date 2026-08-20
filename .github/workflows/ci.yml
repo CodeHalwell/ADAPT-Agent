@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Callable from release.yml, so a tagged release is gated on exactly the
+  # same lint, test-matrix and build checks that guard main.
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   lint:

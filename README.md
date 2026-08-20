@@ -309,6 +309,7 @@ adapt_agent/
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute.
 - [SECURITY.md](SECURITY.md) — security policy and reporting.
 - [CHANGELOG.md](CHANGELOG.md) — release history.
+- [docs/releasing.md](docs/releasing.md) — how a version tag publishes to PyPI.
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community guidelines.
 - [docs/](docs/) — extended documentation.
 - [examples/](examples/) — runnable examples.

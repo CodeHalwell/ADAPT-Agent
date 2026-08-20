@@ -26,7 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`adapt` console script**, a short alias for `adapt-agent` (both map to
   `adapt_agent.cli:main`), so `uv run adapt install skill` works straight after
   `uv add adapt-agent`. Help output echoes whichever name was invoked.
-
 - **One-call framework evals** (`adapt_agent.optimization.evals`, re-exported
   from `adapt_agent.evaluation`): `evaluate_agent(agent, data, metrics=...,
   judge=...)` scores an agent built with any supported framework (LangGraph,
@@ -62,44 +61,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   works from the CLI (judge-aware when `--judge` is also passed, and routing
   judge calls only to rows that declare a judge check; `--metric judge` grades
   every row explicitly).
-
-### Packaging
-
-- Bundled skill files are declared as `package-data` and ship in **both** the
-  wheel and the sdist; a test asserts every skill file is covered by a
-  `package-data` glob, so a new file can't silently go missing from the wheel.
-- Added `MANIFEST.in`, so the sdist also carries `docs/`, `examples/`,
-  `CHANGELOG.md` and the other project docs for downstream packagers.
-- The distribution version is now single-sourced from `adapt_agent.__version__`
-  via `[tool.setuptools.dynamic]`, so the package and the distribution can no
-  longer disagree. Both artifacts pass `twine check`.
-
-### Documentation
-
-- **Agent skill guide** (`docs/skill.md`): what a skill is, install targets,
-  the Python registry API, and the rules for bundling your own. Linked from the
-  MkDocs nav, the README, and `docs/cli.md` (which now documents both console
-  scripts and the `install` / `skills` commands).
-- **Running Evals guide** (`docs/evals.md`): quick start, built-in check
-  table, per-row checks, LLM-as-judge, framework-by-framework notes (LangGraph
-  / Microsoft Agent Framework / Google ADK / Pydantic AI / CrewAI / OpenAI
-  Agents / Claude Agent SDK), output extraction, direct-harness usage, and CLI
-  examples. Added `examples/08_agent_evals.py` (offline, no framework or API
-  key required) and new API reference entries.
-
-- **Per-framework guides and example ladders** for all seven supported frameworks
-  (LangGraph, Microsoft Agent Framework, Google ADK, Pydantic AI, CrewAI, OpenAI
-  Agents SDK, Claude Agent SDK). Each framework gains a verbose
-  `docs/frameworks/<framework>.md` guide plus an `examples/<framework>/` folder
-  with a 3–4 step ladder (basic guarded agent → policy/observability/trust →
-  evaluate & optimize → multi-agent system + declarative YAML training), a
-  `train.yaml` template, and a README. Added a `docs/frameworks/` index hub, a new
-  "Framework Guides" section in the MkDocs nav, and a per-framework table in
-  `examples/README.md`. Examples guard their optional-framework import and run
-  offline (deterministic judge stubs, no API key) where they exercise ADAPT-Agent.
-
-### Added
-
 - **Declarative YAML/JSON training config** (`adapt_agent.optimization.config`):
   `load_training_config()` / `run_training()` and the `adapt-agent train CONFIG.yaml`
   CLI command wire a whole optimization run (target, dataset, judge, metrics,
@@ -115,6 +76,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failures (`LLMJudge.suggest_tools`, `LLMJudge.red_team`, `LLMToolProposer`);
   `OptimizationResult.recommendations` surfaces those advisory suggestions.
 - `OptimizableAgent.add_tool_parameter()` convenience for declaring tool/skill knobs.
+
+### Packaging
+
+- **Release automation to PyPI on tag.** Pushing a `v*` tag now runs a gated
+  pipeline: the tag must match `adapt_agent.__version__`; the full lint /
+  type-check / 3.10-3.14 test matrix is re-run on the tagged commit (by reusing
+  `ci.yml` as a callable workflow); the distributions are built once, checked
+  with `twine check --strict`, asserted to contain the bundled skill,
+  `py.typed` and both console scripts, and smoke-tested by installing the wheel
+  into a clean venv and running `adapt install skill`; only then are they
+  published via PyPI Trusted Publishing (OIDC, no stored API token) and
+  attached to a generated GitHub Release. `workflow_dispatch` runs the same
+  pipeline against TestPyPI for rehearsal. See `docs/releasing.md`.
+- Bundled skill files are declared as `package-data` and ship in **both** the
+  wheel and the sdist; a test asserts every skill file is covered by a
+  `package-data` glob, so a new file can't silently go missing from the wheel.
+- Added `MANIFEST.in`, so the sdist also carries `docs/`, `examples/`,
+  `CHANGELOG.md` and the other project docs for downstream packagers.
+- The distribution version is now single-sourced from `adapt_agent.__version__`
+  via `[tool.setuptools.dynamic]`, so the package and the distribution can no
+  longer disagree. Both artifacts pass `twine check`.
+
+### Documentation
+
+- **Release guide** (`docs/releasing.md`): the one-time PyPI trusted-publisher
+  setup (including the *pending publisher* flow this first release needs), the
+  step-by-step release procedure, what the pipeline verifies before publishing,
+  and troubleshooting. Linked from the README, `CONTRIBUTING.md` and the nav.
+- **Agent skill guide** (`docs/skill.md`): what a skill is, install targets,
+  the Python registry API, and the rules for bundling your own. Linked from the
+  MkDocs nav, the README, and `docs/cli.md` (which now documents both console
+  scripts and the `install` / `skills` commands).
+- **Running Evals guide** (`docs/evals.md`): quick start, built-in check
+  table, per-row checks, LLM-as-judge, framework-by-framework notes (LangGraph
+  / Microsoft Agent Framework / Google ADK / Pydantic AI / CrewAI / OpenAI
+  Agents / Claude Agent SDK), output extraction, direct-harness usage, and CLI
+  examples. Added `examples/08_agent_evals.py` (offline, no framework or API
+  key required) and new API reference entries.
+- **Per-framework guides and example ladders** for all seven supported frameworks
+  (LangGraph, Microsoft Agent Framework, Google ADK, Pydantic AI, CrewAI, OpenAI
+  Agents SDK, Claude Agent SDK). Each framework gains a verbose
+  `docs/frameworks/<framework>.md` guide plus an `examples/<framework>/` folder
+  with a 3–4 step ladder (basic guarded agent → policy/observability/trust →
+  evaluate & optimize → multi-agent system + declarative YAML training), a
+  `train.yaml` template, and a README. Added a `docs/frameworks/` index hub, a new
+  "Framework Guides" section in the MkDocs nav, and a per-framework table in
+  `examples/README.md`. Examples guard their optional-framework import and run
+  offline (deterministic judge stubs, no API key) where they exercise ADAPT-Agent.
 
 ### Changed / Fixed
 
@@ -141,7 +150,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ground truth.
 - `pyyaml` is now a runtime dependency; the "dependency-free" framing is dropped
   in favour of "install what the job needs" (agent-framework SDKs stay lazy).
-
 - **Dataset-driven optimization & evaluation subsystem** (`adapt_agent.optimization`).
   Evaluate any agent against a golden dataset and automatically optimize it --
   tuning prompts, few-shot examples, models, hyperparameters, routing/topology,

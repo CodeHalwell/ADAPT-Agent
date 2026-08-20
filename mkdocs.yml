@@ -61,4 +61,5 @@ nav:
   - Optimization & Evaluation: optimization.md
   - Observability: observability.md
   - CLI: cli.md
+  - Releasing: releasing.md
   - API Reference: api.md
