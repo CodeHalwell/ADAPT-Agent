@@ -295,15 +295,27 @@ def test_install_result_to_dict(tmp_path):
     assert payload["path"].endswith(SKILL_NAME)
 
 
-def test_install_reports_os_errors_as_skill_error(tmp_path, monkeypatch):
-    import adapt_agent.skills as skills_module
+def test_install_restores_the_previous_skill_when_the_swap_fails(tmp_path, monkeypatch):
+    """If the final rename fails, the moved-aside install is put back."""
+    installed = install_skill(SKILL_NAME, tmp_path)
+    (installed.path / SKILL_FILE).write_text("ORIGINAL", encoding="utf-8")
 
-    def boom(*args, **kwargs):
-        raise OSError("disk full")
+    real_rename = Path.rename
+    calls = {"n": 0}
 
-    monkeypatch.setattr(skills_module.shutil, "copytree", boom)
+    def flaky_rename(self, target):
+        # Let the "move the old install aside" rename through, fail the swap.
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("cross-device link")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", flaky_rename)
     with pytest.raises(SkillError, match="Could not install skill"):
-        install_skill(SKILL_NAME, tmp_path)
+        install_skill(SKILL_NAME, tmp_path, force=True)
+
+    monkeypatch.undo()
+    assert (installed.path / SKILL_FILE).read_text(encoding="utf-8") == "ORIGINAL"
 
 
 # -- packaging invariant -----------------------------------------------------------
@@ -470,3 +482,88 @@ def test_every_example_object_is_accounted_for():
         f"unmapped example objects in the skill: {unknown}. Add them to "
         "_EXAMPLE_OBJECTS so their methods get verified, or to _NON_FIRST_PARTY."
     )
+
+
+# -- installing from a zipped distribution / crash safety -------------------------
+
+
+def test_install_works_from_a_zip_imported_package(tmp_path):
+    """The module claims zip support; prove it on the running interpreter.
+
+    ``importlib.resources.as_file()`` only handles directories from 3.12, so
+    materialising the skill directory that way broke zip-imported installs on
+    3.10/3.11. Files are copied through the traversable API instead.
+    """
+    import subprocess
+    import zipfile
+
+    root = Path(__file__).resolve().parent.parent
+    archive = tmp_path / "pkg.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        for path in (root / "adapt_agent").rglob("*"):
+            if path.is_file() and "__pycache__" not in path.parts:
+                bundle.write(path, path.relative_to(root).as_posix())
+
+    script = f"""
+import sys
+sys.path.insert(0, {str(archive)!r})
+import adapt_agent.skills as skills
+assert type(skills.__loader__).__name__ == "zipimporter", "not imported from the zip"
+result = skills.install_skill("adapt-agent", {str(tmp_path / "out")!r})
+print(sorted(p.relative_to(result.path).as_posix()
+             for p in result.path.rglob("*") if p.is_file()))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, cwd=tmp_path
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "SKILL.md" in completed.stdout
+    assert "references/evals.md" in completed.stdout
+
+
+def test_failed_force_install_preserves_the_existing_skill(tmp_path, monkeypatch):
+    """A forced upgrade that dies mid-copy must not destroy what was there."""
+    import adapt_agent.skills as skills_module
+
+    installed = install_skill(SKILL_NAME, tmp_path)
+    (installed.path / SKILL_FILE).write_text("ORIGINAL", encoding="utf-8")
+
+    def exploding(skill, destination):
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / SKILL_FILE).write_bytes(b"partial")
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(skills_module, "_materialize", exploding)
+    with pytest.raises(SkillError, match="Could not install skill"):
+        install_skill(SKILL_NAME, tmp_path, force=True)
+
+    # The previous installation is still there, and intact.
+    assert (installed.path / SKILL_FILE).read_text(encoding="utf-8") == "ORIGINAL"
+    # ... and no staging directory was left behind.
+    assert [p.name for p in tmp_path.iterdir()] == [SKILL_NAME]
+
+
+def test_failed_first_install_leaves_no_staging_directory(tmp_path, monkeypatch):
+    import adapt_agent.skills as skills_module
+
+    def exploding(skill, destination):
+        raise OSError("boom")
+
+    monkeypatch.setattr(skills_module, "_materialize", exploding)
+    with pytest.raises(SkillError):
+        install_skill(SKILL_NAME, tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_materialize_refuses_unsafe_relative_paths(tmp_path):
+    import adapt_agent.skills as skills_module
+
+    hostile = Skill(
+        name="x",
+        description="d",
+        files=("../escape.md",),
+        metadata={},
+        declared_name="x",
+    )
+    with pytest.raises(SkillError, match="unsafe path"):
+        skills_module._materialize(hostile, tmp_path / "dest")

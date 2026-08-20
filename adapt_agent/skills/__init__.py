@@ -34,6 +34,7 @@ from __future__ import annotations
 import re
 import shutil
 import sys
+import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib import resources
@@ -365,20 +366,33 @@ def install_skill(
     if replaced and not force:
         raise SkillError(f"{target_dir} already exists. Pass --force (force=True) to replace it.")
 
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    # Stage the copy in a sibling directory, then swap it into place. Two
+    # reasons: a failed copy must never leave the user without the skill they
+    # already had, and staging on the same filesystem makes the swap a rename.
+    staging = Path(tempfile.mkdtemp(prefix=f".{resolved.name}.", dir=skills_dir))
+    staged = staging / resolved.name
+    previous = staging / "previous"
     try:
-        skills_dir.mkdir(parents=True, exist_ok=True)
-        # ``as_file`` materialises the packaged directory on disk when the
-        # distribution is zipped, so this works from any install layout.
-        with resources.as_file(resolved.source) as source_dir:
-            if replaced:
-                shutil.rmtree(target_dir)
-            shutil.copytree(source_dir, target_dir)
-    except SkillError:
-        raise
+        _materialize(resolved, staged)
+        if replaced:
+            # Move the old install aside rather than deleting it, so a failure
+            # during the swap can put it back.
+            target_dir.rename(previous)
+        try:
+            staged.rename(target_dir)
+        except OSError:
+            if previous.exists() and not target_dir.exists():
+                previous.rename(target_dir)
+            raise
     except OSError as exc:
         raise SkillError(
             f"Could not install skill {resolved.name!r} to {target_dir}: {exc}"
         ) from exc
+    finally:
+        # Removes the staged copy on failure, and the superseded install on
+        # success -- both live under ``staging``.
+        shutil.rmtree(staging, ignore_errors=True)
 
     return InstallResult(
         skill=resolved,
@@ -386,6 +400,27 @@ def install_skill(
         files=resolved.files,
         replaced=replaced,
     )
+
+
+def _materialize(skill: Skill, destination: Path) -> None:
+    """Copy a packaged skill's files to ``destination``.
+
+    Reads through the :mod:`importlib.resources` traversable API one file at a
+    time rather than ``as_file()`` on the directory: ``as_file()`` only gained
+    directory support in 3.12, so on 3.10/3.11 a zip-imported package raised
+    ``IsADirectoryError`` and installing was impossible. Walking the known file
+    list works identically from a wheel, an editable checkout, and a zip.
+    """
+    for relative in skill.files:
+        parts = relative.split("/")
+        if any(part in ("", ".", "..") for part in parts):  # defensive
+            raise SkillError(f"Refusing to install unsafe path {relative!r}")
+        node = skill.source
+        for part in parts:
+            node = node / part
+        out = destination.joinpath(*parts)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(node.read_bytes())
 
 
 def install_all(
