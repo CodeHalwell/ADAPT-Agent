@@ -61,8 +61,19 @@ See [docs/optimization.md](docs/optimization.md) and
 ### Patches
 - **`PatchManager`** — management of framework-specific patches.
 
+### Agent skill
+- **A bundled agent skill.** The wheel ships a `SKILL.md` (plus reference files)
+  that teaches a coding agent to use this library. Install it into a project
+  with one command and any agent working there picks it up automatically:
+
+  ```bash
+  uv add adapt-agent && uv run adapt install skill    # -> ./.claude/skills/adapt-agent
+  ```
+
+  See [docs/skill.md](docs/skill.md).
+
 ### CLI
-- **`adapt-agent`** — command-line interface for inspecting the library, validating configuration files, and initialising monitoring for an agent.
+- **`adapt-agent`** (also available as **`adapt`**) — command-line interface for installing the bundled agent skill, inspecting the library, validating configuration files, initialising monitoring, and running evals or optimization.
 
 ## Adapter support matrix
 
@@ -84,6 +95,15 @@ Async-only frameworks (Microsoft Agent Framework, Google ADK, Claude Agent SDK) 
 
 ```bash
 pip install adapt-agent
+# or, with uv:
+uv add adapt-agent
+```
+
+Then, if a coding agent will be working in the project, install the bundled
+agent skill so it knows how to use the library:
+
+```bash
+adapt install skill          # uv: uv run adapt install skill
 ```
 
 ### Optional dependencies (extras)
@@ -194,6 +214,11 @@ On each `execute(...)` the adapter performs input screening, policy enforcement,
 ## CLI usage
 
 ```bash
+# Install the bundled agent skill so coding agents can drive the library
+adapt install skill                  # -> ./.claude/skills/adapt-agent
+adapt install skill --target user    # -> ~/.claude/skills
+adapt skills                         # list what is bundled
+
 # Show library information and feature summary
 adapt-agent info
 
@@ -273,8 +298,10 @@ adapt_agent/
 ├── evaluation/        # AgentEvaluator
 ├── observability/     # AgentObserver
 ├── patches/           # PatchManager
+├── skills/            # Bundled agent skills (SKILL.md) + install registry
+│   └── adapt-agent/   # The skill shipped in the wheel
 ├── cli/               # Command-line interface
-└── exceptions.py      # AdaptError, SecurityBlockedError, AdapterError, ...
+└── exceptions.py      # AdaptError, SecurityBlockedError, SkillError, ...
 ```
 
 ## Documentation and examples
@@ -282,6 +309,7 @@ adapt_agent/
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute.
 - [SECURITY.md](SECURITY.md) — security policy and reporting.
 - [CHANGELOG.md](CHANGELOG.md) — release history.
+- [docs/releasing.md](docs/releasing.md) — how a version tag publishes to PyPI.
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community guidelines.
 - [docs/](docs/) — extended documentation.
 - [examples/](examples/) — runnable examples.

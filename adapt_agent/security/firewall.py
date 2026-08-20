@@ -31,7 +31,7 @@ _CATASTROPHIC_RE = re.compile(r"\([^)(]*[+*]\)[+*]")
 
 
 class Firewall:
-    """Security firewall for LLM agents.
+    r"""Security firewall for LLM agents.
 
     Provides input/output filtering, pattern matching, and threat detection
     to protect against malicious inputs and prevent sensitive data leakage.
@@ -41,10 +41,20 @@ class Firewall:
     can never silently nullify the blocklist. Allowed patterns only short-circuit
     content that has already passed every block check.
 
-    When ``whitelist_mode=True`` the firewall operates as a strict allowlist:
-    a full match against any allowed pattern short-circuits to *allowed* before
-    block checks run (the historical behaviour). Use this only when the allowed
-    patterns are themselves the security boundary.
+    When ``whitelist_mode=True`` a full match against any allowed pattern
+    short-circuits to *allowed* **before** block checks run (the historical
+    behaviour). Use this only when the allowed patterns are themselves the
+    security boundary.
+
+    .. warning::
+       Neither mode makes allowed patterns *restrictive*. They exempt content,
+       they never reject it: content matching no allowed pattern is still
+       allowed once the block checks pass. ``whitelist_mode`` changes only the
+       precedence between allowed and blocked patterns, not this. To require
+       that input match a shape, invert a custom filter instead::
+
+           permitted = re.compile(r"^[\w\s.,?!-]+$")
+           firewall.add_custom_filter(lambda c: not permitted.fullmatch(c))
     """
 
     def __init__(

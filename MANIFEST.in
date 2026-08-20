@@ -1,0 +1,33 @@
+# Source-distribution contents beyond what setuptools includes automatically.
+#
+# The wheel's runtime data (py.typed, the bundled agent skills) is declared in
+# pyproject.toml under [tool.setuptools.package-data]; this file governs the
+# sdist, so a downstream packager building from source gets the docs, examples
+# and tests too.
+
+include LICENSE
+include README.md
+include CHANGELOG.md
+include CONTRIBUTING.md
+include CODE_OF_CONDUCT.md
+include SECURITY.md
+
+# Runtime package data. These also reach the sdist via
+# [tool.setuptools.package-data], but naming them here keeps the sdist correct
+# if that ever changes: without SKILL.md, `adapt install skill` has nothing to
+# install, and without py.typed downstream type checkers ignore the package.
+include adapt_agent/py.typed
+recursive-include adapt_agent/skills *.md
+recursive-include adapt_agent/skills/*/scripts *
+
+recursive-include docs *.md
+recursive-include examples *.py *.md *.yaml *.yml *.json *.jsonl
+recursive-include tests *.py
+
+exclude .pre-commit-config.yaml
+prune .github
+prune .jules
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .DS_Store
