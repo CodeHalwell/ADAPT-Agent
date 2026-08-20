@@ -153,6 +153,7 @@ target:
   components:                            # introspected for tunable knobs
     researcher: "myapp.agents:researcher"
     writer: "myapp.agents:writer"
+    workflow: "myapp.app:workflow"       # every `component:` below must be here
 dataset:
   path: "golden.jsonl"
   format: jsonl
@@ -183,6 +184,10 @@ ignored: `target` is a **mapping** with `entrypoint` (a bare string raises
 is a separate `dataset.val_path` file rather than a `split` fraction; and
 `judge.provider` takes a registered provider (`anthropic`, `openai`, `gemini`,
 …). Use `--save-config` on the CLI to write the winning configuration out.
+Every `parameters[].component` must also name a component declared under
+`target.components`, or `adapt-agent train` fails at build time with
+`references unknown component` — the config parses either way, so this one
+only surfaces when you run it.
 
 ```bash
 adapt-agent train train.yaml

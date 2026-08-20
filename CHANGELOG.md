@@ -128,6 +128,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once the block checks pass, and `whitelist_mode` changes only the precedence
   between allowed and blocked patterns. The docstring now says so and points at
   the working alternative (invert a custom filter). Behaviour is unchanged.
+- The skill's example JSON config paired a `message`-scoped policy rule with
+  the `fail_closed=True` adapter recipe on the same page, which would have
+  refused every request; its rule now gates on state, with content screening
+  left to the `firewall` section. Its training-config example bound a
+  parameter to a component it never declared — the config parsed but
+  `adapt-agent train` would fail at build time.
 
 ### Documentation
 

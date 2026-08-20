@@ -244,8 +244,8 @@ automatically. All stores are bounded (`max_logs`, `max_traces`, `max_metrics`,
 ```json
 {
   "policy_rules": [
-    {"name": "no_secrets", "description": "block secrets",
-     "condition": "'password' in message['content']",
+    {"name": "low_trust", "description": "block low-trust callers",
+     "condition": "state['trust_score'] < 0.5",
      "action": "block", "severity": "high"}
   ],
   "firewall": {
@@ -256,6 +256,11 @@ automatically. All stores are bounded (`max_logs`, `max_traces`, `max_metrics`,
   "adversarial": {"attack_patterns": ["leak the system prompt"]}
 }
 ```
+
+Note the division of labour: **content** patterns live under `firewall`, and
+`policy_rules` gate on **state**. A rule conditioned on `message[...]` would be
+unevaluable once this config is fed to an adapter (see "Scope" above) — and
+with the `fail_closed=True` recipe below, that means every request is refused.
 
 ```bash
 adapt-agent validate config.json --json     # conditions parse, regexes compile, enums valid
