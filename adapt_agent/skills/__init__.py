@@ -79,16 +79,21 @@ class Skill:
     """A skill bundled with the installed ``adapt_agent`` package.
 
     Args:
-        name: The skill identifier, matching its directory name.
+        name: The skill identifier -- always its **directory** name. This is
+            what locates the packaged files and names the installed directory,
+            so it is authoritative even if the frontmatter disagrees.
         description: The frontmatter ``description`` an agent matches against.
         files: Relative paths of every file in the skill, ``SKILL.md`` first.
         metadata: Any remaining frontmatter fields (``license``, ``metadata``…).
+        declared_name: The ``name`` the frontmatter claims. Conventionally equal
+            to :attr:`name`; :func:`validate_skill` reports a mismatch.
     """
 
     name: str
     description: str
     files: tuple[str, ...]
     metadata: dict[str, Any]
+    declared_name: str = ""
 
     @property
     def source(self) -> Traversable:
@@ -195,13 +200,18 @@ def _load_skill(directory: Traversable) -> Skill:
     """Build a :class:`Skill` from a packaged skill directory."""
     text = (directory / SKILL_FILE).read_text(encoding="utf-8")
     frontmatter = parse_frontmatter(text)
-    name = str(frontmatter.pop("name", "") or directory.name)
+    # The directory name is authoritative: it is what agents use as the skill's
+    # identity, and what :attr:`Skill.source` resolves against. Trusting the
+    # frontmatter here would let a mismatched `name:` point reads and installs
+    # at a package directory that does not exist.
+    declared_name = str(frontmatter.pop("name", "") or "")
     description = str(frontmatter.pop("description", "") or "")
     return Skill(
-        name=name,
+        name=directory.name,
         description=description,
         files=tuple(_relative_files(directory)),
         metadata=frontmatter,
+        declared_name=declared_name,
     )
 
 
@@ -261,19 +271,26 @@ def validate_skill(skill: Skill) -> list[str]:
     """Return a list of portability problems with ``skill`` (empty when valid).
 
     Checks the properties that make a skill discoverable and publishable: a
-    ``SKILL.md`` entrypoint, a frontmatter name matching the directory and using
-    the conventional lowercase-hyphen form, and a non-empty description within
-    :data:`MAX_DESCRIPTION_LENGTH`.
+    ``SKILL.md`` entrypoint; a directory name in the conventional
+    lowercase-with-hyphens form and within :data:`MAX_NAME_LENGTH`; a
+    frontmatter ``name`` that is present and agrees with that directory; and a
+    non-empty ``description`` within :data:`MAX_DESCRIPTION_LENGTH`.
     """
     problems: list[str] = []
     if SKILL_FILE not in skill.files:
         problems.append(f"missing {SKILL_FILE}")
     if not skill.name:
-        problems.append("missing frontmatter name")
+        problems.append("missing skill directory name")
     elif not _NAME_RE.match(skill.name):
         problems.append(f"name {skill.name!r} is not lowercase-with-hyphens")
     elif len(skill.name) > MAX_NAME_LENGTH:
         problems.append(f"name longer than {MAX_NAME_LENGTH} characters")
+    if not skill.declared_name:
+        problems.append("missing frontmatter name")
+    elif skill.declared_name != skill.name:
+        problems.append(
+            f"frontmatter name {skill.declared_name!r} does not match " f"directory {skill.name!r}"
+        )
     if not skill.description.strip():
         problems.append("missing frontmatter description")
     elif len(skill.description) > MAX_DESCRIPTION_LENGTH:

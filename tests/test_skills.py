@@ -156,16 +156,31 @@ def test_parse_frontmatter_handles_crlf():
 # -- validation ------------------------------------------------------------------
 
 
-def _skill(name="demo", description="Does a thing.", files=(SKILL_FILE,)):
-    return Skill(name=name, description=description, files=tuple(files), metadata={})
+def _skill(name="demo", description="Does a thing.", files=(SKILL_FILE,), declared_name=None):
+    return Skill(
+        name=name,
+        description=description,
+        files=tuple(files),
+        metadata={},
+        declared_name=name if declared_name is None else declared_name,
+    )
 
 
 def test_validate_flags_missing_skill_file():
     assert "missing SKILL.md" in validate_skill(_skill(files=("other.md",)))
 
 
-def test_validate_flags_missing_name():
-    assert "missing frontmatter name" in validate_skill(_skill(name=""))
+def test_validate_flags_missing_directory_name():
+    assert "missing skill directory name" in validate_skill(_skill(name=""))
+
+
+def test_validate_flags_missing_frontmatter_name():
+    assert "missing frontmatter name" in validate_skill(_skill(declared_name=""))
+
+
+def test_validate_flags_frontmatter_directory_mismatch():
+    problems = validate_skill(_skill(name="demo", declared_name="something-else"))
+    assert any("does not match directory" in p for p in problems)
 
 
 def test_validate_flags_non_conventional_name():
@@ -326,3 +341,132 @@ def test_skills_module_imports_no_heavy_dependencies():
     newly_imported = set(sys.modules) - before
     forbidden = ("langgraph", "pydantic_ai", "crewai", "anthropic", "openai", "google")
     assert not [m for m in newly_imported if m.split(".")[0] in forbidden]
+
+
+# -- the skill's code examples must call APIs that exist -------------------------
+#
+# The skill exists so an agent can copy working code out of it. A recipe naming
+# a method that does not exist is therefore a shipped bug, and one that no
+# ordinary unit test would notice. This walks every ``obj.method(`` in the
+# skill's Python blocks and checks it against the real class.
+
+#: Example variable name -> the first-party class it stands for.
+_EXAMPLE_OBJECTS = {
+    "firewall": "adapt_agent.security:Firewall",
+    "policy": "adapt_agent.core:PolicyEnforcer",
+    "defense": "adapt_agent.adversarial:AdversarialDefense",
+    "trust": "adapt_agent.core:TrustManager",
+    "taint": "adapt_agent.security:TaintTracker",
+    "observer": "adapt_agent.observability:AgentObserver",
+    "harness": "adapt_agent.evaluation:EvaluationHarness",
+    "report": "adapt_agent.evaluation:EvaluationReport",
+    "judge": "adapt_agent.evaluation:LLMJudge",
+    "target": "adapt_agent.optimization:OptimizableAgent",
+    "guarded": "adapt_agent.adapters._governed:_GovernedAgent",
+    "result": "adapt_agent.optimization:OptimizationResult",
+    "skill": "adapt_agent.skills:Skill",
+    "exc": "adapt_agent.exceptions:SecurityBlockedError",
+    "source": "adapt_agent.security:TaintSource",
+}
+
+#: Names that legitimately are not first-party objects (user code, stdlib,
+#: placeholders). Listed explicitly so a new example variable forces a decision
+#: rather than silently escaping the check.
+_NON_FIRST_PARTY = {
+    "cfg",  # a user config dict
+    "data",  # a GoldenDataset the user built
+    "orchestrator",  # the user's own agent code
+    "content",  # the str parameter of a custom firewall filter
+    "researcher",  # the user's own sub-agent
+    "v",  # a lambda parameter
+}
+
+
+def _resolve(spec):
+    import importlib
+
+    module_name, _, attr = spec.partition(":")
+    return getattr(importlib.import_module(module_name), attr)
+
+
+def _documented_attributes():
+    """Map example variable name -> every attribute/method used on it.
+
+    Covers plain attribute access as well as calls: an example reading a field
+    that does not exist (``result.trials``) fails just as hard as one calling a
+    method that does not exist.
+    """
+    used: dict[str, set[str]] = {}
+    for skill in available_skills():
+        for relative in skill.files:
+            if not relative.endswith(".md"):
+                continue
+            for block in re.findall(r"```python\n(.*?)```", skill.read(relative), re.S):
+                for obj, attr in re.findall(
+                    r"\b([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)", _strip_noise(block)
+                ):
+                    used.setdefault(obj, set()).add(attr)
+    return used
+
+
+def _strip_noise(block: str) -> str:
+    """Drop import lines and string literals before scanning for attributes.
+
+    `from adapt_agent.security import ...` and `"golden.jsonl"` both contain a
+    dotted name that is not attribute access on an object.
+    """
+    lines = [line for line in block.splitlines() if not re.match(r"\s*(from|import)\s", line)]
+    text = "\n".join(lines)
+    return re.sub(
+        r"(\"\"\".*?\"\"\"|\'\'\'.*?\'\'\'|\"[^\"\n]*\"|\'[^\'\n]*\')", '""', text, flags=re.S
+    )
+
+
+def _public_names(cls):
+    """Every attribute name valid on ``cls``.
+
+    Three sources, because ``hasattr`` alone sees only the first: class
+    attributes and methods; dataclass fields without defaults (annotations
+    only, never class attributes); and plain instance attributes assigned as
+    ``self.x = ...`` in ``__init__``.
+    """
+    import inspect
+
+    names = set(dir(cls))
+    for klass in getattr(cls, "__mro__", [cls]):
+        names.update(getattr(klass, "__annotations__", {}))
+        try:
+            source = inspect.getsource(klass)
+        except (OSError, TypeError):  # pragma: no cover - builtins have no source
+            continue
+        names.update(re.findall(r"\bself\.([a-z_][a-z0-9_]*)\s*(?::[^=]+)?=", source))
+    return names
+
+
+def test_skill_examples_only_use_attributes_that_exist():
+    missing = []
+    for obj, attributes in _documented_attributes().items():
+        if obj in _NON_FIRST_PARTY:
+            continue
+        spec = _EXAMPLE_OBJECTS.get(obj)
+        if spec is None:
+            continue  # covered by the companion test below
+        cls = _resolve(spec)
+        valid = _public_names(cls)
+        for attr in sorted(attributes):
+            if attr not in valid:
+                missing.append(f"{cls.__name__}.{attr} (documented as {obj}.{attr})")
+    assert not missing, "skill documents attributes that do not exist: " + ", ".join(missing)
+
+
+def test_every_example_object_is_accounted_for():
+    """A new example variable must be mapped to a class or explicitly excused."""
+    unknown = sorted(
+        obj
+        for obj in _documented_attributes()
+        if obj not in _EXAMPLE_OBJECTS and obj not in _NON_FIRST_PARTY
+    )
+    assert not unknown, (
+        f"unmapped example objects in the skill: {unknown}. Add them to "
+        "_EXAMPLE_OBJECTS so their methods get verified, or to _NON_FIRST_PARTY."
+    )

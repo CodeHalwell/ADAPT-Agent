@@ -144,4 +144,6 @@ uv publish --token "$PYPI_TOKEN"   # needs a PyPI API token
 
 `uv publish --dry-run` is also the quickest way to sanity-check a build locally
 before tagging: it validates the files against the index without uploading and
-needs no credentials.
+needs no credentials. It needs a recent uv — the flag is absent from older
+releases (0.7.x), where `uvx twine check --strict dist/*` alone is the
+equivalent local check.

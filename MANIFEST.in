@@ -11,10 +11,12 @@ include CHANGELOG.md
 include CONTRIBUTING.md
 include CODE_OF_CONDUCT.md
 include SECURITY.md
-include py.typed
 
-# Bundled agent skills (SKILL.md + supporting files) must ship in the sdist as
-# well as the wheel, or `adapt install skill` has nothing to install.
+# Runtime package data. These also reach the sdist via
+# [tool.setuptools.package-data], but naming them here keeps the sdist correct
+# if that ever changes: without SKILL.md, `adapt install skill` has nothing to
+# install, and without py.typed downstream type checkers ignore the package.
+include adapt_agent/py.typed
 recursive-include adapt_agent/skills *.md
 recursive-include adapt_agent/skills/*/scripts *
 

@@ -26,7 +26,7 @@ result = CoordinateAscentOptimizer(harness, judge=judge, max_evals=60, seed=0).o
 
 result.baseline_score, result.best_score, result.improvement
 result.best_config          # {parameter_name: value}, already applied in place
-result.trials               # every candidate tried
+result.history              # every Trial evaluated, in order
 result.recommendations      # advisory tool/skill suggestions from the judge
 ```
 

@@ -22,7 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `parse_frontmatter()` and `validate_skill()`, reading files through
   `importlib.resources` so they work from a wheel, an editable checkout, or a
   zipped distribution. Adds `SkillError` to the exception hierarchy. Importing
-  the registry pulls in no agent framework or LLM SDK.
+  the registry pulls in no agent framework or LLM SDK. A skill's **directory
+  name is authoritative** — it locates the packaged files and names the
+  installed directory — while the frontmatter `name` is kept as
+  `Skill.declared_name` and a mismatch between the two is reported by
+  `validate_skill()`.
 - **`adapt` console script**, a short alias for `adapt-agent` (both map to
   `adapt_agent.cli:main`), so `uv run adapt install skill` works straight after
   `uv add adapt-agent`. Help output echoes whichever name was invoked.

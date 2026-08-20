@@ -70,11 +70,15 @@ from adapt_agent.security import Firewall
 firewall = Firewall(max_content_length=10_000)
 firewall.add_blocked_pattern(r"(?i)ignore previous instructions")
 firewall.add_allowed_pattern(r"^[\w\s.,?!-]+$")     # allow-list mode
-firewall.add_filter(my_callable)                     # custom predicate
+
+# A custom filter returns True when the content should be BLOCKED.
+firewall.add_custom_filter(lambda content: "internal-only" in content.lower())
 
 firewall.check_input("Summarise the notes")   # -> True (allowed)
-firewall.check_output(result_text)
+firewall.check_output(result_text)            # -> False when a control fires
 firewall.get_security_events()
+firewall.sanitize(content)                    # redact rather than reject
+firewall.get_stats()
 ```
 
 `max_content_length` is DoS protection — oversized content is rejected before
@@ -122,17 +126,28 @@ Also: `detect_prompt_injection`, `detect_jailbreak`, `detect_custom_pattern`,
 
 ```python
 from adapt_agent.core import TrustManager
-from adapt_agent.security import TaintTracker, TaintLevel, TaintSource
+from adapt_agent.security import TaintLevel, TaintTracker
 
 trust = TrustManager()
-trust.update_trust("agent-1", delta)
+trust.update_trust_score("agent-1", -0.2, reason="policy violation")  # -> new score
 trust.get_trust_score("agent-1")
+trust.is_trusted("agent-1", threshold=0.6)
+trust.get_trust_history("agent-1")
 
 taint = TaintTracker()
-taint.mark_tainted(data_id, level=TaintLevel.HIGH, source=TaintSource.USER_INPUT)
-taint.is_tainted(data_id)
-taint.propagate(src_id, dst_id)
+# Register the origin first; it returns a TaintSource whose id marks data.
+source = taint.register_source("web-search", "external_api", level=TaintLevel.HIGH)
+taint.mark_tainted("doc-1", [source.source_id])       # data id -> source ids
+taint.is_tainted("doc-1")                              # -> True
+taint.get_taint_level("doc-1")                         # -> TaintLevel.HIGH
+taint.propagate_taint("doc-1", "summary-1", operation="summarize")
+taint.get_taint_flow("summary-1")                      # how it became tainted
+taint.sanitize("doc-1")                                # clear the taint
 ```
+
+`TaintSource` is a plain class (`source_id`, `source_type`, `level`,
+`metadata`), not an enum — you name your own sources. `TaintLevel` is the enum:
+`UNTAINTED`, `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
 
 Use taint to keep untrusted content (tool output, retrieved documents, user
 input) flagged as it moves through an agent, and trust to gate actions on a
@@ -144,12 +159,24 @@ source's history.
 from adapt_agent.observability import AgentObserver
 
 observer = AgentObserver()
-trace_id = observer.start_trace("agent-1", input_data)
-observer.log_event(trace_id, "tool_call", {"name": "search"})
-observer.end_trace(trace_id, output)
-observer.get_traces(agent_id="agent-1", limit=10)
-observer.get_metrics()
+
+# You supply the trace id; start_trace returns the trace dict, not an id.
+trace_id = "trace-1"
+observer.start_trace(trace_id, "agent-1", "answer_question", metadata={"user": "u1"})
+observer.log_event(trace_id, "tool_call", "searched the knowledge base",
+                   metadata={"name": "search"})
+observer.end_trace(trace_id, status="completed", result=output)
+
+observer.get_traces(agent_id="agent-1", status="completed", limit=10)
+observer.record_metric("latency_ms", 812.0)
+observer.get_metric_stats("latency_ms")   # per-metric stats, by name
+observer.get_logs(level="ERROR", limit=20)
 ```
+
+Note the argument order: `start_trace(trace_id, agent_id, operation, metadata=None)`,
+`log_event(trace_id, event_type, description, metadata=None)` — the description
+is a required string — and `end_trace(trace_id, status="completed", result=None)`,
+whose second positional argument is the *status*, not the result.
 
 Passing the observer to an adapter traces every governed execution
 automatically. All stores are bounded (`max_logs`, `max_traces`, `max_metrics`,
