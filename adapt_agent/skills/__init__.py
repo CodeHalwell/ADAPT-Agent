@@ -366,14 +366,19 @@ def install_skill(
     if replaced and not force:
         raise SkillError(f"{target_dir} already exists. Pass --force (force=True) to replace it.")
 
-    skills_dir.mkdir(parents=True, exist_ok=True)
     # Stage the copy in a sibling directory, then swap it into place. Two
     # reasons: a failed copy must never leave the user without the skill they
     # already had, and staging on the same filesystem makes the swap a rename.
-    staging = Path(tempfile.mkdtemp(prefix=f".{resolved.name}.", dir=skills_dir))
-    staged = staging / resolved.name
-    previous = staging / "previous"
+    #
+    # Destination and staging setup are inside the try as well: a read-only
+    # filesystem or a full disk fails here, and this function's contract is to
+    # raise SkillError rather than leak a raw OSError at callers.
+    staging: Path | None = None
     try:
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=f".{resolved.name}.", dir=skills_dir))
+        staged = staging / resolved.name
+        previous = staging / "previous"
         _materialize(resolved, staged)
         if replaced:
             # Move the old install aside rather than deleting it, so a failure
@@ -392,7 +397,8 @@ def install_skill(
     finally:
         # Removes the staged copy on failure, and the superseded install on
         # success -- both live under ``staging``.
-        shutil.rmtree(staging, ignore_errors=True)
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
 
     return InstallResult(
         skill=resolved,

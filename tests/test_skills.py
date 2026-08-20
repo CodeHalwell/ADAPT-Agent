@@ -391,6 +391,9 @@ _NON_FIRST_PARTY = {
     "content",  # the str parameter of a custom firewall filter
     "researcher",  # the user's own sub-agent
     "v",  # a lambda parameter
+    "json",  # stdlib
+    "config",  # a dict loaded from a JSON config file
+    "fw_config",  # the "firewall" sub-dict of that config
 }
 
 
@@ -567,3 +570,68 @@ def test_materialize_refuses_unsafe_relative_paths(tmp_path):
     )
     with pytest.raises(SkillError, match="unsafe path"):
         skills_module._materialize(hostile, tmp_path / "dest")
+
+
+# -- documented configs and constructor arguments must be real --------------------
+#
+# The attribute audit above catches `obj.does_not_exist`. These catch the other
+# way a recipe rots: the attribute exists but the *arguments* or *schema* are
+# wrong, so an agent copying the snippet gets an exception anyway.
+
+
+def _code_blocks(text: str, language: str) -> list[str]:
+    return re.findall(rf"```{language}\n(.*?)```", text, re.DOTALL)
+
+
+def test_documented_training_configs_parse():
+    """Every training-config YAML in the skill must satisfy the real schema."""
+    import yaml
+
+    from adapt_agent.optimization.config import parse_training_config
+
+    skill = get_skill(SKILL_NAME)
+    checked = 0
+    for source in skill.files:
+        if not source.endswith(".md"):
+            continue
+        for block in _code_blocks(skill.read(source), "yaml"):
+            raw = yaml.safe_load(block)
+            if not isinstance(raw, dict) or "target" not in raw:
+                continue  # not a training config
+            parse_training_config(raw)  # raises TrainingConfigError if wrong
+            checked += 1
+    assert checked, "expected at least one training-config example in the skill"
+
+
+def test_documented_llmjudge_providers_are_registered():
+    """`LLMJudge("x")` resolves through the provider registry, not judge aliases.
+
+    Friendly aliases such as "claude" are only understood by ``get_judge()``, so
+    a documented ``LLMJudge("claude")`` raises KeyError for anyone copying it.
+    """
+    from adapt_agent.optimization.providers import available_providers
+
+    registered = set(available_providers())
+    skill = get_skill(SKILL_NAME)
+    for source in skill.files:
+        if not source.endswith(".md"):
+            continue
+        code = "\n".join(_code_blocks(skill.read(source), "python"))
+        for name in re.findall(r'LLMJudge\(\s*"([^"]+)"', code):
+            assert name in registered, (
+                f"{source} documents LLMJudge({name!r}), which is not a registered "
+                f"provider ({sorted(registered)}). Use get_judge({name!r}) instead."
+            )
+
+
+def test_documented_get_judge_providers_resolve():
+    """`get_judge("x")` names in the skill must resolve to a real judge."""
+    from adapt_agent.optimization.judges import JUDGE_REGISTRY
+
+    skill = get_skill(SKILL_NAME)
+    for source in skill.files:
+        if not source.endswith(".md"):
+            continue
+        code = "\n".join(_code_blocks(skill.read(source), "python"))
+        for name in re.findall(r'get_judge\(\s*"([^"]+)"', code):
+            assert name in JUDGE_REGISTRY, f"{source}: unknown judge provider {name!r}"

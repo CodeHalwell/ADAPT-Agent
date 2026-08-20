@@ -175,12 +175,13 @@ Turn an agent into a search space and improve it against the same golden data:
 
 ```python
 from adapt_agent.optimization import (
-    OptimizableAgent, EvaluationHarness, LLMJudge, CoordinateAscentOptimizer,
+    OptimizableAgent, EvaluationHarness, CoordinateAscentOptimizer,
     GoldenDataset, exact_match,
 )
+from adapt_agent.optimization.judges import get_judge
 
 target = OptimizableAgent.from_agent(agent)        # discovers prompts/models/tools
-judge = LLMJudge("claude")
+judge = get_judge("claude")                        # provider alias -> ClaudeJudge
 harness = EvaluationHarness([exact_match(), judge.as_metric("quality")],
                             primary_metric="quality")
 

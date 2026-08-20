@@ -206,4 +206,45 @@ adapt-agent monitor --agent-id my-agent --config config.json
 adapt-agent info
 ```
 
-Adapters accept the same structure as their positional `config` argument.
+**This file does not configure an adapter.** It is a validation and reporting
+artifact: `validate` checks the schema, and `monitor` validates it and reports
+how many rules and patterns it contains. Passing it as an adapter's positional
+`config` argument stores the dict and nothing else — `firewall`,
+`policy_enforcer` and `defense` stay `None`, and the wrapped agent runs with
+**no controls at all**. That failure is silent, which makes it worth stating
+plainly: controls exist only if you construct them and pass them as keyword
+arguments.
+
+To drive an adapter from such a file, build the controls yourself:
+
+```python
+import json
+from adapt_agent.adapters import LangGraphAdapter
+from adapt_agent.adversarial import AdversarialDefense
+from adapt_agent.core import PolicyEnforcer
+from adapt_agent.security import Firewall
+
+config = json.loads(open("config.json").read())
+
+fw_config = config.get("firewall", {})
+firewall = Firewall(max_content_length=fw_config.get("max_content_length", 10_000))
+for pattern in fw_config.get("blocked_patterns", []):
+    firewall.add_blocked_pattern(pattern)
+for pattern in fw_config.get("allowed_patterns", []):
+    firewall.add_allowed_pattern(pattern)
+
+policy = PolicyEnforcer()
+for rule in config.get("policy_rules", []):
+    policy.add_rule(**rule)
+
+defense = AdversarialDefense()
+for pattern in config.get("adversarial", {}).get("attack_patterns", []):
+    defense.add_attack_pattern(pattern)
+
+# Keyword arguments -- this is what actually installs the controls.
+adapter = LangGraphAdapter(firewall=firewall, policy_enforcer=policy, defense=defense)
+```
+
+After wrapping, confirm the controls are really attached rather than assuming:
+`adapter.firewall`, `adapter.policy_enforcer` and `adapter.defense` should all
+be non-`None`.

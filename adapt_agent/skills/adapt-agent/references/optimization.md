@@ -8,14 +8,15 @@ agent becomes the objective the optimizer maximises.
 
 ```python
 from adapt_agent.optimization import (
-    GoldenDataset, EvaluationHarness, LLMJudge, OptimizableAgent,
+    GoldenDataset, EvaluationHarness, OptimizableAgent,
     CoordinateAscentOptimizer, exact_match,
 )
+from adapt_agent.optimization.judges import get_judge
 
 data = GoldenDataset.from_jsonl("golden.jsonl")
 train, holdout = data.split(0.8, seed=0)
 
-judge = LLMJudge("claude")
+judge = get_judge("claude")
 harness = EvaluationHarness([exact_match(), judge.as_metric("quality")],
                             primary_metric="quality")
 
@@ -147,24 +148,41 @@ findings surfaced as `result.recommendations`.
 One file describes the whole run:
 
 ```yaml
-target: myapp.agents:build()
-components:
-  researcher: myapp.agents:researcher
-  writer: myapp.agents:writer
+target:
+  entrypoint: "myapp.app:run"            # callable input -> output
+  components:                            # introspected for tunable knobs
+    researcher: "myapp.agents:researcher"
+    writer: "myapp.agents:writer"
 dataset:
-  path: golden.jsonl
-  split: 0.8
-  seed: 0
-metrics: [exact_match]
+  path: "golden.jsonl"
+  format: jsonl
+  val_path: "holdout.jsonl"              # optional held-out split
 judge:
-  provider: claude
+  provider: anthropic                    # a registered provider name
   model: claude-opus-4-8
+  adversarial: true                      # the judge IS the adversary
+metrics: [exact_match, token_f1]
+primary_metric: exact_match
 optimizer:
-  name: default
+  type: default                          # NOT `name`
   max_evals: 60
   seed: 0
-save_config: best.json
+  suggest_tools: true                    # let the judge propose new tools
+parameters:                              # knobs no framework exposes
+  - name: workflow.max_round_count
+    kind: routing
+    component: workflow
+    attr: max_round_count
+    bounds: [4, 12]
+    step: 1
 ```
+
+Schema notes worth getting right, because each one raises or is silently
+ignored: `target` is a **mapping** with `entrypoint` (a bare string raises
+`TrainingConfigError`); the optimizer key is `type`, not `name`; a holdout set
+is a separate `dataset.val_path` file rather than a `split` fraction; and
+`judge.provider` takes a registered provider (`anthropic`, `openai`, `gemini`,
+…). Use `--save-config` on the CLI to write the winning configuration out.
 
 ```bash
 adapt-agent train train.yaml

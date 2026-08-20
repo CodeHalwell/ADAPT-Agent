@@ -29,7 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validate_skill()`. Installing copies files through the traversable API and
   stages them in a sibling directory before swapping into place, so it works
   from a zip-imported package on every supported Python and a failed
-  `--force` upgrade leaves the existing installation intact.
+  `--force` upgrade leaves the existing installation intact. Destination and
+  staging setup failures are reported as `SkillError` rather than leaking a raw
+  `OSError`, matching the documented contract.
 - **`adapt` console script**, a short alias for `adapt-agent` (both map to
   `adapt_agent.cli:main`), so `uv run adapt install skill` works straight after
   `uv add adapt-agent`. Help output echoes whichever name was invoked.

@@ -138,13 +138,19 @@ Bare callables must accept `(output, expected)`; wrap in
 
 ```python
 from adapt_agent.evaluation import LLMJudge
-from adapt_agent.optimization.judges import ClaudeJudge, OpenAIJudge, GeminiJudge
+from adapt_agent.optimization.judges import ClaudeJudge, OpenAIJudge, GeminiJudge, get_judge
 
-judge = LLMJudge("claude")                      # provider name
+judge = get_judge("claude")                     # alias -> ClaudeJudge
+judge = LLMJudge("anthropic")                   # or a registered provider name
 judge = LLMJudge(ClaudeJudge(model="claude-opus-4-8"))
 judge = LLMJudge(lambda prompt: my_llm(prompt)) # any callable
 judge = LLMJudge(my_provider, pass_threshold=0.7, scale=10, adversarial=True)
 ```
+
+`LLMJudge(...)` takes a **registered provider name** — the aliases
+(`claude`, `google`) are resolved by `get_judge()`, not by the provider
+registry, so `LLMJudge("claude")` raises `KeyError`. `evaluate_agent(judge=...)`
+goes through `get_judge()`, so `judge="claude"` is fine there.
 
 Providers: `anthropic`/`claude`, `openai`, `azure`, `gemini`/`google`,
 `mistral`, `cohere`, `groq`, `together`, `openrouter`, `ollama`, `bedrock`,
