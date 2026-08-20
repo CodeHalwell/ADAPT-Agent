@@ -70,14 +70,20 @@ from adapt_agent.security import Firewall
 firewall = Firewall(max_content_length=10_000)
 firewall.add_blocked_pattern(r"(?i)ignore previous instructions")
 
-# Allow-list mode is OPT-IN. `add_allowed_pattern` on a default Firewall
-# (whitelist_mode=False) never rejects anything -- content that matches no
-# blocked pattern is allowed regardless. Pass whitelist_mode=True to make
-# "must match an allowed pattern" actually enforced.
-strict = Firewall(whitelist_mode=True)
-strict.add_allowed_pattern(r"^[\w\s.,?!-]+$")
-strict.check_input("hello there")   # -> True
-strict.check_input("!!!@@@###")     # -> False (matches no allowed pattern)
+# Allowed patterns EXEMPT content; they do not restrict it. Content matching
+# no allowed pattern is still allowed, because _check() returns True once the
+# block checks pass. `whitelist_mode=True` only changes *precedence* -- an
+# allowed fullmatch then wins over the blocklist -- it does NOT reject
+# non-matches. There is no "only this shape may pass" switch.
+firewall.add_allowed_pattern(r"^\[trusted\].*")   # exempt, never restrict
+
+# For real allow-listing, invert a custom filter: block whatever does not match.
+import re
+
+permitted = re.compile(r"^[\w\s.,?!-]+$")
+firewall.add_custom_filter(lambda content: not permitted.fullmatch(content))
+firewall.check_input("hello there")   # -> True
+firewall.check_input("!!!@@@###")     # -> False (blocked by the filter)
 
 # A custom filter returns True when the content should be BLOCKED.
 firewall.add_custom_filter(lambda content: "internal-only" in content.lower())

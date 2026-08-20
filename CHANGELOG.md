@@ -122,6 +122,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content with the firewall, gates state with policy rules, recommends
   `PolicyEnforcer(fail_closed=True)` for security rules, and documents the
   sandbox's real grammar (no function calls, no negative indexes).
+- `Firewall`'s class docstring described `whitelist_mode=True` as "a strict
+  allowlist". It is not: allowed patterns **exempt** content and never reject
+  it, in either mode — content matching no allowed pattern is still allowed
+  once the block checks pass, and `whitelist_mode` changes only the precedence
+  between allowed and blocked patterns. The docstring now says so and points at
+  the working alternative (invert a custom filter). Behaviour is unchanged.
 
 ### Documentation
 

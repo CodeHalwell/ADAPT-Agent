@@ -142,7 +142,7 @@ from adapt_agent.optimization.judges import ClaudeJudge, OpenAIJudge, GeminiJudg
 
 judge = get_judge("claude")                     # alias -> ClaudeJudge
 judge = LLMJudge("anthropic")                   # or a registered provider name
-judge = LLMJudge(ClaudeJudge(model="claude-opus-4-8"))
+judge = ClaudeJudge(model="claude-opus-4-8")   # already an LLMJudge
 judge = LLMJudge(lambda prompt: my_llm(prompt)) # any callable
 judge = LLMJudge(my_provider, pass_threshold=0.7, scale=10, adversarial=True)
 ```
