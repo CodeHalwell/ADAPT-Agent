@@ -2,8 +2,9 @@
 
 Releases are cut by pushing a version tag. A GitHub Actions workflow
 ([`.github/workflows/release.yml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/.github/workflows/release.yml))
-runs the full test matrix, builds and validates the distributions, publishes
-them to PyPI, and opens a GitHub Release.
+runs the full test matrix, builds and validates the distributions with
+[uv](https://docs.astral.sh/uv/), publishes them to PyPI with `uv publish`, and
+opens a GitHub Release.
 
 ```bash
 git tag -a v0.3.0 -m "v0.3.0"
@@ -14,6 +15,10 @@ Authentication uses **PyPI Trusted Publishing** (OIDC): GitHub proves the
 workflow's identity to PyPI directly, so there is no API token stored in this
 repository and nothing to rotate. That does require a one-time setup on PyPI —
 see below.
+
+The workflow installs uv with `astral-sh/setup-uv`, which tracks the latest
+release. Attestation upload needs a recent uv; if you ever pin an older version
+there, publishes will still succeed but without PEP 740 provenance.
 
 ## One-time setup
 
@@ -55,6 +60,11 @@ environment. Then use **Actions → Release → Run workflow** and pick
 `testpypi` to run the entire pipeline against the test index without touching
 the real one.
 
+The publish target itself is already configured — `pyproject.toml` declares
+TestPyPI under `[[tool.uv.index]]`, which is what `uv publish --index testpypi`
+resolves. It is marked `explicit = true`, so it never participates in
+dependency resolution.
+
 ## Cutting a release
 
 1. **Update the version.** Edit `__version__` in `adapt_agent/__init__.py`.
@@ -89,11 +99,11 @@ after deletion — so the pipeline front-loads everything that could go wrong:
 | --- | --- |
 | `version` | The tag matches `adapt_agent.__version__`, so `v0.3.0` cannot ship `0.2.0`. |
 | `ci` | The same lint, type-check and 3.10–3.14 test matrix that guards `main`, re-run on the tagged commit. |
-| `build` | `twine check --strict` on both artifacts. |
+| `build` | Built with `uv build --no-sources`, then `twine check --strict` (via `uvx`) on both artifacts. |
 | `build` | The built filenames carry the expected version. |
 | `build` | The wheel really contains `SKILL.md` and its reference files, `py.typed`, and both console scripts; the sdist carries the skill too. |
-| `build` | A clean venv installs the wheel, runs `adapt --version`, and runs `adapt install skill` end to end. |
-| `publish-pypi` | Uploads via OIDC, with PEP 740 attestations, in the `pypi` environment. |
+| `build` | A clean `uv venv` installs the wheel, runs `adapt --version`, and runs `adapt install skill` end to end. |
+| `publish-pypi` | `uv publish --trusted-publishing always` in the `pypi` environment. PEP 740 attestations are generated and uploaded by default, and `--check-url` makes a re-run skip files already on the index. |
 | `github-release` | Creates the GitHub Release with generated notes and attaches the exact artifacts that went to PyPI. |
 
 The skill and console-script assertions exist because those are *packaging
@@ -126,7 +136,12 @@ Should the workflow ever be unavailable, the same artifacts can be produced and
 uploaded by hand — though this bypasses every check above, so prefer the tag:
 
 ```bash
-python -m build
-python -m twine check --strict dist/*
-python -m twine upload dist/*      # needs a PyPI API token
+uv build --no-sources
+uvx twine check --strict dist/*
+uv publish --dry-run               # verify the upload without sending anything
+uv publish --token "$PYPI_TOKEN"   # needs a PyPI API token
 ```
+
+`uv publish --dry-run` is also the quickest way to sanity-check a build locally
+before tagging: it validates the files against the index without uploading and
+needs no credentials.

@@ -79,16 +79,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Packaging
 
-- **Release automation to PyPI on tag.** Pushing a `v*` tag now runs a gated
-  pipeline: the tag must match `adapt_agent.__version__`; the full lint /
-  type-check / 3.10-3.14 test matrix is re-run on the tagged commit (by reusing
-  `ci.yml` as a callable workflow); the distributions are built once, checked
-  with `twine check --strict`, asserted to contain the bundled skill,
-  `py.typed` and both console scripts, and smoke-tested by installing the wheel
-  into a clean venv and running `adapt install skill`; only then are they
-  published via PyPI Trusted Publishing (OIDC, no stored API token) and
-  attached to a generated GitHub Release. `workflow_dispatch` runs the same
-  pipeline against TestPyPI for rehearsal. See `docs/releasing.md`.
+- **Release automation to PyPI on tag, built and published with uv.** Pushing a
+  `v*` tag runs a gated pipeline: the tag must match `adapt_agent.__version__`;
+  the full lint / type-check / 3.10-3.14 test matrix is re-run on the tagged
+  commit (by reusing `ci.yml` as a callable workflow); `uv build --no-sources`
+  builds the distributions once, which are then checked with
+  `uvx twine check --strict`, asserted to contain the bundled skill, `py.typed`
+  and both console scripts, and smoke-tested by installing the wheel into a
+  clean `uv venv` and running `adapt install skill`; only then does
+  `uv publish` upload them via PyPI Trusted Publishing (OIDC, no stored API
+  token, PEP 740 attestations by default) and attach them to a generated
+  GitHub Release. `workflow_dispatch` runs the same pipeline against TestPyPI
+  for rehearsal, using the `testpypi` publish target declared under
+  `[[tool.uv.index]]`. See `docs/releasing.md`.
 - Bundled skill files are declared as `package-data` and ship in **both** the
   wheel and the sdist; a test asserts every skill file is covered by a
   `package-data` glob, so a new file can't silently go missing from the wheel.

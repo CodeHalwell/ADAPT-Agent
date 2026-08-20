@@ -4,6 +4,7 @@ name: Release
 #
 #   git tag -a v0.2.0 -m "v0.2.0" && git push origin v0.2.0
 #
+# Building and publishing are done with uv (`uv build` / `uv publish`).
 # Authentication uses PyPI Trusted Publishing (OIDC) -- there is no API token
 # stored in this repository. The one-time PyPI setup is documented in
 # docs/releasing.md; without it the publish step fails with an auth error.
@@ -52,7 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           # Read __version__ without importing the package (no deps needed).
-          package_version="$(python -c "
+          package_version="$(python3 -c "
           import pathlib, re
           source = pathlib.Path('adapt_agent/__init__.py').read_text(encoding='utf-8')
           match = re.search(r'^__version__\s*=\s*[\"\x27]([^\"\x27]+)[\"\x27]', source, re.M)
@@ -97,27 +98,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9
         with:
-          python-version: "3.11"
-          cache: "pip"
+          enable-cache: true
 
-      - name: Install build tooling
-        run: |
-          python -m pip install --upgrade pip
-          pip install build twine
-
+      # --no-sources ignores any tool.uv.sources overrides, so this builds the
+      # package exactly as a consumer installing from the index would get it.
       - name: Build sdist and wheel
-        run: python -m build
+        run: uv build --no-sources
 
       - name: Check distribution metadata
-        run: python -m twine check --strict dist/*
+        run: uvx twine check --strict dist/*
 
       - name: Verify the artifacts contain what they must
         env:
           EXPECTED_VERSION: ${{ needs.version.outputs.version }}
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           import glob, os, sys, tarfile, zipfile
 
           expected = os.environ["EXPECTED_VERSION"]
@@ -175,8 +173,8 @@ jobs:
       - name: Smoke-test the wheel in a clean environment
         run: |
           set -euo pipefail
-          python -m venv /tmp/smoke
-          /tmp/smoke/bin/pip install --quiet --timeout 60 --retries 5 dist/*.whl
+          uv venv /tmp/smoke
+          VIRTUAL_ENV=/tmp/smoke uv pip install --quiet dist/*.whl
           # Both console scripts resolve, and the version they report matches.
           /tmp/smoke/bin/adapt --version
           /tmp/smoke/bin/adapt-agent --version
@@ -195,7 +193,8 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  # 4a. Manual rehearsal against TestPyPI.
+  # 4a. Manual rehearsal against TestPyPI. The `testpypi` publish target is
+  #     defined under [[tool.uv.index]] in pyproject.toml, hence the checkout.
   publish-testpypi:
     name: Publish to TestPyPI
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
@@ -207,6 +206,11 @@ jobs:
     permissions:
       id-token: write # Trusted Publishing (OIDC); no API token needed.
     steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9
+
       - name: Download distributions
         uses: actions/download-artifact@v8
         with:
@@ -214,9 +218,11 @@ jobs:
           path: dist/
 
       - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
+        run: |
+          uv publish \
+            --index testpypi \
+            --trusted-publishing always \
+            --check-url https://test.pypi.org/simple/
 
   # 4b. The real thing: a pushed v* tag (or an explicit manual choice).
   publish-pypi:
@@ -230,14 +236,23 @@ jobs:
     permissions:
       id-token: write # Trusted Publishing (OIDC); no API token needed.
     steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9
+
       - name: Download distributions
         uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
 
+      # `--trusted-publishing always` fails loudly if OIDC is unavailable
+      # rather than silently falling back to an anonymous upload attempt.
+      # `--check-url` makes a re-run skip files already on the index.
       - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+        run: |
+          uv publish \
+            --trusted-publishing always \
+            --check-url https://pypi.org/simple/
 
   # 5. Record the release on GitHub with the same artifacts that went to PyPI.
   github-release:

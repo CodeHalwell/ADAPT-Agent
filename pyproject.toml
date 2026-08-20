@@ -119,6 +119,15 @@ adapt_agent = [
     "skills/*/scripts/*",
 ]
 
+# TestPyPI as a named publish target, so `uv publish --index testpypi`
+# rehearses a release without touching the real index. `explicit = true` keeps
+# it out of dependency resolution -- it is only ever used when named.
+[[tool.uv.index]]
+name = "testpypi"
+url = "https://test.pypi.org/simple/"
+publish-url = "https://test.pypi.org/legacy/"
+explicit = true
+
 [tool.black]
 line-length = 100
 target-version = ['py310', 'py311', 'py312', 'py313']
