@@ -30,6 +30,11 @@ jobs:
         run: black --check .
       - name: Mypy
         run: mypy adapt_agent
+      # A retired or typo'd action ref fails a run before any step executes.
+      # release.yml only runs on a tag, so without this the discovery happens
+      # after cutting one. Checked here, and on the tag path via workflow_call.
+      - name: Check workflow action refs resolve
+        run: python3 scripts/check_action_refs.py
 
   test:
     runs-on: ubuntu-latest
