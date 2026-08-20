@@ -106,6 +106,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `package-data` glob, so a new file can't silently go missing from the wheel.
 - Added `MANIFEST.in`, so the sdist also carries `docs/`, `examples/`,
   `CHANGELOG.md` and the other project docs for downstream packagers.
+- **Fixed the release workflow failing before it ran a single step.** It
+  referenced `astral-sh/setup-uv@v9`, which does not exist: that action
+  published floating major tags only up to `v7`, so `v8`/`v9`/`v10` resolve to
+  nothing and the run dies at *Prepare all required actions*. All three uses are
+  now pinned to the full tag `v10.0.1`.
+- Added `scripts/check_action_refs.py`, run in CI's lint job, which resolves
+  every `uses:` ref in `.github/workflows/` against its remote and fails with
+  the newest published version when one is missing. `release.yml` only runs on
+  a tag, so without this check a bad ref is discovered after cutting one. An
+  unreachable remote is skipped rather than failed, so the gate cannot go
+  flaky.
 - The distribution version is now single-sourced from `adapt_agent.__version__`
   via `[tool.setuptools.dynamic]`, so the package and the distribution can no
   longer disagree. Both artifacts pass `twine check`.

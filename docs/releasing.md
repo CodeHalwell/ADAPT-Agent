@@ -16,9 +16,15 @@ workflow's identity to PyPI directly, so there is no API token stored in this
 repository and nothing to rotate. That does require a one-time setup on PyPI —
 see below.
 
-The workflow installs uv with `astral-sh/setup-uv`, which tracks the latest
-release. Attestation upload needs a recent uv; if you ever pin an older version
-there, publishes will still succeed but without PEP 740 provenance.
+The workflow installs uv with `astral-sh/setup-uv`, pinned to a full version
+(`@v10.0.1`). That pin is deliberate: setup-uv stopped publishing floating major
+tags after v7, so `@v8`, `@v9` and `@v10` do not resolve and a workflow using one
+fails at *Prepare all required actions*, before any step runs. Bump it to another
+full `vX.Y.Z` tag, never to a bare major.
+
+The action installs the latest uv release by default, which is what attestation
+upload needs; pinning an older uv via its `version:` input would still publish,
+but without PEP 740 provenance.
 
 ## One-time setup
 
