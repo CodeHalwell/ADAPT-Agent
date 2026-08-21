@@ -137,7 +137,8 @@ install_governance(agent, firewall=fw, agent_id="triage")
 
 This is the one partial. Pydantic AI has a native *output* validator but no
 pre-run hook, so `install_governance` covers outputs only, and passing it a
-`policy_enforcer` raises rather than accepting a control it cannot honour. Screen inputs with
+`policy_enforcer` or `defense` raises rather than accepting a control it cannot
+honour. Screen inputs with
 [`PydanticAIAdapter`](adapters.md) or by calling `gate.review_input(...)` before
 `agent.run`. Using both is the recommended setup.
 

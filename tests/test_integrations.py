@@ -576,28 +576,42 @@ def test_report_only_mode_still_audits_policy():
         )
 
 
-def test_pydantic_ai_refuses_a_policy_it_cannot_honour():
+def test_pydantic_ai_refuses_controls_it_cannot_honour():
     """Accepting a control and ignoring it is worse than refusing it.
 
-    An output validator never sees agent state, so a policy rule could only be
-    meaningless here -- and with a fail-open enforcer it would report "no
-    violation" for a rule that never ran.
+    An output-only seam never sees agent state (so a policy rule is
+    unevaluable) and never screens input (so `AdversarialDefense`, which
+    analyses input, never runs). Both would look configured and do nothing.
     """
     enforcer = PolicyEnforcer()
-    with pytest.raises(ValueError, match="cannot evaluate a policy_enforcer"):
-        pai.governance_output_validator(policy_enforcer=enforcer)
+    defense = AdversarialDefense()
 
     class FakeAgent:
         def output_validator(self, func):
             raise AssertionError("a rejected config must never be registered")
 
-    with pytest.raises(ValueError, match="cannot evaluate a policy_enforcer"):
-        pai.install_governance(FakeAgent(), policy_enforcer=enforcer)
-    # A gate carrying one is caught too, not just the keyword form.
-    with pytest.raises(ValueError, match="cannot evaluate a policy_enforcer"):
-        pai.governance_output_validator(gate=GovernanceGate(policy_enforcer=enforcer))
-    # Without policy it still builds normally.
+    for kwargs in ({"policy_enforcer": enforcer}, {"defense": defense}):
+        with pytest.raises(ValueError, match="cannot honour"):
+            pai.governance_output_validator(**kwargs)
+        with pytest.raises(ValueError, match="cannot honour"):
+            pai.install_governance(FakeAgent(), **kwargs)
+        # A gate carrying one is caught too, not just the keyword form.
+        with pytest.raises(ValueError, match="cannot honour"):
+            pai.governance_output_validator(gate=GovernanceGate(**kwargs))
+
+    # The firewall alone -- the control this seam *can* honour -- still works.
     assert pai.governance_output_validator(firewall=_firewall())("clean") == "clean"
+
+
+def test_openai_guardrail_policy_sees_the_runtime_context():
+    """A rule gating on `state['trust_score']` reads what the caller passed to
+    `Runner.run(..., context=...)`, which arrives as `RunContextWrapper.context`."""
+    from adapt_agent.integrations._common import context_state
+
+    class RunContextWrapper:
+        context = {"trust_score": 0.1}
+
+    assert context_state(RunContextWrapper()) == {"trust_score": 0.1}
 
 
 def test_adk_policy_sees_the_callbacks_session_state():

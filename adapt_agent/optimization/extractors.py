@@ -365,7 +365,7 @@ def _unwrap_envelope(value: Any, depth: int) -> Any:
                 return _unwrap_envelope(value[key], depth - 1)
         return value
     if isinstance(value, Sequence):
-        return value
+        return _unwrap_stream(value, depth)
     for _, predicate, unwrap in (*_CUSTOM_EXTRACTORS, *_BUILTIN_EXTRACTORS):
         try:
             if not predicate(value):
@@ -376,6 +376,28 @@ def _unwrap_envelope(value: Any, depth: int) -> Any:
         if inner is None or inner is value:
             continue
         return _unwrap_envelope(inner, depth - 1)
+    return value
+
+
+def _unwrap_stream(value: Sequence[Any], depth: int) -> Any:
+    """Find the final payload in a drained message/event stream.
+
+    An async framework's result is materialised into a *list* -- a Claude Agent
+    SDK message stream, a Google ADK event stream. Returning that list as the
+    payload makes every structural metric score 0.0 against the real fields,
+    because the answer is still inside the last message.
+
+    Scanned from the end, like :func:`_extract_sequence`, and only elements that
+    a registered extractor actually *recognises* count: a genuine structured
+    list (a list of records the dataset expects) contains nothing recognisable
+    and is returned unchanged.
+    """
+    for item in reversed(value):
+        if item is None or isinstance(item, (str, bytes, int, float, bool)):
+            continue
+        unwrapped = _unwrap_envelope(item, depth - 1)
+        if unwrapped is not item and unwrapped is not None and unwrapped != "":
+            return unwrapped
     return value
 
 

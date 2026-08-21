@@ -426,3 +426,30 @@ def test_unexportable_parameters_are_reported_even_without_a_header(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "Not exported" in text and "_tool_a" in text
     assert "baseline=" not in text  # the provenance header really is suppressed
+
+
+class _StreamMessage:
+    """Claude Agent SDK ``ResultMessage`` shape: final text under `.result`."""
+
+    subtype = "success"
+
+    def __init__(self, result):
+        self.result = result
+
+
+def test_drained_event_stream_is_unwrapped_before_structural_scoring():
+    """An async framework's result is materialised into a *list*.
+
+    Treating that list as the payload left the answer inside the last message,
+    so every structural metric scored a false 0.0.
+    """
+    stream = [_StreamMessage('{"lane": "NOS", "matter": "M1"}')]
+    assert extract_output_payload(stream) == {"lane": "NOS", "matter": "M1"}
+    assert field_match("lane")(extract_output_payload(stream), {"lane": "NOS"}) == 1.0
+
+
+def test_a_genuine_structured_list_survives_stream_unwrapping():
+    """Only *recognised* framework objects count, so a real list is preserved."""
+    records = [{"lane": "NOS"}, {"lane": "OTHER"}]
+    assert extract_output_payload(records) == records
+    assert extract_output_payload(["a", "b"]) == ["a", "b"]

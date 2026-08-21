@@ -63,6 +63,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A drained event stream defeated structural scoring.** An async framework's
+  result is materialised into a list, and `extract_output_payload` returned that
+  list as the payload -- so a Claude Agent SDK `ResultMessage` carrying
+  `{"lane": "NOS"}` left every `field_match` scoring a false 0.0. Recognised
+  streams are now scanned from the end for their final payload, while a genuine
+  structured list (containing nothing a registered extractor recognises) is
+  returned unchanged.
+- **OpenAI guardrail policy never saw the runtime context.** Authorization data
+  passed as `Runner.run(..., context=...)` arrives on `RunContextWrapper.context`
+  and was not merged into the policy state, so a rule gating on
+  `state['trust_score']` found the key absent and failed open.
+- **`defense` was silently inert on the Pydantic AI validator**, for the same
+  reason as `policy_enforcer`: `scan_output` runs the firewall only, deliberately,
+  since adversarial-*input* detection over an answer flags an agent legitimately
+  quoting an instruction. It is now refused alongside policy rather than accepted
+  and ignored.
 - **A `policy_enforcer` given to the Pydantic AI validator was silently
   ignored.** That seam sees only the output, so a state-gating rule could never
   fire; it now raises with a pointer to the adapter rather than accepting a

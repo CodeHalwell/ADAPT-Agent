@@ -28,7 +28,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from adapt_agent.core.governance import GovernanceGate
-from adapt_agent.integrations._common import as_state, build_gate, optional_import
+from adapt_agent.integrations._common import (
+    as_state,
+    build_gate,
+    context_state,
+    optional_import,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from adapt_agent.adversarial import AdversarialDefense
@@ -54,7 +59,9 @@ def governance_guardrails(
             what happens next.
         firewall: Screens the agent input and final output.
         defense: Adversarial analysis of the input.
-        policy_enforcer: Evaluated against the input as agent state.
+        policy_enforcer: Evaluated against the input *and the run's runtime
+            context* (``Runner.run(..., context=...)``), so a rule gating on
+            authorization data such as ``state['trust_score']`` sees it.
         agent_id: Recorded in ``output_info`` so a tripwire names the agent.
         screen_output: Also register an output guardrail.
 
@@ -81,7 +88,11 @@ def governance_guardrails(
 
     async def adapt_input_guardrail(context: Any, agent: Any, agent_input: Any) -> Any:
         threats = resolved.scan_input(agent_input)
-        threats.extend(f"policy:{n}" for n in resolved.policy_violations(as_state(agent_input)))
+        # The runtime context must be merged in: a rule gating on
+        # `state['trust_score']` reads what the caller passed to
+        # `Runner.run(..., context=...)`, not the agent input.
+        state = as_state(agent_input, **context_state(context))
+        threats.extend(f"policy:{n}" for n in resolved.policy_violations(state))
         return agents.GuardrailFunctionOutput(
             output_info={"agent_id": agent_id, "threats": threats},
             tripwire_triggered=bool(threats),

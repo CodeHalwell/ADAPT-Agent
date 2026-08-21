@@ -134,9 +134,9 @@ Three things worth knowing:
 * **`Pydantic AI` is half-covered.** It has a native output validator but no
   pre-run hook, so `install_governance` screens outputs only. Screen inputs with
   `PydanticAIAdapter` (or `gate.review_input(...)` before `agent.run`). Using
-  both is the recommended setup. Passing it a `policy_enforcer` **raises** rather
-  than silently ignoring one: policy gates on state, which an output-only seam
-  never sees.
+  both is the recommended setup. Passing it a `policy_enforcer` or `defense`
+  **raises** rather than silently ignoring one: policy gates on state and
+  adversarial defense analyses input, neither of which an output-only seam sees.
 * **Google ADK can refuse instead of raising.** `on_block="refuse"` returns an
   `LlmResponse` that short-circuits the model, so one blocked branch does not
   abort a whole agent tree. The default `"raise"` matches every other entry point.

@@ -89,14 +89,20 @@ def context_state(context: Any) -> dict[str, Any]:
     this the key is simply absent, and a fail-open enforcer reads that as "no
     violation": the rule never fires and nothing says so.
     """
+    # ADK: `Context.state`; some versions expose it via the session instead.
     state = getattr(context, "state", None)
     if isinstance(state, Mapping):
         return dict(state)
-    # ADK's Context exposes session state indirectly on some versions.
     session = getattr(context, "session", None)
     session_state = getattr(session, "state", None)
     if isinstance(session_state, Mapping):
         return dict(session_state)
+    # OpenAI Agents: `RunContextWrapper.context` is whatever the caller passed to
+    # `Runner.run(..., context=...)` -- the conventional home for authorization
+    # data a policy rule gates on.
+    runtime = getattr(context, "context", None)
+    if isinstance(runtime, Mapping):
+        return dict(runtime)
     return {}
 
 

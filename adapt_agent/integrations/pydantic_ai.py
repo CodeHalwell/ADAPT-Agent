@@ -26,11 +26,12 @@ A structured ``output_type`` is screened field by field: the gate reaches the
 text inside a Pydantic model, so a prompt-injection string smuggled into one
 field of a structured answer is still caught.
 
-**Policy is refused, not ignored.** Passing a ``policy_enforcer`` here raises:
-a policy rule gates on agent state, which an output-only seam never sees, so
-honouring it is impossible and accepting it quietly would leave you believing a
-blocking rule was active when nothing ever consulted it. Enforce policy through
-the adapter; the two compose.
+**Unsupported controls are refused, not ignored.** Passing ``policy_enforcer``
+or ``defense`` here raises. A policy rule gates on agent state and adversarial
+defense analyses *input*; an output-only seam sees neither, so honouring them is
+impossible, and accepting them quietly would leave you believing a control was
+active when nothing ever consulted it. Enforce both through the adapter; the two
+compose.
 """
 
 from __future__ import annotations
@@ -70,9 +71,10 @@ def governance_output_validator(
         agent.output_validator(governance_output_validator(firewall=fw))
 
     Raises:
-        ValueError: If a ``policy_enforcer`` is supplied (directly or on a
-            ``gate``). See the module docstring -- this seam cannot honour one,
-            and silently ignoring it would be worse than refusing.
+        ValueError: If a ``policy_enforcer`` or ``defense`` is supplied
+            (directly or on a ``gate``). See the module docstring -- this seam
+            cannot honour either, and silently ignoring one would be worse than
+            refusing it.
     """
     resolved = build_gate(
         gate=gate,
@@ -82,7 +84,7 @@ def governance_output_validator(
         block_on_violation=block_on_violation,
         agent_id=agent_id,
     )
-    _reject_policy(resolved)
+    _reject_unsupported(resolved)
 
     def adapt_governance_validator(output: Any) -> Any:
         resolved.review_output(output)
@@ -91,23 +93,38 @@ def governance_output_validator(
     return adapt_governance_validator
 
 
-def _reject_policy(gate: GovernanceGate) -> None:
-    """Refuse a ``policy_enforcer`` this seam cannot honour.
+def _reject_unsupported(gate: GovernanceGate) -> None:
+    """Refuse the controls this output-only seam cannot honour.
 
-    An output validator sees only the result. A policy rule gates on agent
-    *state*, which is not in scope here, so evaluating one would either be
-    meaningless or -- with a fail-open enforcer -- silently report "no
-    violation" for a rule that never ran. Accepting the parameter and quietly
-    ignoring it is the failure mode that makes a security control dangerous, so
-    this raises instead of pretending.
+    An output validator sees only the result, so two of the gate's controls are
+    structurally out of reach here:
+
+    * ``policy_enforcer`` gates on agent *state*, which is never in scope;
+    * ``defense`` is *input* analysis -- :meth:`GovernanceGate.scan_output` runs
+      the firewall only, deliberately, since adversarial-instruction detection
+      over an answer flags an agent legitimately quoting an instruction.
+
+    Accepting either and quietly doing nothing is the failure mode that makes a
+    security control dangerous: it looks configured. So this raises instead of
+    pretending. Use :class:`~adapt_agent.adapters.PydanticAIAdapter` for both --
+    the adapter and this validator compose.
     """
-    if gate.policy_enforcer is not None:
+    unsupported = [
+        name
+        for name, value in (
+            ("policy_enforcer", gate.policy_enforcer),
+            ("defense", gate.defense),
+        )
+        if value is not None
+    ]
+    if unsupported:
         raise ValueError(
-            "Pydantic AI's output validator cannot evaluate a policy_enforcer: a "
-            "policy rule gates on agent state, which an output-only seam never "
-            "sees. Use PydanticAIAdapter (execute/aexecute) for policy "
-            "enforcement, and keep this validator for output screening -- the "
-            "two compose. See adapt_agent.integrations.pydantic_ai."
+            f"Pydantic AI's output validator cannot honour {', '.join(unsupported)}: "
+            "a policy rule gates on agent state and adversarial defense analyses "
+            "*input*, neither of which an output-only seam sees. Use "
+            "PydanticAIAdapter (execute/aexecute) for those, and keep this "
+            "validator for output screening -- the two compose. See "
+            "adapt_agent.integrations.pydantic_ai."
         )
 
 
@@ -129,7 +146,7 @@ def install_governance(
     Raises:
         TypeError: If ``agent`` has no ``output_validator`` (i.e. it is not a
             Pydantic AI agent).
-        ValueError: If a ``policy_enforcer`` is supplied -- see
+        ValueError: If a ``policy_enforcer`` or ``defense`` is supplied -- see
             :func:`governance_output_validator`.
     """
     register = getattr(agent, "output_validator", None)
