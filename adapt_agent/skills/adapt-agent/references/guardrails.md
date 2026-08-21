@@ -47,8 +47,7 @@ Adapter(
 | Claude Agent SDK | `ClaudeAgentSDKAdapter` | `[claude-agent]` | `query` function |
 
 Import from `adapt_agent.adapters`. Importing an adapter never imports the
-framework — that happens only when you wrap and run. Async-only frameworks are
-driven synchronously (coroutines awaited, async event streams drained).
+framework — that happens only when you wrap and run.
 
 ```python
 from adapt_agent.adapters import LangGraphAdapter
@@ -61,6 +60,108 @@ try:
 except SecurityBlockedError as exc:
     print(exc.reason, exc.threats)
 ```
+
+### Async: use `aexecute`, not a worker thread
+
+A governed agent has **two** entry points with identical governance:
+
+| Call | Use when |
+| --- | --- |
+| `guarded.execute(payload)` | a synchronous caller. An async framework is driven by running its coroutine to completion — impossible inside a running loop, where it raises `AdapterError`. |
+| `await guarded.aexecute(payload)` | **any async application.** The framework is awaited in *your* event loop. |
+
+This matters because Pydantic AI, the Claude Agent SDK and Microsoft Agent
+Framework are async-native, so `execute` is unavailable to them in their most
+natural deployment — an async web handler.
+
+Reach for `aexecute` rather than pushing `execute` onto a worker thread. A
+thread serialises concurrent requests behind one blocking call and severs
+`contextvars`, which is how OpenTelemetry propagates the active span — so
+offloading loses trace parentage. `aexecute` keeps both. A *synchronous*
+framework works through `aexecute` too, so an async app can use one entry point
+everywhere.
+
+```python
+result = await guarded.aexecute({"messages": [{"role": "user", "content": "Hi"}]})
+```
+
+## Native hooks: govern inside the graph, not just at its edge
+
+An adapter wraps an agent from the outside. That is right when a framework has
+no interception point, but wrapping a *multi-agent graph* — a
+`WorkflowBuilder(...).build().as_agent()`, a supervisor with four specialists —
+governs only the boundary: the raw request in, the final answer out. It cannot
+give the specialist reading untrusted email different rules from the intake
+router, because from outside they are one object.
+
+Every framework below already has an interception point, and most are async by
+contract. `adapt_agent.integrations` plugs the same governance into it, so rules
+nest per agent, compose with middleware the app already stacks, and don't fight
+the workflow runtime.
+
+| Framework | Factory (in `adapt_agent.integrations.*`) | Attach to |
+| --- | --- | --- |
+| Microsoft Agent Framework | `agent_framework.governance_middleware()` | `Agent(middleware=[...])` |
+| Google ADK | `google_adk.governance_callbacks()` | `LlmAgent(**callbacks)` |
+| OpenAI Agents SDK | `openai_agents.governance_guardrails()` | `Agent(**guardrails)` |
+| OpenAI Agents SDK — handoff target | `openai_agents.governance_agent_hooks()` | `Agent(hooks=...)` |
+| Claude Agent SDK | `claude_agent.governance_hooks()` | `ClaudeAgentOptions(hooks=...)` |
+| LangGraph | `langgraph.governance_hooks()` | `create_react_agent(**hooks)` |
+| CrewAI | `crewai.governance_callbacks()` | `Crew(**callbacks)` |
+| Pydantic AI | `pydantic_ai.install_governance(agent)` | output only — see below |
+
+Every factory takes the same controls (`firewall`, `defense`, `policy_enforcer`,
+`block_on_violation`, `agent_id`) or a shared `gate=`, and all of them run the
+same `GovernanceGate`, so rules cannot drift between frameworks or from the
+adapters.
+
+```python
+from adapt_agent.integrations.agent_framework import governance_middleware
+
+agent = chat_client.create_agent(
+    instructions="...",
+    middleware=[
+        usage_middleware("nos"),                              # the app's own
+        governance_middleware(firewall=fw, agent_id="nos"),   # composes with it
+    ],
+)
+```
+
+Set `agent_id` per agent: it is named in the raised `SecurityBlockedError`, which
+is how you tell *which* specialist refused.
+
+Three things worth knowing:
+
+* **`Pydantic AI` is half-covered.** It has a native output validator but no
+  pre-run hook, so `install_governance` screens outputs only. Screen inputs with
+  `PydanticAIAdapter` (or `gate.review_input(...)` before `agent.run`). Using
+  both is the recommended setup. Passing it a `policy_enforcer` or `defense`
+  **raises** rather than silently ignoring one: policy gates on state and
+  adversarial defense analyses input, neither of which an output-only seam sees.
+* **Google ADK can refuse instead of raising.** `on_block="refuse"` returns an
+  `LlmResponse` that short-circuits the model, so one blocked branch does not
+  abort a whole agent tree. The default `"raise"` matches every other entry point.
+* **A LangGraph or Claude hook sees what a wrapper cannot.** Hooks fire on
+  *every* model call and *every* tool input inside one run — which is where
+  injected content actually arrives, having been fetched by a previous tool
+  rather than typed by the user.
+
+### What the caller sees when a hook refuses
+
+Each framework surfaces a refusal in its own idiom, so catch accordingly:
+
+| Framework | On block the caller sees |
+| --- | --- |
+| MS Agent Framework | `SecurityBlockedError` propagates out of `await agent.run(...)`; the app's outer middleware sees it as an exception passing through `call_next()` |
+| Google ADK | `SecurityBlockedError` out of the run, or with `on_block="refuse"` a normal `LlmResponse` carrying the refusal text |
+| OpenAI Agents SDK | the SDK's own `InputGuardrailTripwireTriggered` / `OutputGuardrailTripwireTriggered`; threats are on `exc.guardrail_result.output.output_info["threats"]` |
+| Claude Agent SDK | no exception — the hook returns `{"decision": "block", "reason": ...}` and the model is told why, so the agent can respond to the refusal |
+| LangGraph | `SecurityBlockedError` raised from the hook node, aborting that graph run |
+| CrewAI | `SecurityBlockedError` from the kickoff callback; a task `guardrail` instead returns `(False, message)` and CrewAI retries |
+| Pydantic AI | `SecurityBlockedError` from the output validator, aborting the run |
+
+Keep `wrap_agent` for anything with no hook concept, and for governing a whole
+graph's boundary in one line.
 
 ## Firewall
 
@@ -311,3 +412,15 @@ adapter = LangGraphAdapter(firewall=firewall, policy_enforcer=policy, defense=de
 After wrapping, confirm the controls are really attached rather than assuming:
 `adapter.firewall`, `adapter.policy_enforcer` and `adapter.defense` should all
 be non-`None`.
+
+
+## OpenAI handoffs need a different seam
+
+Input guardrails run for the **starting agent of a run only** — the SDK gates
+them on `current_turn == 0`. A specialist reached by a handoff never runs its
+own, so its firewall, defense and policy rules are silently skipped for
+transferred content. Use `governance_agent_hooks()` there: it binds to
+`AgentHooks.on_llm_start`, which fires per agent and per model call (so it also
+screens tool results returning to the model), and to `on_end` for the agent's
+own answer. `inner=` keeps the app's own
+lifecycle hooks running.

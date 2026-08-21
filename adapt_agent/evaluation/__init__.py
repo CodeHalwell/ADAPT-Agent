@@ -19,6 +19,7 @@ from adapt_agent.optimization.evaluation import (
 )
 from adapt_agent.optimization.extractors import (
     available_extractors,
+    extract_output_payload,
     extract_output_text,
     register_extractor,
 )
@@ -28,6 +29,8 @@ from adapt_agent.optimization.metrics import (
     checks,
     contains,
     exact_match,
+    field_match,
+    field_metrics,
     get_metric,
     jaccard,
     json_subset,
@@ -195,12 +198,15 @@ __all__ = [
     "jaccard",
     "numeric_close",
     "json_subset",
+    "field_match",
+    "field_metrics",
     "levenshtein_ratio",
     "checks",
     "get_metric",
     # one-call framework evals
     "evaluate_agent",
     "extract_output_text",
+    "extract_output_payload",
     "register_extractor",
     "available_extractors",
     "framework_runner",

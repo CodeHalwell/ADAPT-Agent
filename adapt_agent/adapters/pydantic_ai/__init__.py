@@ -36,6 +36,7 @@ class PydanticAIAdapter(GovernedAdapter):
 
     framework_name = "Pydantic AI"
     run_method_names = ("run_sync", "run")
+    async_run_method_names = ("run", "run_sync")
     operation = "pydantic_ai.run"
 
     def _prepare_input(self, payload: dict[str, Any]) -> Any:

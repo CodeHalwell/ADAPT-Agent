@@ -7,6 +7,288 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-21
+
+### Added
+
+- **Async is now a first-class path, not a leaf-node rescue.** Every governed
+  agent gained `aexecute`, the awaitable twin of `execute` with identical
+  governance. It awaits the framework in the *caller's* event loop, so
+  concurrent requests stay concurrent and `contextvars` -- how OpenTelemetry
+  propagates the active span -- survive. Previously an async-native framework
+  (Pydantic AI, the Claude Agent SDK, Microsoft Agent Framework) could only be
+  governed from a synchronous caller, and the advice to use a worker thread cost
+  both concurrency and trace parentage. `aresolve_runner` and
+  `EvaluationHarness.aevaluate` mirror it upward; the governance stages are
+  shared, so the two call styles cannot drift.
+- **Native governance hooks for every supported framework**
+  (`adapt_agent.integrations`). An adapter wraps an agent from the outside, which
+  governs only a graph's boundary; these plug into the framework's own
+  interception point so rules nest *per agent* inside a multi-agent graph,
+  compose with middleware the app already stacks, and don't fight the workflow
+  runtime. Each factory was written against the installed SDK's own source:
+  Microsoft Agent Framework (`Agent(middleware=[...])`), Google ADK
+  (before/after model callbacks, with an `on_block="refuse"` mode that
+  short-circuits the model instead of aborting the tree), OpenAI Agents SDK
+  (input/output guardrails), Claude Agent SDK (`UserPromptSubmit` and
+  `PreToolUse` hooks -- the latter reaching tool inputs no outer wrapper can
+  see), LangGraph (`pre_model_hook`/`post_model_hook`), CrewAI (kickoff
+  callbacks plus a task guardrail), and Pydantic AI (output validator only --
+  it has no native pre-run hook, and the docs say so rather than inventing one).
+- `GovernanceGate` (`adapt_agent.core.governance`): the single, framework-free
+  implementation of screen -> policy -> screen, now shared by both the adapters
+  and the native hooks so a fix reaches every framework at once.
+- **Concurrency for evals.** `EvaluationHarness.evaluate(..., concurrency=N)`
+  runs examples in a thread pool for synchronous agents; `aevaluate(...,
+  concurrency=N)` uses a bounded async worker pool for async ones.
+  `evaluate_agent` takes the same knob. A serial harness made optimization
+  impractical -- a 60-eval sweep over a 113-case split is 6,780 LLM round-trips.
+  Both paths preserve index ordering, non-fatal per-example errors, and the
+  `max_results` memory bound.
+- `extract_output_payload`: unwraps the framework envelope but **keeps the
+  structure** -- a mapping passes through, a declared structured output (Pydantic
+  model or dataclass) becomes a dict, and a JSON string (including a
+  ```` ```json ```` fenced one) is parsed back into an object. Previously a
+  structured answer was either flattened to `.text` by `extract_output_text` or
+  left as a `repr()` by `output_extractor=None`. Three shapes that would each
+  have scored 0.0 across every column are handled by name: a LangGraph
+  `response_format=` **state** (the answer is under `structured_response`,
+  beside `messages`; the state is identified by what LangGraph guarantees --
+  `add_messages` coerces every entry to a `BaseMessage` -- so an answer that
+  merely has fields of those names is not peeled); a **single-field answer** like
+  `{"result": "granted"}` or `{"answer": {"city": "Paris"}}`, which is the
+  answer rather than an envelope around one. Shape alone cannot decide that --
+  both readings occur for `{"result": [...]}` -- so `execute` now marks its own
+  wrapper (`GovernedEnvelope`, a plain `dict` in every respect that matters but
+  identifiable), and extraction stops guessing; and a declared output
+  whose field happens to be *called* `answer` or
+  `result`, which the generic attribute peel would have reduced to its own
+  value. `extract_output_text` likewise leaves a declared output unchanged, so a
+  per-row `field_match` dispatched by `checks` still sees its fields. A **list of
+  records** is the answer rather than a message stream, so a list of dataclasses
+  or models comes back whole instead of collapsing to its last element.
+- `field_match(field, ...)` and `field_metrics([...])`: score a structured
+  output per field, reported under the field's own name, so a report aggregates
+  as a per-column table (`{"lane": 0.94, ..., "pack": 0.0}`) rather than one
+  blended number that hides which column moved. `evaluate_agent` switches to
+  payload extraction automatically when every metric is structural.
+- `OptimizationResult.to_config(path)` reserves the `_provenance` namespace.
+  `load_tuned_config` skips that key on the way in, so a tuned parameter named
+  for it could be exported but never reloaded -- and in JSON the real provenance
+  block overwrote it first. It is described rather than written, so the loss is
+  visible instead of silent.
+- `OptimizationResult.to_config(path)` handles a bare parameter name that is
+  also a component prefix (`{"agent": 1, "agent.temperature": 0.2}`): the two
+  cannot share the top level, and which one survived depended only on dict
+  ordering -- one order raised `TypeError`, the other silently dropped the
+  component's knobs. The qualified knobs are exported and the bare name is
+  described.
+- `OptimizationResult.to_config(path)` and `load_tuned_config(path)`: export the
+  winning configuration as reviewable `{component: {parameter: value}}` YAML and
+  load it back. The optimizer applied its result in place, to live objects, so
+  it died with the process; now the loop is optimize -> diff -> review -> commit
+  and a machine-rewritten prompt cannot reach production unread.
+
+### Security
+
+- **A tool result carrying a prompt injection reached the model unscreened.**
+  Google ADK returns a tool's output under `Part.function_response.response`, a
+  mapping, never `Part.text` -- and `extract_texts` neither walked that
+  attribute nor reached it within its recursion bound, so the firewall was blind
+  on exactly the path that carries untrusted content back from the open web. The
+  identical string as a plain text part was blocked. Tool-response attributes
+  are now walked explicitly, and the bound is sized from the deepest real
+  payload (a governed ADK tool result is eight hops) rather than a guess,
+  because a security scan that stops early fails open.
+
+### Fixed
+
+- **A Claude tool *result* was never screened.** Only `UserPromptSubmit` and
+  `PreToolUse` were governed by default, so whatever a tool fetched from the
+  open web reached the model unscreened unless it happened to be copied into a
+  *subsequent* tool call. `PostToolUse` joins the defaults -- the same gap
+  closed on the ADK side.
+- **A tool matcher silently disabled prompt screening.** `matcher=` is a tool
+  name, and it was attached to every governed event including
+  `UserPromptSubmit`, describing a prompt event that can never match. It now
+  applies to tool-scoped events only, which is what the parameter's own
+  documentation already said.
+- **A coroutine returning a stream was not drained.** Both `execute` and
+  `aexecute` awaited once and handed the still-live async generator on, so
+  output screening found no text -- a firewall bypass for streamed content --
+  and the caller received a generator where the envelope documents a list. The
+  awaited value is resolved recursively, and the sync path now routes through
+  the same resolver as the async one rather than keeping a parallel copy that
+  could drift.
+- **A handoff target's input governance never ran.** The OpenAI Agents SDK runs
+  input guardrails for the *starting* agent of a run only (`run.py` gates them
+  on `current_turn == 0`), so a specialist reached by a handoff had its
+  firewall, defense and policy rules configured, documented and silently
+  skipped for transferred content. Confirmed by driving a real handoff against
+  the installed SDK. New `openai_agents.governance_agent_hooks()` binds to
+  `AgentHooks.on_llm_start`, which fires per agent and per model call -- so it
+  also screens tool results on their way back to the model -- and `inner=`
+  keeps the app's own lifecycle hooks running. `on_end` screens the
+  specialist's answer, so a handoff target is governed in both directions.
+- **`aexecute` blocked the event loop on a synchronous framework.** The
+  resolver falls back to the sync runner so an async app can use one entry
+  point uniformly, but calling it did the work before the first await: a
+  heartbeat task got zero ticks and three concurrent calls serialised (0.45s
+  for 3 x 150ms). The sync fallback runs in a worker thread now --
+  `asyncio.to_thread`, so `contextvars` and the active span still reach the
+  framework -- and the same three calls take 0.15s.
+- **A shared gate's label did not reach every message.** The Claude refusal
+  reason and the OpenAI tripwire's `output_info` interpolated the factory
+  parameter rather than the resolved gate id, so a binding using a shared gate
+  reported the default while applying that gate's controls. Both use
+  `resolved.agent_id` now, matching the MAF span.
+- **An ADK refusal did not say which agent refused.** `on_block="refuse"`
+  returns an ordinary `LlmResponse`, so unlike the raising path it carried
+  nothing for the surrounding graph to inspect -- two specialists produced
+  byte-identical objects, though the factory documented `agent_id` as
+  identifying which one refused. The id and the threats now travel in
+  `custom_metadata["adapt_agent"]`, leaving `refusal_text` as the caller's copy
+  for the end user.
+- **One problem was reported several times.** A payload yields many texts -- a
+  request's parts, a message list, a model's fields -- so a single blocked
+  request raised `["firewall", "firewall", "firewall"]`. Threat labels are
+  de-duplicated, keeping first-seen order; the multiplicity counted texts
+  scanned, not distinct problems.
+- **A shared gate was labelled by the wrong agent.** Passing
+  `gate=` alongside `agent_id=` -- the advertised multi-agent setup -- returned
+  the gate unchanged, so a violation raised an error naming the *shared* gate
+  while the hook traced the same invocation under the binding's id. The binding's
+  id now wins where it is given, the gate's own label applies where it is not,
+  and the span carries whichever the error does.
+- **A blocked output was traced as a successful run.** The observer span closed
+  as `completed` before post-middleware and output screening ran, so a caller
+  received `SecurityBlockedError` while telemetry recorded success -- hiding the
+  output-policy failures monitoring exists to surface. The span now closes last,
+  and as an error when either stage raises, on `execute`, `aexecute`, and the
+  Microsoft Agent Framework middleware (the only native hook that opens a span).
+- **A bare parameter name did not survive the config round trip.** `to_config`
+  filed a name with no `component.` prefix under a synthetic `agent` section,
+  renaming it on the way out; `load_tuned_config` could not recover the original,
+  so `apply()` silently skipped it and the export/reload round trip did not
+  restore the winner. Bare names now stay at the top level, under their own name.
+- **A per-row `field_match` scored a false 0.0 on a model result.** A row's
+  `{"check": {"name": "field_match", ...}}` is dispatched by `checks`, which
+  cannot be marked structural (the row decides at run time), so extraction leaves
+  a Pydantic AI result as a model object. Mapping coercion now accepts models and
+  dataclasses, matching what payload extraction already did.
+- **A tuple parameter was exported as a list.** Both encoders read a sequence
+  back as a `list`, so reloading changed the winning value's type and a setter
+  expecting a tuple would receive a list. Tuples are now described rather than
+  exported, keeping the invariant that the config body is exactly what applies
+  cleanly.
+- **A drained event stream defeated structural scoring.** An async framework's
+  result is materialised into a list, and `extract_output_payload` returned that
+  list as the payload -- so a Claude Agent SDK `ResultMessage` carrying
+  `{"lane": "NOS"}` left every `field_match` scoring a false 0.0. Recognised
+  streams are now scanned from the end for their final payload, while a genuine
+  structured list (containing nothing a registered extractor recognises) is
+  returned unchanged.
+- **OpenAI guardrail policy never saw the runtime context.** Authorization data
+  passed as `Runner.run(..., context=...)` arrives on `RunContextWrapper.context`
+  and was not merged into the policy state, so a rule gating on
+  `state['trust_score']` found the key absent and failed open.
+- **`defense` was silently inert on the Pydantic AI validator**, for the same
+  reason as `policy_enforcer`: `scan_output` runs the firewall only, deliberately,
+  since adversarial-*input* detection over an answer flags an agent legitimately
+  quoting an instruction. It is now refused alongside policy rather than accepted
+  and ignored.
+- **A `policy_enforcer` given to the Pydantic AI validator was silently
+  ignored.** That seam sees only the output, so a state-gating rule could never
+  fire; it now raises with a pointer to the adapter rather than accepting a
+  control it cannot honour.
+- **ADK policy never saw session state.** The callback synthesised policy state
+  from the model request alone, so a rule reading `state['trust_score']` found
+  the key absent and a fail-open enforcer read that as "no violation". The
+  callback context's state is now merged in.
+- **A cancelled native hook left its observer span open**, the same
+  `except Exception` gap as the adapter path.
+- **The threaded eval pool stalled behind a slow example.** Refilling waited on
+  the *oldest* future, idling the other workers until it finished; with variable
+  LLM latency that collapses the achieved concurrency (measured: 0.96s against
+  an 0.65s ideal). It now refills from whichever future completes first, with
+  index ordering restored by the accumulator.
+- **`aexecute` still blocked on a directly-wrapped OpenAI SDK `Agent`.** Such an
+  agent exposes neither `run` nor `run_sync`, so the async preference list could
+  not match and the adapter fell back to its synchronous `Runner.run_sync`
+  lambda. It now has an async SDK runner using `Runner.run`.
+- **`aexecute` called the framework's *synchronous* entry point.** The runner
+  was resolved once from the sync-first `run_method_names`, so on LangGraph,
+  CrewAI, Pydantic AI and the OpenAI Agents SDK the async path invoked
+  `invoke`/`kickoff`/`run_sync` and blocked the very event loop it exists to
+  cooperate with -- while `ainvoke`/`kickoff_async`/`run` went unused. Adapters
+  now declare `async_run_method_names` and `aexecute` resolves against it,
+  falling back to the sync runner for a framework that has no async twin.
+- **A cancelled `aexecute` left its observer span open forever.**
+  `asyncio.CancelledError` derives from `BaseException`, so `except Exception`
+  never saw it and neither the error nor the completion path ran.
+- **Renaming a structural metric stripped its `structural` flag.**
+  `metrics={"lane_acc": field_match("lane")}` fell back to text extraction, so a
+  model-returning agent scored 0.0. The flag now survives both rename paths --
+  the harness's and `evaluate_agent`'s, the latter of which had been missed.
+- **Report-only mode silently disabled policy auditing.** With
+  `block_on_violation=False` the adapter skipped `policy_violations()` entirely,
+  and since `PolicyEnforcer.check_state` is what records violations and fires
+  warn/log handlers, the documented rollout mode recorded nothing at all rather
+  than recording without refusing. Policy is now evaluated whatever the blocking
+  mode; only the refusal is conditional.
+- **`to_config` crashed on tool and skill parameters.** Those hold live
+  callables, which no YAML or JSON encoder can represent, so exporting a run
+  from the default optimizer's tool stage raised. They are now listed by
+  `module:qualname` for the review diff and kept out of the config body, so the
+  file stays reloadable and `apply()` can never write a stand-in string over a
+  real tool list.
+- **A `policy_enforcer` passed to the Microsoft Agent Framework or Google ADK
+  hooks was silently inert.** Both called `review_input` without a `state`, and
+  the gate only evaluates policy when given one -- so the control was accepted,
+  documented, and did nothing, while `call_next()` ran on. Every hook now passes
+  a state, and a test drives all four input-screening hooks against a recording
+  enforcer so one binding cannot forget again.
+- **A structured output nested under a wrapper attribute went unscreened.** Text
+  extraction recursed only into `dict`/`list`/`tuple`, so a Pydantic AI
+  `AgentRunResult.output` holding a `BaseModel` -- the ordinary shape -- had its
+  wrapper walked and the answer inside it skipped. Any non-primitive is now
+  followed.
+- **A governed adapter's envelope defeated structural metrics.** `execute`
+  returns `{"result": <payload>}`, which `extract_output_payload` treated as the
+  payload, so every `field_match` scored 0.0 against the real fields. A single
+  conventional key is now peeled; a multi-key mapping is still treated as the
+  answer, so a structured result that happens to contain `result` is unharmed.
+- **The threaded eval path was not memory-bounded.** `evaluate(concurrency>1)`
+  materialised the whole dataset and handed it to `ThreadPoolExecutor.map`,
+  which itself submits every example up front. Replaced with bounded submission
+  that keeps at most `concurrency` runs in flight and pulls lazily, matching
+  what `aevaluate` already did.
+- **Structured outputs were almost entirely unscreened.** Text extraction only
+  probed a handful of conventional attribute names (`text`, `content`,
+  `output`, ...), so a Pydantic model or dataclass with fields like `lane` or
+  `note` -- exactly what a Pydantic AI `output_type` produces -- passed through
+  the firewall untouched, and an injection smuggled into one field was never
+  seen. Pydantic (v1 and v2) model and dataclass fields are now walked.
+- `execute` raising inside a running event loop abandoned the framework's
+  coroutine un-awaited, emitting a `RuntimeWarning` that pointed at the
+  framework instead of the real problem. The coroutine is now closed, and the
+  error message points at `aexecute`.
+- `get_metric` surfaced a raw `TypeError` for a built-in needing arguments; it
+  now explains that `field_match` is reachable through a mapping check spec.
+
+### Documentation
+
+- `references/guardrails.md` carried no async warning at all, while the evals
+  gotchas did -- the one page omitting it described the code path that raises.
+  It now documents `aexecute`, why a worker thread is the wrong fix, and the
+  native-hook matrix.
+- New `docs/integrations.md`, plus async/concurrency/structured-scoring and
+  config-export sections across the skill and the docs site.
+- Two more tests that *execute the documentation verbatim* rather than
+  inspecting it: the structured-scoring recipe is run, and every integration
+  factory named in the matrix is resolved.
+
+
 ### Added
 
 - **Bundled agent skill** (`adapt_agent/skills/adapt-agent/`): the wheel now

@@ -7,6 +7,8 @@ method names, sync/async results, result attributes) without importing the
 optional dependencies.
 """
 
+import importlib.util
+
 import pytest
 
 from adapt_agent.adapters import (
@@ -252,9 +254,17 @@ def test_openai_agents_object_with_run_sync():
     assert result["result"].final_output == "HI"
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("agents") is not None, reason="openai-agents is installed"
+)
 def test_openai_agents_non_callable_uses_sdk_runner_and_reports_missing_dep():
-    # A non-callable "agent" with no run method falls back to the SDK Runner,
-    # which isn't installed here -> MissingDependencyError at execution time.
+    """The fallback path *when the SDK is absent*.
+
+    Ungated, this asserted an environment rather than a behaviour: with
+    openai-agents installed the fallback reaches a real ``Runner.run(object())``
+    and raises ``AttributeError``, so a contributor who has the SDK saw a
+    failure that says nothing about their change.
+    """
     from adapt_agent.exceptions import MissingDependencyError
 
     adapter = OpenAIAgentsAdapter()

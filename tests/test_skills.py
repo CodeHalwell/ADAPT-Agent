@@ -5,6 +5,7 @@ frontmatter must be valid, its internal links must resolve, and every file must
 be covered by the packaging globs so it actually reaches the wheel.
 """
 
+import ast
 import fnmatch
 import re
 import sys
@@ -13,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from adapt_agent.exceptions import SkillError
+from adapt_agent.optimization.evals import evaluate_agent
 from adapt_agent.skills import (
     MAX_DESCRIPTION_LENGTH,
     MAX_NAME_LENGTH,
@@ -397,6 +399,7 @@ _NON_FIRST_PARTY = {
     "permitted",  # a compiled regex in the allow-list example
     "config",  # a dict loaded from a JSON config file
     "fw_config",  # the "firewall" sub-dict of that config
+    "chat_client",  # the MAF client the user built (agent_framework)
 }
 
 
@@ -832,3 +835,125 @@ def test_documented_training_config_parameters_reference_declared_components():
                         f"{parameter.component!r}, which is not declared under "
                         f"target.components ({sorted(declared)})"
                     )
+
+
+def test_documented_integration_factories_all_exist():
+    """Every factory named in the guardrails matrix must be importable.
+
+    The matrix is the skill's index into `adapt_agent.integrations`; a renamed
+    factory would send an agent to a function that does not exist.
+    """
+    import importlib
+    import re as _re
+
+    text = get_skill(SKILL_NAME).read("references/guardrails.md")
+    rows = _re.findall(
+        r"`(agent_framework|google_adk|openai_agents|claude_agent|langgraph|crewai|pydantic_ai)\.([a-z_]+)\(\)`",
+        text,
+    )
+    assert rows, "the native-hook matrix vanished from guardrails.md"
+    for module_name, factory in rows:
+        module = importlib.import_module(f"adapt_agent.integrations.{module_name}")
+        assert callable(getattr(module, factory, None)), f"{module_name}.{factory} is not callable"
+
+
+def test_documented_field_metrics_recipe_runs_as_written():
+    """Execute the structured-scoring block from SKILL.md verbatim."""
+    skill = get_skill(SKILL_NAME)
+    blocks = [b for b in _code_blocks(skill.read(), "python") if "field_metrics(" in b]
+    assert blocks, "the field_metrics recipe vanished from SKILL.md"
+
+    class _Envelope:
+        text = '{"lane": "NOS", "matter": "M1", "action": "file", "pack": "none"}'
+        messages: list = []
+
+    class _Agent:
+        def run(self, _):
+            return _Envelope()
+
+    namespace = {
+        "agent": _Agent(),
+        "data": [
+            {
+                "input": "e",
+                "expected": {"lane": "NOS", "matter": "M1", "action": "file", "pack": "P1"},
+            }
+        ],
+        "evaluate_agent": evaluate_agent,
+    }
+    exec(blocks[0], namespace)  # noqa: S102 - executing our own documentation
+    assert namespace["report"].aggregate == {
+        "lane": 1.0,
+        "matter": 1.0,
+        "action": 1.0,
+        "pack": 0.0,
+    }
+
+
+def test_documented_output_extractor_values_are_usable():
+    """Every `output_extractor=` the docs prescribe must actually be accepted.
+
+    The mixed-metric escape hatch was documented as `output_extractor="payload"`,
+    a string `evaluate_agent` rejects -- so following the advice raised
+    `ValueError`. A prescription that cannot be executed is worse than none: it
+    is reached for precisely when something has already gone wrong.
+    """
+    import adapt_agent.evaluation as api
+
+    pattern = r"output_extractor=([A-Za-z_\"'][\w\"']*)"
+    prescribed: set[str] = set()
+
+    for path in (Path("docs"), Path("adapt_agent/skills")):
+        for markdown in path.rglob("*.md"):
+            prescribed.update(re.findall(pattern, markdown.read_text(encoding="utf-8")))
+
+    # Docstrings too. The first version of this guard read only the two markdown
+    # files, and the very next review round found the same unsupported string
+    # still sitting in `checks()`'s own docstring -- the guard was right and its
+    # *scope* was wrong. Source is parsed rather than grepped so that ordinary
+    # code (`output_extractor=extractor`) is not mistaken for advice.
+    for source in Path("adapt_agent").rglob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                doc = ast.get_docstring(node)
+                if doc:
+                    prescribed.update(re.findall(pattern, doc))
+
+    assert prescribed, "nothing prescribes an extractor any more -- has this guard drifted?"
+
+    for value in sorted(prescribed):
+        if value == "None":  # a documented, and accepted, way to unwrap nothing
+            continue
+        if value.startswith(("'", '"')):
+            bare = value.strip("'\"")
+            assert bare == "auto", (
+                f"docs prescribe output_extractor={value}, but evaluate_agent accepts "
+                f"only 'auto', a callable, or None"
+            )
+        else:
+            assert callable(getattr(api, value, None)), (
+                f"docs prescribe output_extractor={value}, which is not a callable "
+                f"exported from adapt_agent.evaluation"
+            )
+
+    # And the escape hatch does what it is prescribed for: a structural row
+    # scores through a mixed metric list.
+    class Agent:
+        def run(self, _):
+            return {"answer": "Paris", "confidence": 1}
+
+    rows = [
+        {
+            "input": "q",
+            "expected": {"answer": "Paris"},
+            "metadata": {"check": {"name": "field_match", "field": "answer"}},
+        }
+    ]
+    report = evaluate_agent(
+        Agent(),
+        rows,
+        metrics=[api.checks(), api.exact_match()],
+        output_extractor=api.extract_output_payload,
+    )
+    assert report.aggregate["checks"] == 1.0

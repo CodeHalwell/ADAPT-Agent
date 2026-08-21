@@ -225,3 +225,44 @@ that drives the system and the components supply the tunable knobs.
 - **Budget is per-run**: `max_evals` counts harness evaluations, each of which
   runs the whole dataset — reduce with `dataset.sample(n, seed=0)` while
   iterating.
+
+## Exporting the winning configuration
+
+`result.best_config` is applied to the live components in place and dies with
+the process. For a project whose prompts are version-controlled, that is the
+wrong end state — and an LLM-rewritten prompt reaching production without a
+human reading the diff is worse than losing a tuning run.
+
+```python
+result = CoordinateAscentOptimizer(harness, judge=judge).optimize(target, dataset)
+result.to_config("specialists/.config/tuned.yaml")
+```
+
+The file nests by component, because parameter names follow
+`"<component>.<knob>"`:
+
+```yaml
+# Tuned by adapt-agent.
+# baseline=0.6300 best=0.9100 improvement=+0.2800 over 60 evals.
+# Review this diff before committing: prompts here were machine-written.
+researcher:
+  system_prompt: |
+    You are a careful researcher...
+  temperature: 0.2
+writer:
+  model: gpt-4o
+```
+
+So the loop becomes **optimize → diff → review → commit**, and the application
+keeps loading prompts from the YAML it always did. `header=False` drops the
+comment block; `default_component=` names the section for a parameter with no
+`.` prefix.
+
+Round-trip it with `load_tuned_config`, which flattens the file back into the
+form `OptimizableAgent.apply` expects:
+
+```python
+from adapt_agent.optimization import load_tuned_config
+
+target.apply(load_tuned_config("specialists/.config/tuned.yaml"))
+```
