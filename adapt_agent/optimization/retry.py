@@ -1,0 +1,221 @@
+"""Transient-error classification and backoff for evaluation runs.
+
+Why this exists: under concurrency, provider rate limiting is *expected*, and an
+evaluation harness that scores a throttled example zero does not merely lose a
+data point -- it corrupts the comparison. A 429 is indistinguishable from a bad
+prompt once it lands as ``error`` plus a zero score, and the damage is
+systematic rather than random: whichever candidate happens to be evaluated while
+the provider is busiest scores lowest, so an optimizer can select a prompt for
+having been lucky with rate limits. That is a measurement bug, not a robustness
+nicety.
+
+Two pieces, both duck-typed so no provider SDK is ever imported:
+
+* :func:`is_transient_error` -- does this exception look like throttling or a
+  transient server/network fault, as opposed to the agent being broken?
+* :class:`RetryPolicy` -- how many attempts, and how long to wait between them,
+  honouring a server-supplied ``Retry-After`` when there is one.
+
+The classifier is deliberately generous. A false positive costs one slow retry;
+a false negative silently biases every score the run produces.
+"""
+
+from __future__ import annotations
+
+import random
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+#: HTTP status codes worth retrying: throttling, request timeouts, and the
+#: 5xx family that means "the server, not your request, is having a problem".
+_TRANSIENT_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+#: Attributes that may carry an HTTP status, in the order providers use them.
+_STATUS_ATTRS = ("status_code", "status", "http_status", "code")
+
+#: Exception *type name* fragments that mark a transient fault. Matched
+#: case-insensitively against the class name and its bases, so provider-specific
+#: subclasses (``RateLimitError``, ``APITimeoutError``, ``ServiceUnavailable``,
+#: ``ThrottlingException``, ...) are all caught without importing any of them.
+_TRANSIENT_TYPE_FRAGMENTS = (
+    "ratelimit",
+    "toomanyrequests",
+    "throttl",
+    "timeout",
+    "timedout",
+    "serviceunavailable",
+    "unavailable",
+    "overloaded",
+    "apiconnection",
+    "connectionerror",
+    "connectionreset",
+    "internalserver",
+    "badgateway",
+    "temporarilyunavailable",
+)
+
+#: Message fragments, matched case-insensitively. Bare status numbers are
+#: matched as whole words so a token count or an id containing "429" does not
+#: trip them.
+_TRANSIENT_MESSAGE_FRAGMENTS = (
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "throttl",
+    "service unavailable",
+    "temporarily unavailable",
+    "overloaded",
+    "server had an error",
+    "internal server error",
+    "bad gateway",
+    "gateway timeout",
+    "connection reset",
+    "connection aborted",
+    "timed out",
+    "timeout",
+)
+
+_STATUS_WORD = re.compile(r"\b(408|409|425|429|500|502|503|504)\b")
+
+
+def _status_of(exc: BaseException) -> int | None:
+    """Return an HTTP status carried by ``exc`` (directly or on a response)."""
+    for source in (exc, getattr(exc, "response", None)):
+        if source is None:
+            continue
+        for attr in _STATUS_ATTRS:
+            value = getattr(source, attr, None)
+            if isinstance(value, bool):  # bool is an int; never a status
+                continue
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+    return None
+
+
+def _type_names(exc: BaseException) -> list[str]:
+    """Lowercased class names of ``exc`` and its bases, punctuation stripped."""
+    return [cls.__name__.replace("_", "").lower() for cls in type(exc).__mro__]
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """Return ``True`` when ``exc`` looks like throttling or a transient fault.
+
+    Checked in order of decreasing reliability: an explicit HTTP status, then
+    the exception's type name, then its message. Never imports a provider SDK.
+
+    A :class:`KeyboardInterrupt` / :class:`SystemExit` / ``CancelledError`` is
+    never transient -- those mean *stop*, not *try again*.
+    """
+    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        return False
+    if type(exc).__name__ == "CancelledError":
+        return False
+
+    status = _status_of(exc)
+    if status is not None:
+        return status in _TRANSIENT_STATUS
+
+    names = _type_names(exc)
+    if any(fragment in name for name in names for fragment in _TRANSIENT_TYPE_FRAGMENTS):
+        return True
+
+    message = str(exc).lower()
+    if any(fragment in message for fragment in _TRANSIENT_MESSAGE_FRAGMENTS):
+        return True
+    return bool(_STATUS_WORD.search(message))
+
+
+def retry_after_seconds(exc: BaseException) -> float | None:
+    """Return the server's requested wait, if it supplied one.
+
+    Reads a ``retry_after`` attribute or a ``Retry-After`` header off an
+    attached response. Only the delay-seconds form is understood; the HTTP-date
+    form returns ``None`` so the caller falls back to its own backoff. Negative
+    or absurd values are rejected rather than trusted.
+    """
+    candidates: list[Any] = [getattr(exc, "retry_after", None)]
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            candidates.append(headers.get("retry-after", headers.get("Retry-After")))
+        except Exception:  # a headers object that does not behave like a mapping
+            pass
+
+    for value in candidates:
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= seconds <= 300.0:
+            return seconds
+    return None
+
+
+@dataclass
+class RetryPolicy:
+    """Exponential backoff for transient provider errors.
+
+    Args:
+        attempts: Total tries per example, including the first. ``1`` disables
+            retrying without disabling classification, so a throttled example is
+            still *reported* as transient rather than as a bad answer.
+        initial_backoff: Seconds to wait after the first failure.
+        multiplier: Growth factor applied per subsequent failure.
+        max_backoff: Ceiling on a single wait.
+        jitter: Fraction of the computed delay to randomise, in ``[0, 1]``.
+            Full-zero makes waits deterministic (useful in tests); the default
+            spreads retries so concurrent workers do not resynchronise into the
+            thundering herd that caused the throttling.
+        is_transient: Classifier override. Defaults to
+            :func:`is_transient_error`; supply your own to widen or narrow it.
+        respect_retry_after: Prefer a server-supplied ``Retry-After`` over the
+            computed backoff when one is present.
+    """
+
+    attempts: int = 3
+    initial_backoff: float = 0.5
+    multiplier: float = 2.0
+    max_backoff: float = 30.0
+    jitter: float = 0.25
+    is_transient: Callable[[BaseException], bool] = field(default=is_transient_error)
+    respect_retry_after: bool = True
+
+    def should_retry(self, exc: BaseException, attempt: int) -> bool:
+        """Whether a failure on 1-based ``attempt`` earns another try."""
+        if attempt >= max(1, self.attempts):
+            return False
+        try:
+            return bool(self.is_transient(exc))
+        except Exception:  # a broken custom classifier must not abort the run
+            return False
+
+    def delay_for(self, exc: BaseException, attempt: int) -> float:
+        """Seconds to wait before retry number ``attempt`` (1-based)."""
+        if self.respect_retry_after:
+            requested = retry_after_seconds(exc)
+            if requested is not None:
+                return min(requested, self.max_backoff)
+        delay = min(self.initial_backoff * (self.multiplier ** (attempt - 1)), self.max_backoff)
+        if self.jitter > 0.0:
+            spread = delay * min(self.jitter, 1.0)
+            delay = max(0.0, delay + random.uniform(-spread, spread))
+        return delay
+
+
+#: Used when a harness is constructed without an explicit policy.
+DEFAULT_RETRY_POLICY = RetryPolicy()
+
+
+__all__ = [
+    "RetryPolicy",
+    "DEFAULT_RETRY_POLICY",
+    "is_transient_error",
+    "retry_after_seconds",
+]

@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Microsoft Agent Framework agents yielded nothing tunable.** The
+  introspector required `.instructions` and `.chat_client` as *attributes*.
+  Current releases put the client on `.client` and the prompt, tools and
+  sampling settings inside `default_options`, so `detect()` returned `None`,
+  no `PROMPT` parameter was discovered, and `OptimizableAgent.from_agent()`
+  silently produced nothing to optimize -- which reads as "this agent has no
+  knobs" rather than as a broken introspector, against a framework the library
+  lists as supported. Both layouts are read now, attribute first. Verified
+  against `agent-framework-core` itself, not a fake of it: the fakes in the test
+  suite all encoded the old shape, which is exactly why this shipped green.
+- **A throttled example was scored as a bad answer.** Transient provider
+  failures (429, 5xx, timeouts, dropped connections) are now retried with
+  jittered exponential backoff, honouring `Retry-After`; one that outlives its
+  retries is marked `transient`, counted in `EvaluationReport.n_transient_errors`,
+  and excluded from the score and from `failures()`.
+
+  This is a measurement bug, not a robustness nicety. Under concurrency, rate
+  limiting is expected, and a throttled case scoring `0.0` is indistinguishable
+  from a bad prompt -- but it biases *systematically*: whichever candidate is
+  evaluated while the provider is busiest scores lowest, so an optimizer can
+  select a prompt for having been lucky. One 429 in three cases moved a perfect
+  run from `1.000` to `0.667`. Only errors classified transient are retried; a
+  genuinely broken agent still fails once and scores zero.
+
+### Added
+
+- **`EvaluationHarness(concurrency=)`**, a per-instance default used when a call
+  site passes none. `0.3.0` added `concurrency` to `evaluate`/`aevaluate`, but an
+  `Optimizer` calls `harness.evaluate(target, dataset)` with no keyword
+  arguments -- so the knob could not reach the one path that needs it, being
+  `max_evals x len(dataset)` round trips rather than a single pass. A per-call
+  argument still wins where one is given.
+- **`adapt_agent.optimization.retry`**: `RetryPolicy`, `is_transient_error` and
+  `retry_after_seconds`, all duck-typed so no provider SDK is imported. Pass
+  `RetryPolicy(attempts=1)` to classify transient failures without retrying
+  them, or `is_transient=` to supply your own classifier.
+
 ## [0.3.1] - 2026-08-21
 
 ### Security

@@ -67,7 +67,7 @@ Inspect what was found: `target.describe()`, `target.parameters`,
 | Framework | Discovered knobs |
 | --- | --- |
 | Pydantic AI | `_system_prompts` / `system_prompt`, `model`, `model_settings` (temperature/top_p/max_tokens), function tools |
-| Microsoft Agent Framework | `instructions`, chat-client model + settings, `tools`; Magentic/workflow routing limits |
+| Microsoft Agent Framework | `instructions`, client model + settings, `tools`; Magentic/workflow routing limits. Reads both layouts: `.chat_client`/`.instructions` attributes, and current releases' `.client` + `default_options["instructions"]` |
 | Google ADK | `instruction`, `global_instruction`, `model`, `generate_content_config` (temperature/top_p/max_output_tokens), `tools`, `sub_agents` (recursive) |
 | LangGraph | best-effort structural walk of `nodes` → node runnable prompts, bound chat models, tool lists |
 | CrewAI | agent `role`/`goal`/`backstory`, `llm`, task descriptions, `tools` |

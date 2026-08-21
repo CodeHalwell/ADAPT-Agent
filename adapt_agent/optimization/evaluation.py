@@ -25,6 +25,7 @@ from typing import Any, cast
 
 from adapt_agent.optimization.dataset import Example, GoldenDataset
 from adapt_agent.optimization.metrics import Metric, MetricFn, coerce_metric
+from adapt_agent.optimization.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,13 @@ class ExampleResult:
     scores: dict[str, float]
     latency: float
     error: str | None = None
+    #: True when this example failed with a *transient* provider error (429,
+    #: 5xx, timeout) that survived every retry. Such a result says nothing about
+    #: the agent's quality, so it is kept out of the aggregate and out of
+    #: :meth:`EvaluationReport.failures` -- see :attr:`EvaluationReport.n_transient_errors`.
+    transient: bool = False
+    #: How many times the agent was called for this example (1 = no retry).
+    attempts: int = 1
 
     @property
     def primary_ok(self) -> bool:
@@ -158,6 +166,13 @@ class EvaluationReport:
         primary_metric: Name of the metric whose aggregate is the headline score.
         results: Per-example :class:`ExampleResult` records.
         n_errors: Number of examples that raised during execution.
+        n_transient_errors: How many of ``n_errors`` were transient provider
+            faults (throttling, 5xx, timeouts) that outlived their retries.
+            These are *excluded from* :attr:`aggregate`, so a run that hit rate
+            limits scores the same as one that did not -- otherwise whichever
+            candidate was evaluated while the provider was busiest would score
+            lowest, and an optimizer would select for luck. Compare it against
+            ``n`` to judge whether a run is trustworthy at all.
         total_latency: Wall-clock seconds summed across example runs.
     """
 
@@ -165,6 +180,7 @@ class EvaluationReport:
     primary_metric: str
     results: list[ExampleResult] = field(default_factory=list)
     n_errors: int = 0
+    n_transient_errors: int = 0
     total_latency: float = 0.0
     #: Default threshold used by :meth:`failures` when none is supplied. Set by
     #: the producing :class:`EvaluationHarness` from its ``failure_threshold``;
@@ -198,11 +214,18 @@ class EvaluationReport:
         (set by the producing harness, default ``1.0``). Supplying ``threshold``
         explicitly always wins. Lower the threshold for continuous-score metrics
         so this doesn't return every imperfect example.
+
+        Examples that failed transiently (see :attr:`n_transient_errors`) are
+        omitted: this list is what gets handed to an LLM proposer as "cases your
+        instruction still gets wrong", and "the provider throttled you" is not
+        evidence about the instruction.
         """
         name = metric or self.primary_metric
         cutoff = self.failure_threshold if threshold is None else threshold
         out: list[ExampleResult] = []
         for r in self.results:
+            if r.transient:
+                continue
             if r.error is not None or r.scores.get(name, 0.0) < cutoff:
                 out.append(r)
         return out
@@ -223,6 +246,7 @@ class EvaluationReport:
             "aggregate": dict(self.aggregate),
             "n": self.n,
             "n_errors": self.n_errors,
+            "n_transient_errors": self.n_transient_errors,
             "avg_latency": self.avg_latency,
         }
 
@@ -230,7 +254,9 @@ class EvaluationReport:
         metrics = ", ".join(f"{k}={v:.3f}" for k, v in sorted(self.aggregate.items()))
         return (
             f"EvaluationReport(score={self.score:.3f} [{self.primary_metric}], "
-            f"n={self.n}, errors={self.n_errors}, {metrics})"
+            f"n={self.n}, errors={self.n_errors}"
+            + (f" ({self.n_transient_errors} transient)" if self.n_transient_errors else "")
+            + f", {metrics})"
         )
 
 
@@ -275,6 +301,8 @@ class EvaluationHarness:
         failure_threshold: float = 1.0,
         cache: bool = False,
         output_extractor: Callable[[Any], Any] | None = None,
+        concurrency: int = 1,
+        retry: RetryPolicy | None = None,
     ):
         self.metrics: list[Metric] = self._normalize_metrics(metrics)
         if not self.metrics:
@@ -291,6 +319,8 @@ class EvaluationHarness:
         # Reserved: no caching is performed today (see class docstring).
         self.cache = cache
         self.output_extractor = output_extractor
+        self.concurrency = max(1, concurrency)
+        self.retry = DEFAULT_RETRY_POLICY if retry is None else retry
 
     @staticmethod
     def _normalize_metrics(metrics: Any) -> list[Metric]:
@@ -319,15 +349,17 @@ class EvaluationHarness:
         return [coerce_metric(metrics)]
 
     def evaluate(
-        self, agent: Any, dataset: GoldenDataset, *, concurrency: int = 1
+        self, agent: Any, dataset: GoldenDataset, *, concurrency: int | None = None
     ) -> EvaluationReport:
         """Run ``agent`` over ``dataset`` and return an :class:`EvaluationReport`.
 
         Args:
             agent: Anything :func:`resolve_runner` accepts.
             dataset: The golden dataset to score against.
-            concurrency: How many examples to run at once. ``1`` (the default)
-                keeps the historical strictly-serial behaviour. Higher values
+            concurrency: How many examples to run at once. ``None`` (the
+                default) uses the harness's own ``concurrency``, itself ``1``
+                unless set, which keeps the historical strictly-serial
+                behaviour. Higher values
                 run examples in a thread pool, which is the right tool for a
                 *synchronous* agent whose time goes on network I/O -- an LLM
                 round-trip per example. For an async-native agent prefer
@@ -337,6 +369,7 @@ class EvaluationHarness:
         per-example non-fatal error handling is identical on both paths.
         """
         runner = resolve_runner(agent)
+        concurrency = self.concurrency if concurrency is None else concurrency
         if concurrency <= 1:
             return self._build_report(
                 self._run_one(runner, index, example) for index, example in enumerate(dataset)
@@ -376,13 +409,14 @@ class EvaluationHarness:
                     yield future.result()
 
     async def aevaluate(
-        self, agent: Any, dataset: GoldenDataset, *, concurrency: int = 1
+        self, agent: Any, dataset: GoldenDataset, *, concurrency: int | None = None
     ) -> EvaluationReport:
         """Async twin of :meth:`evaluate`, for async-native agents.
 
         Runs up to ``concurrency`` examples at once against the caller's event
         loop -- no threads, so ``contextvars`` (tracing spans) are preserved and
-        a governed agent's :meth:`aexecute` path is used.
+        a governed agent's :meth:`aexecute` path is used. ``None`` takes the
+        harness's own ``concurrency``.
 
         This is the difference between an eval you run once and one you run
         often: a coordinate-ascent sweep is ``max_evals x len(dataset)`` LLM
@@ -395,6 +429,7 @@ class EvaluationHarness:
         dropped rather than accumulated.
         """
         runner = aresolve_runner(agent)
+        concurrency = self.concurrency if concurrency is None else concurrency
         accumulator = _Accumulator(self)
         examples = enumerate(dataset)
 
@@ -423,34 +458,87 @@ class EvaluationHarness:
 
     def _run_one(self, runner: Callable[[Any], Any], index: int, example: Example) -> ExampleResult:
         start = time.perf_counter()
-        try:
-            output = runner(example.inputs)
-        except Exception as exc:  # non-fatal: record and score zero
-            return self._error_result(index, example, time.perf_counter() - start, exc)
-        return self._score_one(index, example, output, time.perf_counter() - start)
+        policy = self.retry
+        attempt = 1
+        while True:
+            try:
+                output = runner(example.inputs)
+            except Exception as exc:  # non-fatal: retry if transient, else record
+                if policy.should_retry(exc, attempt):
+                    delay = policy.delay_for(exc, attempt)
+                    logger.info(
+                        "Transient error on example %d (attempt %d/%d), retrying in %.2fs: %s",
+                        index,
+                        attempt,
+                        policy.attempts,
+                        delay,
+                        exc,
+                    )
+                    # A thread-pool worker, or the caller's own thread on the
+                    # serial path: blocking here is what we want, and it is the
+                    # backpressure that lets the provider recover.
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+                return self._error_result(
+                    index, example, time.perf_counter() - start, exc, attempts=attempt
+                )
+            return self._score_one(
+                index, example, output, time.perf_counter() - start, attempts=attempt
+            )
 
     async def _arun_one(
         self, runner: Callable[[Any], Awaitable[Any]], index: int, example: Example
     ) -> ExampleResult:
         start = time.perf_counter()
-        try:
-            output = await runner(example.inputs)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # non-fatal: record and score zero
-            return self._error_result(index, example, time.perf_counter() - start, exc)
+        policy = self.retry
+        attempt = 1
+        while True:
+            try:
+                output = await runner(example.inputs)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # non-fatal: retry if transient, else record
+                if not policy.should_retry(exc, attempt):
+                    return self._error_result(
+                        index, example, time.perf_counter() - start, exc, attempts=attempt
+                    )
+                delay = policy.delay_for(exc, attempt)
+                logger.info(
+                    "Transient error on example %d (attempt %d/%d), retrying in %.2fs: %s",
+                    index,
+                    attempt,
+                    policy.attempts,
+                    delay,
+                    exc,
+                )
+                # `asyncio.sleep`, never `time.sleep`: this coroutine is sharing
+                # the caller's loop with every other in-flight example.
+                await asyncio.sleep(delay)
+                attempt += 1
         latency = time.perf_counter() - start
         # Scoring goes to a worker thread. Metrics are synchronous by contract,
         # and an LLM judge's provider call is a *network* round trip: run inline
         # here, the agent calls overlap but their judging serialises on the loop
         # and stalls every other task. `asyncio.to_thread` propagates
         # `contextvars`, so a judge still sees the caller's tracing context.
-        return await asyncio.to_thread(self._score_one, index, example, output, latency)
+        return await asyncio.to_thread(self._score_one, index, example, output, latency, attempt)
 
     def _error_result(
-        self, index: int, example: Example, latency: float, exc: Exception
+        self, index: int, example: Example, latency: float, exc: Exception, *, attempts: int = 1
     ) -> ExampleResult:
-        logger.warning("Agent raised on example %d: %s", index, exc)
+        transient = self.retry.should_retry(exc, 0)
+        if transient:
+            logger.warning(
+                "Example %d failed transiently after %d attempt(s); excluded from the "
+                "score rather than counted against the agent: %s",
+                index,
+                attempts,
+                exc,
+            )
+        else:
+            logger.warning("Agent raised on example %d: %s", index, exc)
         return ExampleResult(
             index=index,
             inputs=example.inputs if self.capture_output else None,
@@ -459,10 +547,12 @@ class EvaluationHarness:
             scores={m.name: 0.0 for m in self.metrics},
             latency=latency,
             error=str(exc),
+            transient=transient,
+            attempts=attempts,
         )
 
     def _score_one(
-        self, index: int, example: Example, output: Any, latency: float
+        self, index: int, example: Example, output: Any, latency: float, attempts: int = 1
     ) -> ExampleResult:
         """Apply the output extractor and every metric. Shared by both paths."""
         if self.output_extractor is not None:
@@ -486,6 +576,7 @@ class EvaluationHarness:
             expected=example.expected,
             scores=scores,
             latency=latency,
+            attempts=attempts,
         )
 
     def _build_report(self, results_iter: Any) -> EvaluationReport:
@@ -513,15 +604,23 @@ class _Accumulator:
         self._counts: dict[str, int] = {}
         self._unordered = False
         self._n_errors = 0
+        self._n_transient_errors = 0
         self._total_latency = 0.0
 
     def add(self, result: ExampleResult) -> None:
         self._total_latency += result.latency
         if result.error is not None:
             self._n_errors += 1
-        for name, score in result.scores.items():
-            self._sums[name] = self._sums.get(name, 0.0) + score
-            self._counts[name] = self._counts.get(name, 0) + 1
+        if result.transient:
+            # A throttled example carries a zero score it did not earn. Folding
+            # that into the mean is what lets an optimizer prefer whichever
+            # candidate happened to run when the provider was least busy, so the
+            # record is kept (and counted) but never scored.
+            self._n_transient_errors += 1
+        else:
+            for name, score in result.scores.items():
+                self._sums[name] = self._sums.get(name, 0.0) + score
+                self._counts[name] = self._counts.get(name, 0) + 1
         if result.index < self._harness.max_results:
             if self._results and result.index < self._results[-1].index:
                 self._unordered = True
@@ -539,6 +638,7 @@ class _Accumulator:
             primary_metric=self._harness.primary_metric,
             results=self._results,
             n_errors=self._n_errors,
+            n_transient_errors=self._n_transient_errors,
             total_latency=self._total_latency,
             failure_threshold=self._harness.failure_threshold,
         )
@@ -548,6 +648,7 @@ __all__ = [
     "EvaluationHarness",
     "EvaluationReport",
     "ExampleResult",
+    "RetryPolicy",
     "aresolve_runner",
     "resolve_runner",
 ]

@@ -110,6 +110,11 @@ from adapt_agent.optimization.providers import (
     get_provider,
     register_provider,
 )
+from adapt_agent.optimization.retry import (
+    DEFAULT_RETRY_POLICY,
+    RetryPolicy,
+    is_transient_error,
+)
 from adapt_agent.optimization.runners import adk_runner, framework_runner, langgraph_inputs
 from adapt_agent.optimization.target import OptimizableAgent, wrap
 
@@ -158,6 +163,9 @@ __all__ = [
     "ExampleResult",
     "resolve_runner",
     "aresolve_runner",
+    "RetryPolicy",
+    "DEFAULT_RETRY_POLICY",
+    "is_transient_error",
     "evaluate_agent",
     # framework output extraction / runners
     "extract_output_text",

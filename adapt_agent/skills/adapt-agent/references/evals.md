@@ -188,6 +188,17 @@ async-native agent — it awaits in your loop, so `contextvars` (tracing spans)
 survive and no thread is involved; use `evaluate(concurrency=)` for a sync agent
 whose time goes on network I/O.
 
+**On the optimizer path, set it on the harness instead.** An `Optimizer` calls
+`harness.evaluate(target, dataset)` with no keyword arguments, so a per-call
+`concurrency=` cannot reach the one path that needs it most:
+
+```python
+harness = EvaluationHarness(metrics, concurrency=8)   # the per-instance default
+CoordinateAscentOptimizer(harness=harness, ...).optimize(target, dataset)
+```
+
+A per-call argument still wins where one is given.
+
 Both preserve the guarantees of the serial path: results are reported in
 **example-index order** regardless of completion order, a per-example exception
 is still a non-fatal zero-scored error, and `max_results` still bounds stored
@@ -195,10 +206,42 @@ records while every example is aggregated. `avg_latency` stays the mean
 *per-example* latency, not wall-clock/n, so it remains comparable across
 concurrency settings.
 
+### Throttling is retried, and never scored
+
 Concurrency multiplies provider rate-limit pressure by the same factor: `N`
-in-flight examples is `N` simultaneous LLM calls, and a 429 surfaces as a
-per-example error scoring 0.0 rather than as a crash — which can look like a
-quality regression. Start at 4–8 and raise it against your own quota.
+in-flight examples is `N` simultaneous LLM calls. Start at 4–8 and raise it
+against your own quota.
+
+Transient failures — 429, 5xx, timeouts, dropped connections — are retried with
+jittered exponential backoff (three attempts by default), honouring a
+`Retry-After` header when the provider sends one. A failure that outlives its
+retries is recorded as `transient`, counted in `report.n_transient_errors`, and
+then **left out of the score entirely**:
+
+```python
+report.score               # unaffected by throttling
+report.n_errors            # includes transient failures
+report.n_transient_errors  # how many of them were the provider's fault
+report.failures()          # excludes them: not evidence about your prompt
+```
+
+This is a correctness property, not a convenience. Scoring a throttled example
+zero makes it indistinguishable from a bad prompt, and the error is systematic
+rather than random: whichever candidate is evaluated while the provider is
+busiest scores lowest, so an optimizer can select a prompt for having been lucky
+with rate limits. Check `n_transient_errors` against `n` to judge whether a run
+is trustworthy at all.
+
+Only errors classified transient are retried — a genuinely broken agent still
+fails once and scores zero, as it should. Tune or replace the policy:
+
+```python
+from adapt_agent.optimization import RetryPolicy
+
+EvaluationHarness(metrics, retry=RetryPolicy(attempts=5, max_backoff=60))
+EvaluationHarness(metrics, retry=RetryPolicy(attempts=1))   # classify, don't retry
+EvaluationHarness(metrics, retry=RetryPolicy(is_transient=my_classifier))
+```
 
 ## Choosing metrics
 
