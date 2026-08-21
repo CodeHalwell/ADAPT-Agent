@@ -457,7 +457,7 @@ class _GovernedAgent:
         """
         trace_id, payload = self._before(input_data)
         try:
-            raw = self._adapter._call_runner(self._arunner, payload)
+            raw = await self._acall_runner(payload)
             result = await _aresolve_result(raw)
         except BaseException as exc:
             # BaseException, not Exception: `asyncio.CancelledError` derives from
@@ -466,6 +466,29 @@ class _GovernedAgent:
             self._trace_error(trace_id, exc)
             raise
         return self._after(trace_id, result)
+
+    async def _acall_runner(self, payload: dict[str, Any]) -> Any:
+        """Invoke the async-preferred runner without blocking the caller's loop.
+
+        A framework with no async entry point still reaches `aexecute` -- the
+        resolver falls back to the sync runner so an async app can use one entry
+        point uniformly. But calling it does the work *before* the first await,
+        which blocks the whole loop: measured with a slow sync agent, a
+        heartbeat task got zero ticks and three concurrent calls serialised
+        (0.45s for 3 x 150ms). That defeats the concurrency this method exists
+        for, and this docstring promises.
+
+        A declared coroutine or async-generator function returns immediately, so
+        it is called inline. Anything else goes to a worker thread --
+        ``asyncio.to_thread`` propagates ``contextvars``, so an active
+        OpenTelemetry span still reaches the framework. A runner that merely
+        *returns* a coroutine (some adapters resolve one via a lambda) takes the
+        thread hop too and pays only its cost, because it returns at once.
+        """
+        runner = self._arunner
+        if inspect.iscoroutinefunction(runner) or inspect.isasyncgenfunction(runner):
+            return self._adapter._call_runner(runner, payload)
+        return await asyncio.to_thread(self._adapter._call_runner, runner, payload)
 
     # -- shared governance stages ---------------------------------------------
     # execute() and aexecute() differ only in how the framework result is

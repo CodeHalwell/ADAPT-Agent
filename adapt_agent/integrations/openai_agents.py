@@ -146,6 +146,7 @@ def governance_agent_hooks(
     defense: Any = None,
     policy_enforcer: Any = None,
     agent_id: str = "agent",
+    screen_output: bool = True,
     inner: Any = None,
 ) -> Any:
     """Governance on ``AgentHooks``, which runs for **every** agent in a run.
@@ -157,7 +158,8 @@ def governance_agent_hooks(
     shape a security control can take, so this is the seam for those agents.
 
     ``on_llm_start`` fires before every model call *for the agent it is attached
-    to*, and receives the input items about to be sent. Confirmed against the
+    to* and receives the input items about to be sent; ``on_end`` fires when the
+    agent finishes and receives its answer, so both directions are covered. Confirmed against the
     installed SDK, including through a handoff::
 
         hooks fired: ['triage:on_start', 'triage:on_llm_start(items=1)',
@@ -179,6 +181,7 @@ def governance_agent_hooks(
         policy_enforcer: Evaluated against the items plus the run's runtime
             context (``Runner.run(..., context=...)``).
         agent_id: Named in the raised error.
+        screen_output: Also screen the agent's final answer, on ``on_end``.
         inner: An existing ``AgentHooks`` to delegate to, so an app's own
             lifecycle hooks still run. Governance is applied first.
 
@@ -210,14 +213,25 @@ def governance_agent_hooks(
             if inner is not None:
                 await inner.on_llm_start(context, agent, system_prompt, input_items)
 
+        async def on_end(self, context: Any, agent: Any, output: Any) -> None:
+            # The other half of the seam. Guardrails give a handoff target
+            # neither input *nor* output screening; covering only the input made
+            # this factory the very thing it was added to replace -- a control
+            # that looks complete and is half missing.
+            if screen_output:
+                resolved.review_output(output)
+            if inner is not None:
+                await inner.on_end(context, agent, output)
+
     hooks = AdaptGovernanceHooks()
     if inner is not None:
         # Every *other* lifecycle hook belongs to the app. `__getattr__` cannot
         # forward them: the base class defines them, so lookup never misses and
         # the app's would be silently shadowed by the SDK's no-ops -- configured,
         # and doing nothing. Bind them on the instance, where they win.
+        governed = {"on_llm_start", "on_end"}
         for name in dir(base):
-            if name.startswith("on_") and name != "on_llm_start" and hasattr(inner, name):
+            if name.startswith("on_") and name not in governed and hasattr(inner, name):
                 setattr(hooks, name, getattr(inner, name))
     return hooks
 

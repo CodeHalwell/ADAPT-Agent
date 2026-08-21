@@ -101,6 +101,82 @@ def test_a_coroutine_returning_a_stream_is_drained():
     assert asyncio.run(guarded.aexecute({"messages": []}))["result"] == ["part one", "part two"]
 
 
+def test_aexecute_does_not_block_the_loop_on_a_sync_agent():
+    """A framework with no async entry point still reaches `aexecute`.
+
+    Calling the sync runner inline did the work *before* the first await, so the
+    whole loop stalled -- measured at zero heartbeat ticks and three concurrent
+    calls serialising. That defeats the concurrency this entry point exists for.
+    """
+    delay = 0.05
+
+    class SyncAgent:
+        def invoke(self, payload):
+            time.sleep(delay)
+            return "done"
+
+    guarded = LangGraphAdapter().wrap_agent(SyncAgent())
+
+    async def main():
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(delay / 10)
+                ticks += 1
+
+        beat = asyncio.ensure_future(heartbeat())
+        await guarded.aexecute({"messages": []})
+        beat.cancel()
+        return ticks
+
+    assert asyncio.run(main()) >= 3, "the event loop was blocked by the sync runner"
+
+
+def test_aexecute_runs_sync_agents_concurrently():
+    """The measurable consequence: three calls overlap instead of serialising."""
+    delay = 0.05
+
+    class SyncAgent:
+        def invoke(self, payload):
+            time.sleep(delay)
+            return "done"
+
+    guarded = LangGraphAdapter().wrap_agent(SyncAgent())
+
+    async def main():
+        started = time.perf_counter()
+        await asyncio.gather(*(guarded.aexecute({"messages": []}) for _ in range(3)))
+        return time.perf_counter() - started
+
+    assert asyncio.run(main()) < delay * 2.5, "three sync runs serialised"
+
+
+def test_aexecute_preserves_contextvars_through_a_sync_agent():
+    """Offloading to a thread must not lose the tracing context.
+
+    `asyncio.to_thread` propagates `contextvars`, which is the whole reason
+    `aexecute` exists rather than telling callers to use a worker thread.
+    """
+    trace: contextvars.ContextVar[str | None] = contextvars.ContextVar("trace", default=None)
+    seen: list[str | None] = []
+
+    class SyncAgent:
+        def invoke(self, payload):
+            seen.append(trace.get())
+            return "done"
+
+    guarded = LangGraphAdapter().wrap_agent(SyncAgent())
+
+    async def main():
+        trace.set("span-abc")
+        await guarded.aexecute({"messages": []})
+
+    asyncio.run(main())
+    assert seen == ["span-abc"]
+
+
 def test_sync_execute_also_drains_a_coroutine_returning_a_stream():
     """The sync resolver had the same bug as its async twin.
 

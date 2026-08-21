@@ -133,7 +133,8 @@ specialist's own input guardrail ran: False
 
 For those agents use `governance_agent_hooks()`, which binds to
 `AgentHooks.on_llm_start` — per agent, per model call, so it also screens tool
-results on their way back to the model. Pass `inner=` to keep the app's own
+results on their way back to the model — and to `on_end`, so the specialist's
+own answer is screened too. Pass `inner=` to keep the app's own
 lifecycle hooks running.
 
 ```python

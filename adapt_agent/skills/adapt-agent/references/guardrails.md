@@ -421,5 +421,6 @@ them on `current_turn == 0`. A specialist reached by a handoff never runs its
 own, so its firewall, defense and policy rules are silently skipped for
 transferred content. Use `governance_agent_hooks()` there: it binds to
 `AgentHooks.on_llm_start`, which fires per agent and per model call (so it also
-screens tool results returning to the model). `inner=` keeps the app's own
+screens tool results returning to the model), and to `on_end` for the agent's
+own answer. `inner=` keeps the app's own
 lifecycle hooks running.

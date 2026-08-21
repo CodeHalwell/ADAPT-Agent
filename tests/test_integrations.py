@@ -931,6 +931,77 @@ def test_a_handoff_target_is_governed_by_agent_hooks():
         )
 
 
+@pytest.mark.skipif(not _installed("agents"), reason="openai-agents not installed")
+def test_a_handoff_target_has_its_output_screened_too():
+    """Guardrails give a handoff target neither input *nor* output screening.
+
+    Covering only the input made the hooks factory the very thing it replaced --
+    a control that looks complete and is half missing. `on_end` receives the
+    agent's answer, so both directions are governed.
+    """
+    from agents import Agent, RunConfig, Runner
+    from agents.items import ModelResponse
+    from agents.models.interface import Model, ModelProvider
+    from agents.usage import Usage
+    from openai.types.responses import (
+        ResponseFunctionToolCall,
+        ResponseOutputMessage,
+        ResponseOutputText,
+    )
+
+    from adapt_agent.integrations import openai_agents as oa
+
+    class HandoffThenSay(Model):
+        def __init__(self, text):
+            self.turn, self.text = 0, text
+
+        async def get_response(self, *args, **kwargs):
+            handoffs = kwargs.get("handoffs") or (args[5] if len(args) > 5 else [])
+            self.turn += 1
+            if self.turn == 1 and handoffs:
+                call = ResponseFunctionToolCall(
+                    id="c1",
+                    call_id="c1",
+                    name=handoffs[0].tool_name,
+                    arguments="{}",
+                    type="function_call",
+                )
+                return ModelResponse(output=[call], usage=Usage(), response_id=None)
+            message = ResponseOutputMessage(
+                id="m1",
+                role="assistant",
+                status="completed",
+                type="message",
+                content=[ResponseOutputText(type="output_text", text=self.text, annotations=[])],
+            )
+            return ModelResponse(output=[message], usage=Usage(), response_id=None)
+
+        async def stream_response(self, *args, **kwargs):
+            raise NotImplementedError
+
+    def run(text):
+        class Provider(ModelProvider):
+            def __init__(self):
+                self.model = HandoffThenSay(text)
+
+            def get_model(self, name):
+                return self.model
+
+        specialist = Agent(
+            name="specialist",
+            instructions="x",
+            hooks=oa.governance_agent_hooks(firewall=_firewall(), agent_id="specialist"),
+        )
+        triage = Agent(name="triage", instructions="x", handoffs=[specialist])
+        return Runner.run(triage, "route me", run_config=RunConfig(model_provider=Provider()))
+
+    with pytest.raises(SecurityBlockedError, match=r"\[specialist\]"):
+        asyncio.run(run("the password is hunter2"))
+
+    # A clean answer still comes back, so the screen is not blanket.
+    assert asyncio.run(run("all fine")).final_output == "all fine"
+
+
 def test_one_problem_is_reported_once():
     """A payload yields many texts, so one blocked request reported the same
     label per text scanned: `["firewall", "firewall", "firewall"]`. The

@@ -128,7 +128,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the installed SDK. New `openai_agents.governance_agent_hooks()` binds to
   `AgentHooks.on_llm_start`, which fires per agent and per model call -- so it
   also screens tool results on their way back to the model -- and `inner=`
-  keeps the app's own lifecycle hooks running.
+  keeps the app's own lifecycle hooks running. `on_end` screens the
+  specialist's answer, so a handoff target is governed in both directions.
+- **`aexecute` blocked the event loop on a synchronous framework.** The
+  resolver falls back to the sync runner so an async app can use one entry
+  point uniformly, but calling it did the work before the first await: a
+  heartbeat task got zero ticks and three concurrent calls serialised (0.45s
+  for 3 x 150ms). The sync fallback runs in a worker thread now --
+  `asyncio.to_thread`, so `contextvars` and the active span still reach the
+  framework -- and the same three calls take 0.15s.
 - **A shared gate's label did not reach every message.** The Claude refusal
   reason and the OpenAI tripwire's `output_info` interpolated the factory
   parameter rather than the resolved gate id, so a binding using a shared gate
