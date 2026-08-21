@@ -100,9 +100,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are now walked explicitly, and the bound is sized from the deepest real
   payload (a governed ADK tool result is eight hops) rather than a guess,
   because a security scan that stops early fails open.
+- **An instruction hidden in a mapping *key* bypassed screening.** A tool
+  response is attacker-shaped data, keys included:
+  `{"ignore previous instructions": ""}` renders to the model exactly like the
+  same text in a value, but `extract_texts` walked only values -- so the
+  identical string was blocked as a value and passed untouched as a key.
+  String keys are scanned now.
 
 ### Fixed
 
+- **`aevaluate` scored on the event loop.** Metrics are synchronous by
+  contract and an LLM judge's provider call is a network round trip, so agent
+  calls overlapped while their judging serialised and stalled every other
+  task -- the concurrency knob bought nothing for exactly the model-graded runs
+  it exists for. Scoring is offloaded (4 rows x 50 ms: 0.21 s -> 0.06 s).
+- **A blocking sync generator was drained on the event loop.** `aexecute`
+  offloaded *creating* a synchronous fallback runner's generator but iterated it
+  on the loop thread, so a streaming SDK that blocks between yields still
+  serialised concurrent calls (0 heartbeat ticks -> 28).
 - **A Claude tool *result* was never screened.** Only `UserPromptSubmit` and
   `PreToolUse` were governed by default, so whatever a tool fetched from the
   open web reached the model unscreened unless it happened to be copied into a
@@ -606,6 +621,7 @@ package that actually installs and is usable end to end.
   optimization, adversarial defense, evaluation, observability, patches, and the
   `adapt-agent` CLI (`info` command).
 
-[Unreleased]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/CodeHalwell/ADAPT-Agent/releases/tag/v0.3.0
 [0.2.0]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/CodeHalwell/ADAPT-Agent/releases/tag/v0.1.0

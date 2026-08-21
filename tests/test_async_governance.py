@@ -101,6 +101,75 @@ def test_a_coroutine_returning_a_stream_is_drained():
     assert asyncio.run(guarded.aexecute({"messages": []}))["result"] == ["part one", "part two"]
 
 
+def test_aevaluate_does_not_score_on_the_event_loop():
+    """Metrics are synchronous by contract, and a judge's call is a network hop.
+
+    Scored inline, the agent calls overlap but their judging serialises on the
+    loop and stalls every other task -- the concurrency knob then buys nothing
+    for exactly the model-graded runs it was added for.
+    """
+    from adapt_agent.optimization.dataset import Example
+    from adapt_agent.optimization.metrics import Metric
+
+    delay = 0.05
+
+    def slow_judge(output, expected):
+        time.sleep(delay)
+        return 1.0
+
+    class Agent:
+        async def run(self, inputs):
+            await asyncio.sleep(delay / 10)
+            return "ok"
+
+    examples = [Example(inputs=f"q{i}", expected="ok") for i in range(4)]
+    harness = EvaluationHarness([Metric("slow_judge", slow_judge)])
+
+    async def main():
+        started = time.perf_counter()
+        report = await harness.aevaluate(Agent(), examples, concurrency=4)
+        return time.perf_counter() - started, report.score
+
+    elapsed, score = asyncio.run(main())
+    assert score == 1.0
+    assert elapsed < delay * 2.5, "scoring serialised on the event loop"
+
+
+def test_a_blocking_sync_generator_is_drained_off_the_loop():
+    """Creating the generator is cheap; iterating it is where a streaming sync
+    SDK blocks, so offloading only creation still stalls the loop."""
+    delay = 0.05
+
+    class Agent:
+        def invoke(self, payload):
+            def stream():
+                for index in range(3):
+                    time.sleep(delay)
+                    yield f"chunk {index}"
+
+            return stream()
+
+    guarded = LangGraphAdapter().wrap_agent(Agent())
+
+    async def main():
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(delay / 10)
+                ticks += 1
+
+        beat = asyncio.ensure_future(heartbeat())
+        result = await guarded.aexecute({"messages": []})
+        beat.cancel()
+        return ticks, result["result"]
+
+    ticks, result = asyncio.run(main())
+    assert result == ["chunk 0", "chunk 1", "chunk 2"]
+    assert ticks >= 5, "the event loop was blocked while draining the generator"
+
+
 def test_aexecute_does_not_block_the_loop_on_a_sync_agent():
     """A framework with no async entry point still reaches `aexecute`.
 

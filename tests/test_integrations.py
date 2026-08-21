@@ -1002,6 +1002,24 @@ def test_a_handoff_target_has_its_output_screened_too():
     assert asyncio.run(run("all fine")).final_output == "all fine"
 
 
+def test_an_instruction_hidden_in_a_mapping_key_is_screened():
+    """A tool response is attacker-shaped data, keys included.
+
+    `{"ignore previous instructions": ""}` renders to the model exactly like the
+    same text in a value, and scanning only values let it through untouched
+    while the identical string as a value was blocked.
+    """
+    gate = GovernanceGate(firewall=_firewall(), block_on_violation=False)
+
+    in_key = {"tool_name": "WebFetch", "tool_response": {INJECTION: ""}}
+    in_value = {"tool_name": "WebFetch", "tool_response": {"body": INJECTION}}
+    assert gate.scan_input(in_key) == ["firewall"]
+    assert gate.scan_input(in_value) == ["firewall"], "the control must still fire"
+
+    # Ordinary structural keys are not themselves threats.
+    assert gate.scan_input({"messages": [], "context": {}, "tool_name": "WebFetch"}) == []
+
+
 def test_one_problem_is_reported_once():
     """A payload yields many texts, so one blocked request reported the same
     label per text scanned: `["firewall", "firewall", "firewall"]`. The

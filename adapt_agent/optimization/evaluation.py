@@ -439,7 +439,13 @@ class EvaluationHarness:
             raise
         except Exception as exc:  # non-fatal: record and score zero
             return self._error_result(index, example, time.perf_counter() - start, exc)
-        return self._score_one(index, example, output, time.perf_counter() - start)
+        latency = time.perf_counter() - start
+        # Scoring goes to a worker thread. Metrics are synchronous by contract,
+        # and an LLM judge's provider call is a *network* round trip: run inline
+        # here, the agent calls overlap but their judging serialises on the loop
+        # and stalls every other task. `asyncio.to_thread` propagates
+        # `contextvars`, so a judge still sees the caller's tracing context.
+        return await asyncio.to_thread(self._score_one, index, example, output, latency)
 
     def _error_result(
         self, index: int, example: Example, latency: float, exc: Exception
