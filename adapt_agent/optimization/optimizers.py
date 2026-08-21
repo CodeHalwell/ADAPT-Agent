@@ -165,9 +165,19 @@ class OptimizationResult:
         """
         nested: dict[str, Any] = {}
         unexportable: dict[str, str] = {}
+        # A bare name that is also a component prefix -- `{"agent": 1,
+        # "agent.temperature": 0.2}` -- cannot share the top level with its own
+        # namespace. Written first it is indexed into as a mapping (`TypeError`);
+        # written second it overwrites the component's knobs. Both outcomes
+        # depend only on dict ordering, so the collision is resolved up front:
+        # the qualified knobs are the ones that can round-trip, and the bare
+        # name is described instead.
+        namespaces = {name.partition(".")[0] for name in self.best_config if "." in name}
         for name, value in self.best_config.items():
             component, _, knob = name.partition(".")
-            if not knob and isinstance(value, dict):
+            if not knob and name in namespaces:
+                unexportable[name] = _describe(value)
+            elif not knob and isinstance(value, dict):
                 # A bare name written as a top-level mapping is indistinguishable
                 # from a component section on reload, so `load_tuned_config`
                 # would return it as "<name>.<key>" and `apply()` would skip it.

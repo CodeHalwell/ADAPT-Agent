@@ -65,6 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as a per-column table (`{"lane": 0.94, ..., "pack": 0.0}`) rather than one
   blended number that hides which column moved. `evaluate_agent` switches to
   payload extraction automatically when every metric is structural.
+- `OptimizationResult.to_config(path)` handles a bare parameter name that is
+  also a component prefix (`{"agent": 1, "agent.temperature": 0.2}`): the two
+  cannot share the top level, and which one survived depended only on dict
+  ordering -- one order raised `TypeError`, the other silently dropped the
+  component's knobs. The qualified knobs are exported and the bare name is
+  described.
 - `OptimizationResult.to_config(path)` and `load_tuned_config(path)`: export the
   winning configuration as reviewable `{component: {parameter: value}}` YAML and
   load it back. The optimizer applied its result in place, to live objects, so

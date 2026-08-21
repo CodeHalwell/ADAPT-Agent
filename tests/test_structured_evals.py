@@ -193,6 +193,55 @@ def test_per_row_field_check_survives_text_extraction_of_a_declared_model():
     assert evaluate_agent(ModelAgent(), rows, metrics=checks()).aggregate == {"checks": 1.0}
 
 
+def test_per_row_field_check_survives_a_plain_mapping_output():
+    """Regression: the conventional-key peel hit ordinary dicts too.
+
+    Marking a declared model safe was not enough -- `{"answer": "Paris",
+    "confidence": 1}` is a mapping, and text extraction peeled it to `"Paris"`
+    by its conventional key before the row's `field_match("answer")` ran.
+    """
+
+    class DictAgent:
+        def run(self, _):
+            return {"answer": "Paris", "confidence": 1}
+
+    rows = [
+        {
+            "input": "capital of France?",
+            "expected": {"answer": "Paris"},
+            "metadata": {"check": {"name": "field_match", "field": "answer"}},
+        }
+    ]
+    assert evaluate_agent(DictAgent(), rows, metrics=checks()).aggregate == {"checks": 1.0}
+
+
+@pytest.mark.parametrize(
+    "check,expected,output",
+    [
+        # Structural rows keep the structure...
+        ({"name": "field_match", "field": "answer"}, {"answer": "Paris"}, {"answer": "P", "c": 1}),
+        # ...and text rows still get text, from every output shape.
+        ("exact_match", "Paris", "Paris"),
+        ("exact_match", "Paris", {"answer": "Paris"}),
+        ("exact_match", "Paris", Envelope("Paris")),
+        ({"name": "numeric_close", "tolerance": 0.1}, {"result": 42}, {"result": 42.02}),
+    ],
+)
+def test_checks_flattens_only_the_rows_that_asked_for_text(check, expected, output):
+    """The dispatcher is structural, so it receives the payload -- and each row
+    is flattened individually only when its own check is a text one. Scoring a
+    text row against a dict would be the mirror of the bug being fixed."""
+
+    class Agent:
+        def run(self, _):
+            return output
+
+    rows = [{"input": "q", "expected": expected, "metadata": {"check": check}}]
+    score = evaluate_agent(Agent(), rows, metrics=checks()).aggregate["checks"]
+    # The first case is a deliberate mismatch ("P" != "Paris"); the rest match.
+    assert score == (0.0 if output == {"answer": "P", "c": 1} else 1.0)
+
+
 def test_a_recognised_shape_is_still_peeled_even_though_it_is_a_model():
     """The declared-model check must not outrank the specific extractors here
     either: a LangChain `AIMessage` is a Pydantic model *and* a chat message,
@@ -401,6 +450,28 @@ def test_a_bare_name_holding_a_mapping_is_described_not_exported(tmp_path):
     assert body == {"agent": {"temperature": 0.2}}
     assert "routing" in path.read_text(encoding="utf-8"), "the dropped value must be reported"
     assert load_tuned_config(path) == {"agent.temperature": 0.2}
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"agent": 1, "agent.temperature": 0.2},
+        {"agent.temperature": 0.2, "agent": 1},  # the other insertion order
+    ],
+)
+def test_a_bare_name_colliding_with_a_component_namespace_is_described(tmp_path, config):
+    """A bare name cannot share the top level with its own component section.
+
+    Written first it was indexed into as a mapping (`TypeError`); written second
+    it overwrote the component's knobs. Both outcomes depended only on dict
+    ordering. The qualified knob is the one that round-trips, so it is exported
+    and the bare name is described.
+    """
+    result = OptimizationResult(best_config=config, best_score=1.0, baseline_score=0.0)
+    path = tmp_path / "tuned.yaml"
+    assert result.to_config(path) == {"agent": {"temperature": 0.2}}
+    assert load_tuned_config(path) == {"agent.temperature": 0.2}
+    assert "Not exported" in path.read_text(encoding="utf-8")
 
 
 def test_a_list_of_primitives_still_exports(tmp_path):

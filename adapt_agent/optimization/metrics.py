@@ -19,6 +19,8 @@ import re
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from .extractors import extract_output_text
+
 #: A bare metric function. Either ``(output, expected)`` or, for example-aware
 #: metrics wrapped in :class:`Metric`, ``(output, expected, example)``.
 MetricFn = Callable[..., float]
@@ -311,6 +313,16 @@ def checks(
 
     Rows without a declaration fall back to ``default``.
 
+    The dispatcher is marked **structural**, so
+    :func:`~adapt_agent.optimization.evals.evaluate_agent` keeps the output's
+    structure rather than flattening it to text: a row asking for
+    ``field_match`` needs the fields, and which row asks is only known at call
+    time. Rows asking for a text check still get text -- each one is flattened
+    individually as it is scored. The one case this cannot rescue is ``checks``
+    *mixed* with a plain text metric, where the all-or-nothing rule picks text
+    extraction for the whole run; pass ``output_extractor="payload"`` if a row
+    needs structure there.
+
     Args:
         default: Check applied when a row declares none. A built-in name, a
             :class:`Metric`, or a bare callable. ``None`` makes an undeclared
@@ -338,12 +350,21 @@ def checks(
         else:
             spec_list = list(spec) if isinstance(spec, (list, tuple)) else [spec]
             metric_list = [_resolve_check(item, judge_metric, cache) for item in spec_list]
-        scores = [m(output, expected, example) for m in metric_list]
-        if not scores:
+        if not metric_list:
             raise ValueError("example declares an empty check list")
+        # The dispatcher is marked structural, so the harness hands it the
+        # *payload*. A row asking for a text check wants text, so flatten for
+        # those and only those -- the row is the only thing that knows, and it
+        # only knows at call time. Without this a structured output would score
+        # 0.0 against a row's `exact_match`, which is the mirror of the bug
+        # marking it structural fixes.
+        scores = [
+            m(output if m.structural else extract_output_text(output), expected, example)
+            for m in metric_list
+        ]
         return min(scores) if aggregate == "min" else sum(scores) / len(scores)
 
-    return Metric("checks", _fn, needs_example=True)
+    return Metric("checks", _fn, needs_example=True, structural=True)
 
 
 _JUDGE_CHECK_NAMES = ("judge", "llm_judge")

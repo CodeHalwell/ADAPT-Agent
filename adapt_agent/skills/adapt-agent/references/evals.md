@@ -116,6 +116,11 @@ from adapt_agent.evaluation import checks
 evaluate_agent(agent, data, metrics=checks(default="token_f1", judge=my_judge))
 ```
 
+`checks` is marked **structural**, so the output keeps its structure for a row
+asking `field_match`; rows asking for a text check are flattened individually as
+they are scored. Mixing `checks` with a plain text metric is the one case that
+loses structure for the whole run — pass `output_extractor="payload"` there.
+
 ## Scoring structured output
 
 `extract_output_text` flattens a structured answer: a Microsoft

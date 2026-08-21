@@ -113,6 +113,14 @@ to `exact_match`:
 The dispatcher is a normal metric, so the same dataset works from the CLI
 (`--metric checks`) and inside [optimization](optimization.md) loops.
 
+It is marked **structural**, so the output reaches it with its structure intact
+— a row asking for `field_match` needs the fields, and which row asks is only
+known at call time. Rows asking for a text check are flattened individually as
+they are scored, so both kinds work in one dataset. The exception is `checks`
+*mixed* with a plain text metric, where the all-or-nothing rule picks text
+extraction for the whole run; pass `output_extractor="payload"` if a row needs
+structure there.
+
 ## LLM-as-judge
 
 Pass `judge=` as a provider name, an
