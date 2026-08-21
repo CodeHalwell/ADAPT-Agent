@@ -46,10 +46,12 @@ from adapt_agent.optimization.evaluation import (
     EvaluationHarness,
     EvaluationReport,
     ExampleResult,
+    aresolve_runner,
     resolve_runner,
 )
 from adapt_agent.optimization.extractors import (
     available_extractors,
+    extract_output_payload,
     extract_output_text,
     register_extractor,
 )
@@ -60,6 +62,8 @@ from adapt_agent.optimization.metrics import (
     checks,
     contains,
     exact_match,
+    field_match,
+    field_metrics,
     get_metric,
     jaccard,
     json_subset,
@@ -78,6 +82,7 @@ from adapt_agent.optimization.optimizers import (
     PipelineOptimizer,
     RandomSearchOptimizer,
     Trial,
+    load_tuned_config,
     make_default_optimizer,
 )
 from adapt_agent.optimization.parameters import Parameter, ParameterKind, SearchSpace
@@ -141,6 +146,8 @@ __all__ = [
     "jaccard",
     "numeric_close",
     "json_subset",
+    "field_match",
+    "field_metrics",
     "levenshtein_ratio",
     "checks",
     "get_metric",
@@ -150,9 +157,11 @@ __all__ = [
     "EvaluationReport",
     "ExampleResult",
     "resolve_runner",
+    "aresolve_runner",
     "evaluate_agent",
     # framework output extraction / runners
     "extract_output_text",
+    "extract_output_payload",
     "register_extractor",
     "available_extractors",
     "framework_runner",
@@ -175,6 +184,7 @@ __all__ = [
     # optimizers
     "Optimizer",
     "OptimizationResult",
+    "load_tuned_config",
     "Trial",
     "GridSearchOptimizer",
     "RandomSearchOptimizer",

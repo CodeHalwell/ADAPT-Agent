@@ -27,16 +27,24 @@ dependency installed and are trivial to unit-test.
 
 Async support
 -------------
-Several modern frameworks expose async-only entry points. ``execute`` therefore
-resolves the framework result transparently:
+Several modern frameworks (Pydantic AI, the Claude Agent SDK, Microsoft Agent
+Framework) are async-native, so governance has to work on both call styles.
+Every wrapped agent therefore exposes **two** entry points:
 
-* a coroutine is run to completion;
-* an async generator (or any async iterator) is drained into a list;
-* a sync generator is likewise materialised into a list.
+* :meth:`_GovernedAgent.execute` -- synchronous. The framework result is
+  resolved transparently: a coroutine is run to completion, an async generator
+  (or any async iterator) is drained into a list, and a sync generator is
+  likewise materialised. Called from inside a running event loop, blocking on a
+  coroutine is impossible, so a clear :class:`AdapterError` is raised.
+* :meth:`_GovernedAgent.aexecute` -- ``await``-able, and the correct entry point
+  for any async application. It awaits the framework in the *caller's* loop, so
+  concurrent requests stay concurrent and ``contextvars`` (how OpenTelemetry
+  propagates the active span, among other things) are preserved. Offloading
+  ``execute`` to a worker thread achieves neither.
 
-When called from inside a running event loop, blocking on a coroutine is not
-possible; in that case a clear :class:`AdapterError` is raised pointing the
-caller at the framework's native async API.
+The two share every governance stage; only the framework call itself differs.
+The governance stages are pure synchronous CPU work -- firewall regexes, the
+policy sandbox, middleware -- so there is no async variant of them to write.
 """
 
 import asyncio
@@ -47,6 +55,9 @@ from typing import Any, cast
 
 from adapt_agent.adapters.base import BaseAdapter
 from adapt_agent.adversarial import AdversarialDefense
+from adapt_agent.core.governance import GovernanceGate
+from adapt_agent.core.governance import extract_prompt as _extract_prompt
+from adapt_agent.core.governance import extract_texts as _extract_texts
 from adapt_agent.core.middleware import Middleware
 from adapt_agent.core.policy import PolicyEnforcer
 from adapt_agent.core.types import Agent, AgentState
@@ -57,133 +68,6 @@ from adapt_agent.security.firewall import Firewall
 #: A callable that runs a framework agent given its prepared input. Accepts
 #: arbitrary call signatures (some adapters call it with keyword arguments).
 Runner = Callable[..., Any]
-
-#: Attribute names that commonly hold human-readable text on framework result
-#: and message objects (Pydantic AI ``.output``, Microsoft Agent Framework
-#: ``.text``, CrewAI ``.raw``, OpenAI Agents ``.final_output``, Claude
-#: ``ResultMessage.result`` / ``TextBlock.text``, LangChain ``.content`` ...).
-_TEXT_ATTRS = (
-    "content",
-    "text",
-    "output",
-    "final_output",
-    "raw",
-    "result",
-    "data",
-)
-
-#: Attribute names that hold *containers* of further text-bearing objects
-#: (e.g. ``Content.parts`` in Google ADK, message lists, CrewAI ``tasks_output``).
-#: These are recursed into even when they are framework objects rather than
-#: plain dicts/lists, so screening reaches deeply-structured results.
-_RECURSE_ATTRS = (
-    "content",
-    "parts",
-    "messages",
-    "tasks_output",
-)
-
-
-def _safe_getattr(obj: Any, attr: str) -> Any:
-    """``getattr(obj, attr, None)`` that never propagates.
-
-    Framework result objects may expose attributes via descriptors/properties
-    that raise. Since text extraction feeds the security pipeline, a raising
-    attribute must not crash the whole execution -- treat it as absent.
-    """
-    try:
-        return getattr(obj, attr, None)
-    except Exception:
-        return None
-
-
-def _extract_texts(data: Any) -> list[str]:
-    """Best-effort extraction of human-readable text from an arbitrary payload.
-
-    Adapter payloads are typically dicts that may contain a ``messages`` list or
-    arbitrary string fields, but framework result objects expose their text via
-    attributes instead (see :data:`_TEXT_ATTRS`). We collect every string we can
-    reach so the security controls can scan it without assuming a fixed schema.
-    """
-    texts: list[str] = []
-
-    def _walk(value: Any, depth: int = 0) -> None:
-        if depth > 6:  # bound recursion (defensive against pathological nesting)
-            return
-        if isinstance(value, str):
-            texts.append(value)
-        elif value is None or isinstance(value, (int, float, bool)):
-            # Primitives carry no text and have no attributes worth probing;
-            # returning early avoids pointless getattr lookups on large payloads.
-            return
-        elif isinstance(value, dict):
-            for v in value.values():
-                _walk(v, depth + 1)
-        elif isinstance(value, (list, tuple)):
-            for v in value:
-                _walk(v, depth + 1)
-        else:
-            # Framework message / result objects expose their text via one of a
-            # handful of well-known attributes. Recurse into anything walkable.
-            for attr in _TEXT_ATTRS:
-                inner = _safe_getattr(value, attr)
-                if isinstance(inner, str):
-                    texts.append(inner)
-                elif isinstance(inner, (dict, list, tuple)):
-                    _walk(inner, depth + 1)
-            # Structured content containers (e.g. genai ``Content.parts``) hold
-            # further objects whose text we still want to scan.
-            for attr in _RECURSE_ATTRS:
-                inner = _safe_getattr(value, attr)
-                if inner is not None and not isinstance(inner, (str, int, float, bool)):
-                    _walk(inner, depth + 1)
-
-    _walk(data)
-    return texts
-
-
-def _extract_prompt(payload: Any) -> str:
-    """Derive a single prompt string from an adapter payload.
-
-    Many frameworks (Pydantic AI, OpenAI Agents, Microsoft Agent Framework,
-    Claude Agent SDK) run from a string prompt rather than a state dict. This
-    helper picks the most plausible prompt: the latest user message, then a
-    common prompt-like key, then a string fallback. It accepts a state dict, a
-    bare list/tuple of messages, or a plain string.
-    """
-    if isinstance(payload, str):
-        return payload
-
-    if isinstance(payload, dict):
-        messages: Any = payload.get("messages")
-    elif isinstance(payload, (list, tuple)):
-        messages = payload
-    else:
-        messages = None
-
-    if isinstance(messages, (list, tuple)) and messages:
-        for message in reversed(messages):
-            if isinstance(message, dict):
-                role, content = message.get("role"), message.get("content")
-            else:
-                role = _safe_getattr(message, "role")
-                content = _safe_getattr(message, "content")
-            role_str = role.lower() if isinstance(role, str) else None
-            if isinstance(content, str) and (role_str == "user" or role is None):
-                return content
-        last = messages[-1]
-        last_content = (
-            last.get("content") if isinstance(last, dict) else _safe_getattr(last, "content")
-        )
-        if isinstance(last_content, str):
-            return last_content
-
-    if isinstance(payload, dict):
-        for key in ("prompt", "input", "query", "text"):
-            value = payload.get(key)
-            if isinstance(value, str):
-                return value
-    return str(payload)
 
 
 def _resolve_result(value: Any) -> Any:
@@ -200,9 +84,26 @@ def _resolve_result(value: Any) -> Any:
     # ``AsyncIterable`` covers both ``async def`` generators and custom async
     # iterators (``__aiter__``/``__anext__``), which streaming SDKs often return.
     if isinstance(value, AsyncIterable):
-        return _run_coro(_drain_async_gen(value))
+        return _run_coro(_drain_async_gen(value), value)
     if inspect.isawaitable(value):
-        return _run_coro(_await(value))
+        return _run_coro(_await(value), value)
+    if inspect.isgenerator(value):
+        return list(value)
+    return value
+
+
+async def _aresolve_result(value: Any) -> Any:
+    """Await/drain a framework result *inside the caller's event loop*.
+
+    The async counterpart of :func:`_resolve_result`. Because the caller already
+    owns a running loop, nothing is blocked and no new loop is created -- so
+    ``contextvars`` set by the caller (OpenTelemetry's active span, request-scoped
+    state) remain visible to the framework call.
+    """
+    if isinstance(value, AsyncIterable):
+        return [item async for item in value]
+    if inspect.isawaitable(value):
+        return await value
     if inspect.isgenerator(value):
         return list(value)
     return value
@@ -216,19 +117,39 @@ async def _drain_async_gen(gen: Any) -> list[Any]:
     return [item async for item in gen]
 
 
-def _run_coro(coro: Any) -> Any:
+def _run_coro(coro: Any, source: Any = None) -> Any:
     try:
         running = asyncio.get_running_loop()
     except RuntimeError:
         running = None
     if running is not None:
         coro.close()
+        # Close the framework's own coroutine/async generator too. It was created
+        # by calling the run method and is now never awaited; without this Python
+        # emits a spurious "coroutine was never awaited" RuntimeWarning that
+        # points at the framework rather than at the real problem below.
+        _close_unawaited(source)
         raise AdapterError(
             "Cannot synchronously run an async agent from inside a running event "
-            "loop. Call the framework's native async API directly, or run "
-            "execute() in a worker thread."
+            "loop. Use `await agent.aexecute(...)` (the async twin of execute, "
+            "with identical governance), or call the framework's native async API "
+            "directly. Offloading execute() to a worker thread also works but "
+            "serialises concurrent requests and drops contextvars, so tracing "
+            "context is lost."
         )
     return asyncio.run(coro)
+
+
+def _close_unawaited(value: Any) -> None:
+    """Best-effort close of a coroutine/async generator that will never be awaited."""
+    if value is None:
+        return
+    close = getattr(value, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # pragma: no cover - close() should not raise
+            pass
 
 
 class GovernedAdapter(BaseAdapter):
@@ -383,27 +304,28 @@ class GovernedAdapter(BaseAdapter):
 
     # -- internal helpers shared with the wrapped agent ------------------------
 
+    @property
+    def gate(self) -> GovernanceGate:
+        """A :class:`GovernanceGate` over this adapter's currently-set controls.
+
+        Built per access rather than cached, so reassigning ``adapter.firewall``
+        (or any other control) after construction takes effect immediately.
+        """
+        return GovernanceGate(
+            firewall=self.firewall,
+            defense=self.defense,
+            policy_enforcer=self.policy_enforcer,
+            block_on_violation=self.block_on_violation,
+            agent_id=self.agent_id,
+        )
+
     def _screen_input(self, payload: Any) -> list[str]:
         """Run firewall + adversarial defense over a payload, returning threats."""
-        threats: list[str] = []
-        for text in _extract_texts(payload):
-            if self.firewall is not None and not self.firewall.check_input(text):
-                threats.append("firewall")
-            if self.defense is not None:
-                analysis = self.defense.analyze_input(text)
-                if not analysis["is_safe"]:
-                    threats.extend(analysis["threats_detected"])
-        return threats
+        return self.gate.scan_input(payload)
 
     def _screen_output(self, payload: Any) -> list[str]:
         """Run firewall over an output payload, returning threats."""
-        threats: list[str] = []
-        if self.firewall is None:
-            return threats
-        for text in _extract_texts(payload):
-            if not self.firewall.check_output(text):
-                threats.append("firewall")
-        return threats
+        return self.gate.scan_output(payload)
 
 
 class _GovernedAgent:
@@ -421,15 +343,65 @@ class _GovernedAgent:
         self._last_state: AgentState = {"messages": [], "context": {}}
 
     def execute(self, input_data: dict[str, Any]) -> dict[str, Any]:
-        """Run the wrapped agent with governance applied.
+        """Run the wrapped agent with governance applied, synchronously.
 
         Order of operations: input screening -> policy check -> pre-middleware
         -> traced run -> post-middleware -> output screening.
+
+        An async-native framework is driven by running its coroutine to
+        completion, which is impossible from inside a running event loop. In an
+        async application use :meth:`aexecute` instead -- it applies exactly the
+        same governance.
+
+        Raises:
+            SecurityBlockedError: If a control blocks the input/output (and
+                ``block_on_violation`` is enabled).
+            AdapterError: If the framework is async and an event loop is already
+                running on this thread.
+        """
+        trace_id, payload = self._before(input_data)
+        try:
+            raw = self._adapter._call_runner(self._runner, payload)
+            result = _resolve_result(raw)
+        except Exception as exc:
+            self._trace_error(trace_id, exc)
+            raise
+        return self._after(trace_id, result)
+
+    async def aexecute(self, input_data: dict[str, Any]) -> dict[str, Any]:
+        """Run the wrapped agent with governance applied, asynchronously.
+
+        The async twin of :meth:`execute`, and the right entry point for an
+        async application: the framework is awaited in the caller's own event
+        loop, so concurrent requests stay concurrent and ``contextvars`` -- the
+        mechanism OpenTelemetry uses to propagate the active span -- survive the
+        call. Running :meth:`execute` in a worker thread preserves neither.
+
+        Every governance stage is identical to :meth:`execute`; only the
+        framework call itself is awaited rather than blocked on. A *synchronous*
+        framework works here too (nothing to await is simply passed through), so
+        an async app can use this entry point uniformly.
 
         Raises:
             SecurityBlockedError: If a control blocks the input/output (and
                 ``block_on_violation`` is enabled).
         """
+        trace_id, payload = self._before(input_data)
+        try:
+            raw = self._adapter._call_runner(self._runner, payload)
+            result = await _aresolve_result(raw)
+        except Exception as exc:
+            self._trace_error(trace_id, exc)
+            raise
+        return self._after(trace_id, result)
+
+    # -- shared governance stages ---------------------------------------------
+    # execute() and aexecute() differ only in how the framework result is
+    # materialised; keeping the stages here means governance can never drift
+    # between the two call styles.
+
+    def _before(self, input_data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Stages 1-3: input screening, policy, pre-middleware. Opens the trace."""
         adapter = self._adapter
         trace_id = uuid.uuid4().hex
 
@@ -440,34 +412,30 @@ class _GovernedAgent:
 
         # 2. Policy enforcement against the extracted state.
         self._last_state = adapter.extract_state(input_data)
-        if adapter.policy_enforcer is not None:
-            violations = adapter.policy_enforcer.check_state(self._last_state)
-            if violations and adapter.block_on_violation:
-                blocking = []
-                for v in violations:
-                    rule = adapter.policy_enforcer.get_rule(v)
-                    if rule is not None and rule.get("action") == "block":
-                        blocking.append(v)
-                if blocking:
-                    raise SecurityBlockedError(
-                        "Input blocked by policy", [f"policy:{v}" for v in blocking]
-                    )
+        if adapter.block_on_violation:
+            blocking = adapter.gate.policy_violations(self._last_state)
+            if blocking:
+                raise SecurityBlockedError(
+                    "Input blocked by policy", [f"policy:{v}" for v in blocking]
+                )
 
         # 3. Pre-middleware.
         payload = input_data
         if adapter.middleware is not None:
             payload = adapter.middleware.process_input(input_data)
 
-        # 4. Traced execution.
+        # 4. Traced execution begins (the run itself is the caller's job).
         if adapter.observer is not None:
             adapter.observer.start_trace(trace_id, adapter.agent_id, adapter.operation)
-        try:
-            raw = adapter._call_runner(self._runner, payload)
-            result = _resolve_result(raw)
-        except Exception as exc:
-            if adapter.observer is not None:
-                adapter.observer.end_trace(trace_id, status="error", result=str(exc))
-            raise
+        return trace_id, payload
+
+    def _trace_error(self, trace_id: str, exc: Exception) -> None:
+        if self._adapter.observer is not None:
+            self._adapter.observer.end_trace(trace_id, status="error", result=str(exc))
+
+    def _after(self, trace_id: str, result: Any) -> dict[str, Any]:
+        """Stages 5-6: close the trace, post-middleware, output screening."""
+        adapter = self._adapter
         if adapter.observer is not None:
             adapter.observer.end_trace(trace_id, status="completed")
 
@@ -493,4 +461,10 @@ class _GovernedAgent:
         return self._last_state
 
 
-__all__ = ["GovernedAdapter", "_GovernedAgent", "_extract_texts", "_extract_prompt"]
+__all__ = [
+    "GovernedAdapter",
+    "_GovernedAgent",
+    "_aresolve_result",
+    "_extract_prompt",
+    "_extract_texts",
+]

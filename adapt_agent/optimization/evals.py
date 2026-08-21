@@ -48,7 +48,7 @@ from typing import Any
 
 from adapt_agent.optimization.dataset import GoldenDataset
 from adapt_agent.optimization.evaluation import EvaluationHarness, EvaluationReport
-from adapt_agent.optimization.extractors import extract_output_text
+from adapt_agent.optimization.extractors import extract_output_payload, extract_output_text
 from adapt_agent.optimization.judge import LLMJudge
 from adapt_agent.optimization.metrics import (
     BUILTIN_METRICS,
@@ -62,6 +62,9 @@ from adapt_agent.optimization.runners import AUTO, framework_runner
 #: Metric names routed to the LLM-as-judge instead of a deterministic built-in.
 _JUDGE_NAMES = ("judge", "llm_judge")
 
+#: Sentinel for ``output_extractor``: pick the extractor from the metrics.
+AUTO_EXTRACTOR = "auto"
+
 
 def evaluate_agent(
     agent: Any,
@@ -73,12 +76,13 @@ def evaluate_agent(
     judge_rubric: str | None = None,
     primary_metric: str | None = None,
     input_adapter: Callable[[Any], Any] | str | None = AUTO,
-    output_extractor: Callable[[Any], Any] | None = extract_output_text,
+    output_extractor: Callable[[Any], Any] | None | str = AUTO_EXTRACTOR,
     input_key: str | None = None,
     expected_key: str | None = None,
     capture_output: bool = True,
     max_results: int = 10_000,
     failure_threshold: float = 1.0,
+    concurrency: int = 1,
 ) -> EvaluationReport:
     """Evaluate any agent against a golden dataset and return the report.
 
@@ -115,16 +119,27 @@ def evaluate_agent(
             :func:`~adapt_agent.optimization.runners.framework_runner`:
             ``"auto"`` (default) adapts plain strings for LangGraph graphs;
             pass a callable to customise or ``None`` to disable.
-        output_extractor: Unwraps each framework-native result before scoring;
-            :func:`~adapt_agent.optimization.extractors.extract_output_text` by
-            default. Pass ``None`` to score raw outputs (e.g. for
-            ``json_subset`` over structured state).
+        output_extractor: Unwraps each framework-native result before scoring.
+            ``"auto"`` (the default) picks by metric: if *every* metric is
+            structural (``json_subset``, ``field_match``) it uses
+            :func:`~adapt_agent.optimization.extractors.extract_output_payload`,
+            which strips the framework envelope but keeps the payload; otherwise
+            :func:`~adapt_agent.optimization.extractors.extract_output_text`.
+            The all-or-nothing rule is deliberate -- mixing a text metric with a
+            structural one means text wins, because a dict would score 0.0
+            against ``exact_match``. Pass either function explicitly to override,
+            or ``None`` to score completely raw outputs.
         input_key: Explicit input column name for record/file datasets.
         expected_key: Explicit expected/gold column name for record/file
             datasets.
         capture_output: Store per-example outputs on the report.
         max_results: Cap on stored per-example results.
         failure_threshold: Default cutoff for ``report.failures()``.
+        concurrency: Examples to run at once (thread-backed). ``1`` keeps the
+            serial default. For an async-native agent prefer
+            :meth:`EvaluationHarness.aevaluate
+            <adapt_agent.optimization.evaluation.EvaluationHarness.aevaluate>`,
+            which needs no threads.
 
     Returns:
         The :class:`~adapt_agent.optimization.evaluation.EvaluationReport`.
@@ -132,16 +147,38 @@ def evaluate_agent(
     dataset = _coerce_dataset(data, input_key=input_key, expected_key=expected_key)
     judge_obj = _coerce_judge(judge)
     metric_list = _resolve_metrics(metrics, judge_obj, criteria=judge_criteria, rubric=judge_rubric)
+    extractor: Callable[[Any], Any] | None
+    if isinstance(output_extractor, str):
+        if output_extractor != AUTO_EXTRACTOR:
+            raise ValueError(
+                f"output_extractor must be a callable, None, or {AUTO_EXTRACTOR!r}, "
+                f"got {output_extractor!r}"
+            )
+        extractor = _choose_extractor(metric_list)
+    else:
+        extractor = output_extractor
     harness = EvaluationHarness(
         metric_list,
         primary_metric=primary_metric,
         capture_output=capture_output,
         max_results=max_results,
         failure_threshold=failure_threshold,
-        output_extractor=output_extractor,
+        output_extractor=extractor,
     )
     runner = framework_runner(agent, input_adapter=input_adapter, output_extractor=None)
-    return harness.evaluate(runner, dataset)
+    return harness.evaluate(runner, dataset, concurrency=concurrency)
+
+
+def _choose_extractor(metrics: list[Any]) -> Callable[[Any], Any]:
+    """Pick text vs payload extraction from the resolved metrics.
+
+    Payload extraction is used only when *every* metric is structural: a metric
+    set mixing ``exact_match`` with ``field_match`` must keep text, since a dict
+    scores 0.0 against a text comparison.
+    """
+    if metrics and all(getattr(metric, "structural", False) for metric in metrics):
+        return extract_output_payload
+    return extract_output_text
 
 
 # -- coercion helpers -----------------------------------------------------------

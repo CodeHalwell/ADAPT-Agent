@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import random
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from adapt_agent.optimization.dataset import GoldenDataset
@@ -98,6 +99,103 @@ class OptimizationResult:
     @property
     def n_evals(self) -> int:
         return len(self.history)
+
+    def to_config(
+        self,
+        path: str | Path | None = None,
+        *,
+        default_component: str = "agent",
+        header: bool = True,
+    ) -> dict[str, Any]:
+        """Export the winning configuration as a reviewable, nested mapping.
+
+        :attr:`best_config` is applied *in place*, to live objects, and dies with
+        the process. For any project whose prompts are version-controlled that is
+        the wrong end state -- and an LLM-rewritten prompt reaching production
+        without a human reading the diff is worse than a lost tuning run.
+
+        This turns the result into an artifact, so the loop becomes
+        **optimize -> diff -> review -> commit** and the application keeps
+        loading its prompts from the YAML it always did::
+
+            result.to_config("specialists/.config/tuned.yaml")
+
+        Parameter names follow the ``"<component>.<knob>"`` convention, so the
+        flat config nests by component::
+
+            researcher:
+              system_prompt: |
+                You are a careful researcher...
+              temperature: 0.2
+            writer:
+              model: gpt-4o
+
+        Round-trips through :func:`load_tuned_config`, which flattens it back
+        for :meth:`OptimizableAgent.apply`.
+
+        The format follows the extension: ``.json`` writes JSON, anything else
+        writes YAML. Provenance -- baseline, best and validation scores, and the
+        number of evaluations -- travels with the config, so a diff shows *what
+        it bought* rather than only what changed. In YAML that is a comment
+        header; JSON has no comments, so it goes in a ``"_provenance"`` key
+        which :func:`load_tuned_config` ignores.
+
+        Args:
+            path: Where to write. ``None`` returns the mapping without writing.
+                The parent directory is created if needed.
+            default_component: Section for a parameter name with no ``"."``.
+            header: Record provenance in the file. Comments do not affect
+                parsing or the round-trip.
+
+        Returns:
+            The nested ``{component: {knob: value}}`` mapping (never including
+            the provenance block, so the return value is exactly the config).
+        """
+        nested: dict[str, Any] = {}
+        for name, value in self.best_config.items():
+            component, _, knob = name.partition(".")
+            if not knob:  # a bare name carries no component prefix
+                component, knob = default_component, name
+            nested.setdefault(component, {})[knob] = value
+
+        if path is not None:
+            destination = Path(path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.suffix.lower() == ".json":
+                import json
+
+                payload = dict(nested)
+                if header:
+                    payload["_provenance"] = self._provenance()
+                text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+            else:
+                import yaml
+
+                text = yaml.safe_dump(nested, sort_keys=True, allow_unicode=True, width=100)
+                if header:
+                    provenance = self._provenance()
+                    text = (
+                        "# Tuned by adapt-agent.\n"
+                        f"# baseline={provenance['baseline_score']:.4f} "
+                        f"best={provenance['best_score']:.4f} "
+                        f"improvement={provenance['improvement']:+.4f} "
+                        f"validation={provenance['validation_score']} "
+                        f"over {provenance['n_evals']} evals.\n"
+                        "# Review this diff before committing: prompts here were "
+                        "machine-written.\n"
+                    ) + text
+            destination.write_text(text, encoding="utf-8")
+        return nested
+
+    def _provenance(self) -> dict[str, Any]:
+        """What the tuning run bought, recorded alongside the config."""
+        return {
+            "baseline_score": self.baseline_score,
+            "best_score": self.best_score,
+            "improvement": self.improvement,
+            "validation_score": self.validation_score,
+            "n_evals": self.n_evals,
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -801,6 +899,39 @@ def _dedup(values: list[Any]) -> list[Any]:
     return out
 
 
+def load_tuned_config(path: str | Path) -> dict[str, Any]:
+    """Load a file written by :meth:`OptimizationResult.to_config` as a flat config.
+
+    Flattens ``{component: {knob: value}}`` back to the ``"<component>.<knob>"``
+    keys :meth:`OptimizableAgent.apply` expects, closing the loop::
+
+        target.apply(load_tuned_config("specialists/.config/tuned.yaml"))
+
+    A scalar at the top level is taken as an already-flat entry, so a hand-edited
+    file mixing both shapes still loads. JSON and YAML both work -- YAML is a
+    superset, so one parser reads either -- and the ``_provenance`` block written
+    into a JSON export is skipped rather than applied as a component.
+
+    Raises:
+        ValueError: If the file does not contain a mapping.
+    """
+    import yaml
+
+    loaded = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} does not contain a mapping of components to parameters")
+    flat: dict[str, Any] = {}
+    for component, values in loaded.items():
+        if component == "_provenance":
+            continue  # metadata about the run, not a tunable component
+        if isinstance(values, dict):
+            for knob, value in values.items():
+                flat[f"{component}.{knob}"] = value
+        else:
+            flat[component] = values
+    return flat
+
+
 __all__ = [
     "Trial",
     "OptimizationResult",
@@ -812,4 +943,5 @@ __all__ = [
     "EvolutionaryOptimizer",
     "PipelineOptimizer",
     "make_default_optimizer",
+    "load_tuned_config",
 ]

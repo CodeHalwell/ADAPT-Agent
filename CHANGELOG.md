@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-21
+
+### Added
+
+- **Async is now a first-class path, not a leaf-node rescue.** Every governed
+  agent gained `aexecute`, the awaitable twin of `execute` with identical
+  governance. It awaits the framework in the *caller's* event loop, so
+  concurrent requests stay concurrent and `contextvars` -- how OpenTelemetry
+  propagates the active span -- survive. Previously an async-native framework
+  (Pydantic AI, the Claude Agent SDK, Microsoft Agent Framework) could only be
+  governed from a synchronous caller, and the advice to use a worker thread cost
+  both concurrency and trace parentage. `aresolve_runner` and
+  `EvaluationHarness.aevaluate` mirror it upward; the governance stages are
+  shared, so the two call styles cannot drift.
+- **Native governance hooks for every supported framework**
+  (`adapt_agent.integrations`). An adapter wraps an agent from the outside, which
+  governs only a graph's boundary; these plug into the framework's own
+  interception point so rules nest *per agent* inside a multi-agent graph,
+  compose with middleware the app already stacks, and don't fight the workflow
+  runtime. Each factory was written against the installed SDK's own source:
+  Microsoft Agent Framework (`Agent(middleware=[...])`), Google ADK
+  (before/after model callbacks, with an `on_block="refuse"` mode that
+  short-circuits the model instead of aborting the tree), OpenAI Agents SDK
+  (input/output guardrails), Claude Agent SDK (`UserPromptSubmit` and
+  `PreToolUse` hooks -- the latter reaching tool inputs no outer wrapper can
+  see), LangGraph (`pre_model_hook`/`post_model_hook`), CrewAI (kickoff
+  callbacks plus a task guardrail), and Pydantic AI (output validator only --
+  it has no native pre-run hook, and the docs say so rather than inventing one).
+- `GovernanceGate` (`adapt_agent.core.governance`): the single, framework-free
+  implementation of screen -> policy -> screen, now shared by both the adapters
+  and the native hooks so a fix reaches every framework at once.
+- **Concurrency for evals.** `EvaluationHarness.evaluate(..., concurrency=N)`
+  runs examples in a thread pool for synchronous agents; `aevaluate(...,
+  concurrency=N)` uses a bounded async worker pool for async ones.
+  `evaluate_agent` takes the same knob. A serial harness made optimization
+  impractical -- a 60-eval sweep over a 113-case split is 6,780 LLM round-trips.
+  Both paths preserve index ordering, non-fatal per-example errors, and the
+  `max_results` memory bound.
+- `extract_output_payload`: unwraps the framework envelope but **keeps the
+  structure** -- a mapping passes through, a Pydantic model becomes a dict, and
+  a JSON string (including a ```` ```json ```` fenced one) is parsed back into an
+  object. Previously a structured answer was either flattened to `.text` by
+  `extract_output_text` or left as a `repr()` by `output_extractor=None`.
+- `field_match(field, ...)` and `field_metrics([...])`: score a structured
+  output per field, reported under the field's own name, so a report aggregates
+  as a per-column table (`{"lane": 0.94, ..., "pack": 0.0}`) rather than one
+  blended number that hides which column moved. `evaluate_agent` switches to
+  payload extraction automatically when every metric is structural.
+- `OptimizationResult.to_config(path)` and `load_tuned_config(path)`: export the
+  winning configuration as reviewable `{component: {parameter: value}}` YAML and
+  load it back. The optimizer applied its result in place, to live objects, so
+  it died with the process; now the loop is optimize -> diff -> review -> commit
+  and a machine-rewritten prompt cannot reach production unread.
+
+### Fixed
+
+- **Structured outputs were almost entirely unscreened.** Text extraction only
+  probed a handful of conventional attribute names (`text`, `content`,
+  `output`, ...), so a Pydantic model or dataclass with fields like `lane` or
+  `note` -- exactly what a Pydantic AI `output_type` produces -- passed through
+  the firewall untouched, and an injection smuggled into one field was never
+  seen. Pydantic (v1 and v2) model and dataclass fields are now walked.
+- `execute` raising inside a running event loop abandoned the framework's
+  coroutine un-awaited, emitting a `RuntimeWarning` that pointed at the
+  framework instead of the real problem. The coroutine is now closed, and the
+  error message points at `aexecute`.
+- `get_metric` surfaced a raw `TypeError` for a built-in needing arguments; it
+  now explains that `field_match` is reachable through a mapping check spec.
+
+### Documentation
+
+- `references/guardrails.md` carried no async warning at all, while the evals
+  gotchas did -- the one page omitting it described the code path that raises.
+  It now documents `aexecute`, why a worker thread is the wrong fix, and the
+  native-hook matrix.
+- New `docs/integrations.md`, plus async/concurrency/structured-scoring and
+  config-export sections across the skill and the docs site.
+- Two more tests that *execute the documentation verbatim* rather than
+  inspecting it: the structured-scoring recipe is run, and every integration
+  factory named in the matrix is resolved.
+
+
 ### Added
 
 - **Bundled agent skill** (`adapt_agent/skills/adapt-agent/`): the wheel now

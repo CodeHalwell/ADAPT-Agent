@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from adapt_agent.exceptions import SkillError
+from adapt_agent.optimization.evals import evaluate_agent
 from adapt_agent.skills import (
     MAX_DESCRIPTION_LENGTH,
     MAX_NAME_LENGTH,
@@ -397,6 +398,7 @@ _NON_FIRST_PARTY = {
     "permitted",  # a compiled regex in the allow-list example
     "config",  # a dict loaded from a JSON config file
     "fw_config",  # the "firewall" sub-dict of that config
+    "chat_client",  # the MAF client the user built (agent_framework)
 }
 
 
@@ -832,3 +834,56 @@ def test_documented_training_config_parameters_reference_declared_components():
                         f"{parameter.component!r}, which is not declared under "
                         f"target.components ({sorted(declared)})"
                     )
+
+
+def test_documented_integration_factories_all_exist():
+    """Every factory named in the guardrails matrix must be importable.
+
+    The matrix is the skill's index into `adapt_agent.integrations`; a renamed
+    factory would send an agent to a function that does not exist.
+    """
+    import importlib
+    import re as _re
+
+    text = get_skill(SKILL_NAME).read("references/guardrails.md")
+    rows = _re.findall(
+        r"`(agent_framework|google_adk|openai_agents|claude_agent|langgraph|crewai|pydantic_ai)\.([a-z_]+)\(\)`",
+        text,
+    )
+    assert rows, "the native-hook matrix vanished from guardrails.md"
+    for module_name, factory in rows:
+        module = importlib.import_module(f"adapt_agent.integrations.{module_name}")
+        assert callable(getattr(module, factory, None)), f"{module_name}.{factory} is not callable"
+
+
+def test_documented_field_metrics_recipe_runs_as_written():
+    """Execute the structured-scoring block from SKILL.md verbatim."""
+    skill = get_skill(SKILL_NAME)
+    blocks = [b for b in _code_blocks(skill.read(), "python") if "field_metrics(" in b]
+    assert blocks, "the field_metrics recipe vanished from SKILL.md"
+
+    class _Envelope:
+        text = '{"lane": "NOS", "matter": "M1", "action": "file", "pack": "none"}'
+        messages: list = []
+
+    class _Agent:
+        def run(self, _):
+            return _Envelope()
+
+    namespace = {
+        "agent": _Agent(),
+        "data": [
+            {
+                "input": "e",
+                "expected": {"lane": "NOS", "matter": "M1", "action": "file", "pack": "P1"},
+            }
+        ],
+        "evaluate_agent": evaluate_agent,
+    }
+    exec(blocks[0], namespace)  # noqa: S102 - executing our own documentation
+    assert namespace["report"].aggregate == {
+        "lane": 1.0,
+        "matter": 1.0,
+        "action": 1.0,
+        "pack": 0.0,
+    }

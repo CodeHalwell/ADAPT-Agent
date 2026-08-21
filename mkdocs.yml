@@ -47,6 +47,7 @@ nav:
   - Security Model: security.md
   - Policy Enforcement: policy.md
   - Framework Adapters: adapters.md
+  - Native Framework Hooks: integrations.md
   - Framework Guides:
       - Overview: frameworks/index.md
       - LangGraph: frameworks/langgraph.md

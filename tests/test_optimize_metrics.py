@@ -366,10 +366,24 @@ def test_levenshtein_helper_empty_args():
 # -- registry / get_metric ----------------------------------------------------
 
 
+#: Built-ins that genuinely require an argument, so `get_metric(name)` alone
+#: cannot construct them. They are reachable via a mapping check spec instead.
+PARAMETERISED_BUILTINS = {"field_match"}
+
+
 def test_get_metric_returns_each_builtin():
     for name in M.BUILTIN_METRICS:
+        if name in PARAMETERISED_BUILTINS:
+            continue
         m = get_metric(name)
         assert isinstance(m, Metric)
+
+
+def test_get_metric_explains_parameterised_builtins():
+    """A required-argument built-in must not surface a raw TypeError."""
+    for name in PARAMETERISED_BUILTINS:
+        with pytest.raises(TypeError, match="cannot be built by name alone"):
+            get_metric(name)
 
 
 def test_get_metric_names_match_factory_names():
@@ -394,6 +408,7 @@ def test_builtin_metrics_keys_complete():
         "numeric_close",
         "json_subset",
         "levenshtein_ratio",
+        "field_match",
         "checks",
     }
     assert set(M.BUILTIN_METRICS) == expected

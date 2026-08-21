@@ -283,3 +283,54 @@ is `module:attribute` (append `()` to call a factory). Judge routing matches
 every row with the `--judge` provider. The identical flags work on
 `adapt-agent optimize`, so the eval that gates your agent is the same eval
 that trains it -- see [Optimization & Evaluation](optimization.md).
+
+## Running examples concurrently
+
+`evaluate` is serial by default, which is fine for a smoke test and untenable
+for optimization: a `CoordinateAscentOptimizer(max_evals=60)` sweep over a
+113-case split is 6,780 agent calls, each an LLM round-trip.
+
+```python
+report = harness.evaluate(agent, dataset, concurrency=8)          # sync agent: threads
+report = await harness.aevaluate(agent, dataset, concurrency=8)   # async agent: no threads
+report = evaluate_agent(agent, data, concurrency=8)               # same knob
+```
+
+Use `aevaluate` for an async-native agent — it awaits in your loop, so
+`contextvars` (tracing spans) survive and no thread is involved. Use
+`evaluate(concurrency=)` for a synchronous agent whose time goes on network I/O.
+
+Both keep the serial path's guarantees: results are reported in **example-index
+order** regardless of completion order, a per-example exception is still a
+non-fatal zero-scored error, and `max_results` still bounds stored records while
+every example is aggregated.
+
+## Scoring structured output
+
+`extract_output_text` flattens a structured answer — a Microsoft
+`AgentRunResponse` is a recognised shape, so it becomes `.text` and the object
+is gone — while `output_extractor=None` unwraps nothing and scores a `repr()`.
+`extract_output_payload` is the middle path: strip the framework envelope, keep
+the payload.
+
+```python
+from adapt_agent.evaluation import field_metrics
+
+report = evaluate_agent(agent, data, metrics=field_metrics(["lane", "matter", "action", "pack"]))
+report.aggregate    # {"lane": 0.94, "matter": 0.90, "action": 0.63, "pack": 0.0}
+```
+
+A mapping or sequence passes through, a Pydantic model becomes a dict, and a
+JSON string is parsed back into an object (including a fenced ```` ```json ````
+block). Non-JSON text degrades to text rather than erroring.
+
+`evaluate_agent` selects it automatically when **every** metric is structural
+(`json_subset`, `field_match`); mixing in a text metric keeps text extraction,
+because a dict scores 0.0 against `exact_match`.
+
+`field_match(field, check="exact_match", missing=0.0, **options)` scores one
+field and reports under its name, which turns `aggregate` into a per-column
+table instead of one blended number that hides which column moved. That
+`pack: 0.0` is a column the agent never gets right; averaged in, it reads as a
+mild dip. A deterministic field check is also cheaper and more correct than
+asking a judge whether two labels agree.

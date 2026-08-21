@@ -14,9 +14,11 @@ crashes an optimization loop.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -31,6 +33,22 @@ logger = logging.getLogger(__name__)
 # Covers LangGraph (``invoke``), CrewAI (``kickoff``), Pydantic AI (``run_sync``),
 # the OptimizableAgent / Microsoft Agent Framework (``run``).
 _RUN_METHOD_NAMES = ("run_sync", "invoke", "kickoff", "run")
+
+# The same list for the async path, with the preference *inverted*: a framework
+# exposing both styles should be driven by its async entry point so the event
+# loop is never blocked. ``aexecute`` leads because a governed agent exposes it
+# alongside ``execute`` (see adapt_agent.adapters._governed).
+_ARUN_METHOD_NAMES = (
+    "aexecute",
+    "arun",
+    "ainvoke",
+    "kickoff_async",
+    "run",
+    "invoke",
+    "kickoff",
+    "run_sync",
+    "execute",
+)
 
 
 def resolve_runner(agent: Any) -> Callable[[Any], Any]:
@@ -60,6 +78,37 @@ def resolve_runner(agent: Any) -> Callable[[Any], Any]:
     )
 
 
+def aresolve_runner(agent: Any) -> Callable[[Any], Awaitable[Any]]:
+    """Return an ``async`` ``Callable[[input], output]`` from an agent.
+
+    The async twin of :func:`resolve_runner`. Two differences matter:
+
+    * **Async entry points win.** A framework exposing both styles (Pydantic AI
+      ``run``/``run_sync``, LangGraph ``ainvoke``/``invoke``) is driven by the
+      async one, so the caller's event loop is never blocked. A governed agent's
+      :meth:`aexecute <adapt_agent.adapters._governed._GovernedAgent.aexecute>`
+      is preferred over its ``execute``.
+    * **The result is awaited in the caller's loop**, so concurrency is real and
+      ``contextvars`` (tracing spans, request-scoped state) are preserved.
+
+    A purely synchronous agent works too: there is simply nothing to await, and
+    it is called directly. Note that such an agent *blocks the loop* for the
+    duration of its call -- for a sync agent prefer
+    :meth:`EvaluationHarness.evaluate` with ``concurrency``, which uses threads.
+    """
+    for name in _ARUN_METHOD_NAMES:
+        method = getattr(agent, name, None)
+        if callable(method):
+            return _aresolving_runner(method)
+    if callable(agent):
+        return _aresolving_runner(cast("Callable[[Any], Any]", agent))
+    raise TypeError(
+        "Cannot evaluate object: expected a callable, an object with a callable "
+        "run method (aexecute/arun/ainvoke/run/invoke/kickoff/run_sync), or a "
+        "governed agent. Pass an explicit runner if your framework differs."
+    )
+
+
 def _resolving_runner(method: Callable[[Any], Any]) -> Callable[[Any], Any]:
     """Wrap a framework run method so sync/async results are materialized."""
     # Imported lazily; reuses the adapters' result resolver (coroutines awaited,
@@ -68,6 +117,16 @@ def _resolving_runner(method: Callable[[Any], Any]) -> Callable[[Any], Any]:
 
     def _runner(input_data: Any) -> Any:
         return _resolve_result(method(input_data))
+
+    return _runner
+
+
+def _aresolving_runner(method: Callable[[Any], Any]) -> Callable[[Any], Awaitable[Any]]:
+    """Wrap a run method so its result is awaited/drained in the caller's loop."""
+    from adapt_agent.adapters._governed import _aresolve_result
+
+    async def _runner(input_data: Any) -> Any:
+        return await _aresolve_result(method(input_data))
 
     return _runner
 
@@ -241,7 +300,14 @@ class EvaluationHarness:
             for name, m in metrics.items():
                 if isinstance(m, Metric):
                     # Honour the mapping key as the metric's reporting name.
-                    normalized.append(Metric(name, m.fn, needs_example=m.needs_example))
+                    normalized.append(
+                        Metric(
+                            name,
+                            m.fn,
+                            needs_example=m.needs_example,
+                            structural=m.structural,
+                        )
+                    )
                 else:
                     normalized.append(Metric(name, m))
                 # Note: a bare callable mapped under ``name`` becomes an
@@ -251,57 +317,122 @@ class EvaluationHarness:
             return [coerce_metric(m) for m in metrics]
         return [coerce_metric(metrics)]
 
-    def evaluate(self, agent: Any, dataset: GoldenDataset) -> EvaluationReport:
-        """Run ``agent`` over ``dataset`` and return an :class:`EvaluationReport`."""
+    def evaluate(
+        self, agent: Any, dataset: GoldenDataset, *, concurrency: int = 1
+    ) -> EvaluationReport:
+        """Run ``agent`` over ``dataset`` and return an :class:`EvaluationReport`.
+
+        Args:
+            agent: Anything :func:`resolve_runner` accepts.
+            dataset: The golden dataset to score against.
+            concurrency: How many examples to run at once. ``1`` (the default)
+                keeps the historical strictly-serial behaviour. Higher values
+                run examples in a thread pool, which is the right tool for a
+                *synchronous* agent whose time goes on network I/O -- an LLM
+                round-trip per example. For an async-native agent prefer
+                :meth:`aevaluate`, which needs no threads.
+
+        Ordering is by example index regardless of completion order, and the
+        per-example non-fatal error handling is identical on both paths.
+        """
         runner = resolve_runner(agent)
-        results: list[ExampleResult] = []
-        sums: dict[str, float] = {}
-        counts: dict[str, int] = {}
-        n_errors = 0
-        total_latency = 0.0
+        if concurrency <= 1:
+            return self._build_report(
+                self._run_one(runner, index, example) for index, example in enumerate(dataset)
+            )
 
-        for index, example in enumerate(dataset):
-            result = self._run_one(runner, index, example)
-            total_latency += result.latency
-            if result.error is not None:
-                n_errors += 1
-            for name, score in result.scores.items():
-                sums[name] = sums.get(name, 0.0) + score
-                counts[name] = counts.get(name, 0) + 1
-            if len(results) < self.max_results:
-                results.append(result)
+        examples = list(enumerate(dataset))
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            # ``map`` yields in submission order, so results stay index-ordered
+            # while still running ``concurrency`` examples at a time.
+            return self._build_report(
+                pool.map(lambda pair: self._run_one(runner, pair[0], pair[1]), examples)
+            )
 
-        aggregate = {name: sums[name] / counts[name] for name in sums if counts[name]}
-        # Ensure every metric appears even if all examples errored before scoring.
-        for m in self.metrics:
-            aggregate.setdefault(m.name, 0.0)
-        return EvaluationReport(
-            aggregate=aggregate,
-            primary_metric=self.primary_metric,
-            results=results,
-            n_errors=n_errors,
-            total_latency=total_latency,
-            failure_threshold=self.failure_threshold,
-        )
+    async def aevaluate(
+        self, agent: Any, dataset: GoldenDataset, *, concurrency: int = 1
+    ) -> EvaluationReport:
+        """Async twin of :meth:`evaluate`, for async-native agents.
+
+        Runs up to ``concurrency`` examples at once against the caller's event
+        loop -- no threads, so ``contextvars`` (tracing spans) are preserved and
+        a governed agent's :meth:`aexecute` path is used.
+
+        This is the difference between an eval you run once and one you run
+        often: a coordinate-ascent sweep is ``max_evals x len(dataset)`` LLM
+        round-trips, which is untenable strictly serially.
+
+        Results are aggregated as they complete but **reported in index order**.
+        Memory stays bounded whatever the dataset size: exactly ``concurrency``
+        tasks are alive at a time (a worker pool over the dataset, not one task
+        per example), and records past ``max_results`` are aggregated then
+        dropped rather than accumulated.
+        """
+        runner = aresolve_runner(agent)
+        accumulator = _Accumulator(self)
+        examples = enumerate(dataset)
+
+        async def _worker() -> None:
+            while True:
+                # Safe without a lock: ``next`` on a shared iterator contains no
+                # await, so the event loop cannot switch coroutines mid-call.
+                try:
+                    index, example = next(examples)
+                except StopIteration:
+                    return
+                accumulator.add(await self._arun_one(runner, index, example))
+
+        workers = [asyncio.ensure_future(_worker()) for _ in range(max(1, concurrency))]
+        try:
+            await asyncio.gather(*workers)
+        except BaseException:
+            # A cancellation (or an error escaping a worker) must not leave the
+            # remaining workers running detached.
+            for worker in workers:
+                worker.cancel()
+            raise
+        return accumulator.report()
+
+    # -- per-example execution -------------------------------------------------
 
     def _run_one(self, runner: Callable[[Any], Any], index: int, example: Example) -> ExampleResult:
         start = time.perf_counter()
         try:
             output = runner(example.inputs)
-            latency = time.perf_counter() - start
         except Exception as exc:  # non-fatal: record and score zero
-            latency = time.perf_counter() - start
-            logger.warning("Agent raised on example %d: %s", index, exc)
-            return ExampleResult(
-                index=index,
-                inputs=example.inputs if self.capture_output else None,
-                output=None,
-                expected=example.expected,
-                scores={m.name: 0.0 for m in self.metrics},
-                latency=latency,
-                error=str(exc),
-            )
+            return self._error_result(index, example, time.perf_counter() - start, exc)
+        return self._score_one(index, example, output, time.perf_counter() - start)
 
+    async def _arun_one(
+        self, runner: Callable[[Any], Awaitable[Any]], index: int, example: Example
+    ) -> ExampleResult:
+        start = time.perf_counter()
+        try:
+            output = await runner(example.inputs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # non-fatal: record and score zero
+            return self._error_result(index, example, time.perf_counter() - start, exc)
+        return self._score_one(index, example, output, time.perf_counter() - start)
+
+    def _error_result(
+        self, index: int, example: Example, latency: float, exc: Exception
+    ) -> ExampleResult:
+        logger.warning("Agent raised on example %d: %s", index, exc)
+        return ExampleResult(
+            index=index,
+            inputs=example.inputs if self.capture_output else None,
+            output=None,
+            expected=example.expected,
+            scores={m.name: 0.0 for m in self.metrics},
+            latency=latency,
+            error=str(exc),
+        )
+
+    def _score_one(
+        self, index: int, example: Example, output: Any, latency: float
+    ) -> ExampleResult:
+        """Apply the output extractor and every metric. Shared by both paths."""
         if self.output_extractor is not None:
             try:
                 output = self.output_extractor(output)
@@ -325,5 +456,66 @@ class EvaluationHarness:
             latency=latency,
         )
 
+    def _build_report(self, results_iter: Any) -> EvaluationReport:
+        """Aggregate a stream of per-example results into a report."""
+        accumulator = _Accumulator(self)
+        for result in results_iter:
+            accumulator.add(result)
+        return accumulator.report()
 
-__all__ = ["EvaluationHarness", "EvaluationReport", "ExampleResult", "resolve_runner"]
+
+class _Accumulator:
+    """Running aggregation over per-example results.
+
+    Shared by the serial, threaded and async paths so all three produce
+    identical reports. Records are kept by *index* rather than by arrival, so
+    results may be added out of order (as they do on the async path) and still
+    come back index-ordered -- while never holding more than ``max_results`` of
+    them.
+    """
+
+    def __init__(self, harness: EvaluationHarness):
+        self._harness = harness
+        self._results: list[ExampleResult] = []
+        self._sums: dict[str, float] = {}
+        self._counts: dict[str, int] = {}
+        self._unordered = False
+        self._n_errors = 0
+        self._total_latency = 0.0
+
+    def add(self, result: ExampleResult) -> None:
+        self._total_latency += result.latency
+        if result.error is not None:
+            self._n_errors += 1
+        for name, score in result.scores.items():
+            self._sums[name] = self._sums.get(name, 0.0) + score
+            self._counts[name] = self._counts.get(name, 0) + 1
+        if result.index < self._harness.max_results:
+            if self._results and result.index < self._results[-1].index:
+                self._unordered = True
+            self._results.append(result)
+
+    def report(self) -> EvaluationReport:
+        if self._unordered:
+            self._results.sort(key=lambda r: r.index)
+        aggregate = {n: self._sums[n] / self._counts[n] for n in self._sums if self._counts[n]}
+        # Ensure every metric appears even if all examples errored before scoring.
+        for metric in self._harness.metrics:
+            aggregate.setdefault(metric.name, 0.0)
+        return EvaluationReport(
+            aggregate=aggregate,
+            primary_metric=self._harness.primary_metric,
+            results=self._results,
+            n_errors=self._n_errors,
+            total_latency=self._total_latency,
+            failure_threshold=self._harness.failure_threshold,
+        )
+
+
+__all__ = [
+    "EvaluationHarness",
+    "EvaluationReport",
+    "ExampleResult",
+    "aresolve_runner",
+    "resolve_runner",
+]

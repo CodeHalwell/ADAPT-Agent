@@ -15,7 +15,7 @@ All built-ins are pure-Python and dependency-free.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 #: A bare metric function. Either ``(output, expected)`` or, for example-aware
@@ -31,12 +31,21 @@ class Metric:
         fn: The scoring callable returning a float (clamped to ``[0, 1]``).
         needs_example: When ``True`` the harness calls ``fn(output, expected,
             example)``; otherwise ``fn(output, expected)``.
+        structural: Marks a metric that scores a *structured* output (a mapping)
+            rather than text. :func:`~adapt_agent.optimization.evals.evaluate_agent`
+            reads this to pick
+            :func:`~adapt_agent.optimization.extractors.extract_output_payload`
+            over ``extract_output_text``, so the structure a structural metric
+            needs is not flattened away before it runs.
     """
 
-    def __init__(self, name: str, fn: MetricFn, *, needs_example: bool = False):
+    def __init__(
+        self, name: str, fn: MetricFn, *, needs_example: bool = False, structural: bool = False
+    ):
         self.name = name
         self.fn = fn
         self.needs_example = needs_example
+        self.structural = structural
 
     def __call__(self, output: Any, expected: Any, example: Any = None) -> float:
         if self.needs_example:
@@ -198,7 +207,71 @@ def json_subset() -> Metric:
         matched = sum(1 for k, v in exp.items() if out.get(k) == v)
         return matched / len(exp)
 
-    return Metric("json_subset", _fn)
+    return Metric("json_subset", _fn, structural=True)
+
+
+def field_match(
+    field: str,
+    *,
+    check: str = "exact_match",
+    name: str | None = None,
+    missing: float = 0.0,
+    **options: Any,
+) -> Metric:
+    """Score **one field** of a structured output, reported under its own name.
+
+    A single blended number hides which column moved. Scoring four fields
+    separately turns a report's ``aggregate`` into the per-column table you
+    actually reason about::
+
+        {"lane": 0.94, "matter": 0.90, "action": 0.63, "pack": 0.0}
+
+    That ``pack: 0.0`` is a column the agent never gets right; averaged into one
+    score it would read as a mild dip. It also removes the main reason to reach
+    for a judge on structured output -- a deterministic field check is both
+    cheaper and more correct than asking an LLM whether two labels agree.
+
+    Pair with
+    :func:`~adapt_agent.optimization.extractors.extract_output_payload`, which
+    keeps the structure that ``extract_output_text`` would flatten.
+
+    Args:
+        field: Key to compare on both sides.
+        check: Name of the built-in metric used to compare the two values
+            (``exact_match`` by default; ``numeric_close``, ``token_f1``, ...).
+        name: Reporting name. Defaults to ``field``, which is what makes the
+            aggregate read as a column table.
+        missing: Score when either side lacks the field. ``0.0`` by default --
+            a field the agent failed to emit is a failure, not a skip.
+        **options: Forwarded to the inner check's factory, e.g.
+            ``field_match("total", check="numeric_close", tolerance=0.01)``.
+
+    Raises:
+        ValueError: If ``check`` is unknown, or is ``field_match`` itself.
+    """
+    if check == "field_match":
+        raise ValueError("field_match cannot nest inside itself; pick a scalar check")
+    factory = BUILTIN_METRICS.get(check)
+    if factory is None:
+        raise ValueError(f"Unknown check {check!r}. Available: {sorted(BUILTIN_METRICS)}")
+    inner = factory(**options)
+
+    def _fn(output: Any, expected: Any) -> float:
+        out, exp = _as_mapping(output), _as_mapping(expected)
+        if out is None or exp is None or field not in exp or field not in out:
+            return missing
+        return inner(out[field], exp[field])
+
+    return Metric(name or field, _fn, structural=True)
+
+
+def field_metrics(fields: Sequence[str], **options: Any) -> list[Metric]:
+    """Build one :func:`field_match` metric per field.
+
+    ``metrics=field_metrics(["lane", "matter", "action", "pack"])`` replaces four
+    hand-written closures, and the report comes back keyed by column.
+    """
+    return [field_match(field, **options) for field in fields]
 
 
 def levenshtein_ratio() -> Metric:
@@ -345,16 +418,31 @@ BUILTIN_METRICS: dict[str, Callable[..., Metric]] = {
     "numeric_close": numeric_close,
     "json_subset": json_subset,
     "levenshtein_ratio": levenshtein_ratio,
+    "field_match": field_match,
     "checks": checks,
 }
 
 
 def get_metric(name: str) -> Metric:
-    """Look up a built-in metric by name using default settings."""
+    """Look up a built-in metric by name using default settings.
+
+    Raises:
+        KeyError: If ``name`` is not a built-in.
+        TypeError: If the metric cannot be built without arguments --
+            ``field_match`` needs a ``field``, so it is only reachable through a
+            mapping spec such as ``{"name": "field_match", "field": "lane"}``.
+    """
     factory = BUILTIN_METRICS.get(name)
     if factory is None:
         raise KeyError(f"Unknown built-in metric {name!r}. Available: {sorted(BUILTIN_METRICS)}")
-    return factory()
+    try:
+        return factory()
+    except TypeError as exc:
+        raise TypeError(
+            f"Built-in metric {name!r} needs arguments and cannot be built by name alone. "
+            f'Use a mapping spec, e.g. {{"name": "{name}", "field": "..."}}, '
+            f"or call {name}(...) directly."
+        ) from exc
 
 
 # -- low-level helpers --------------------------------------------------------
@@ -418,6 +506,8 @@ __all__ = [
     "numeric_close",
     "json_subset",
     "levenshtein_ratio",
+    "field_match",
+    "field_metrics",
     "checks",
     "BUILTIN_METRICS",
     "get_metric",

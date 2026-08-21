@@ -93,6 +93,7 @@ Each maps `(output, expected)` to `[0, 1]`.
 | `json_subset` | fraction of expected dict key/values present in output dict | — |
 | `levenshtein_ratio` | normalised edit-distance similarity | — |
 | `checks` | per-row dispatch (see below) | `default`, `judge`, `aggregate` |
+| `field_match` | one field of a structured output, reported under its own name | `field`, `check`, `name`, `missing` |
 
 Import them from `adapt_agent.evaluation` and call the factory:
 `numeric_close(tolerance=0.5, relative=True)`.
@@ -114,6 +115,69 @@ Import them from `adapt_agent.evaluation` and call the factory:
 from adapt_agent.evaluation import checks
 evaluate_agent(agent, data, metrics=checks(default="token_f1", judge=my_judge))
 ```
+
+## Scoring structured output
+
+`extract_output_text` flattens a structured answer: a Microsoft
+`AgentRunResponse` is a recognised shape, so it becomes `.text` and the object
+is gone. `output_extractor=None` unwraps nothing at all and scores a `repr()`.
+Neither is what a structured-output agent needs, so there is a third option:
+
+```python
+from adapt_agent.evaluation import extract_output_payload, field_metrics
+
+report = evaluate_agent(agent, data, metrics=field_metrics(["lane", "matter", "action", "pack"]))
+report.aggregate    # {"lane": 0.94, "matter": 0.90, "action": 0.63, "pack": 0.0}
+```
+
+`extract_output_payload` strips the framework envelope and keeps the payload: a
+mapping or sequence passes through, a Pydantic model becomes a dict, and a JSON
+string is parsed back into an object (including a ```` ```json ```` fenced one,
+which is how most models emit structured answers). Non-JSON text degrades to
+text rather than erroring.
+
+`evaluate_agent` selects it automatically when **every** metric is structural
+(`json_subset`, `field_match`). The all-or-nothing rule is deliberate: mixing a
+text metric with a structural one keeps text, because a dict scores 0.0 against
+`exact_match`. Pass either extractor explicitly to override.
+
+`field_match(field, check="exact_match", name=None, missing=0.0, **options)`
+scores one field, reported under the field's name — which is what turns
+`aggregate` into a per-column table instead of one blended number that hides
+which column moved. `field_metrics([...])` builds one per field. Options go to
+the inner check: `field_match("total", check="numeric_close", tolerance=0.01)`.
+Rows can request it too: `{"check": {"name": "field_match", "field": "lane"}}`.
+
+A missing field scores `missing` (default `0.0`) — a field the agent failed to
+emit is a failure, not a skip.
+
+## Running examples concurrently
+
+`evaluate` is serial by default. That is fine for a 20-row smoke test and
+untenable for what optimization needs: `CoordinateAscentOptimizer(max_evals=60)`
+over a 113-case split is 6,780 agent calls, each an LLM round-trip.
+
+```python
+report = harness.evaluate(agent, dataset, concurrency=8)          # sync agent: threads
+report = await harness.aevaluate(agent, dataset, concurrency=8)   # async agent: no threads
+```
+
+`evaluate_agent(..., concurrency=8)` takes the same knob. Use `aevaluate` for an
+async-native agent — it awaits in your loop, so `contextvars` (tracing spans)
+survive and no thread is involved; use `evaluate(concurrency=)` for a sync agent
+whose time goes on network I/O.
+
+Both preserve the guarantees of the serial path: results are reported in
+**example-index order** regardless of completion order, a per-example exception
+is still a non-fatal zero-scored error, and `max_results` still bounds stored
+records while every example is aggregated. `avg_latency` stays the mean
+*per-example* latency, not wall-clock/n, so it remains comparable across
+concurrency settings.
+
+Concurrency multiplies provider rate-limit pressure by the same factor: `N`
+in-flight examples is `N` simultaneous LLM calls, and a 429 surfaces as a
+per-example error scoring 0.0 rather than as a crash — which can look like a
+quality regression. Start at 4–8 and raise it against your own quota.
 
 ## Choosing metrics
 
@@ -190,7 +254,8 @@ from adapt_agent.evaluation import register_extractor
 register_extractor("my_fw", lambda v: isinstance(v, MyResult), lambda v: v.completion)
 ```
 
-Pass `output_extractor=None` to score raw outputs.
+Pass `output_extractor=None` to score raw outputs, or
+`extract_output_payload` to keep structure (see *Scoring structured output*).
 
 ## Driving the harness directly
 
@@ -230,8 +295,10 @@ free.
 materialisation, input adaptation and extraction on its own if you want the
 plain `input -> text` callable without an eval.
 
-Async agents are driven synchronously. Inside an already-running event loop
-(notebook, async handler) that raises — run the eval in a worker thread.
+Async agents are driven synchronously by `evaluate`. Inside an already-running
+event loop that raises — use `await harness.aevaluate(agent, dataset)` instead,
+which awaits in your loop rather than blocking it. A governed agent's
+`aexecute` is preferred automatically by `aresolve_runner`.
 
 ## CLI
 

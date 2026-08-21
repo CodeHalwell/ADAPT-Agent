@@ -37,6 +37,7 @@ framework can be plugged in without touching this module.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -300,6 +301,105 @@ def extract_output_text(value: Any) -> Any:
     return _extract(value, _MAX_DEPTH)
 
 
+def extract_output_payload(value: Any) -> Any:
+    """Unwrap the framework envelope but **keep the structure**.
+
+    :func:`extract_output_text` is the right default for text and number checks,
+    but it flattens a structured answer: a Microsoft ``AgentRunResponse`` is a
+    recognised shape, so it becomes ``.text`` and the object is gone. The only
+    escape used to be ``output_extractor=None``, which unwraps nothing at all
+    and leaves a metric scoring a ``repr()``. Neither is what a structured-output
+    agent needs.
+
+    This extractor takes the middle path -- strip the framework wrapper, then
+    recover the payload:
+
+    * a mapping or sequence comes back unchanged;
+    * a Pydantic model (or anything with ``model_dump``/``dict``) becomes a dict;
+    * a JSON string is parsed back into an object, including one wrapped in a
+      `````json`` fence, which is how most models emit structured answers;
+    * anything that is not JSON is returned as the extracted text, so a
+      partially-structured pipeline degrades to text rather than to an error.
+
+    Use it with :func:`~adapt_agent.optimization.metrics.json_subset` or
+    :func:`~adapt_agent.optimization.metrics.field_match`;
+    :func:`~adapt_agent.optimization.evals.evaluate_agent` selects it
+    automatically when the metrics you asked for are structural.
+    """
+    unwrapped = _unwrap_envelope(value, _MAX_DEPTH)
+    if isinstance(unwrapped, Mapping) or (
+        isinstance(unwrapped, Sequence) and not isinstance(unwrapped, (str, bytes))
+    ):
+        return unwrapped
+    as_dict = _model_to_dict(unwrapped)
+    if as_dict is not None:
+        return as_dict
+
+    text = extract_output_text(unwrapped)
+    if isinstance(text, str):
+        parsed = _parse_json(text)
+        if parsed is not None:
+            return parsed
+    return text
+
+
+def _unwrap_envelope(value: Any, depth: int) -> Any:
+    """Peel framework wrappers off ``value`` without collapsing it to text.
+
+    Applies the same registered extractors as :func:`extract_output_text`, but
+    stops as soon as the inner value is structured rather than continuing down
+    to a string.
+    """
+    if value is None or isinstance(value, (str, bytes)) or depth <= 0:
+        return value
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, Sequence):
+        return value
+    for _, predicate, unwrap in (*_CUSTOM_EXTRACTORS, *_BUILTIN_EXTRACTORS):
+        try:
+            if not predicate(value):
+                continue
+            inner = unwrap(value)
+        except Exception:
+            continue
+        if inner is None or inner is value:
+            continue
+        return _unwrap_envelope(inner, depth - 1)
+    return value
+
+
+def _model_to_dict(value: Any) -> dict[str, Any] | None:
+    """Convert a Pydantic (v1 or v2) model or dataclass-like object to a dict."""
+    for attr in ("model_dump", "dict"):
+        method = getattr(value, attr, None)
+        if callable(method):
+            try:
+                dumped = method()
+            except Exception:
+                continue
+            if isinstance(dumped, dict):
+                return dumped
+    return None
+
+
+def _parse_json(text: str) -> Any | None:
+    """Parse ``text`` as JSON, tolerating a ``` fence. ``None`` if it is not JSON."""
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        # ```json\n{...}\n``` -- drop the fence lines and keep the body.
+        lines = candidate.splitlines()
+        if len(lines) >= 2:
+            body = lines[1:-1] if lines[-1].strip().startswith("```") else lines[1:]
+            candidate = "\n".join(body).strip()
+    if not candidate or candidate[0] not in "{[":
+        return None
+    try:
+        return json.loads(candidate)
+    except ValueError:
+        return None
+
+
 def _extract(value: Any, depth: int) -> Any:
     if value is None:
         return ""
@@ -341,6 +441,7 @@ __all__ = [
     "ExtractorFn",
     "ExtractorPredicate",
     "available_extractors",
+    "extract_output_payload",
     "extract_output_text",
     "register_extractor",
 ]

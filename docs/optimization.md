@@ -193,3 +193,39 @@ report.to_dict()        # JSON-friendly summary
 
 See `examples/06_optimize_with_golden_dataset.py` for a complete, offline,
 runnable walkthrough.
+
+## Exporting the winning configuration
+
+`result.best_config` is applied to the live components in place and dies with
+the process. For a project whose prompts are version-controlled that is the
+wrong end state — and a machine-rewritten prompt reaching production without a
+human reading the diff is worse than losing a tuning run.
+
+```python
+result = CoordinateAscentOptimizer(harness, judge=judge).optimize(target, dataset)
+result.to_config("specialists/.config/tuned.yaml")
+```
+
+Parameter names follow `"<component>.<knob>"`, so the file nests by component:
+
+```yaml
+# Tuned by adapt-agent.
+# baseline=0.6300 best=0.9100 improvement=+0.2800 over 60 evals.
+# Review this diff before committing: prompts here were machine-written.
+researcher:
+  system_prompt: |
+    You are a careful researcher...
+  temperature: 0.2
+writer:
+  model: gpt-4o
+```
+
+The loop becomes **optimize → diff → review → commit**, and the application
+keeps loading prompts from the YAML it always did. Round-trip it with
+`load_tuned_config`:
+
+```python
+from adapt_agent.optimization import load_tuned_config
+
+target.apply(load_tuned_config("specialists/.config/tuned.yaml"))
+```

@@ -32,6 +32,7 @@ need one only if your agent already uses it.
 | Score an agent against expected outputs | `evaluate_agent(...)` — below | [references/evals.md](references/evals.md) |
 | Check text/number answers, or grade open-ended ones | checks + LLM-as-judge — below | [references/evals.md](references/evals.md) |
 | Block prompt injection, enforce policy, trace runs | a governed adapter — below | [references/guardrails.md](references/guardrails.md) |
+| Govern one agent *inside* a multi-agent graph | native hooks — below | [references/guardrails.md](references/guardrails.md) |
 | Improve prompts/models/tools automatically | an optimizer — below | [references/optimization.md](references/optimization.md) |
 
 Read the reference file for the task at hand before writing non-trivial code;
@@ -42,8 +43,11 @@ each one carries the full API surface, per-framework notes, and gotchas:
   `EvaluationHarness` directly, and a per-framework table (LangGraph input
   adaptation, Google ADK runners, Pydantic AI structured output, …).
 - [references/guardrails.md](references/guardrails.md) — the adapter matrix,
-  `Firewall` / `PolicyEnforcer` / `AdversarialDefense` / `TrustManager` /
-  `TaintTracker` APIs, the governance pipeline order, and config-file schema.
+  the async `aexecute` path, the native-hook integrations (middleware /
+  callbacks / guardrails per framework), the `Firewall` / `TrustManager` /
+  `TaintTracker` APIs (`adapt_agent.security`), `PolicyEnforcer`
+  (`adapt_agent.core`) and `AdversarialDefense` (`adapt_agent.adversarial`, not
+  `security`), the governance pipeline order, and config-file schema.
 - [references/optimization.md](references/optimization.md) — `OptimizableAgent`,
   what gets introspected per framework, the optimizer strategies, proposers, and
   the declarative `adapt-agent train` config.
@@ -105,6 +109,21 @@ without one fall back to `exact_match`.
 
 Rows can parameterise a check — `{"check": {"name": "numeric_close", "tolerance": 0.5}}` —
 or combine several — `{"check": ["contains", "numeric_close"]}` (all must pass).
+
+**Structured output?** Score it per field rather than as one blended number:
+
+```python
+from adapt_agent.evaluation import field_metrics
+
+report = evaluate_agent(agent, data, metrics=field_metrics(["lane", "matter", "action", "pack"]))
+report.aggregate    # {"lane": 0.94, "matter": 0.90, "action": 0.63, "pack": 0.0}
+```
+
+That `pack: 0.0` is a column the agent never gets right; averaged into a single
+score it would read as a mild dip. `evaluate_agent` notices the metrics are
+structural and switches to `extract_output_payload`, which strips the framework
+envelope but keeps the payload (parsing a JSON answer, including a fenced one).
+A deterministic field check is cheaper and more correct here than a judge.
 
 To score every row the same way instead, pass `metrics=`:
 
@@ -190,6 +209,42 @@ function calls and negative indexes. Adapters exist for every supported
 framework and share this constructor — see
 [references/guardrails.md](references/guardrails.md).
 
+### In an async app, await `aexecute`
+
+`execute` drives an async framework by running its coroutine to completion,
+which is impossible inside a running event loop — so in an async web handler it
+raises. Use the async twin, which applies identical governance:
+
+```python
+result = await guarded.aexecute({"messages": [{"role": "user", "content": "Hi"}]})
+```
+
+Prefer this over pushing `execute` onto a worker thread: a thread serialises
+concurrent requests and severs `contextvars`, losing the OpenTelemetry span
+parentage. Pydantic AI, the Claude Agent SDK and Microsoft Agent Framework are
+all async-native, so this is their normal path.
+
+### Governing one agent inside a graph
+
+Wrapping a multi-agent workflow governs only its outer boundary. To give each
+specialist its own rules, plug into the framework's own middleware/callback
+chain instead — same controls, same `GovernanceGate`:
+
+```python
+from adapt_agent.integrations.agent_framework import governance_middleware
+
+agent = chat_client.create_agent(
+    instructions="...",
+    middleware=[usage_middleware("nos"),                          # the app's own
+                governance_middleware(firewall=fw, agent_id="nos")],
+)
+```
+
+There is a factory per framework (`agent_framework`, `google_adk`,
+`openai_agents`, `claude_agent`, `langgraph`, `crewai`, `pydantic_ai`) in
+`adapt_agent.integrations`; `agent_id` names the refusing agent in the error.
+Keep `wrap_agent` where a framework has no hook concept.
+
 ## Optimizing an agent
 
 Turn an agent into a search space and improve it against the same golden data:
@@ -208,7 +263,15 @@ harness = EvaluationHarness([exact_match(), judge.as_metric("quality")],
 
 result = CoordinateAscentOptimizer(harness, judge=judge).optimize(target, dataset)
 result.improvement       # baseline -> best; the winner is applied in place
+result.to_config("specialists/.config/tuned.yaml")   # ...and to a reviewable file
 ```
+
+`best_config` is applied to live objects and dies with the process. `to_config`
+writes it as `{component: {parameter: value}}` YAML, so the loop becomes
+**optimize → diff → review → commit** and the app keeps loading prompts from
+version control. `load_tuned_config(path)` flattens it back for `target.apply`.
+Machine-rewritten prompts should not reach production without a human reading
+the diff.
 
 The judge both scores candidates and rewrites prompts from observed failures.
 `references/optimization.md` covers multi-agent systems, the other search
@@ -221,9 +284,16 @@ strategies, and the declarative `adapt-agent train config.yaml` flow.
   `output_extractor=extract_output_text` or the metric sees a `repr()`.
 - **Google ADK needs a runner.** ADK agents execute inside a `Runner` with a
   session; use `adk_runner(agent_or_runner)` and pass that to `evaluate_agent`.
-- **Async frameworks are driven synchronously** (coroutines awaited, event
-  streams drained). Inside an already-running event loop — a notebook, an async
-  web handler — run the eval in a worker thread instead.
+- **Async frameworks are driven synchronously by `execute`** (coroutines
+  awaited, event streams drained). Inside an already-running event loop use
+  `await guarded.aexecute(...)`, or `await harness.aevaluate(agent, data,
+  concurrency=8)` for evals — not a worker thread, which serialises requests and
+  drops tracing context.
+- **A serial eval is the reason nobody re-runs one.** A coordinate-ascent sweep
+  is `max_evals x len(dataset)` LLM round-trips. Pass `concurrency=` to
+  `evaluate_agent`/`evaluate` (threads, for sync agents) or use `aevaluate`
+  (no threads, for async ones); ordering and per-example error handling are
+  unchanged.
 - **A structured (non-text) output survives extraction unchanged**, so score it
   with `json_subset` or a custom callable rather than `exact_match`.
 - **Unlabeled rows are fine** for judge-graded evals; `expected` is optional.
