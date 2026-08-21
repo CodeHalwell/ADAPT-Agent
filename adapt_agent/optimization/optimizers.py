@@ -104,7 +104,6 @@ class OptimizationResult:
         self,
         path: str | Path | None = None,
         *,
-        default_component: str = "agent",
         header: bool = True,
     ) -> dict[str, Any]:
         """Export the winning configuration as a reviewable, nested mapping.
@@ -121,7 +120,8 @@ class OptimizationResult:
             result.to_config("specialists/.config/tuned.yaml")
 
         Parameter names follow the ``"<component>.<knob>"`` convention, so the
-        flat config nests by component::
+        flat config nests by component. A name with no prefix stays at the top
+        level as a scalar, so it round-trips back under its own name::
 
             researcher:
               system_prompt: |
@@ -129,6 +129,7 @@ class OptimizationResult:
               temperature: 0.2
             writer:
               model: gpt-4o
+            temperature: 0.2        # a bare name, unchanged
 
         Round-trips through :func:`load_tuned_config`, which flattens it back
         for :meth:`OptimizableAgent.apply`.
@@ -154,7 +155,6 @@ class OptimizationResult:
         Args:
             path: Where to write. ``None`` returns the mapping without writing.
                 The parent directory is created if needed.
-            default_component: Section for a parameter name with no ``"."``.
             header: Record provenance in the file. Comments do not affect
                 parsing or the round-trip.
 
@@ -167,11 +167,7 @@ class OptimizationResult:
         unexportable: dict[str, str] = {}
         for name, value in self.best_config.items():
             component, _, knob = name.partition(".")
-            if not knob:  # a bare name carries no component prefix
-                component, knob = default_component, name
-            if _is_exportable(value):
-                nested.setdefault(component, {})[knob] = value
-            else:
+            if not _is_exportable(value):
                 # A TOOL/SKILL parameter holds live callables or SDK objects. They
                 # cannot be written to YAML/JSON, and a string standing in for one
                 # would corrupt the agent if `apply()` later wrote it back over the
@@ -179,6 +175,15 @@ class OptimizationResult:
                 # records which were selected, for review, and stays safely
                 # reloadable.
                 unexportable[name] = _describe(value)
+            elif knob:
+                nested.setdefault(component, {})[knob] = value
+            else:
+                # A parameter with no "<component>." prefix stays at the top
+                # level as a scalar. Filing it under a synthetic component would
+                # rename it on the way out, and `load_tuned_config` could not
+                # recover the original -- `apply()` would then silently skip it,
+                # breaking the round trip this method exists to provide.
+                nested[name] = value
 
         if path is not None:
             destination = Path(path)
@@ -932,10 +937,19 @@ def _dedup(values: list[Any]) -> list[Any]:
 
 
 def _is_exportable(value: Any) -> bool:
-    """Can ``value`` survive a YAML/JSON round trip as itself?"""
+    """Can ``value`` survive a YAML/JSON round trip **as itself**?
+
+    Note the tuple exclusion. Both encoders write a tuple as a sequence and read
+    it back as a ``list``, so exporting one would change the winning value's type
+    on reload -- and a setter or framework field expecting a tuple would then
+    receive a list. The invariant here is that everything in the config body
+    applies cleanly, so a tuple is described rather than exported.
+    """
     if value is None or isinstance(value, (str, bool, int, float)):
         return True
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, tuple):
+        return False
+    if isinstance(value, list):
         return all(_is_exportable(v) for v in value)
     if isinstance(value, dict):
         return all(isinstance(k, str) and _is_exportable(v) for k, v in value.items())

@@ -243,12 +243,55 @@ def test_to_config_round_trips_through_load_tuned_config(tmp_path):
     assert load_tuned_config(path) == result.best_config
 
 
-def test_to_config_places_bare_names_under_a_default_component():
+def test_bare_parameter_names_round_trip_under_their_own_name(tmp_path):
+    """A name with no ``component.`` prefix must survive export and reload.
+
+    Filing it under a synthetic component renamed it on the way out, and
+    `load_tuned_config` could not recover the original -- so `apply()` silently
+    skipped it and the advertised round trip did not restore the winner.
+    """
+    config = {
+        "temperature": 0.2,
+        "researcher.system_prompt": "Be brief.",
+        "writer.model": "gpt-4o",
+    }
+    result = OptimizationResult(best_config=config, best_score=1.0, baseline_score=0.0)
+    for suffix in ("yaml", "json"):
+        path = tmp_path / f"tuned.{suffix}"
+        body = result.to_config(path)
+        assert body["temperature"] == 0.2, "a bare name must stay at the top level"
+        assert body["researcher"] == {"system_prompt": "Be brief."}
+        assert load_tuned_config(path) == config
+
+
+def test_tuple_values_are_described_rather_than_silently_retyped(tmp_path):
+    """Both encoders read a tuple back as a list.
+
+    Exporting one would change the winning value's type on reload, and a setter
+    expecting a tuple would receive a list -- so the config body, which is meant
+    to be exactly what applies cleanly, leaves it out and describes it instead.
+    """
     result = OptimizationResult(
-        best_config={"temperature": 0.5}, best_score=1.0, baseline_score=0.0
+        best_config={"a.bounds": (0, 1), "a.temperature": 0.5},
+        best_score=1.0,
+        baseline_score=0.0,
     )
-    assert result.to_config() == {"agent": {"temperature": 0.5}}
-    assert result.to_config(default_component="root") == {"root": {"temperature": 0.5}}
+    path = tmp_path / "tuned.yaml"
+    body = result.to_config(path)
+    assert body == {"a": {"temperature": 0.5}}
+    assert "bounds" in path.read_text(encoding="utf-8"), "the dropped value must be reported"
+    # Everything that *is* exported still round-trips as itself.
+    assert load_tuned_config(path) == {"a.temperature": 0.5}
+
+
+def test_a_list_of_primitives_still_exports(tmp_path):
+    """The tuple exclusion must not sweep up ordinary list values."""
+    result = OptimizationResult(
+        best_config={"a.stops": ["\n", "END"]}, best_score=1.0, baseline_score=0.0
+    )
+    path = tmp_path / "tuned.yaml"
+    assert result.to_config(path) == {"a": {"stops": ["\n", "END"]}}
+    assert load_tuned_config(path) == {"a.stops": ["\n", "END"]}
 
 
 def test_load_tuned_config_rejects_a_non_mapping(tmp_path):
@@ -453,3 +496,25 @@ def test_a_genuine_structured_list_survives_stream_unwrapping():
     records = [{"lane": "NOS"}, {"lane": "OTHER"}]
     assert extract_output_payload(records) == records
     assert extract_output_payload(["a", "b"]) == ["a", "b"]
+
+
+def test_per_row_field_check_handles_model_and_dataclass_values():
+    """A per-row `{"check": {"name": "field_match", ...}}` cannot mark the outer
+    `checks` metric structural -- the row decides at runtime -- so extraction
+    leaves a Pydantic AI result as a model object and the metric must cope."""
+
+    class Model:
+        def model_dump(self):
+            return {"lane": "NOS"}
+
+    @dataclasses.dataclass
+    class Triage:
+        lane: str
+
+    metric = checks()
+    example = type("Ex", (), {"metadata": {"check": {"name": "field_match", "field": "lane"}}})()
+    assert metric(Model(), {"lane": "NOS"}, example) == 1.0
+    assert metric(Triage(lane="NOS"), {"lane": "NOS"}, example) == 1.0
+    assert metric(Triage(lane="OTHER"), {"lane": "NOS"}, example) == 0.0
+    # Non-mapping values are still not mappings.
+    assert json_subset()("not json at all", {"lane": "NOS"}) == 0.0

@@ -14,6 +14,7 @@ All built-ins are pure-Python and dependency-free.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -460,6 +461,14 @@ def _extract_number(value: Any) -> float | None:
 
 
 def _as_mapping(value: Any) -> dict[str, Any] | None:
+    """Coerce a structured output to a mapping, or ``None`` if it is not one.
+
+    Accepts a dict, a JSON string, and a **model or dataclass**. The last matters
+    for per-row checks: ``{"check": {"name": "field_match", ...}}`` is dispatched
+    by the ``checks`` metric, which cannot be marked structural (the row decides
+    at runtime), so automatic extraction leaves a Pydantic AI result as a model
+    object. Without this the field would score a false 0.0.
+    """
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
@@ -470,6 +479,25 @@ def _as_mapping(value: Any) -> dict[str, Any] | None:
             return obj if isinstance(obj, dict) else None
         except Exception:
             return None
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        try:
+            return {f.name: getattr(value, f.name, None) for f in dataclasses.fields(value)}
+        except Exception:
+            return None
+    # Any object offering a dump. Deliberately more permissive than the
+    # security-side `_structured_fields`, and matched to
+    # `extractors._model_to_dict` so the two agree: there, an unconvertible
+    # object would silently reach a metric as itself; here the worst case is a
+    # surprising score, never a missed screen.
+    for attr in ("model_dump", "dict"):
+        method = getattr(value, attr, None)
+        if callable(method):
+            try:
+                dumped = method()
+            except Exception:
+                continue
+            if isinstance(dumped, dict):
+                return dumped
     return None
 
 

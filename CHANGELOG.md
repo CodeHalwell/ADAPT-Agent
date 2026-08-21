@@ -63,6 +63,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A bare parameter name did not survive the config round trip.** `to_config`
+  filed a name with no `component.` prefix under a synthetic `agent` section,
+  renaming it on the way out; `load_tuned_config` could not recover the original,
+  so `apply()` silently skipped it and the export/reload round trip did not
+  restore the winner. Bare names now stay at the top level, under their own name.
+- **A per-row `field_match` scored a false 0.0 on a model result.** A row's
+  `{"check": {"name": "field_match", ...}}` is dispatched by `checks`, which
+  cannot be marked structural (the row decides at run time), so extraction leaves
+  a Pydantic AI result as a model object. Mapping coercion now accepts models and
+  dataclasses, matching what payload extraction already did.
+- **A tuple parameter was exported as a list.** Both encoders read a sequence
+  back as a `list`, so reloading changed the winning value's type and a setter
+  expecting a tuple would receive a list. Tuples are now described rather than
+  exported, keeping the invariant that the config body is exactly what applies
+  cleanly.
 - **A drained event stream defeated structural scoring.** An async framework's
   result is materialised into a list, and `extract_output_payload` returned that
   list as the payload -- so a Claude Agent SDK `ResultMessage` carrying
