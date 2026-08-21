@@ -105,8 +105,11 @@ def governance_middleware(
         resolved.review_input(messages, state=as_state(messages))
         with traced(observer, agent_id, operation):
             await call_next()
-        if screen_output:
-            resolved.review_output(getattr(context, "result", None))
+            # Inside the span, not after it. A blocked result is exactly the
+            # event an observer exists to surface, and screening outside the
+            # scope recorded the run as `completed` before raising.
+            if screen_output:
+                resolved.review_output(getattr(context, "result", None))
 
     return _mark_agent_middleware(adapt_governance)
 

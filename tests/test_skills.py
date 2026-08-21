@@ -887,3 +887,59 @@ def test_documented_field_metrics_recipe_runs_as_written():
         "action": 1.0,
         "pack": 0.0,
     }
+
+
+def test_documented_output_extractor_values_are_usable():
+    """Every `output_extractor=` the docs prescribe must actually be accepted.
+
+    The mixed-metric escape hatch was documented as `output_extractor="payload"`,
+    a string `evaluate_agent` rejects -- so following the advice raised
+    `ValueError`. A prescription that cannot be executed is worse than none: it
+    is reached for precisely when something has already gone wrong.
+    """
+    import adapt_agent.evaluation as api
+
+    docs = [Path("docs/evals.md"), Path("adapt_agent/skills/adapt-agent/references/evals.md")]
+    prescribed = {
+        value
+        for path in docs
+        if path.exists()
+        for value in re.findall(r"output_extractor=([A-Za-z_\"'][\w\"']*)", path.read_text())
+    }
+    assert prescribed, "the docs no longer prescribe an extractor -- has this guard drifted?"
+
+    for value in sorted(prescribed):
+        if value == "None":  # a documented, and accepted, way to unwrap nothing
+            continue
+        if value.startswith(("'", '"')):
+            bare = value.strip("'\"")
+            assert bare == "auto", (
+                f"docs prescribe output_extractor={value}, but evaluate_agent accepts "
+                f"only 'auto', a callable, or None"
+            )
+        else:
+            assert callable(getattr(api, value, None)), (
+                f"docs prescribe output_extractor={value}, which is not a callable "
+                f"exported from adapt_agent.evaluation"
+            )
+
+    # And the escape hatch does what it is prescribed for: a structural row
+    # scores through a mixed metric list.
+    class Agent:
+        def run(self, _):
+            return {"answer": "Paris", "confidence": 1}
+
+    rows = [
+        {
+            "input": "q",
+            "expected": {"answer": "Paris"},
+            "metadata": {"check": {"name": "field_match", "field": "answer"}},
+        }
+    ]
+    report = evaluate_agent(
+        Agent(),
+        rows,
+        metrics=[api.checks(), api.exact_match()],
+        output_extractor=api.extract_output_payload,
+    )
+    assert report.aggregate["checks"] == 1.0

@@ -106,7 +106,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `completed` before post-middleware and output screening ran, so a caller
   received `SecurityBlockedError` while telemetry recorded success -- hiding the
   output-policy failures monitoring exists to surface. The span now closes last,
-  and as an error when either stage raises, on both `execute` and `aexecute`.
+  and as an error when either stage raises, on `execute`, `aexecute`, and the
+  Microsoft Agent Framework middleware (the only native hook that opens a span).
 - **A bare parameter name did not survive the config round trip.** `to_config`
   filed a name with no `component.` prefix under a synthetic `agent` section,
   renaming it on the way out; `load_tuned_config` could not recover the original,

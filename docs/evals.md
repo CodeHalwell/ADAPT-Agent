@@ -118,8 +118,9 @@ It is marked **structural**, so the output reaches it with its structure intact
 known at call time. Rows asking for a text check are flattened individually as
 they are scored, so both kinds work in one dataset. The exception is `checks`
 *mixed* with a plain text metric, where the all-or-nothing rule picks text
-extraction for the whole run; pass `output_extractor="payload"` if a row needs
-structure there.
+extraction for the whole run; pass `output_extractor=extract_output_payload`
+(imported from `adapt_agent.evaluation`) if a row needs structure there — at the
+cost of the text metric, which then scores a mapping.
 
 ## LLM-as-judge
 

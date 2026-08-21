@@ -692,6 +692,49 @@ def test_a_tool_result_carrying_an_injection_is_screened():
     assert asyncio.run(before(type("Ctx", (), {"state": {}})(), request)) is None
 
 
+def test_a_blocked_output_is_traced_as_an_error_in_the_middleware():
+    """The same bug as the adapter's `_after`, in the native hook.
+
+    `review_output` sat *after* the traced scope, so the span closed as
+    `completed` and the middleware then raised -- telemetry recording success
+    for exactly the event an observer exists to surface. Fixing the adapter path
+    last round did not fix this one; the class needed checking, not the instance.
+    """
+
+    class Observer:
+        def __init__(self):
+            self.events = []
+
+        def start_trace(self, trace_id, agent_id, operation):
+            self.events.append("start")
+
+        def end_trace(self, trace_id, status="completed", result=None):
+            self.events.append(f"end:{status}")
+
+    def run(output):
+        observer = Observer()
+        context = MafContext([])
+        middleware = maf.governance_middleware(
+            firewall=_firewall(), observer=observer, agent_id="nos"
+        )
+
+        async def call_next():
+            context.result = output
+
+        async def main():
+            try:
+                await middleware(context, call_next)
+            except SecurityBlockedError:
+                pass
+
+        asyncio.run(main())
+        return observer.events
+
+    assert run("the password is hunter2") == ["start", "end:error"]
+    # ...and a clean run is still a completed one, so the fix is not blanket.
+    assert run("nothing to see") == ["start", "end:completed"]
+
+
 def test_native_hook_trace_closes_on_cancellation():
     class Observer:
         def __init__(self):
