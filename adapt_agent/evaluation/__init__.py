@@ -112,7 +112,6 @@ class AgentEvaluator:
 
         self._evaluation_results.append(results)
 
-
         return results
 
     def compute_aggregate_metrics(
