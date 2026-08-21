@@ -89,6 +89,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`wrap_agent` gave unusable advice for callable-only adapters.** The Google
   ADK adapter takes a callable by design, so its error read `Expected one of ''`.
   It now names the actual contract.
+- **Nested retry budgets multiplied.** `LLMJudge` retried internally and then
+  re-raised into a harness that retried again: three attempts at each layer is
+  **nine provider calls for one row**, with the backoff reset between them --
+  piling on load exactly while the provider is throttling. An exhausted error is
+  stamped now, and the harness excludes the row instead of spending a second
+  budget. Measured 9 -> 3.
+- **A custom classifier did not reach the judge.** `LLMJudge._complete` gated on
+  the module-level `is_transient_error` before consulting the policy, so
+  `RetryPolicy(is_transient=...)` was ignored there and the judge swallowed into
+  `on_error` what the harness would have retried and excluded.
+- **Preserving newlines briefly made one a detection boundary.** The phrase
+  patterns excluded `\n` from their gaps, so `"ignore\nprevious instructions"`
+  evaded a pattern that caught the same words on one line -- a bypass introduced
+  by the fix above it. Gaps cross line breaks now; sentence-enders still stop a
+  match, so a phrase cannot be stitched together across unrelated sentences.
 - **Completeness had to reach every path that ranks on a score.** Guarding the
   global best was not enough:
 

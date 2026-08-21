@@ -684,3 +684,87 @@ def test_a_custom_classifier_governs_metric_failures_too() -> None:
     )
     assert narrow.n_transient_errors == 0
     assert len(narrow.failures()) == 3
+
+
+# -- nested retry budgets must not multiply -----------------------------------
+
+
+def test_a_judge_and_the_harness_do_not_each_spend_a_retry_budget() -> None:
+    """Three attempts at two layers is nine provider calls for one row.
+
+    Worse than wasteful: the backoff resets between the layers, so the load
+    lands hardest exactly while the provider is throttling.
+    """
+    from adapt_agent.optimization.judge import LLMJudge
+
+    calls = {"n": 0}
+
+    def always_throttled(prompt, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("429 Too Many Requests")
+
+    policy = RetryPolicy(attempts=3, initial_backoff=0.001, jitter=0.0)
+    harness = EvaluationHarness(
+        [LLMJudge(always_throttled, retry=policy).as_metric()], retry=policy
+    )
+    report = harness.evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+
+    assert calls["n"] == 3, f"retried at both layers: {calls['n']} provider calls for one row"
+    assert report.n_transient_errors == 1
+    assert report.failures() == []
+
+
+def test_a_metric_without_its_own_retries_is_still_retried_by_the_harness() -> None:
+    """The marker must not switch retrying off for ordinary metrics."""
+    from adapt_agent.optimization.metrics import Metric
+
+    calls = {"n": 0}
+
+    def flaky(output, expected):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RuntimeError("429 Too Many Requests")
+        return 1.0
+
+    EvaluationHarness([Metric("custom", flaky)], retry=FAST).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    assert calls["n"] == 3
+
+
+def test_a_custom_classifier_reaches_the_judge() -> None:
+    """`RetryPolicy(is_transient=...)` governs the judge's own classification.
+
+    Gating on the module-level default meant the judge swallowed into
+    `on_error` what the harness would have retried and excluded.
+    """
+    from adapt_agent.optimization.judge import LLMJudge
+
+    policy = RetryPolicy(
+        attempts=2,
+        initial_backoff=0.001,
+        jitter=0.0,
+        is_transient=lambda exc: "SQUELCH" in str(exc),
+    )
+
+    calls = {"n": 0}
+
+    def squelch(prompt, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("SQUELCH: provider hiccup")
+
+    with pytest.raises(RuntimeError, match="SQUELCH"):
+        LLMJudge(squelch, retry=policy).score("i", "o")
+    assert calls["n"] == 2, "the custom classifier never reached the judge"
+
+    # ...and the converse: a 429 is *not* transient under that policy, so it
+    # takes the on_error path instead of being retried.
+    calls["n"] = 0
+
+    def plain_429(prompt, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("429 Too Many Requests")
+
+    verdict = LLMJudge(plain_429, retry=policy).score("i", "o")
+    assert calls["n"] == 1
+    assert verdict.score == 0.0

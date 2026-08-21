@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any
 from adapt_agent.optimization.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
-    is_transient_error,
+    mark_retries_exhausted,
 )
 
 if TYPE_CHECKING:
@@ -536,7 +536,12 @@ class LLMJudge:
                 if any(tag in name for tag in ("Authentication", "Permission", "InvalidAPIKey")):
                     logger.error("Judge completion failed with auth/permission error: %s", exc)
                     raise
-                if is_transient_error(exc):
+                # Classify through the *policy*, not the module-level default:
+                # a caller who supplied `RetryPolicy(is_transient=...)` for a
+                # provider-specific exception must be honoured here too, or
+                # the judge swallows into `on_error` what the harness would
+                # have retried and excluded.
+                if policy.should_retry(exc, 0):
                     if policy.should_retry(exc, attempt):
                         delay = policy.delay_for(exc, attempt)
                         logger.info(
@@ -556,6 +561,9 @@ class LLMJudge:
                         attempt,
                         exc,
                     )
+                    # Stamped so the harness excludes the row without spending a
+                    # second retry budget on an already-exhausted call.
+                    mark_retries_exhausted(exc)
                     raise
                 logger.warning("Judge completion failed, returning None: %s", exc)
                 return None

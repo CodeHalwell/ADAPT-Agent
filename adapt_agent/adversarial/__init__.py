@@ -61,15 +61,21 @@ class AdversarialDefense:
     #: the phrase rather than one spelling of it closes that without widening
     #: into false positives on ordinary prose.
     _INJECTION_PATTERNS = (
-        r"\b(?:ignore|disregard|forget|override)\b[^.!?\n]{0,40}?"
-        r"\b(?:previous|prior|earlier|above|preceding|all)\b[^.!?\n]{0,40}?"
+        # The gaps must cross a line break. Preserving newlines in
+        # :func:`_normalize` is what lets the ``system:`` anchor work, but a
+        # gap that excluded ``\n`` then made a newline a *detection boundary* --
+        # "ignore\nprevious instructions" evaded a pattern that caught the same
+        # words on one line. Sentence-enders still stop a match, so the phrase
+        # cannot be stitched together across unrelated sentences.
+        r"\b(?:ignore|disregard|forget|override)\b[^.!?]{0,40}?"
+        r"\b(?:previous|prior|earlier|above|preceding|all)\b[^.!?]{0,40}?"
         r"\b(?:instruction|instructions|prompt|prompts|rule|rules|direction|directions)\b",
         r"\bdisregard\s+all\b",
         r"\bnew\s+instructions\s*:",
         r"(?:^|\n)\s*system\s*:",
         # Scoped, unlike the bare "override" substring this replaces: that
         # flagged ordinary developer prose ("override the default timeout").
-        r"\boverride\b[^.!?\n]{0,40}?"
+        r"\boverride\b[^.!?]{0,40}?"
         r"\b(?:instruction|instructions|prompt|prompts|rule|rules|system|safety|guardrail|filter)\b",
     )
 

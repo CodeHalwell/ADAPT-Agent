@@ -216,12 +216,36 @@ class RetryPolicy:
         return delay
 
 
+#: Attribute stamped on an exception whose retries a *lower* layer already
+#: spent. Nested retry loops otherwise multiply: a judge that tries three times
+#: and re-raises, inside a harness that tries three times, is nine provider
+#: calls for one row with the backoff reset twice -- piling on load precisely
+#: while the provider is throttling.
+_EXHAUSTED_MARKER = "__adapt_retries_exhausted__"
+
+
+def mark_retries_exhausted(exc: BaseException) -> BaseException:
+    """Record that ``exc`` already used up a retry budget. Returns ``exc``."""
+    try:
+        setattr(exc, _EXHAUSTED_MARKER, True)
+    except Exception:  # an exception type that refuses attributes
+        pass
+    return exc
+
+
+def retries_already_exhausted(exc: BaseException) -> bool:
+    """Whether a lower layer already spent this error's retries."""
+    return bool(getattr(exc, _EXHAUSTED_MARKER, False))
+
+
 #: Used when a harness is constructed without an explicit policy.
 DEFAULT_RETRY_POLICY = RetryPolicy()
 
 
 __all__ = [
     "RetryPolicy",
+    "mark_retries_exhausted",
+    "retries_already_exhausted",
     "DEFAULT_RETRY_POLICY",
     "is_transient_error",
     "retry_after_seconds",

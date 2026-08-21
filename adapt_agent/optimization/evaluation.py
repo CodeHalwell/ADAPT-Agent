@@ -28,6 +28,7 @@ from adapt_agent.optimization.metrics import Metric, MetricFn, coerce_metric
 from adapt_agent.optimization.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
+    retries_already_exhausted,
 )
 
 logger = logging.getLogger(__name__)
@@ -619,6 +620,19 @@ class EvaluationHarness:
             try:
                 return metric(output, example.expected, example), False
             except Exception as exc:
+                # A metric that runs its own retry loop (LLMJudge does) stamps
+                # the error when its budget is spent. Retrying here as well
+                # would multiply the budgets and reset the backoff, adding
+                # load exactly while the provider is throttling.
+                if retries_already_exhausted(exc):
+                    logger.warning(
+                        "Metric %s failed transiently on example %d (its own retries "
+                        "were already spent); excluded from the score: %s",
+                        metric.name,
+                        index,
+                        exc,
+                    )
+                    return 0.0, True
                 if policy.should_retry(exc, attempt):
                     delay = policy.delay_for(exc, attempt)
                     logger.info(
