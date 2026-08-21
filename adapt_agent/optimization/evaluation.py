@@ -195,6 +195,13 @@ class EvaluationReport:
     #: error counts, which are also totals: ``n`` would give impossible
     #: summaries like ``n=1, n_transient_errors=4``.
     n_evaluated: int = 0
+    #: Rows that contributed a sample to each metric's mean. A metric whose
+    #: own provider call was throttled has fewer than :attr:`n_evaluated`,
+    #: which is the only way to tell its aggregate is over a subset --
+    #: :attr:`is_complete` speaks for the primary metric alone.
+    metric_samples: dict[str, int] = field(default_factory=dict)
+    #: Rows where each metric failed transiently and lost its sample.
+    transient_by_metric: dict[str, int] = field(default_factory=dict)
     total_latency: float = 0.0
     #: Default threshold used by :meth:`failures` when none is supplied. Set by
     #: the producing :class:`EvaluationHarness` from its ``failure_threshold``;
@@ -231,11 +238,23 @@ class EvaluationReport:
         return max(0, self.n_evaluated - self.n_transient_errors)
 
     @property
+    def partial_metrics(self) -> list[str]:
+        """Metrics whose aggregate is a mean over fewer rows than were run.
+
+        A secondary metric can be throttled while the primary scores fine, so
+        :attr:`is_complete` stays ``True`` -- correct for the optimizer, which
+        ranks on the primary, but it would otherwise leave a partial secondary
+        aggregate looking like a full one.
+        """
+        return sorted(name for name, count in self.transient_by_metric.items() if count)
+
+    @property
     def is_complete(self) -> bool:
-        """Whether every example actually produced a score.
+        """Whether every example actually produced a *primary* score.
 
         ``False`` means at least one row was dropped for a transient provider
         failure, so :attr:`score` is a mean over a *subset* of the dataset.
+        Secondary metrics are reported by :attr:`partial_metrics` instead.
         Two such scores are not comparable with each other, nor with a complete
         one -- see :meth:`Optimizer._record`, which refuses to crown an
         incomplete trial for exactly that reason.
@@ -293,6 +312,8 @@ class EvaluationReport:
             "n_errors": self.n_errors,
             "n_transient_errors": self.n_transient_errors,
             "is_complete": self.is_complete,
+            "partial_metrics": self.partial_metrics,
+            "metric_samples": dict(self.metric_samples),
             "avg_latency": self.avg_latency,
         }
 
@@ -729,6 +750,7 @@ class _Accumulator:
         self._n_errors = 0
         self._n_transient_errors = 0
         self._n_evaluated = 0
+        self._transient_by_metric: dict[str, int] = {}
         self._total_latency = 0.0
 
     def add(self, result: ExampleResult) -> None:
@@ -742,8 +764,14 @@ class _Accumulator:
             # candidate happened to run when the provider was least busy, so the
             # record is kept (and counted) but never scored.
             self._n_transient_errors += 1
+            for metric in self._harness.metrics:
+                self._transient_by_metric[metric.name] = (
+                    self._transient_by_metric.get(metric.name, 0) + 1
+                )
         else:
             skip = set(result.transient_metrics)
+            for name in skip:
+                self._transient_by_metric[name] = self._transient_by_metric.get(name, 0) + 1
             for name, score in result.scores.items():
                 if name in skip:
                     # This metric's own provider call failed; its zero is not a
@@ -770,6 +798,8 @@ class _Accumulator:
             n_errors=self._n_errors,
             n_transient_errors=self._n_transient_errors,
             n_evaluated=self._n_evaluated,
+            metric_samples=dict(self._counts),
+            transient_by_metric=dict(self._transient_by_metric),
             total_latency=self._total_latency,
             failure_threshold=self._harness.failure_threshold,
         )

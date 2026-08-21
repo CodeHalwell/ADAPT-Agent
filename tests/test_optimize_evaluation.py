@@ -440,6 +440,8 @@ def test_report_to_dict():
         "n_errors": 0,
         "n_transient_errors": 0,
         "is_complete": True,
+        "partial_metrics": [],
+        "metric_samples": {"echo": 2},
         "avg_latency": report.avg_latency,
     }
     # aggregate is a copy, not the same object.

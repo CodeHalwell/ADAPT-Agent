@@ -885,3 +885,104 @@ def test_the_metric_adapter_still_propagates_so_the_row_is_excluded() -> None:
     )
     assert report.n_transient_errors == 3, "the metric adapter stopped propagating"
     assert report.failures() == []
+
+
+# -- partial aggregates and validation are visible, not silent ----------------
+
+
+def test_a_partial_secondary_aggregate_is_visible() -> None:
+    """`is_complete` speaks for the primary, so a secondary needs its own signal.
+
+    Scoping transient failures to the failing metric stopped a throttled
+    secondary erasing the primary -- but left its mean computed over whichever
+    rows survived, in a report claiming `is_complete=True` and zero transient
+    errors.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    calls = {"n": 0}
+
+    def flaky(output, expected):
+        calls["n"] += 1
+        if calls["n"] % 2 == 0:
+            raise RuntimeError("429 Too Many Requests")
+        return 1.0
+
+    report = EvaluationHarness(
+        [exact_match(), Metric("secondary", flaky)], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.is_complete is True, "the primary scored fine"
+    assert report.n_evaluated == 4
+    assert report.metric_samples == {"exact_match": 4, "secondary": 2}
+    assert report.transient_by_metric == {"secondary": 2}
+    assert report.partial_metrics == ["secondary"]
+    assert report.to_dict()["partial_metrics"] == ["secondary"]
+
+
+def test_nothing_is_partial_when_no_metric_was_throttled() -> None:
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    report = EvaluationHarness([exact_match()]).evaluate(lambda x: "ok", dataset)
+    assert report.partial_metrics == []
+    assert report.metric_samples == {"exact_match": 3}
+
+
+def test_an_incomplete_validation_pass_is_reported_not_hidden() -> None:
+    """Validation does not steer the search, so it re-runs but never aborts.
+
+    It must not be reported as if it were whole, though: it is the number a
+    user reads to decide whether the tuned config generalises.
+    """
+    from adapt_agent.optimization.optimizers import Optimizer
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+
+    class _Probe(Optimizer):
+        strategy_name = "probe"
+
+        def __init__(self, harness):
+            self.harness = harness
+            self.verbose = False
+
+        def optimize(self, *args, **kwargs):  # pragma: no cover - not exercised
+            raise NotImplementedError
+
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+    report = _Probe(harness)._evaluate_validation(_throttle_on("hard"), dataset)
+
+    assert report.is_complete is False, "a partial validation is still returned"
+    assert report.n_transient_errors == 1
+
+
+def test_a_validation_pass_that_recovers_on_the_re_run_is_complete() -> None:
+    from adapt_agent.optimization.optimizers import Optimizer
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+    evaluations = {"n": 0}
+
+    class _Harness(EvaluationHarness):
+        def evaluate(self, agent, data, **kwargs):
+            evaluations["n"] += 1
+            target = _throttle_on("hard") if evaluations["n"] == 1 else (lambda p: "ok")
+            return super().evaluate(target, data, **kwargs)
+
+    class _Probe(Optimizer):
+        strategy_name = "probe"
+
+        def __init__(self, harness):
+            self.harness = harness
+            self.verbose = False
+
+        def optimize(self, *args, **kwargs):  # pragma: no cover - not exercised
+            raise NotImplementedError
+
+    harness = _Harness([exact_match()], retry=RetryPolicy(attempts=1))
+    report = _Probe(harness)._evaluate_validation(object(), dataset)
+
+    assert evaluations["n"] == 2
+    assert report.is_complete is True

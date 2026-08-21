@@ -89,6 +89,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`wrap_agent` gave unusable advice for callable-only adapters.** The Google
   ADK adapter takes a callable by design, so its error read `Expected one of ''`.
   It now names the actual contract.
+- **The Claude Agent SDK's own subagent field still vetoed detection.**
+  Requiring a *populated* foreign marker fixed the unset case and left the
+  configured one: define any subagent and `detect()` returned `None` again,
+  taking every tunable prompt/model/tool setting with it. `agents` is a native
+  field and is no longer a foreign marker at all.
+- **A partial secondary aggregate looked complete.** Scoping transient failures
+  to the failing metric stopped a throttled secondary erasing the primary, but
+  left its mean over whichever rows survived in a report claiming
+  `is_complete=True`. `EvaluationReport.metric_samples`,
+  `transient_by_metric` and `partial_metrics` make that visible;
+  `is_complete` continues to speak for the primary, which is what the optimizer
+  ranks on.
+- **Validation bypassed the completeness guard.** Both optimizers took
+  `.score` straight off the validation report, so a throttled held-out row
+  produced a mean over survivors with nothing to say so -- and it is the number
+  a user reads to decide whether a tuned config generalises. It re-runs once
+  and never aborts (validation does not steer the search), with the outcome on
+  `OptimizationResult.validation_complete`.
 - **Role markers are parsed per line now, not matched with an anchored regex.**
   That one expression was rewritten in four consecutive review rounds -- it
   missed a bare CR, then a newline inside a phrase, then Markdown decoration

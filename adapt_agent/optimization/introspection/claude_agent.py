@@ -33,7 +33,12 @@ from adapt_agent.optimization.parameters import Parameter, ParameterKind
 
 #: Attributes that identify *other* frameworks' agent objects; their presence
 #: means the object is not a Claude Agent SDK options object.
-_FOREIGN_ATTRS = ("handoffs", "sub_agents", "agents", "kickoff", "instructions")
+#: Markers of *other* frameworks. `agents` is deliberately absent: it is the
+#: Claude SDK's own subagent-definition field, so vetoing on it rejected the
+#: very object this introspector exists for. Requiring a populated value only
+#: narrowed that to options with subagents configured -- still a real, and
+#: more advanced, Claude setup.
+_FOREIGN_ATTRS = ("handoffs", "sub_agents", "kickoff", "instructions")
 
 #: The discrete set of Claude Agent SDK ``permission_mode`` values. Exposing
 #: these as candidates makes the knob a real (searchable) routing parameter.
@@ -45,21 +50,18 @@ def _predicate(obj: Any) -> bool:
 
     Carrying both ``system_prompt`` and ``allowed_tools`` is the discriminator,
     and it is unique among the supported frameworks. Objects with a *populated*
-    ``handoffs``/``sub_agents``/``agents``/``kickoff``/``instructions`` are
-    rejected as belonging elsewhere -- populated, not merely present, because
-    the SDK's own options object declares some of those names itself. The body
-    never raises.
+    ``handoffs``/``sub_agents``/``kickoff``/``instructions`` are rejected as
+    belonging elsewhere -- populated, not merely present, since an unset
+    attribute is not evidence of anything. The body never raises.
     """
     try:
         if not (hasattr(obj, "system_prompt") and hasattr(obj, "allowed_tools")):
             return False
         for foreign in _FOREIGN_ATTRS:
-            # Presence alone is not evidence of another framework, and treating
-            # it as such is fragile: `ClaudeAgentOptions` grew an `agents` field
-            # (defaulting to None) for subagent definitions, and a bare
-            # `hasattr` check then rejected every real options object -- so
-            # `detect` returned None and no knobs were found at all. Only a
-            # populated value counts.
+            # Presence alone is not evidence of another framework: an
+            # attribute that exists but holds nothing says nothing. (The field
+            # that made this matter, `agents`, is no longer listed at all -- see
+            # `_FOREIGN_ATTRS`.)
             if getattr(obj, foreign, None):
                 return False
         return True

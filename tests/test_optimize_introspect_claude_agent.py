@@ -202,3 +202,35 @@ def test_allowed_tools_single_has_no_candidates() -> None:
     )
     by_name = {p.name: p for p in introspect(opts)}
     assert by_name["agent.allowed_tools"].candidates is None
+
+
+def test_configured_subagents_do_not_block_detection() -> None:
+    """`agents` is the Claude SDK's own subagent field, not a foreign marker.
+
+    Requiring a *populated* foreign value fixed the unset case and left this
+    one: configure any subagent and `detect()` went back to None, taking every
+    tunable prompt/model/tool setting with it.
+    """
+    options = types.SimpleNamespace(
+        system_prompt="You are helpful.",
+        allowed_tools=["Read"],
+        agents={"researcher": types.SimpleNamespace(description="d", prompt="p")},
+    )
+    assert _predicate(options) is True
+    assert detect(options) == "claude_agent"
+    assert any(p.kind is ParameterKind.PROMPT for p in introspect(options))
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("claude_agent_sdk") is None,
+    reason="claude-agent-sdk is not installed",
+)
+def test_a_real_options_object_with_subagents_is_introspectable() -> None:
+    import claude_agent_sdk  # type: ignore[import-not-found]
+
+    options = claude_agent_sdk.ClaudeAgentOptions(
+        system_prompt="You are helpful.", allowed_tools=["Read"]
+    )
+    options.agents = {"researcher": {"description": "d", "prompt": "p"}}
+    assert detect(options) == "claude_agent"
+    assert any(p.kind is ParameterKind.PROMPT for p in introspect(options))

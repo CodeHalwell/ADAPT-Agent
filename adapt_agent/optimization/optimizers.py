@@ -87,6 +87,7 @@ class OptimizationResult:
         history: Every :class:`Trial` evaluated, in order.
         best_report: The :class:`EvaluationReport` for the winning configuration.
         validation_score: Score of ``best_config`` on a held-out set, if provided.
+        validation_complete: Whether that score covered every held-out row.
         recommendations: Advisory, human-readable suggestions gathered during the
             run (e.g. new tools/skills the judge proposes). These are never applied
             automatically -- the optimizer only *selects* among existing tools.
@@ -99,6 +100,11 @@ class OptimizationResult:
     history: list[Trial] = field(default_factory=list)
     best_report: EvaluationReport | None = None
     validation_score: float | None = None
+    #: False when transient provider failures cost the validation pass some
+    #: rows, so :attr:`validation_score` is a mean over a subset and is not
+    #: comparable with :attr:`best_score`. ``True`` when there was no
+    #: validation set at all -- there is nothing partial about not running.
+    validation_complete: bool = True
     recommendations: list[str] = field(default_factory=list)
 
     @property
@@ -388,8 +394,11 @@ class Optimizer:
             target.apply(state.best_config)
 
         validation_score: float | None = None
+        validation_complete = True
         if val_dataset:
-            validation_score = self.harness.evaluate(target, val_dataset).score
+            validation_report = self._evaluate_validation(target, val_dataset)
+            validation_score = validation_report.score
+            validation_complete = validation_report.is_complete
 
         recommendations = list(self._recommendations)
         recommendations.extend(self._suggest_tools(target, state))
@@ -402,6 +411,7 @@ class Optimizer:
             history=state.history,
             best_report=state.best_report,
             validation_score=validation_score,
+            validation_complete=validation_complete,
             recommendations=recommendations,
         )
         if self.verbose:
@@ -471,6 +481,42 @@ class Optimizer:
                 f"baseline, so continuing would silently return the starting configuration "
                 f"as the winner. Lower the concurrency, widen the retry policy, or wait for "
                 f"the provider to recover."
+            )
+        return retried
+
+    def _evaluate_validation(
+        self, target: OptimizableAgent, dataset: GoldenDataset
+    ) -> EvaluationReport:
+        """Evaluate the held-out set, re-running once if throttling cost it rows.
+
+        Validation does not steer the search, so unlike the baseline this never
+        aborts -- a partial held-out score is still worth reporting. It must not
+        be reported *as if* it were whole, though: it is the number a user reads
+        to decide whether the tuned config generalises, and a mean over the rows
+        that happened to survive throttling silently answers a different
+        question. The completeness travels with it on
+        :attr:`OptimizationResult.validation_complete`.
+        """
+        report = self.harness.evaluate(target, dataset)
+        if report.is_complete:
+            return report
+        logger.warning(
+            "[%s] validation scored %.4f over %d of %d rows (%d transient failures); re-running",
+            self.strategy_name,
+            report.score,
+            report.n_scored,
+            report.n_evaluated,
+            report.n_transient_errors,
+        )
+        retried = self.harness.evaluate(target, dataset)
+        if not retried.is_complete:
+            logger.error(
+                "[%s] validation is still incomplete after a re-run (%d of %d rows lost to "
+                "transient failures). validation_score covers only the rows that succeeded; "
+                "OptimizationResult.validation_complete is False.",
+                self.strategy_name,
+                retried.n_transient_errors,
+                retried.n_evaluated,
             )
         return retried
 
@@ -955,7 +1001,9 @@ class PipelineOptimizer(Optimizer):
         if best_config:
             target.apply(best_config)
 
-        validation_score = self.harness.evaluate(target, val_dataset).score if val_dataset else None
+        validation_report = self._evaluate_validation(target, val_dataset) if val_dataset else None
+        validation_score = validation_report.score if validation_report else None
+        validation_complete = validation_report.is_complete if validation_report else True
 
         # Optionally run the pipeline-level tool suggestion on the cumulative best,
         # then dedupe so a repeated suggestion from several stages appears once.
@@ -975,6 +1023,7 @@ class PipelineOptimizer(Optimizer):
             history=combined_history,
             best_report=best_report,
             validation_score=validation_score,
+            validation_complete=validation_complete,
             recommendations=_dedup(combined_recommendations),
         )
 
