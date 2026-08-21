@@ -104,6 +104,7 @@ the workflow runtime.
 | Microsoft Agent Framework | `agent_framework.governance_middleware()` | `Agent(middleware=[...])` |
 | Google ADK | `google_adk.governance_callbacks()` | `LlmAgent(**callbacks)` |
 | OpenAI Agents SDK | `openai_agents.governance_guardrails()` | `Agent(**guardrails)` |
+| OpenAI Agents SDK — handoff target | `openai_agents.governance_agent_hooks()` | `Agent(hooks=...)` |
 | Claude Agent SDK | `claude_agent.governance_hooks()` | `ClaudeAgentOptions(hooks=...)` |
 | LangGraph | `langgraph.governance_hooks()` | `create_react_agent(**hooks)` |
 | CrewAI | `crewai.governance_callbacks()` | `Crew(**callbacks)` |
@@ -411,3 +412,14 @@ adapter = LangGraphAdapter(firewall=firewall, policy_enforcer=policy, defense=de
 After wrapping, confirm the controls are really attached rather than assuming:
 `adapter.firewall`, `adapter.policy_enforcer` and `adapter.defense` should all
 be non-`None`.
+
+
+## OpenAI handoffs need a different seam
+
+Input guardrails run for the **starting agent of a run only** — the SDK gates
+them on `current_turn == 0`. A specialist reached by a handoff never runs its
+own, so its firewall, defense and policy rules are silently skipped for
+transferred content. Use `governance_agent_hooks()` there: it binds to
+`AgentHooks.on_llm_start`, which fires per agent and per model call (so it also
+screens tool results returning to the model). `inner=` keeps the app's own
+lifecycle hooks running.

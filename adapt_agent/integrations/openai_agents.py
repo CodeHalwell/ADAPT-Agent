@@ -21,6 +21,22 @@ it.
 
 ``output_info`` carries the ADAPT-Agent threat list, so a caught tripwire can
 report *what* matched: ``exc.guardrail_result.output.output_info["threats"]``.
+
+**Guardrails do not cover a handoff target.** The SDK runs input guardrails for
+the *starting* agent only -- ``run.py`` gates them on ``current_turn == 0`` --
+so a specialist reached by a handoff never runs its own, and content transferred
+to it is screened by whatever the entry agent's guardrail saw, not by the
+specialist's rules. Verified against the installed SDK by driving a real handoff:
+
+.. code-block:: text
+
+    input guardrails that ran: ['triage']
+    handoff happened: True (final agent: specialist)
+    specialist's own input guardrail ran: False
+
+For a specialist, use :func:`governance_agent_hooks` instead, which binds to
+``AgentHooks.on_llm_start`` -- per agent, per model call, and therefore also on
+the way back from a tool.
 """
 
 from __future__ import annotations
@@ -65,6 +81,11 @@ def governance_guardrails(
         agent_id: Recorded in ``output_info`` so a tripwire names the agent.
         screen_output: Also register an output guardrail.
 
+    Note:
+        Input guardrails run for the *starting* agent of a run only. An agent
+        reachable by handoff needs :func:`governance_agent_hooks`, or its input
+        governance silently never runs.
+
     Returns:
         A dict of ``Agent(...)`` kwargs: ``input_guardrails`` and (when
         ``screen_output``) ``output_guardrails``.
@@ -94,7 +115,7 @@ def governance_guardrails(
         state = as_state(agent_input, **context_state(context))
         threats.extend(f"policy:{n}" for n in resolved.policy_violations(state))
         return agents.GuardrailFunctionOutput(
-            output_info={"agent_id": agent_id, "threats": threats},
+            output_info={"agent_id": resolved.agent_id, "threats": threats},
             tripwire_triggered=bool(threats),
         )
 
@@ -107,7 +128,7 @@ def governance_guardrails(
         async def adapt_output_guardrail(context: Any, agent: Any, agent_output: Any) -> Any:
             threats = resolved.scan_output(agent_output)
             return agents.GuardrailFunctionOutput(
-                output_info={"agent_id": agent_id, "threats": threats},
+                output_info={"agent_id": resolved.agent_id, "threats": threats},
                 tripwire_triggered=bool(threats),
             )
 
@@ -118,4 +139,87 @@ def governance_guardrails(
     return guardrails
 
 
-__all__ = ["governance_guardrails"]
+def governance_agent_hooks(
+    *,
+    gate: GovernanceGate | None = None,
+    firewall: Any = None,
+    defense: Any = None,
+    policy_enforcer: Any = None,
+    agent_id: str = "agent",
+    inner: Any = None,
+) -> Any:
+    """Governance on ``AgentHooks``, which runs for **every** agent in a run.
+
+    :func:`governance_guardrails` is the SDK's own idiom and the right default
+    for a run's entry point, but the SDK gates input guardrails on
+    ``current_turn == 0``: a specialist reached by a handoff never runs its own.
+    A control that is configured, documented, and silently skipped is the worst
+    shape a security control can take, so this is the seam for those agents.
+
+    ``on_llm_start`` fires before every model call *for the agent it is attached
+    to*, and receives the input items about to be sent. Confirmed against the
+    installed SDK, including through a handoff::
+
+        hooks fired: ['triage:on_start', 'triage:on_llm_start(items=1)',
+                      'SPECIALIST:on_start', 'SPECIALIST:on_llm_start(items=3)']
+
+    Because it runs per model call rather than per run, it also screens tool
+    results on their way back to the model -- the path that carries whatever a
+    tool fetched from the open web.
+
+    A block raises :class:`~adapt_agent.exceptions.SecurityBlockedError`, which
+    aborts the run. That is a harder stop than a tripwire; use guardrails where
+    you want the SDK's own refusal path.
+
+    Args:
+        gate: A pre-built gate to share across agents; otherwise built from the
+            controls below.
+        firewall: Screens the items about to reach the model.
+        defense: Adversarial analysis of those items.
+        policy_enforcer: Evaluated against the items plus the run's runtime
+            context (``Runner.run(..., context=...)``).
+        agent_id: Named in the raised error.
+        inner: An existing ``AgentHooks`` to delegate to, so an app's own
+            lifecycle hooks still run. Governance is applied first.
+
+    Returns:
+        An ``AgentHooks`` instance for ``Agent(hooks=...)``.
+
+    Raises:
+        ImportError: If ``openai-agents`` is not installed.
+    """
+    agents = optional_import("agents", "openai-agents", "governance_agent_hooks")
+    resolved = build_gate(
+        gate=gate,
+        firewall=firewall,
+        defense=defense,
+        policy_enforcer=policy_enforcer,
+        block_on_violation=True,
+        agent_id=agent_id,
+    )
+
+    base: Any = agents.AgentHooks  # resolved at call time; never imported at module load
+
+    class AdaptGovernanceHooks(base):
+        async def on_llm_start(
+            self, context: Any, agent: Any, system_prompt: Any, input_items: Any
+        ) -> None:
+            resolved.review_input(
+                input_items, state=as_state(input_items, **context_state(context))
+            )
+            if inner is not None:
+                await inner.on_llm_start(context, agent, system_prompt, input_items)
+
+    hooks = AdaptGovernanceHooks()
+    if inner is not None:
+        # Every *other* lifecycle hook belongs to the app. `__getattr__` cannot
+        # forward them: the base class defines them, so lookup never misses and
+        # the app's would be silently shadowed by the SDK's no-ops -- configured,
+        # and doing nothing. Bind them on the instance, where they win.
+        for name in dir(base):
+            if name.startswith("on_") and name != "on_llm_start" and hasattr(inner, name):
+                setattr(hooks, name, getattr(inner, name))
+    return hooks
+
+
+__all__ = ["governance_agent_hooks", "governance_guardrails"]

@@ -103,6 +103,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A handoff target's input governance never ran.** The OpenAI Agents SDK runs
+  input guardrails for the *starting* agent of a run only (`run.py` gates them
+  on `current_turn == 0`), so a specialist reached by a handoff had its
+  firewall, defense and policy rules configured, documented and silently
+  skipped for transferred content. Confirmed by driving a real handoff against
+  the installed SDK. New `openai_agents.governance_agent_hooks()` binds to
+  `AgentHooks.on_llm_start`, which fires per agent and per model call -- so it
+  also screens tool results on their way back to the model -- and `inner=`
+  keeps the app's own lifecycle hooks running.
+- **A shared gate's label did not reach every message.** The Claude refusal
+  reason and the OpenAI tripwire's `output_info` interpolated the factory
+  parameter rather than the resolved gate id, so a binding using a shared gate
+  reported the default while applying that gate's controls. Both use
+  `resolved.agent_id` now, matching the MAF span.
 - **An ADK refusal did not say which agent refused.** `on_block="refuse"`
   returns an ordinary `LlmResponse`, so unlike the raising path it carried
   nothing for the surrounding graph to inspect -- two specialists produced

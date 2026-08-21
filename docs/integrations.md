@@ -27,6 +27,7 @@ middleware an app already stacks.
 | Microsoft Agent Framework | `Agent(middleware=[...])` | `agent_framework.governance_middleware()` |
 | Google ADK | `LlmAgent(before_model_callback=...)` | `google_adk.governance_callbacks()` |
 | OpenAI Agents SDK | `Agent(input_guardrails=[...])` | `openai_agents.governance_guardrails()` |
+| OpenAI Agents SDK — handoff target | `Agent(hooks=...)` | `openai_agents.governance_agent_hooks()` |
 | Claude Agent SDK | `ClaudeAgentOptions(hooks={...})` | `claude_agent.governance_hooks()` |
 | LangGraph | `create_react_agent(pre_model_hook=...)` | `langgraph.governance_hooks()` |
 | CrewAI | `Crew(before_kickoff_callbacks=[...])` | `crewai.governance_callbacks()` |
@@ -109,6 +110,29 @@ from adapt_agent.integrations.openai_agents import governance_guardrails
 
 agent = Agent(name="triage", instructions="...",
               **governance_guardrails(firewall=fw, agent_id="triage"))
+```
+
+**Guardrails cover the entry point, not a handoff target.** The SDK runs input
+guardrails for the *starting* agent only (`run.py` gates them on `current_turn
+== 0`), so a specialist reached by a handoff never runs its own — verified by
+driving a real handoff against the installed SDK:
+
+```text
+input guardrails that ran: ['triage']
+handoff happened: True (final agent: specialist)
+specialist's own input guardrail ran: False
+```
+
+For those agents use `governance_agent_hooks()`, which binds to
+`AgentHooks.on_llm_start` — per agent, per model call, so it also screens tool
+results on their way back to the model. Pass `inner=` to keep the app's own
+lifecycle hooks running.
+
+```python
+from adapt_agent.integrations.openai_agents import governance_agent_hooks
+
+specialist = Agent(name="specialist", instructions="...",
+                   hooks=governance_agent_hooks(firewall=fw, agent_id="specialist"))
 ```
 
 Tripping a guardrail raises the SDK's own `InputGuardrailTripwireTriggered`, so

@@ -95,7 +95,7 @@ def governance_hooks(
         return {
             "decision": "block",
             "reason": (
-                f"Blocked by ADAPT-Agent [{agent_id}]: {', '.join(sorted(set(threats)))}. "
+                f"Blocked by ADAPT-Agent [{resolved.agent_id}]: {', '.join(sorted(set(threats)))}. "
                 "Do not retry this content; tell the user it was refused."
             ),
         }
