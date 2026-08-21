@@ -17,9 +17,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import deque
 from collections.abc import Awaitable, Callable, Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any, cast
@@ -355,21 +354,26 @@ class EvaluationHarness:
         keeps at most ``concurrency`` runs in flight and pulls from the dataset
         lazily, so memory stays bounded on a large dataset -- the same property
         :meth:`aevaluate` gets from its worker pool.
+
+        Refilling waits on *whichever* future finishes first rather than on the
+        oldest. Waiting on the oldest would idle the rest of the pool behind one
+        slow example -- and with LLM latency the spread is wide, so that
+        collapses the concurrency actually achieved. Results therefore arrive
+        out of order, which is fine: the accumulator restores index order.
         """
         examples = enumerate(dataset)
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            pending: deque[Future[ExampleResult]] = deque(
+            pending = {
                 pool.submit(self._run_one, runner, index, example)
                 for index, example in islice(examples, concurrency)
-            )
+            }
             while pending:
-                # Popping the *oldest* future preserves index ordering: results
-                # are yielded in submission order, not completion order.
-                result = pending.popleft().result()
-                nxt = next(examples, None)
-                if nxt is not None:
-                    pending.append(pool.submit(self._run_one, runner, nxt[0], nxt[1]))
-                yield result
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    nxt = next(examples, None)
+                    if nxt is not None:
+                        pending.add(pool.submit(self._run_one, runner, nxt[0], nxt[1]))
+                    yield future.result()
 
     async def aevaluate(
         self, agent: Any, dataset: GoldenDataset, *, concurrency: int = 1

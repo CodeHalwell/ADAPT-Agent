@@ -574,3 +574,71 @@ def test_report_only_mode_still_audits_policy():
         assert len(enforcer.get_violations()) == 1, (
             f"block_on_violation={blocking} recorded no violation -- " "policy auditing was skipped"
         )
+
+
+def test_pydantic_ai_refuses_a_policy_it_cannot_honour():
+    """Accepting a control and ignoring it is worse than refusing it.
+
+    An output validator never sees agent state, so a policy rule could only be
+    meaningless here -- and with a fail-open enforcer it would report "no
+    violation" for a rule that never ran.
+    """
+    enforcer = PolicyEnforcer()
+    with pytest.raises(ValueError, match="cannot evaluate a policy_enforcer"):
+        pai.governance_output_validator(policy_enforcer=enforcer)
+
+    class FakeAgent:
+        def output_validator(self, func):
+            raise AssertionError("a rejected config must never be registered")
+
+    with pytest.raises(ValueError, match="cannot evaluate a policy_enforcer"):
+        pai.install_governance(FakeAgent(), policy_enforcer=enforcer)
+    # A gate carrying one is caught too, not just the keyword form.
+    with pytest.raises(ValueError, match="cannot evaluate a policy_enforcer"):
+        pai.governance_output_validator(gate=GovernanceGate(policy_enforcer=enforcer))
+    # Without policy it still builds normally.
+    assert pai.governance_output_validator(firewall=_firewall())("clean") == "clean"
+
+
+def test_adk_policy_sees_the_callbacks_session_state():
+    """A rule gating on `state['trust_score']` reads session state, not the
+    model request -- so the callback must merge the context in."""
+    enforcer = _RecordingEnforcer()
+    callbacks = adk.governance_callbacks(policy_enforcer=enforcer)
+
+    class Context:
+        state = {"trust_score": 0.1}
+
+    with pytest.raises(SecurityBlockedError):
+        asyncio.run(callbacks["before_model_callback"](Context(), AdkRequest(["hi"])))
+    assert enforcer.states[0]["trust_score"] == 0.1
+
+
+def test_native_hook_trace_closes_on_cancellation():
+    class Observer:
+        def __init__(self):
+            self.events = []
+
+        def start_trace(self, trace_id, agent_id, operation):
+            self.events.append("start")
+
+        def end_trace(self, trace_id, status="completed", result=None):
+            self.events.append(f"end:{status}")
+
+    observer = Observer()
+    middleware = maf.governance_middleware(
+        firewall=Firewall(), observer=observer, screen_output=False
+    )
+
+    async def main():
+        async def call_next():
+            await asyncio.sleep(10)
+
+        task = asyncio.ensure_future(middleware(MafContext(["hi"]), call_next))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+    assert observer.events == ["start", "end:error"]

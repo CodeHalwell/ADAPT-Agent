@@ -38,7 +38,12 @@ from typing import TYPE_CHECKING, Any
 
 from adapt_agent.core.governance import GovernanceGate
 from adapt_agent.exceptions import SecurityBlockedError
-from adapt_agent.integrations._common import as_state, build_gate, optional_import
+from adapt_agent.integrations._common import (
+    as_state,
+    build_gate,
+    context_state,
+    optional_import,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from adapt_agent.adversarial import AdversarialDefense
@@ -68,7 +73,9 @@ def governance_callbacks(
             controls below.
         firewall: Screens the outgoing request contents and the model response.
         defense: Adversarial analysis of the request contents.
-        policy_enforcer: Evaluated against the request as agent state.
+        policy_enforcer: Evaluated against the request *and the callback's
+            session state*, so a rule gating on session data such as
+            ``state['trust_score']`` sees it.
         block_on_violation: ``False`` scans and records without blocking.
         agent_id: Named in the raised error / refusal, identifying which agent
             in the tree refused.
@@ -102,8 +109,10 @@ def governance_callbacks(
         # ``parts[*].text`` the gate reaches structurally -- no ADK import here.
         try:
             contents = getattr(llm_request, "contents", None)
-            # `state=` is required, or a configured policy_enforcer never runs.
-            resolved.review_input(contents, state=as_state(contents))
+            # `state=` is required, or a configured policy_enforcer never runs --
+            # and the session state must be merged in, since that is where a rule
+            # gating on `state['trust_score']` reads from.
+            resolved.review_input(contents, state=as_state(contents, **context_state(context)))
         except SecurityBlockedError:
             if on_block == "raise":
                 raise

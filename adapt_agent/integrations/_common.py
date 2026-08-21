@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 from adapt_agent.core.governance import GovernanceGate
@@ -58,7 +58,9 @@ def traced(observer: Any, agent_id: str, operation: str) -> Iterator[None]:
     observer.start_trace(trace_id, agent_id, operation)
     try:
         yield
-    except Exception as exc:
+    except BaseException as exc:
+        # BaseException, not Exception: `asyncio.CancelledError` derives from it,
+        # so a cancelled request would otherwise leave the span open forever.
         observer.end_trace(trace_id, status="error", result=str(exc))
         raise
     observer.end_trace(trace_id, status="completed")
@@ -77,6 +79,25 @@ def optional_import(module: str, extra: str, needed_for: str) -> Any:
         raise ImportError(
             f"{needed_for} needs the {module!r} package: " f"pip install 'adapt-agent[{extra}]'."
         ) from exc
+
+
+def context_state(context: Any) -> dict[str, Any]:
+    """Extract a framework callback context's own state mapping, if it has one.
+
+    A policy rule typically gates on session data -- ``state['trust_score']`` --
+    which lives on the framework's context, not in the model request. Without
+    this the key is simply absent, and a fail-open enforcer reads that as "no
+    violation": the rule never fires and nothing says so.
+    """
+    state = getattr(context, "state", None)
+    if isinstance(state, Mapping):
+        return dict(state)
+    # ADK's Context exposes session state indirectly on some versions.
+    session = getattr(context, "session", None)
+    session_state = getattr(session, "state", None)
+    if isinstance(session_state, Mapping):
+        return dict(session_state)
+    return {}
 
 
 def as_state(messages: Any, **extra: Any) -> dict[str, Any]:
@@ -102,4 +123,4 @@ def as_state(messages: Any, **extra: Any) -> dict[str, Any]:
     return state
 
 
-__all__ = ["as_state", "build_gate", "optional_import", "traced"]
+__all__ = ["as_state", "build_gate", "context_state", "optional_import", "traced"]

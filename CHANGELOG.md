@@ -63,6 +63,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `policy_enforcer` given to the Pydantic AI validator was silently
+  ignored.** That seam sees only the output, so a state-gating rule could never
+  fire; it now raises with a pointer to the adapter rather than accepting a
+  control it cannot honour.
+- **ADK policy never saw session state.** The callback synthesised policy state
+  from the model request alone, so a rule reading `state['trust_score']` found
+  the key absent and a fail-open enforcer read that as "no violation". The
+  callback context's state is now merged in.
+- **A cancelled native hook left its observer span open**, the same
+  `except Exception` gap as the adapter path.
+- **The threaded eval pool stalled behind a slow example.** Refilling waited on
+  the *oldest* future, idling the other workers until it finished; with variable
+  LLM latency that collapses the achieved concurrency (measured: 0.96s against
+  an 0.65s ideal). It now refills from whichever future completes first, with
+  index ordering restored by the accumulator.
+- **`aexecute` still blocked on a directly-wrapped OpenAI SDK `Agent`.** Such an
+  agent exposes neither `run` nor `run_sync`, so the async preference list could
+  not match and the adapter fell back to its synchronous `Runner.run_sync`
+  lambda. It now has an async SDK runner using `Runner.run`.
 - **`aexecute` called the framework's *synchronous* entry point.** The runner
   was resolved once from the sync-first `run_method_names`, so on LangGraph,
   CrewAI, Pydantic AI and the OpenAI Agents SDK the async path invoked

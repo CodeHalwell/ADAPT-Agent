@@ -503,3 +503,41 @@ def test_cancelling_aexecute_closes_the_observer_span():
 
     asyncio.run(main())
     assert observer.events == ["start", "end:error"]
+
+
+def test_threaded_pool_refills_from_any_completed_future():
+    """One slow example must not idle the rest of the pool behind it.
+
+    Waiting on the *oldest* future blocks refilling even after the other
+    `concurrency - 1` finish, which collapses the achieved concurrency exactly
+    when latency is variable -- i.e. on every real LLM workload.
+    """
+
+    class SlowFirst:
+        def invoke(self, x):
+            time.sleep(0.30 if x == "q0" else 0.02)
+            return "a" + x[1:]
+
+    harness = EvaluationHarness([exact_match()])
+    started = time.perf_counter()
+    report = harness.evaluate(SlowFirst(), _dataset(24), concurrency=4)
+    elapsed = time.perf_counter() - started
+
+    assert report.score == 1.0
+    assert [r.index for r in report.results] == list(range(24)), "ordering must survive"
+    # With refill the run is bounded by the slow example (~0.30s) plus the rest
+    # spread over the other workers; head-of-line blocking pushes it past 0.45s.
+    assert elapsed < 0.45, f"pool stalled behind the slow example ({elapsed:.2f}s)"
+
+
+def test_openai_agents_direct_wrap_gets_an_async_sdk_runner():
+    """An SDK `Agent` exposes neither run nor run_sync, so the async preference
+    list cannot match it -- without an override `aexecute` falls back to the
+    synchronous `Runner.run_sync` lambda and blocks the loop."""
+    from adapt_agent.adapters import OpenAIAgentsAdapter
+
+    class SDKAgent:
+        name = "triage"
+
+    guarded = OpenAIAgentsAdapter().wrap_agent(SDKAgent())
+    assert guarded._arunner is not guarded._runner
