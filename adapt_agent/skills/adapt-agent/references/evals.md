@@ -141,13 +141,16 @@ or dataclass) becomes a dict, and a JSON string is parsed back into an object
 (including a ```` ```json ```` fenced one, which is how most models emit
 structured answers). Non-JSON text degrades to text rather than erroring.
 
-Two shapes are easy to get wrong and both used to score 0.0 across the board. A
-**LangGraph** graph built with `response_format=` returns a *state* —
-`{"messages": [...], "remaining_steps": N, "structured_response": {...}}` — and
-the declared output is peeled out of it; the whole state shape is required, so a
-plain `{"structured_response": {...}, "request_id": "42"}` keeps both columns. A
-**single-field answer** like `{"result": "granted"}` is the answer, not an
-envelope: only a conventional key holding something *structured* is peeled.
+Three shapes are easy to get wrong and each used to score 0.0 across the board.
+A **LangGraph** graph built with `response_format=` returns a *state* — a real
+run's keys are `["messages", "structured_response"]` — and the declared output
+is peeled out of it. The state must be recognised as one: `add_messages` coerces
+every entry to a `BaseMessage`, so a real `messages` is a non-empty list of
+message objects, and an answer that merely has fields of those names keeps every
+column. A **single-field answer** like `{"result": "granted"}` is the answer,
+not an envelope: only a conventional key holding something *structured* is
+peeled. A **list of records** is the answer too — only a message/event stream is
+scanned from the end.
 
 `extract_output_text` leaves a declared output unchanged, which is what lets a
 per-row `field_match` still see its fields — on the `checks` path the row picks

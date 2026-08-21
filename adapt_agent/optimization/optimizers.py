@@ -62,6 +62,13 @@ class Trial:
     metrics: dict[str, float] = field(default_factory=dict)
 
 
+#: Reserved top-level name: the exported file's own metadata block. A tuned
+#: parameter using it could be written but never reloaded, so it is described
+#: instead -- see :meth:`OptimizationResult.to_config` and
+#: :func:`load_tuned_config`.
+_PROVENANCE_KEY = "_provenance"
+
+
 @dataclass
 class OptimizationResult:
     """The outcome of an optimization run.
@@ -175,7 +182,15 @@ class OptimizationResult:
         namespaces = {name.partition(".")[0] for name in self.best_config if "." in name}
         for name, value in self.best_config.items():
             component, _, knob = name.partition(".")
-            if not knob and name in namespaces:
+            if component == _PROVENANCE_KEY:
+                # The file's own metadata block owns this name, and
+                # `load_tuned_config` skips it on the way back in. Writing a
+                # tuned parameter there would export a value that never
+                # reloads -- and in JSON would be overwritten by the real
+                # provenance. Described, so the loss is visible rather than
+                # silent.
+                unexportable[name] = _describe(value)
+            elif not knob and name in namespaces:
                 unexportable[name] = _describe(value)
             elif not knob and isinstance(value, dict):
                 # A bare name written as a top-level mapping is indistinguishable
@@ -213,7 +228,7 @@ class OptimizationResult:
                 if unexportable:
                     provenance["unexportable"] = unexportable
                 if provenance:
-                    payload["_provenance"] = provenance
+                    payload[_PROVENANCE_KEY] = provenance
                 text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
             else:
                 import yaml
@@ -1007,7 +1022,7 @@ def load_tuned_config(path: str | Path) -> dict[str, Any]:
         raise ValueError(f"{path} does not contain a mapping of components to parameters")
     flat: dict[str, Any] = {}
     for component, values in loaded.items():
-        if component == "_provenance":
+        if component == _PROVENANCE_KEY:
             continue  # metadata about the run, not a tunable component
         if isinstance(values, dict):
             for knob, value in values.items():

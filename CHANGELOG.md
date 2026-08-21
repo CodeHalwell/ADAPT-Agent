@@ -53,18 +53,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left as a `repr()` by `output_extractor=None`. Three shapes that would each
   have scored 0.0 across every column are handled by name: a LangGraph
   `response_format=` **state** (the answer is under `structured_response`,
-  beside `messages` and `remaining_steps` -- the whole shape is required, so an
-  ordinary field of that name is not peeled); a **single-field answer** like
+  beside `messages`; the state is identified by what LangGraph guarantees --
+  `add_messages` coerces every entry to a `BaseMessage` -- so an answer that
+  merely has fields of those names is not peeled); a **single-field answer** like
   `{"result": "granted"}`, which is the answer rather than an envelope around
   one; and a declared output whose field happens to be *called* `answer` or
   `result`, which the generic attribute peel would have reduced to its own
   value. `extract_output_text` likewise leaves a declared output unchanged, so a
-  per-row `field_match` dispatched by `checks` still sees its fields.
+  per-row `field_match` dispatched by `checks` still sees its fields. A **list of
+  records** is the answer rather than a message stream, so a list of dataclasses
+  or models comes back whole instead of collapsing to its last element.
 - `field_match(field, ...)` and `field_metrics([...])`: score a structured
   output per field, reported under the field's own name, so a report aggregates
   as a per-column table (`{"lane": 0.94, ..., "pack": 0.0}`) rather than one
   blended number that hides which column moved. `evaluate_agent` switches to
   payload extraction automatically when every metric is structural.
+- `OptimizationResult.to_config(path)` reserves the `_provenance` namespace.
+  `load_tuned_config` skips that key on the way in, so a tuned parameter named
+  for it could be exported but never reloaded -- and in JSON the real provenance
+  block overwrote it first. It is described rather than written, so the loss is
+  visible instead of silent.
 - `OptimizationResult.to_config(path)` handles a bare parameter name that is
   also a component prefix (`{"agent": 1, "agent.temperature": 0.2}`): the two
   cannot share the top level, and which one survived depended only on dict

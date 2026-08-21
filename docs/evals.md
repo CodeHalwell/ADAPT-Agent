@@ -336,11 +336,17 @@ text rather than erroring.
 Two shapes need naming, because both used to score 0.0 across the board:
 
 - A **LangGraph** graph built with `response_format=` returns a *state*, not an
-  answer — `{"messages": [...], "remaining_steps": N, "structured_response":
-  {...}}`. The declared output is peeled out of it. The whole state shape is
-  required, not just the key: on its own `structured_response` is an ordinary
-  field name, so `{"structured_response": {...}, "request_id": "42"}` keeps both
-  columns.
+  answer — a real run's keys are exactly `["messages", "structured_response"]`.
+  The declared output is peeled out of it. The state has to be recognised as
+  one, not merely carry the key: on their own both `structured_response` and
+  `messages` are ordinary field names, so what identifies a state is what
+  LangGraph guarantees — `add_messages` coerces every entry to a `BaseMessage`,
+  so `messages` is a non-empty list of message *objects*. An answer like
+  `{"messages": ["audit"], "structured_response": {...}, "request_id": "42"}`
+  keeps every column.
+- A **list of records** is the answer, not a message stream. A stream is scanned
+  from the end for its final message; a list of dataclasses or models is
+  returned whole.
 - A **single-field answer** like `{"result": "granted"}` is the answer, not an
   envelope around one. Only a conventional key holding something *structured*
   is peeled, so a one-column output keeps its column.

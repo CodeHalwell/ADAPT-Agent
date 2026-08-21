@@ -72,9 +72,7 @@ _MAPPING_KEYS = (
 )
 
 #: Where LangGraph's ``create_react_agent(response_format=...)`` puts the
-#: declared structured output -- see ``AgentStateWithStructuredResponse``, whose
-#: keys are ``messages``, ``remaining_steps`` and ``structured_response``. Both
-#: are required before the state is peeled; see :func:`_unwrap_envelope`.
+#: declared structured output -- see ``AgentStateWithStructuredResponse``.
 _STRUCTURED_STATE_KEY = "structured_response"
 _MESSAGES_KEY = "messages"
 
@@ -379,14 +377,14 @@ def _unwrap_envelope(value: Any, depth: int) -> Any:
         # would find its field gone.
         # LangGraph is the exception to the multi-key rule: a graph built with
         # ``response_format=`` returns a *state* -- ``{"messages": [...],
-        # "remaining_steps": N, "structured_response": <the answer>}`` -- so the
-        # single-key test below never fires and every field metric would score
-        # 0.0 against the state rather than the answer inside it. The whole
-        # state shape is required, not just the key: on its own
-        # ``structured_response`` is an ordinary field name, and peeling
-        # ``{"structured_response": {...}, "request_id": "42"}`` would lose the
-        # sibling columns -- the very mistake the multi-key rule exists to avoid.
-        if _MESSAGES_KEY in value:
+        # "structured_response": <the answer>}`` -- so the single-key test below
+        # never fires and every field metric would score 0.0 against the state
+        # rather than the answer inside it. The state must be recognised as one,
+        # not merely carry the key: on its own ``structured_response`` is an
+        # ordinary field name, and peeling ``{"structured_response": {...},
+        # "request_id": "42"}`` would lose the sibling columns -- the mistake the
+        # multi-key rule exists to avoid.
+        if _is_graph_state(value):
             declared = value.get(_STRUCTURED_STATE_KEY)
             if declared is not None and not _is_scalar(declared):
                 return _unwrap_envelope(declared, depth - 1)
@@ -449,6 +447,11 @@ def _unwrap_stream(value: Sequence[Any], depth: int) -> Any:
     for item in reversed(value):
         if item is None or isinstance(item, (str, bytes, int, float, bool)):
             continue
+        if _is_declared_model(item) and not _is_recognised_wrapper(item):
+            # A list of declared *records* is the answer, not a stream with the
+            # answer in its last element. Converting one and returning it would
+            # silently drop every other row.
+            return value
         unwrapped = _unwrap_envelope(item, depth - 1)
         if unwrapped is not item and unwrapped is not None and unwrapped != "":
             return unwrapped
@@ -458,6 +461,45 @@ def _unwrap_stream(value: Sequence[Any], depth: int) -> Any:
 def _is_scalar(value: Any) -> bool:
     """Values that cannot themselves be a wrapped payload."""
     return value is None or isinstance(value, (str, bytes, int, float, bool))
+
+
+def _is_recognised_wrapper(value: Any) -> bool:
+    """Whether a *specific* framework extractor claims ``value``.
+
+    Excludes the generic attribute catch-all, which matches everything. Used to
+    tell a framework object that happens to be declared (a CrewAI ``CrewOutput``
+    is a Pydantic model) from a plain record of the same kind.
+    """
+    for _, predicate, unwrap in (*_CUSTOM_EXTRACTORS, *_BUILTIN_EXTRACTORS):
+        if unwrap is _unwrap_object_attrs:
+            continue
+        try:
+            if predicate(value):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_graph_state(value: Mapping[Any, Any]) -> bool:
+    """Whether ``value`` is a LangGraph state rather than an answer of that shape.
+
+    ``messages`` alone is too weak a signal -- a structured answer may have a
+    field of that name. The discriminator is what LangGraph guarantees about it:
+    ``add_messages`` coerces every entry to a ``BaseMessage``, so a real state's
+    ``messages`` is a non-empty list of *message objects*, never of plain
+    strings or records.
+
+    ``remaining_steps`` deliberately plays no part. It is declared
+    ``NotRequired`` and managed by ``RemainingStepsManager``, so it is absent
+    from the output state -- a real run returns exactly ``['messages',
+    'structured_response']``, and requiring it would reject every genuine
+    LangGraph result.
+    """
+    messages = value.get(_MESSAGES_KEY)
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
+        return False
+    return bool(messages) and all(_is_chat_message(item) for item in messages)
 
 
 def _is_declared_model(value: Any) -> bool:

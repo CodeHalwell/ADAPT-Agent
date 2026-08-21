@@ -474,6 +474,31 @@ def test_a_bare_name_colliding_with_a_component_namespace_is_described(tmp_path,
     assert "Not exported" in path.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    "config,body,reload",
+    [
+        ({"_provenance": 7}, {}, {}),
+        (
+            {"_provenance.mode": "fast", "agent.temperature": 0.2},
+            {"agent": {"temperature": 0.2}},
+            {"agent.temperature": 0.2},
+        ),
+    ],
+)
+def test_the_provenance_namespace_is_reserved(tmp_path, config, body, reload):
+    """A tuned parameter cannot live where the file keeps its own metadata.
+
+    `load_tuned_config` skips `_provenance` on the way in, so exporting a value
+    there wrote something that never reloaded -- and in JSON the real provenance
+    block would overwrite it first. Described instead, so the loss is visible.
+    """
+    result = OptimizationResult(best_config=config, best_score=1.0, baseline_score=0.0)
+    path = tmp_path / "tuned.yaml"
+    assert result.to_config(path) == body
+    assert load_tuned_config(path) == reload
+    assert "_provenance" in path.read_text(encoding="utf-8").split("Not exported")[-1]
+
+
 def test_a_list_of_primitives_still_exports(tmp_path):
     """The tuple exclusion must not sweep up ordinary list values."""
     result = OptimizationResult(
@@ -608,16 +633,24 @@ def test_governed_envelope_is_peeled_before_structural_scoring():
     assert field_match("lane")(extract_output_payload(envelope), {"lane": "NOS"}) == 1.0
 
 
+class _Message:
+    """A LangChain ``BaseMessage`` as `add_messages` leaves it: content + type."""
+
+    def __init__(self, content, type="ai"):
+        self.content = content
+        self.type = type
+
+
 def test_langgraph_structured_state_is_peeled_to_the_declared_answer():
     """A graph built with ``response_format=`` returns a *state*, not an answer.
 
-    ``AgentStateWithStructuredResponse`` is ``{"messages", "remaining_steps",
-    "structured_response"}`` -- multi-key, so the single-key envelope rule never
-    fires and the whole state reached the metric.
+    The state is multi-key, so the single-key envelope rule never fires and the
+    whole state reached the metric. The shape here is what a real run returns --
+    verified against `create_react_agent(response_format=...)`, whose output
+    keys are exactly ``['messages', 'structured_response']``.
     """
     state = {
-        "messages": [],
-        "remaining_steps": 3,
+        "messages": [_Message("go", type="human"), _Message("done")],
         "structured_response": {"lane": "NOS", "matter": "M1"},
     }
     payload = extract_output_payload(state)
@@ -628,25 +661,30 @@ def test_langgraph_structured_state_is_peeled_to_the_declared_answer():
 def test_structured_response_outside_a_langgraph_state_is_left_alone():
     """Regression: the LangGraph rule must not fire on any mapping with the key.
 
-    On its own `structured_response` is an ordinary field name. Peeling
-    `{"structured_response": {...}, "request_id": "42"}` drops the sibling
-    columns -- the very loss the multi-key rule exists to prevent.
+    On its own `structured_response` is an ordinary field name, and so is
+    `messages` -- an answer may carry both. What identifies a real state is what
+    LangGraph guarantees: `add_messages` coerces every entry to a `BaseMessage`,
+    so its `messages` is a non-empty list of message *objects*, never of plain
+    strings. Peeling on the key alone drops the sibling columns -- the loss the
+    multi-key rule exists to prevent.
     """
-    answer = {"structured_response": {"status": "ok"}, "request_id": "42"}
-    assert extract_output_payload(answer) == answer
-    assert field_match("request_id")(extract_output_payload(answer), answer) == 1.0
+    for answer in (
+        {"structured_response": {"status": "ok"}, "request_id": "42"},
+        {"messages": ["audit"], "structured_response": {"status": "ok"}, "request_id": "42"},
+        {"messages": [], "structured_response": {"status": "ok"}, "request_id": "42"},
+    ):
+        assert extract_output_payload(answer) == answer
+        assert field_match("request_id")(extract_output_payload(answer), answer) == 1.0
 
 
 def test_a_plain_langgraph_state_is_untouched_by_the_structured_rule():
     """Without ``response_format=`` there is no ``structured_response`` key, and
-    the state must still arrive whole."""
-    state = {"messages": [], "remaining_steps": 3}
-    assert extract_output_payload(state) == state
-    # A scalar under the key is a value, not a wrapped payload.
-    assert extract_output_payload({"structured_response": "granted", "messages": []}) == {
+    a scalar under it is a value, not a wrapped payload."""
+    state = {
+        "messages": [_Message("go", type="human"), _Message("done")],
         "structured_response": "granted",
-        "messages": [],
     }
+    assert extract_output_payload(state) == state
 
 
 def test_a_multi_key_mapping_is_the_answer_not_an_envelope():
@@ -733,6 +771,51 @@ def test_drained_event_stream_is_unwrapped_before_structural_scoring():
     stream = [_StreamMessage('{"lane": "NOS", "matter": "M1"}')]
     assert extract_output_payload(stream) == {"lane": "NOS", "matter": "M1"}
     assert field_match("lane")(extract_output_payload(stream), {"lane": "NOS"}) == 1.0
+
+
+def test_a_list_of_declared_records_is_the_answer_not_a_stream():
+    """Regression: converting declared models made record lists look like streams.
+
+    `_unwrap_stream` scans from the end for a *recognised* element. Once a
+    dataclass counted as recognised, `[Row("A"), Row("B")]` came back as
+    `{"lane": "B"}` -- every row but the last silently dropped.
+    """
+
+    @dataclasses.dataclass
+    class Row:
+        lane: str
+
+    rows = [Row("A"), Row("B")]
+    assert extract_output_payload(rows) == rows
+
+    class Model:  # the same, declared the Pydantic way
+        model_fields = {"lane": None}
+
+        def __init__(self, lane):
+            self.lane = lane
+
+        def model_dump(self):
+            return {"lane": self.lane}
+
+    models = [Model("A"), Model("B")]
+    assert extract_output_payload(models) == models
+
+
+def test_a_stream_of_framework_objects_is_still_unwrapped_when_declared():
+    """The record-list rule must not disarm real streams: several framework
+    result objects are themselves declared (CrewAI's `CrewOutput` is a Pydantic
+    model), so a *specific* extractor claiming the element still wins."""
+
+    class CrewOutput:  # declared, and a recognised framework shape
+        model_fields = {"raw": None, "tasks_output": None}
+
+        def __init__(self, raw):
+            self.raw = raw
+            self.tasks_output = []
+
+    assert extract_output_payload([CrewOutput("first"), CrewOutput('{"lane": "NOS"}')]) == {
+        "lane": "NOS"
+    }
 
 
 def test_a_genuine_structured_list_survives_stream_unwrapping():
