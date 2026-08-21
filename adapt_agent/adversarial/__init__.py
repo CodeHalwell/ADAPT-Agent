@@ -21,6 +21,29 @@ _NEWLINE_RUN_RE = re.compile(r"\s*\n\s*")
 #: an unusual one. A bare CR is the classic miss: it renders as a line break but
 #: is not ``\n``.
 _LINE_SEPARATORS_RE = re.compile(r"\r\n|\r|\x0b|\x0c|\u0085|\u2028|\u2029")
+#: Purely presentational characters that can precede text on a line -- Markdown
+#: headings and blockquotes, list bullets, emphasis, table cells, quotes.
+#: Stripped before a line is read, so decoration cannot hide a role marker.
+_LINE_DECORATION_RE = re.compile(r"^[\s>#*+=~`'\"\[\](){}|.\u2022\u00b7\u2013\u2014-]*")
+
+
+def _leading_role_marker(normalized: str, tokens: frozenset[str]) -> str | None:
+    """Return the role marker heading some line of ``normalized``, or ``None``.
+
+    Parsed line by line rather than matched with one anchored regex. The regex
+    spelling of this check was rewritten in four consecutive review rounds --
+    it missed a bare CR, then a newline inside a phrase, then Markdown
+    decoration -- because each fix encoded one more way a line can *begin*
+    while the next reviewer found another. Splitting on lines and stripping
+    presentational characters states the actual rule once: a line whose first
+    word is a role token followed by a colon is an injected instruction, and
+    the same word mid-sentence ("our system: v2 is live") is not.
+    """
+    for line in normalized.split("\n"):
+        head, separator, _ = _LINE_DECORATION_RE.sub("", line).partition(":")
+        if separator and head.strip() in tokens:
+            return f"{head.strip()}:"
+    return None
 
 
 def _normalize(text: str) -> str:
@@ -94,12 +117,14 @@ class AdversarialDefense:
         r"\b(?:instruction|instructions|prompt|prompts|rule|rules|direction|directions)\b",
         r"\bdisregard\s+all\b",
         r"\bnew\s+instructions\s*:",
-        r"(?:^|\n)\s*system\s*:",
         # Scoped, unlike the bare "override" substring this replaces: that
         # flagged ordinary developer prose ("override the default timeout").
         r"\boverride\b[^.!?]{0,40}?"
         r"\b(?:instruction|instructions|prompt|prompts|rule|rules|system|safety|guardrail|filter)\b",
     )
+
+    #: Role tokens that, at the head of a line, mark injected instructions.
+    _ROLE_TOKENS = frozenset({"system"})
 
     #: Jailbreak indicators, same treatment.
     _JAILBREAK_PATTERNS = (
@@ -173,6 +198,9 @@ class AdversarialDefense:
         normalized = (
             prompt_normalized if prompt_normalized is not None else _normalize_lines(prompt)
         )
+        role_marker = _leading_role_marker(normalized, self._ROLE_TOKENS)
+        if role_marker is not None:
+            return role_marker
         for indicator in self._INJECTION_INDICATORS:
             match = indicator.search(normalized)
             if match is not None:

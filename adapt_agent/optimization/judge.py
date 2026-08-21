@@ -246,8 +246,18 @@ class LLMJudge:
         *,
         criteria: str | None = None,
         rubric: str | None = None,
+        propagate_transient: bool = False,
     ) -> JudgeVerdict:
-        """Grade a single ``output`` and return a :class:`JudgeVerdict`."""
+        """Grade a single ``output`` and return a :class:`JudgeVerdict`.
+
+        Args:
+            propagate_transient: Let a transient provider failure that outlived
+                its retries escape as an exception instead of collapsing to the
+                ``on_error`` verdict. :meth:`as_metric` sets this so the harness
+                can drop the row rather than score the candidate zero for the
+                provider's congestion. Direct callers keep the fallback --
+                there is no harness behind them to catch anything.
+        """
         rubric_text = rubric or self.rubric
         system = _SCORE_SYSTEM.format(
             stance=self._stance_block(),
@@ -261,7 +271,7 @@ class LLMJudge:
             reference_block=_reference_block(expected),
             criteria_block=_criteria_block(criteria),
         )
-        raw = self._complete(user, system=system)
+        raw = self._complete(user, system=system, propagate_transient=propagate_transient)
         if raw is None:
             return JudgeVerdict(
                 self.on_error,
@@ -492,7 +502,12 @@ class LLMJudge:
                 meta = getattr(example, "metadata", {}) or {}
                 ex_criteria = meta.get("criteria", criteria)
             return self.score(
-                input_data, output, expected, criteria=ex_criteria, rubric=rubric
+                input_data,
+                output,
+                expected,
+                criteria=ex_criteria,
+                rubric=rubric,
+                propagate_transient=True,
             ).score
 
         return Metric(name, _fn, needs_example=True)
@@ -503,7 +518,9 @@ class LLMJudge:
         """Return the adversarial stance directive (or empty) for system prompts."""
         return f"\n{_ADVERSARIAL_STANCE}\n" if self.adversarial else ""
 
-    def _complete(self, prompt: str, *, system: str | None = None) -> str | None:
+    def _complete(
+        self, prompt: str, *, system: str | None = None, propagate_transient: bool = False
+    ) -> str | None:
         """Call the completion function.
 
         Passes ``system`` (rubric/instructions) to the provider when supported.
@@ -512,15 +529,16 @@ class LLMJudge:
 
         * **Auth/permission errors re-raise immediately.** A misconfigured key
           should fail loudly, not score every example zero.
-        * **Transient errors are retried, then re-raised.** A judge's provider
-          call is a network round trip, and under concurrency a 429 there is as
-          likely as one on the agent call. Swallowing it into ``on_error``
-          scored the *candidate* zero for the *provider's* congestion -- the
-          same measurement bug the harness fixes on the agent side, reached by a
-          different route, and the one the documented optimizer example (which
-          grades with ``LLMJudge.as_metric()``) actually hits. Re-raising lets
-          the harness classify the row as transient and drop it from the score
-          instead of counting it against the prompt.
+        * **Transient errors are retried, then re-raised -- but only for
+          ``propagate_transient=True`` callers.** A judge's provider call is a
+          network round trip, and under concurrency a 429 there is as likely as
+          one on the agent call. Swallowing it into ``on_error`` scored the
+          *candidate* zero for the *provider's* congestion, so the metric
+          adapter (:meth:`as_metric`) lets it out and the harness drops the row.
+          Every other entry point -- :meth:`score`, :meth:`critique`,
+          :meth:`improve_prompt` -- keeps its documented graceful fallback:
+          those are standalone calls with no harness to catch anything, and
+          turning them into raisers would be an unannounced breaking change.
         * **Anything else returns ``None``**, which the caller turns into
           ``on_error`` -- a judge that reliably returns garbage is a real
           failure of this configuration.
@@ -561,6 +579,8 @@ class LLMJudge:
                         attempt,
                         exc,
                     )
+                    if not propagate_transient:
+                        return None
                     # Stamped so the harness excludes the row without spending a
                     # second retry budget on an already-exhausted call.
                     mark_retries_exhausted(exc)

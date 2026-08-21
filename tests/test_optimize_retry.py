@@ -735,8 +735,9 @@ def test_a_metric_without_its_own_retries_is_still_retried_by_the_harness() -> N
 def test_a_custom_classifier_reaches_the_judge() -> None:
     """`RetryPolicy(is_transient=...)` governs the judge's own classification.
 
-    Gating on the module-level default meant the judge swallowed into
-    `on_error` what the harness would have retried and excluded.
+    Gating on the module-level default meant a custom classifier never reached
+    it. Observable two ways, since `score()` keeps its `on_error` fallback: the
+    retry count, and whether the metric adapter propagates.
     """
     from adapt_agent.optimization.judge import LLMJudge
 
@@ -753,21 +754,28 @@ def test_a_custom_classifier_reaches_the_judge() -> None:
         calls["n"] += 1
         raise RuntimeError("SQUELCH: provider hiccup")
 
-    with pytest.raises(RuntimeError, match="SQUELCH"):
-        LLMJudge(squelch, retry=policy).score("i", "o")
+    # Classified transient by the custom policy -> retried, then excluded.
+    judge = LLMJudge(squelch, retry=policy)
+    report = EvaluationHarness([judge.as_metric()], retry=policy).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
     assert calls["n"] == 2, "the custom classifier never reached the judge"
+    assert report.n_transient_errors == 1
 
-    # ...and the converse: a 429 is *not* transient under that policy, so it
-    # takes the on_error path instead of being retried.
+    # ...and the converse: a 429 is *not* transient under that policy, so it is
+    # tried once and collapses to on_error rather than being excluded.
     calls["n"] = 0
 
     def plain_429(prompt, **kwargs):
         calls["n"] += 1
         raise RuntimeError("429 Too Many Requests")
 
-    verdict = LLMJudge(plain_429, retry=policy).score("i", "o")
+    other = LLMJudge(plain_429, retry=policy)
+    other_report = EvaluationHarness([other.as_metric()], retry=policy).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
     assert calls["n"] == 1
-    assert verdict.score == 0.0
+    assert other_report.n_transient_errors == 0
 
 
 # -- report denominators ------------------------------------------------------
@@ -803,3 +811,77 @@ def test_avg_latency_is_per_evaluated_row_not_per_stored_record() -> None:
     assert report.n == 1
     assert report.n_evaluated == 4
     assert report.avg_latency == pytest.approx(report.total_latency / 4)
+
+
+# -- transient failures are scoped to what actually failed --------------------
+
+
+def test_a_throttled_secondary_metric_does_not_erase_the_primary() -> None:
+    """Marking the whole row transient deleted a primary score that computed fine.
+
+    With the completeness gate in place that is not just a lost sample: the row
+    counts as unscored, so a run graded by `exact_match` plus a secondary judge
+    could be rejected -- or abort at the baseline -- because the *judge* was
+    throttled.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    harness = EvaluationHarness(
+        [exact_match(), Metric("secondary", throttled)], retry=RetryPolicy(attempts=1)
+    )
+    report = harness.evaluate(lambda x: "ok", _dataset())
+
+    assert report.aggregate["exact_match"] == 1.0
+    assert report.score == 1.0
+    assert report.n_transient_errors == 0
+    assert report.is_complete is True
+    assert report.results[0].transient_metrics == ("secondary",)
+
+
+def test_a_throttled_primary_metric_still_makes_the_row_unusable() -> None:
+    """The primary is the number the optimizer ranks on, so a gap there counts."""
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    harness = EvaluationHarness(
+        [Metric("primary", throttled), exact_match()], retry=RetryPolicy(attempts=1)
+    )
+    report = harness.evaluate(lambda x: "ok", _dataset())
+
+    assert report.n_transient_errors == 3
+    assert report.is_complete is False
+
+
+def test_a_standalone_judge_keeps_its_documented_fallback() -> None:
+    """Propagation is for the metric adapter only.
+
+    `score()`, `critique()` and friends have no harness behind them to catch an
+    exception, so turning them into raisers was an unannounced breaking change.
+    """
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def throttled(prompt, **kwargs):
+        raise RuntimeError("429 Too Many Requests")
+
+    judge = LLMJudge(throttled, retry=RetryPolicy(attempts=1), on_error=0.0)
+    assert judge.score("i", "o").score == 0.0
+    assert judge.critique("i", "o") == ""
+
+
+def test_the_metric_adapter_still_propagates_so_the_row_is_excluded() -> None:
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def throttled(prompt, **kwargs):
+        raise RuntimeError("429 Too Many Requests")
+
+    judge = LLMJudge(throttled, retry=RetryPolicy(attempts=1))
+    report = EvaluationHarness([judge.as_metric()], retry=RetryPolicy(attempts=1)).evaluate(
+        lambda x: "ok", _dataset()
+    )
+    assert report.n_transient_errors == 3, "the metric adapter stopped propagating"
+    assert report.failures() == []

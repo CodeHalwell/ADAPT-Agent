@@ -148,6 +148,10 @@ class ExampleResult:
     scores: dict[str, float]
     latency: float
     error: str | None = None
+    #: Metrics whose own provider call failed transiently on this row. Only
+    #: these lose their score; the rest of the row still counts, so a throttled
+    #: secondary judge cannot erase a primary that computed fine.
+    transient_metrics: tuple[str, ...] = ()
     #: True when this example failed with a *transient* provider error (429,
     #: 5xx, timeout) that survived every retry. Such a result says nothing about
     #: the agent's quality, so it is kept out of the aggregate and out of
@@ -604,11 +608,19 @@ class EvaluationHarness:
                 logger.warning("Output extractor raised on example %d: %s", index, exc)
 
         scores: dict[str, float] = {}
-        transient = False
+        transient_metrics: list[str] = []
         for metric in self.metrics:
             score, metric_transient = self._score_with_metric(metric, output, example, index)
             scores[metric.name] = score
-            transient = transient or metric_transient
+            if metric_transient:
+                transient_metrics.append(metric.name)
+
+        # Only the *primary* makes the whole row unusable: it is the number the
+        # optimizer compares, so a gap there means the row cannot be ranked. A
+        # throttled secondary loses its own sample and nothing else -- marking
+        # the row transient for it would delete a primary score that computed
+        # perfectly well, and (with the completeness gate) could abort a run.
+        transient = self.primary_metric in transient_metrics
 
         return ExampleResult(
             index=index,
@@ -619,6 +631,7 @@ class EvaluationHarness:
             latency=latency,
             error="transient metric failure" if transient else None,
             transient=transient,
+            transient_metrics=tuple(transient_metrics),
             attempts=attempts,
         )
 
@@ -730,7 +743,12 @@ class _Accumulator:
             # record is kept (and counted) but never scored.
             self._n_transient_errors += 1
         else:
+            skip = set(result.transient_metrics)
             for name, score in result.scores.items():
+                if name in skip:
+                    # This metric's own provider call failed; its zero is not a
+                    # measurement. Other metrics on the row are unaffected.
+                    continue
                 self._sums[name] = self._sums.get(name, 0.0) + score
                 self._counts[name] = self._counts.get(name, 0) + 1
         if result.index < self._harness.max_results:

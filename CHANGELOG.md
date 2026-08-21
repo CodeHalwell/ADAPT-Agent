@@ -89,6 +89,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`wrap_agent` gave unusable advice for callable-only adapters.** The Google
   ADK adapter takes a callable by design, so its error read `Expected one of ''`.
   It now names the actual contract.
+- **Role markers are parsed per line now, not matched with an anchored regex.**
+  That one expression was rewritten in four consecutive review rounds -- it
+  missed a bare CR, then a newline inside a phrase, then Markdown decoration
+  (`hello\n### SYSTEM: ...` and `hello\n> SYSTEM: ...` both evaded it) --
+  because each fix encoded one more way a line can begin. Lines are split,
+  presentational characters stripped, and a line whose first word is a role
+  token followed by a colon is the rule, stated once. 10 decorated forms caught,
+  and prose keeps its role words (`- system requirements: 8GB RAM` stays clean).
+- **A throttled secondary metric erased the primary's score.** Any transient
+  metric failure marked the whole row, so `_Accumulator` dropped every score on
+  it -- an `exact_match` primary plus a throttled judge produced a primary
+  aggregate of `0.0`, and with the completeness gate that could reject a
+  candidate or abort at the baseline. Transient status is tracked per metric;
+  only the primary's failure makes a row unusable, since that is the number the
+  optimizer ranks on.
+- **A standalone `LLMJudge` kept its documented fallback.** Re-raising exhausted
+  transient errors reached every public entry point, so `score()`, `critique()`
+  and `improve_prompt()` began raising instead of returning their `on_error`
+  verdict -- an unannounced breaking change for anyone not going through a
+  harness. Only `as_metric()` propagates now.
 - **Two normalisations, because the callers want opposite things.** Collapsing
   newlines hid a role marker on its own line; preserving them let an attacker
   split a registered multiword signature across lines
