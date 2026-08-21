@@ -1,9 +1,22 @@
 """Command-line interface for ADAPT-Agent.
 
+The CLI is published under two console scripts -- ``adapt-agent`` and the
+shorter ``adapt`` -- which are the same program; either name accepts every
+command below.
+
 Commands
 --------
 ``adapt-agent info``
     Print library information.
+
+``adapt install skill [NAME] [--target project|user] [--dir PATH] [--force]``
+    Install an agent skill bundled with the library into a skills directory --
+    ``./.claude/skills`` by default, ``~/.claude/skills`` with ``--target
+    user`` -- so a coding agent picks it up automatically. Omit ``NAME`` to
+    install every bundled skill.
+
+``adapt skills [--json]``
+    List the agent skills bundled with this installation.
 
 ``adapt-agent validate <config_file> [--json]``
     Validate an ADAPT-Agent configuration file (see :func:`validate_config`).
@@ -14,7 +27,12 @@ Commands
 
 ``adapt-agent evaluate <target> --data <file> [--metric NAME ...] [--judge PROVIDER]``
     Evaluate an agent against a golden dataset and print the scores. ``<target>``
-    is ``module:attribute`` (append ``()`` to call a factory).
+    is ``module:attribute`` (append ``()`` to call a factory). Pass
+    ``--extract-output`` to unwrap framework-native results (an
+    ``AgentRunResult``, LangGraph state, ADK events, ...) to final response
+    text before scoring, and ``--metric checks`` to let each dataset row
+    declare its own check via ``metadata`` (text match, numeric tolerance,
+    LLM-judge, ...).
 
 ``adapt-agent optimize <target> --data <file> [--optimizer S] [--judge PROVIDER] ...``
     Optimize an agent against a golden dataset (prompts, few-shot, models,
@@ -44,6 +62,7 @@ Configuration file schema (JSON)
 import argparse
 import ast
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -54,6 +73,15 @@ from adapt_agent import __version__
 _VALID_ACTIONS = {"warn", "block", "modify"}
 _VALID_SEVERITIES = {"low", "medium", "high", "critical"}
 _MAX_CONDITION_LENGTH = 1024
+
+#: Console-script names this CLI is published under (see ``[project.scripts]``).
+#: Used only to echo the invoked name back in ``--help`` output.
+_PROG_NAMES = ("adapt", "adapt-agent")
+
+#: Install targets for bundled agent skills, mirroring
+#: :data:`adapt_agent.skills.INSTALL_TARGETS`. Kept as a static tuple so
+#: building the parser does not import the skills module.
+_SKILL_TARGETS = ("project", "user")
 
 # Static name lists for argparse help/choices, kept here so building the parser
 # never imports the (heavier) optimization subsystem for `info`/`validate`.
@@ -66,6 +94,7 @@ _BUILTIN_METRIC_NAMES = (
     "numeric_close",
     "json_subset",
     "levenshtein_ratio",
+    "checks",
 )
 _OPTIMIZER_CHOICES = (
     "default",
@@ -81,6 +110,17 @@ def _builtin_metric_names() -> list[str]:
     return list(_BUILTIN_METRIC_NAMES)
 
 
+def _prog_name() -> str:
+    """The console-script name to show in help output.
+
+    Both ``adapt`` and ``adapt-agent`` invoke this CLI; echo back whichever the
+    user typed, falling back to the canonical name (e.g. under ``python -m`` or
+    in tests, where ``sys.argv[0]`` is something else entirely).
+    """
+    invoked = os.path.basename(sys.argv[0] or "")
+    return invoked if invoked in _PROG_NAMES else "adapt-agent"
+
+
 def main(args: list[str] | None = None) -> int:
     """Main entry point for the CLI.
 
@@ -91,7 +131,7 @@ def main(args: list[str] | None = None) -> int:
         Process exit code (0 on success, non-zero on error).
     """
     parser = argparse.ArgumentParser(
-        prog="adapt-agent",
+        prog=_prog_name(),
         description="ADAPT-Agent: Adversarial Defense & Policy Training for LLM Agents",
     )
     parser.add_argument(
@@ -115,6 +155,44 @@ def main(args: list[str] | None = None) -> int:
     )
     train_parser.add_argument("config_file", help="Path to a YAML or JSON training config")
     train_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON output"
+    )
+
+    install_parser = subparsers.add_parser(
+        "install", help="Install a bundled agent skill into a skills directory"
+    )
+    install_parser.add_argument(
+        "what",
+        choices=["skill", "skills"],
+        help="What to install (currently: agent skills)",
+    )
+    install_parser.add_argument(
+        "name",
+        nargs="?",
+        help="Skill to install (default: every bundled skill).",
+    )
+    install_parser.add_argument(
+        "--target",
+        choices=_SKILL_TARGETS,
+        default="project",
+        help="Where to install: 'project' (./.claude/skills, the default) or "
+        "'user' (~/.claude/skills).",
+    )
+    install_parser.add_argument(
+        "--dir",
+        dest="directory",
+        help="Explicit skills directory, overriding --target (for tools that "
+        "read SKILL.md folders from elsewhere).",
+    )
+    install_parser.add_argument(
+        "--force", action="store_true", help="Replace an existing installation."
+    )
+    install_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON output"
+    )
+
+    skills_parser = subparsers.add_parser("skills", help="List the bundled agent skills")
+    skills_parser.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON output"
     )
 
@@ -155,11 +233,18 @@ def main(args: list[str] | None = None) -> int:
             action="append",
             default=[],
             metavar="NAME",
-            help=f"Built-in metric to apply (repeatable): {sorted(_builtin_metric_names())}.",
+            help=f"Built-in metric to apply (repeatable): {sorted(_builtin_metric_names())}, "
+            'plus "judge" to grade every row with the --judge provider explicitly.',
         )
         sub.add_argument("--judge", help="LLM-judge provider (e.g. claude, openai, gemini).")
         sub.add_argument("--judge-model", help="Model id for the judge provider.")
         sub.add_argument("--primary", help="Name of the primary (headline) metric.")
+        sub.add_argument(
+            "--extract-output",
+            action="store_true",
+            help="Unwrap framework-native results (AgentRunResult, LangGraph "
+            "state, ADK events, ...) to final response text before scoring.",
+        )
         sub.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
         if name == "optimize":
             sub.add_argument(
@@ -186,6 +271,10 @@ def main(args: list[str] | None = None) -> int:
         return _cmd_info()
     if parsed_args.command == "validate":
         return _cmd_validate(parsed_args.config_file, as_json=parsed_args.json)
+    if parsed_args.command == "install":
+        return _cmd_install(parsed_args)
+    if parsed_args.command == "skills":
+        return _cmd_skills(parsed_args)
     if parsed_args.command == "monitor":
         return _cmd_monitor(
             parsed_args.agent_id, config_file=parsed_args.config, as_json=parsed_args.json
@@ -214,7 +303,10 @@ def _cmd_info() -> int:
     print("  - Adapters: LangGraph, Microsoft Agent Framework, Google ADK,")
     print("    Pydantic AI, CrewAI, OpenAI Agents SDK, Claude Agent SDK")
     print("  - Performance optimization, evaluation and observability")
+    print("  - Golden-dataset evals: text/number checks and LLM-as-judge")
+    print("  - A bundled agent skill so coding agents can drive all of the above")
     print()
+    print(f"Install the agent skill with: {_prog_name()} install skill")
     print("For more information, visit: https://github.com/CodeHalwell/ADAPT-Agent")
     return 0
 
@@ -351,6 +443,94 @@ def _cmd_validate(config_file: str, as_json: bool = False) -> int:
     return 1 if errors else 0
 
 
+# -- agent skills --------------------------------------------------------------
+
+
+def _display_path(path: Any) -> str:
+    """Render a path relative to the working directory when it is inside it."""
+    from pathlib import Path
+
+    path = Path(path)
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
+
+
+def _cmd_install(args: Any) -> int:
+    """Install bundled agent skill(s) into a skills directory."""
+    # Imported lazily so `info`/`validate` stay fast.
+    from adapt_agent.skills import install_all, install_skill
+
+    try:
+        if args.name:
+            results = [
+                install_skill(args.name, args.directory, target=args.target, force=args.force)
+            ]
+        else:
+            results = install_all(args.directory, target=args.target, force=args.force)
+    except Exception as exc:
+        return _fail(exc, args.json)
+
+    if args.json:
+        print(
+            json.dumps(
+                {"status": "ok", "installed": [r.to_dict() for r in results]},
+                indent=2,
+            )
+        )
+        return 0
+
+    if not results:
+        print("No bundled skills to install.")
+        return 0
+
+    for result in results:
+        verb = "Updated" if result.replaced else "Installed"
+        print(
+            f"{verb} the '{result.skill.name}' skill "
+            f"({len(result.files)} files) -> {_display_path(result.path)}"
+        )
+    where = "this project" if args.target == "project" and not args.directory else "you"
+    print(f"An agent working with {where} will now discover it automatically.")
+    return 0
+
+
+def _cmd_skills(args: Any) -> int:
+    """List the agent skills bundled with the installed package."""
+    from adapt_agent.skills import available_skills
+
+    try:
+        skills = available_skills()
+    except Exception as exc:
+        return _fail(exc, args.json)
+
+    if args.json:
+        print(json.dumps({"skills": [s.to_dict() for s in skills]}, indent=2))
+        return 0
+
+    if not skills:
+        print("No skills are bundled with this installation.")
+        return 0
+
+    print(f"{len(skills)} bundled skill(s):")
+    for skill in skills:
+        print(f"  {skill.name} ({len(skill.files)} files)")
+        if skill.description:
+            print(f"    {_first_sentence(skill.description)}")
+    print()
+    print(f"Install with: {_prog_name()} install skill [NAME] [--target project|user]")
+    return 0
+
+
+def _first_sentence(text: str, limit: int = 160) -> str:
+    """First sentence of a description, truncated for a one-line listing."""
+    sentence = text.strip().split(". ")[0].rstrip(".")
+    if len(sentence) > limit:
+        return sentence[: limit - 1].rstrip() + "…"
+    return sentence + "."
+
+
 def _cmd_monitor(agent_id: str, config_file: str | None = None, as_json: bool = False) -> int:
     """Initialise the observability stack for an agent and report readiness."""
     # Imported lazily to keep `info`/`validate` fast and dependency-light.
@@ -476,6 +656,15 @@ def _build_components(specs: list[str]) -> dict[str, Any]:
     return components
 
 
+def _output_extractor(args: Any) -> Any:
+    """Return the framework output extractor when ``--extract-output`` is set."""
+    if not getattr(args, "extract_output", False):
+        return None
+    from adapt_agent.optimization import extract_output_text
+
+    return extract_output_text
+
+
 def _build_judge(provider: str | None, model: str | None) -> Any:
     """Construct an LLM judge for a provider name, or ``None`` when unset."""
     if not provider:
@@ -487,10 +676,24 @@ def _build_judge(provider: str | None, model: str | None) -> Any:
 
 def _build_metrics(names: list[str], judge: Any, primary: str | None) -> tuple[list[Any], str]:
     """Build the metric list (built-ins + optional judge) and the primary name."""
-    from adapt_agent.optimization import get_metric
+    from adapt_agent.optimization import checks, get_metric
 
-    metrics: list[Any] = [get_metric(name) for name in names]
-    if judge is not None:
+    metrics: list[Any] = []
+    for name in names:
+        if name == "checks":
+            # Judge-aware so dataset rows may declare {"check": "judge"}.
+            metrics.append(checks(judge=judge))
+        elif name in ("judge", "llm_judge"):
+            if judge is None:
+                raise ValueError(f"--metric {name} requires --judge PROVIDER.")
+            metrics.append(judge.as_metric("judge"))
+        else:
+            metrics.append(get_metric(name))
+    # A supplied judge also grades every row -- unless a metric already routes
+    # it: an explicit "judge" entry, or a "checks" dispatcher (which judges
+    # exactly the rows that declare a judge check; grading every row anyway
+    # would burn judge calls the dataset opted out of).
+    if judge is not None and not any(m.name in ("judge", "checks") for m in metrics):
         metrics.append(judge.as_metric("judge"))
     if not metrics:
         raise ValueError(
@@ -562,7 +765,9 @@ def _cmd_evaluate(args: Any) -> int:
         dataset = _load_dataset(args.data)
         judge = _build_judge(args.judge, args.judge_model)
         metrics, primary = _build_metrics(args.metric, judge, args.primary)
-        harness = EvaluationHarness(metrics, primary_metric=primary)
+        harness = EvaluationHarness(
+            metrics, primary_metric=primary, output_extractor=_output_extractor(args)
+        )
         report = harness.evaluate(target, dataset)
     except Exception as exc:
         return _fail(exc, args.json)
@@ -588,7 +793,9 @@ def _cmd_optimize(args: Any) -> int:
         val_dataset = _load_dataset(args.val_data) if args.val_data else None
         judge = _build_judge(args.judge, args.judge_model)
         metrics, primary = _build_metrics(args.metric, judge, args.primary)
-        harness = EvaluationHarness(metrics, primary_metric=primary)
+        harness = EvaluationHarness(
+            metrics, primary_metric=primary, output_extractor=_output_extractor(args)
+        )
         optimizer = _build_optimizer(
             args.optimizer, harness, judge, args.max_evals, args.seed, args.verbose
         )

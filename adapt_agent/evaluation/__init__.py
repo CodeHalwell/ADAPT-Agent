@@ -1,6 +1,7 @@
 """Evaluation frameworks for LLM agents."""
 
 import logging
+from collections import deque
 from collections.abc import Callable
 from typing import Any, Optional
 
@@ -11,16 +12,26 @@ from typing import Any, Optional
 # here under the "eval" namespace. These imports pull in no third-party agent
 # framework or LLM SDK.
 from adapt_agent.optimization.dataset import Example, GoldenDataset
+from adapt_agent.optimization.evals import evaluate_agent
 from adapt_agent.optimization.evaluation import (
     EvaluationHarness,
     EvaluationReport,
     ExampleResult,
 )
+from adapt_agent.optimization.extractors import (
+    available_extractors,
+    extract_output_payload,
+    extract_output_text,
+    register_extractor,
+)
 from adapt_agent.optimization.judge import JudgeVerdict, LLMJudge
 from adapt_agent.optimization.metrics import (
     Metric,
+    checks,
     contains,
     exact_match,
+    field_match,
+    field_metrics,
     get_metric,
     jaccard,
     json_subset,
@@ -29,6 +40,7 @@ from adapt_agent.optimization.metrics import (
     regex_match,
     token_f1,
 )
+from adapt_agent.optimization.runners import adk_runner, framework_runner, langgraph_inputs
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +59,7 @@ class AgentEvaluator:
             max_results: Maximum number of evaluation results to store in memory.
         """
         self.max_results = max_results
-        self._evaluation_results: list[dict[str, Any]] = []
+        self._evaluation_results: deque[dict[str, Any]] = deque(maxlen=max_results)
         self._custom_metrics: dict[str, Callable] = {}
 
     def register_metric(
@@ -100,9 +112,6 @@ class AgentEvaluator:
 
         self._evaluation_results.append(results)
 
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._evaluation_results) > self.max_results:
-            self._evaluation_results.pop(0)
 
         return results
 
@@ -187,6 +196,18 @@ __all__ = [
     "jaccard",
     "numeric_close",
     "json_subset",
+    "field_match",
+    "field_metrics",
     "levenshtein_ratio",
+    "checks",
     "get_metric",
+    # one-call framework evals
+    "evaluate_agent",
+    "extract_output_text",
+    "extract_output_payload",
+    "register_extractor",
+    "available_extractors",
+    "framework_runner",
+    "langgraph_inputs",
+    "adk_runner",
 ]

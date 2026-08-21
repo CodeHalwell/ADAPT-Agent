@@ -47,6 +47,7 @@ nav:
   - Security Model: security.md
   - Policy Enforcement: policy.md
   - Framework Adapters: adapters.md
+  - Native Framework Hooks: integrations.md
   - Framework Guides:
       - Overview: frameworks/index.md
       - LangGraph: frameworks/langgraph.md
@@ -56,7 +57,10 @@ nav:
       - CrewAI: frameworks/crewai.md
       - OpenAI Agents SDK: frameworks/openai_agents.md
       - Claude Agent SDK: frameworks/claude_agent.md
+  - Agent Skill: skill.md
+  - Running Evals: evals.md
   - Optimization & Evaluation: optimization.md
   - Observability: observability.md
   - CLI: cli.md
+  - Releasing: releasing.md
   - API Reference: api.md

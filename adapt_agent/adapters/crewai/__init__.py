@@ -38,6 +38,7 @@ class CrewAIAdapter(GovernedAdapter):
 
     framework_name = "CrewAI"
     run_method_names = ("kickoff", "kickoff_async", "run")
+    async_run_method_names = ("kickoff_async", "kickoff", "run")
     operation = "crewai.kickoff"
 
     def _prepare_input(self, payload: dict[str, Any]) -> Any:

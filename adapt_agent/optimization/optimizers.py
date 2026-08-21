@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import random
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from adapt_agent.optimization.dataset import GoldenDataset
@@ -59,6 +60,13 @@ class Trial:
     strategy: str
     accepted: bool = False
     metrics: dict[str, float] = field(default_factory=dict)
+
+
+#: Reserved top-level name: the exported file's own metadata block. A tuned
+#: parameter using it could be written but never reloaded, so it is described
+#: instead -- see :meth:`OptimizationResult.to_config` and
+#: :func:`load_tuned_config`.
+_PROVENANCE_KEY = "_provenance"
 
 
 @dataclass
@@ -98,6 +106,165 @@ class OptimizationResult:
     @property
     def n_evals(self) -> int:
         return len(self.history)
+
+    def to_config(
+        self,
+        path: str | Path | None = None,
+        *,
+        header: bool = True,
+    ) -> dict[str, Any]:
+        """Export the winning configuration as a reviewable, nested mapping.
+
+        :attr:`best_config` is applied *in place*, to live objects, and dies with
+        the process. For any project whose prompts are version-controlled that is
+        the wrong end state -- and an LLM-rewritten prompt reaching production
+        without a human reading the diff is worse than a lost tuning run.
+
+        This turns the result into an artifact, so the loop becomes
+        **optimize -> diff -> review -> commit** and the application keeps
+        loading its prompts from the YAML it always did::
+
+            result.to_config("specialists/.config/tuned.yaml")
+
+        Parameter names follow the ``"<component>.<knob>"`` convention, so the
+        flat config nests by component. A name with no prefix stays at the top
+        level as a scalar, so it round-trips back under its own name::
+
+            researcher:
+              system_prompt: |
+                You are a careful researcher...
+              temperature: 0.2
+            writer:
+              model: gpt-4o
+            temperature: 0.2        # a bare name, unchanged
+
+        Round-trips through :func:`load_tuned_config`, which flattens it back
+        for :meth:`OptimizableAgent.apply`.
+
+        The format follows the extension: ``.json`` writes JSON, anything else
+        writes YAML. Provenance -- baseline, best and validation scores, and the
+        number of evaluations -- travels with the config, so a diff shows *what
+        it bought* rather than only what changed. In YAML that is a comment
+        header; JSON has no comments, so it goes in a ``"_provenance"`` key
+        which :func:`load_tuned_config` ignores.
+
+        **Live objects are described, not exported.** A ``TOOL``/``SKILL``
+        parameter holds callables or SDK objects, which no YAML or JSON encoder
+        can represent. Writing a stand-in string would be worse than useless:
+        :meth:`OptimizableAgent.apply` would later set that string over the real
+        tool list and break the agent. So such parameters are listed -- by
+        ``module:qualname``, which is what a reviewer wants to see anyway -- in a
+        comment header (YAML) or under ``_provenance.unexportable`` (JSON), and
+        left out of the config body, which therefore stays safely reloadable.
+        That listing appears even when ``header=False``: silently dropping a
+        tuned parameter is worse than two lines of comment.
+
+        Args:
+            path: Where to write. ``None`` returns the mapping without writing.
+                The parent directory is created if needed.
+            header: Record provenance in the file. Comments do not affect
+                parsing or the round-trip.
+
+        Returns:
+            The nested ``{component: {knob: value}}`` mapping (never including
+            the provenance block or unexportable parameters, so the return value
+            is exactly the config that will apply cleanly).
+        """
+        nested: dict[str, Any] = {}
+        unexportable: dict[str, str] = {}
+        # A bare name that is also a component prefix -- `{"agent": 1,
+        # "agent.temperature": 0.2}` -- cannot share the top level with its own
+        # namespace. Written first it is indexed into as a mapping (`TypeError`);
+        # written second it overwrites the component's knobs. Both outcomes
+        # depend only on dict ordering, so the collision is resolved up front:
+        # the qualified knobs are the ones that can round-trip, and the bare
+        # name is described instead.
+        namespaces = {name.partition(".")[0] for name in self.best_config if "." in name}
+        for name, value in self.best_config.items():
+            component, _, knob = name.partition(".")
+            if component == _PROVENANCE_KEY:
+                # The file's own metadata block owns this name, and
+                # `load_tuned_config` skips it on the way back in. Writing a
+                # tuned parameter there would export a value that never
+                # reloads -- and in JSON would be overwritten by the real
+                # provenance. Described, so the loss is visible rather than
+                # silent.
+                unexportable[name] = _describe(value)
+            elif not knob and name in namespaces:
+                unexportable[name] = _describe(value)
+            elif not knob and isinstance(value, dict):
+                # A bare name written as a top-level mapping is indistinguishable
+                # from a component section on reload, so `load_tuned_config`
+                # would return it as "<name>.<key>" and `apply()` would skip it.
+                # Ambiguous beats wrong: describe it rather than export a value
+                # that cannot come back as itself.
+                unexportable[name] = _describe(value)
+            elif not _is_exportable(value):
+                # A TOOL/SKILL parameter holds live callables or SDK objects. They
+                # cannot be written to YAML/JSON, and a string standing in for one
+                # would corrupt the agent if `apply()` later wrote it back over the
+                # real tool list. So they are described, not exported -- the file
+                # records which were selected, for review, and stays safely
+                # reloadable.
+                unexportable[name] = _describe(value)
+            elif knob:
+                nested.setdefault(component, {})[knob] = value
+            else:
+                # A parameter with no "<component>." prefix stays at the top
+                # level as a scalar. Filing it under a synthetic component would
+                # rename it on the way out, and `load_tuned_config` could not
+                # recover the original -- `apply()` would then silently skip it,
+                # breaking the round trip this method exists to provide.
+                nested[name] = value
+
+        if path is not None:
+            destination = Path(path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.suffix.lower() == ".json":
+                import json
+
+                payload = dict(nested)
+                provenance = self._provenance() if header else {}
+                if unexportable:
+                    provenance["unexportable"] = unexportable
+                if provenance:
+                    payload[_PROVENANCE_KEY] = provenance
+                text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+            else:
+                import yaml
+
+                text = yaml.safe_dump(nested, sort_keys=True, allow_unicode=True, width=100)
+                if unexportable:
+                    # Reported even when `header=False`: silently dropping a
+                    # tuned parameter is worse than a couple of comment lines.
+                    text = (
+                        "# Not exported (live objects, descriptive only):\n"
+                        + "".join(f"#   {k}: {v}\n" for k, v in sorted(unexportable.items()))
+                    ) + text
+                if header:
+                    provenance = self._provenance()
+                    text = (
+                        "# Tuned by adapt-agent.\n"
+                        f"# baseline={provenance['baseline_score']:.4f} "
+                        f"best={provenance['best_score']:.4f} "
+                        f"improvement={provenance['improvement']:+.4f} "
+                        f"validation={provenance['validation_score']} "
+                        f"over {provenance['n_evals']} evals.\n"
+                        "# Review this diff before committing: prompts here were "
+                        "machine-written.\n"
+                    ) + text
+            destination.write_text(text, encoding="utf-8")
+        return nested
+
+    def _provenance(self) -> dict[str, Any]:
+        """What the tuning run bought, recorded alongside the config."""
+        return {
+            "baseline_score": self.baseline_score,
+            "best_score": self.best_score,
+            "improvement": self.improvement,
+            "validation_score": self.validation_score,
+            "n_evals": self.n_evals,
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -801,6 +968,70 @@ def _dedup(values: list[Any]) -> list[Any]:
     return out
 
 
+def _is_exportable(value: Any) -> bool:
+    """Can ``value`` survive a YAML/JSON round trip **as itself**?
+
+    Note the tuple exclusion. Both encoders write a tuple as a sequence and read
+    it back as a ``list``, so exporting one would change the winning value's type
+    on reload -- and a setter or framework field expecting a tuple would then
+    receive a list. The invariant here is that everything in the config body
+    applies cleanly, so a tuple is described rather than exported.
+    """
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return True
+    if isinstance(value, tuple):
+        return False
+    if isinstance(value, list):
+        return all(_is_exportable(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_exportable(v) for k, v in value.items())
+    return False
+
+
+def _describe(value: Any) -> str:
+    """A stable, readable identifier for a live object, for the review diff."""
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_describe(v) for v in value) + "]"
+    module = getattr(value, "__module__", None)
+    name = getattr(value, "__qualname__", None) or getattr(value, "__name__", None)
+    if name:
+        return f"{module}:{name}" if module else str(name)
+    return f"<{type(value).__name__}>"
+
+
+def load_tuned_config(path: str | Path) -> dict[str, Any]:
+    """Load a file written by :meth:`OptimizationResult.to_config` as a flat config.
+
+    Flattens ``{component: {knob: value}}`` back to the ``"<component>.<knob>"``
+    keys :meth:`OptimizableAgent.apply` expects, closing the loop::
+
+        target.apply(load_tuned_config("specialists/.config/tuned.yaml"))
+
+    A scalar at the top level is taken as an already-flat entry, so a hand-edited
+    file mixing both shapes still loads. JSON and YAML both work -- YAML is a
+    superset, so one parser reads either -- and the ``_provenance`` block written
+    into a JSON export is skipped rather than applied as a component.
+
+    Raises:
+        ValueError: If the file does not contain a mapping.
+    """
+    import yaml
+
+    loaded = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} does not contain a mapping of components to parameters")
+    flat: dict[str, Any] = {}
+    for component, values in loaded.items():
+        if component == _PROVENANCE_KEY:
+            continue  # metadata about the run, not a tunable component
+        if isinstance(values, dict):
+            for knob, value in values.items():
+                flat[f"{component}.{knob}"] = value
+        else:
+            flat[component] = values
+    return flat
+
+
 __all__ = [
     "Trial",
     "OptimizationResult",
@@ -812,4 +1043,5 @@ __all__ = [
     "EvolutionaryOptimizer",
     "PipelineOptimizer",
     "make_default_optimizer",
+    "load_tuned_config",
 ]

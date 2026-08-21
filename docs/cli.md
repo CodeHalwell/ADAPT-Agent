@@ -1,11 +1,42 @@
 # Command-Line Interface
 
-Installing ADAPT-Agent provides the `adapt-agent` console script
-(`adapt_agent.cli:main`). It exposes five commands plus a global `--version`.
+Installing ADAPT-Agent provides two console scripts — `adapt-agent` and the
+shorter `adapt` — which are the same program (`adapt_agent.cli:main`). Either
+name accepts every command below, plus a global `--version`. Under uv, prefix
+with `uv run`.
 
 ```bash
-adapt-agent --version
-adapt-agent            # no command prints help
+adapt --version
+adapt                  # no command prints help
+uv run adapt install skill
+```
+
+---
+
+## `adapt install skill`
+
+Installs the [agent skill](skill.md) bundled inside the wheel into a skills
+directory, so a coding agent can pick it up.
+
+```bash
+adapt install skill                        # -> ./.claude/skills/adapt-agent
+adapt install skill adapt-agent            # a specific bundled skill
+adapt install skill --target user          # -> ~/.claude/skills
+adapt install skill --dir path/to/skills   # an explicit directory
+adapt install skill --force                # replace an existing installation
+adapt install skill --json
+```
+
+Exits non-zero if the skill is unknown, or if it is already installed and
+`--force` was not given.
+
+## `adapt skills`
+
+Lists the skills bundled with this installation.
+
+```bash
+adapt skills
+adapt skills --json
 ```
 
 ---

@@ -14,9 +14,12 @@ All built-ins are pure-Python and dependency-free.
 
 from __future__ import annotations
 
+import dataclasses
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
+
+from .extractors import extract_output_text
 
 #: A bare metric function. Either ``(output, expected)`` or, for example-aware
 #: metrics wrapped in :class:`Metric`, ``(output, expected, example)``.
@@ -31,12 +34,21 @@ class Metric:
         fn: The scoring callable returning a float (clamped to ``[0, 1]``).
         needs_example: When ``True`` the harness calls ``fn(output, expected,
             example)``; otherwise ``fn(output, expected)``.
+        structural: Marks a metric that scores a *structured* output (a mapping)
+            rather than text. :func:`~adapt_agent.optimization.evals.evaluate_agent`
+            reads this to pick
+            :func:`~adapt_agent.optimization.extractors.extract_output_payload`
+            over ``extract_output_text``, so the structure a structural metric
+            needs is not flattened away before it runs.
     """
 
-    def __init__(self, name: str, fn: MetricFn, *, needs_example: bool = False):
+    def __init__(
+        self, name: str, fn: MetricFn, *, needs_example: bool = False, structural: bool = False
+    ):
         self.name = name
         self.fn = fn
         self.needs_example = needs_example
+        self.structural = structural
 
     def __call__(self, output: Any, expected: Any, example: Any = None) -> float:
         if self.needs_example:
@@ -198,7 +210,71 @@ def json_subset() -> Metric:
         matched = sum(1 for k, v in exp.items() if out.get(k) == v)
         return matched / len(exp)
 
-    return Metric("json_subset", _fn)
+    return Metric("json_subset", _fn, structural=True)
+
+
+def field_match(
+    field: str,
+    *,
+    check: str = "exact_match",
+    name: str | None = None,
+    missing: float = 0.0,
+    **options: Any,
+) -> Metric:
+    """Score **one field** of a structured output, reported under its own name.
+
+    A single blended number hides which column moved. Scoring four fields
+    separately turns a report's ``aggregate`` into the per-column table you
+    actually reason about::
+
+        {"lane": 0.94, "matter": 0.90, "action": 0.63, "pack": 0.0}
+
+    That ``pack: 0.0`` is a column the agent never gets right; averaged into one
+    score it would read as a mild dip. It also removes the main reason to reach
+    for a judge on structured output -- a deterministic field check is both
+    cheaper and more correct than asking an LLM whether two labels agree.
+
+    Pair with
+    :func:`~adapt_agent.optimization.extractors.extract_output_payload`, which
+    keeps the structure that ``extract_output_text`` would flatten.
+
+    Args:
+        field: Key to compare on both sides.
+        check: Name of the built-in metric used to compare the two values
+            (``exact_match`` by default; ``numeric_close``, ``token_f1``, ...).
+        name: Reporting name. Defaults to ``field``, which is what makes the
+            aggregate read as a column table.
+        missing: Score when either side lacks the field. ``0.0`` by default --
+            a field the agent failed to emit is a failure, not a skip.
+        **options: Forwarded to the inner check's factory, e.g.
+            ``field_match("total", check="numeric_close", tolerance=0.01)``.
+
+    Raises:
+        ValueError: If ``check`` is unknown, or is ``field_match`` itself.
+    """
+    if check == "field_match":
+        raise ValueError("field_match cannot nest inside itself; pick a scalar check")
+    factory = BUILTIN_METRICS.get(check)
+    if factory is None:
+        raise ValueError(f"Unknown check {check!r}. Available: {sorted(BUILTIN_METRICS)}")
+    inner = factory(**options)
+
+    def _fn(output: Any, expected: Any) -> float:
+        out, exp = _as_mapping(output), _as_mapping(expected)
+        if out is None or exp is None or field not in exp or field not in out:
+            return missing
+        return inner(out[field], exp[field])
+
+    return Metric(name or field, _fn, structural=True)
+
+
+def field_metrics(fields: Sequence[str], **options: Any) -> list[Metric]:
+    """Build one :func:`field_match` metric per field.
+
+    ``metrics=field_metrics(["lane", "matter", "action", "pack"])`` replaces four
+    hand-written closures, and the report comes back keyed by column.
+    """
+    return [field_match(field, **options) for field in fields]
 
 
 def levenshtein_ratio() -> Metric:
@@ -215,9 +291,148 @@ def levenshtein_ratio() -> Metric:
     return Metric("levenshtein_ratio", _fn)
 
 
-# -- registry of zero-arg built-ins for config-driven use ---------------------
+def checks(
+    *,
+    default: Metric | MetricFn | str | None = "exact_match",
+    judge: Any = None,
+    aggregate: str = "min",
+) -> Metric:
+    """Per-example check dispatch: each dataset row declares how it is scored.
 
-BUILTIN_METRICS: dict[str, Callable[[], Metric]] = {
+    Golden datasets often mix answer types -- one row wants an exact text match,
+    the next a number within tolerance, another an LLM-judge grade. This metric
+    reads the check specification from ``example.metadata["check"]`` (or
+    ``"checks"``) and applies the matching scorer to that row:
+
+    * a built-in name -- ``"exact_match"``, ``"numeric_close"``, ...
+    * a parameterised form -- ``{"name": "numeric_close", "tolerance": 0.5}``
+      (extra keys are passed to the metric factory)
+    * ``"judge"`` / ``"llm_judge"`` -- routed to the supplied ``judge`` (its
+      per-example ``criteria`` metadata is honoured as usual)
+    * a list of any of the above -- combined per ``aggregate``
+
+    Rows without a declaration fall back to ``default``.
+
+    The dispatcher is marked **structural**, so
+    :func:`~adapt_agent.optimization.evals.evaluate_agent` keeps the output's
+    structure rather than flattening it to text: a row asking for
+    ``field_match`` needs the fields, and which row asks is only known at call
+    time. Rows asking for a text check still get text -- each one is flattened
+    individually as it is scored. The one case this cannot rescue is ``checks``
+    *mixed* with a plain text metric, where the all-or-nothing rule picks text
+    extraction for the whole run; pass
+    ``output_extractor=extract_output_payload`` if a row needs structure there,
+    at the cost of the text metric, which then scores a mapping.
+
+    Args:
+        default: Check applied when a row declares none. A built-in name, a
+            :class:`Metric`, or a bare callable. ``None`` makes an undeclared
+            row an error (scored ``0.0`` by the harness).
+        judge: An :class:`~adapt_agent.optimization.judge.LLMJudge` (anything
+            with ``as_metric()``) backing rows that declare a judge check.
+        aggregate: How multiple checks on one row combine: ``"min"`` (default;
+            every check must pass for a perfect score) or ``"mean"``.
+    """
+    if aggregate not in ("min", "mean"):
+        raise ValueError(f"aggregate must be 'min' or 'mean', got {aggregate!r}")
+    judge_metric = _judge_check_metric(judge)
+    resolved_default = None if default is None else _resolve_check(default, judge_metric, {})
+    cache: dict[Any, Metric] = {}
+
+    def _fn(output: Any, expected: Any, example: Any = None) -> float:
+        spec: Any = None
+        if example is not None:
+            meta = getattr(example, "metadata", None) or {}
+            spec = meta.get("check", meta.get("checks"))
+        if spec is None:
+            if resolved_default is None:
+                raise ValueError("example declares no check and checks(default=None) was set")
+            metric_list = [resolved_default]
+        else:
+            spec_list = list(spec) if isinstance(spec, (list, tuple)) else [spec]
+            metric_list = [_resolve_check(item, judge_metric, cache) for item in spec_list]
+        if not metric_list:
+            raise ValueError("example declares an empty check list")
+        # The dispatcher is marked structural, so the harness hands it the
+        # *payload*. A row asking for a text check wants text, so flatten for
+        # those and only those -- the row is the only thing that knows, and it
+        # only knows at call time. Without this a structured output would score
+        # 0.0 against a row's `exact_match`, which is the mirror of the bug
+        # marking it structural fixes.
+        scores = [
+            m(output if m.structural else extract_output_text(output), expected, example)
+            for m in metric_list
+        ]
+        return min(scores) if aggregate == "min" else sum(scores) / len(scores)
+
+    return Metric("checks", _fn, needs_example=True, structural=True)
+
+
+_JUDGE_CHECK_NAMES = ("judge", "llm_judge")
+
+
+def _judge_check_metric(judge: Any) -> Metric | None:
+    """Coerce the ``judge`` argument of :func:`checks` into a Metric (or None)."""
+    if judge is None:
+        return None
+    as_metric = getattr(judge, "as_metric", None)
+    if callable(as_metric):
+        return coerce_metric(as_metric("judge"))
+    return coerce_metric(judge, default_name="judge")
+
+
+def _resolve_check(spec: Any, judge_metric: Metric | None, cache: dict[Any, Metric]) -> Metric:
+    """Resolve one check specification into a :class:`Metric`."""
+    if isinstance(spec, Metric):
+        return spec
+    if callable(spec):
+        return coerce_metric(spec)
+    if isinstance(spec, str):
+        if spec in _JUDGE_CHECK_NAMES:
+            if judge_metric is None:
+                raise ValueError(
+                    f"example declares check {spec!r} but checks() was built without a judge"
+                )
+            return judge_metric
+        key: Any = spec
+        params: dict[str, Any] = {}
+    elif isinstance(spec, dict):
+        params = dict(spec)
+        name = params.pop("name", None) or params.pop("check", None)
+        if not isinstance(name, str):
+            raise ValueError(f"check mapping needs a 'name' string, got {spec!r}")
+        if name in _JUDGE_CHECK_NAMES:
+            if judge_metric is None:
+                raise ValueError(
+                    f"example declares check {name!r} but checks() was built without a judge"
+                )
+            return judge_metric
+        spec = name
+        try:
+            key = (name, tuple(sorted(params.items())))
+        except TypeError:  # unhashable parameter values: skip the cache
+            key = None
+    else:
+        raise TypeError(f"Unsupported check specification: {spec!r}")
+
+    if key is not None and key in cache:
+        return cache[key]
+    factory = BUILTIN_METRICS.get(spec)
+    if factory is None:
+        raise KeyError(f"Unknown check {spec!r}. Available: {sorted(BUILTIN_METRICS)}")
+    metric = factory(**params)
+    if key is not None:
+        cache[key] = metric
+    return metric
+
+
+# -- registry of built-in metric factories for config-driven use --------------
+#
+# Every factory is callable with no arguments (how :func:`get_metric` uses it);
+# most also accept keyword options (how :func:`checks` builds parameterised
+# per-row checks such as ``{"name": "numeric_close", "tolerance": 0.5}``).
+
+BUILTIN_METRICS: dict[str, Callable[..., Metric]] = {
     "exact_match": exact_match,
     "contains": contains,
     "regex_match": regex_match,
@@ -226,15 +441,31 @@ BUILTIN_METRICS: dict[str, Callable[[], Metric]] = {
     "numeric_close": numeric_close,
     "json_subset": json_subset,
     "levenshtein_ratio": levenshtein_ratio,
+    "field_match": field_match,
+    "checks": checks,
 }
 
 
 def get_metric(name: str) -> Metric:
-    """Look up a built-in metric by name using default settings."""
+    """Look up a built-in metric by name using default settings.
+
+    Raises:
+        KeyError: If ``name`` is not a built-in.
+        TypeError: If the metric cannot be built without arguments --
+            ``field_match`` needs a ``field``, so it is only reachable through a
+            mapping spec such as ``{"name": "field_match", "field": "lane"}``.
+    """
     factory = BUILTIN_METRICS.get(name)
     if factory is None:
         raise KeyError(f"Unknown built-in metric {name!r}. Available: {sorted(BUILTIN_METRICS)}")
-    return factory()
+    try:
+        return factory()
+    except TypeError as exc:
+        raise TypeError(
+            f"Built-in metric {name!r} needs arguments and cannot be built by name alone. "
+            f'Use a mapping spec, e.g. {{"name": "{name}", "field": "..."}}, '
+            f"or call {name}(...) directly."
+        ) from exc
 
 
 # -- low-level helpers --------------------------------------------------------
@@ -252,6 +483,14 @@ def _extract_number(value: Any) -> float | None:
 
 
 def _as_mapping(value: Any) -> dict[str, Any] | None:
+    """Coerce a structured output to a mapping, or ``None`` if it is not one.
+
+    Accepts a dict, a JSON string, and a **model or dataclass**. The last matters
+    for per-row checks: ``{"check": {"name": "field_match", ...}}`` is dispatched
+    by the ``checks`` metric, which cannot be marked structural (the row decides
+    at runtime), so automatic extraction leaves a Pydantic AI result as a model
+    object. Without this the field would score a false 0.0.
+    """
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
@@ -262,6 +501,25 @@ def _as_mapping(value: Any) -> dict[str, Any] | None:
             return obj if isinstance(obj, dict) else None
         except Exception:
             return None
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        try:
+            return {f.name: getattr(value, f.name, None) for f in dataclasses.fields(value)}
+        except Exception:
+            return None
+    # Any object offering a dump. Deliberately more permissive than the
+    # security-side `_structured_fields`, and matched to
+    # `extractors._model_to_dict` so the two agree: there, an unconvertible
+    # object would silently reach a metric as itself; here the worst case is a
+    # surprising score, never a missed screen.
+    for attr in ("model_dump", "dict"):
+        method = getattr(value, attr, None)
+        if callable(method):
+            try:
+                dumped = method()
+            except Exception:
+                continue
+            if isinstance(dumped, dict):
+                return dumped
     return None
 
 
@@ -298,6 +556,9 @@ __all__ = [
     "numeric_close",
     "json_subset",
     "levenshtein_ratio",
+    "field_match",
+    "field_metrics",
+    "checks",
     "BUILTIN_METRICS",
     "get_metric",
 ]

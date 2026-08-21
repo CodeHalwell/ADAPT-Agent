@@ -41,18 +41,29 @@ from adapt_agent.optimization.config import (
     run_training,
 )
 from adapt_agent.optimization.dataset import Example, GoldenDataset
+from adapt_agent.optimization.evals import evaluate_agent
 from adapt_agent.optimization.evaluation import (
     EvaluationHarness,
     EvaluationReport,
     ExampleResult,
+    aresolve_runner,
     resolve_runner,
+)
+from adapt_agent.optimization.extractors import (
+    available_extractors,
+    extract_output_payload,
+    extract_output_text,
+    register_extractor,
 )
 from adapt_agent.optimization.judge import CompletionFn, JudgeVerdict, LLMJudge
 from adapt_agent.optimization.metrics import (
     BUILTIN_METRICS,
     Metric,
+    checks,
     contains,
     exact_match,
+    field_match,
+    field_metrics,
     get_metric,
     jaccard,
     json_subset,
@@ -71,6 +82,7 @@ from adapt_agent.optimization.optimizers import (
     PipelineOptimizer,
     RandomSearchOptimizer,
     Trial,
+    load_tuned_config,
     make_default_optimizer,
 )
 from adapt_agent.optimization.parameters import Parameter, ParameterKind, SearchSpace
@@ -98,6 +110,7 @@ from adapt_agent.optimization.providers import (
     get_provider,
     register_provider,
 )
+from adapt_agent.optimization.runners import adk_runner, framework_runner, langgraph_inputs
 from adapt_agent.optimization.target import OptimizableAgent, wrap
 
 __all__ = [
@@ -133,7 +146,10 @@ __all__ = [
     "jaccard",
     "numeric_close",
     "json_subset",
+    "field_match",
+    "field_metrics",
     "levenshtein_ratio",
+    "checks",
     "get_metric",
     "BUILTIN_METRICS",
     # evaluation
@@ -141,6 +157,16 @@ __all__ = [
     "EvaluationReport",
     "ExampleResult",
     "resolve_runner",
+    "aresolve_runner",
+    "evaluate_agent",
+    # framework output extraction / runners
+    "extract_output_text",
+    "extract_output_payload",
+    "register_extractor",
+    "available_extractors",
+    "framework_runner",
+    "langgraph_inputs",
+    "adk_runner",
     # target
     "OptimizableAgent",
     "wrap",
@@ -158,6 +184,7 @@ __all__ = [
     # optimizers
     "Optimizer",
     "OptimizationResult",
+    "load_tuned_config",
     "Trial",
     "GridSearchOptimizer",
     "RandomSearchOptimizer",

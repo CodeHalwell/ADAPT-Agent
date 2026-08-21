@@ -1,42 +1,285 @@
 name: Release
 
+# Publishes adapt-agent to PyPI when a version tag is pushed.
+#
+#   git tag -a v0.2.0 -m "v0.2.0" && git push origin v0.2.0
+#
+# Building and publishing are done with uv (`uv build` / `uv publish`).
+# Authentication uses PyPI Trusted Publishing (OIDC) -- there is no API token
+# stored in this repository. The one-time PyPI setup is documented in
+# docs/releasing.md; without it the publish step fails with an auth error.
+#
+# `workflow_dispatch` runs the same pipeline against TestPyPI (or PyPI) so the
+# whole path can be rehearsed before cutting a real tag.
+
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Index to publish to"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+        default: testpypi
+
+# Least privilege by default; jobs opt in to what they need.
+permissions:
+  contents: read
+
+# Never let two releases race to the same index.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  # 1. The tag must agree with the version the package will actually report.
+  #    Catches the classic "tagged v0.3.0, shipped 0.2.0" mistake before a
+  #    single artifact is built.
+  version:
+    name: Check tag matches package version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve and verify version
+        id: resolve
+        run: |
+          set -euo pipefail
+          # Read __version__ without importing the package (no deps needed).
+          package_version="$(python3 -c "
+          import pathlib, re
+          source = pathlib.Path('adapt_agent/__init__.py').read_text(encoding='utf-8')
+          match = re.search(r'^__version__\s*=\s*[\"\x27]([^\"\x27]+)[\"\x27]', source, re.M)
+          if match is None:
+              raise SystemExit('could not find __version__ in adapt_agent/__init__.py')
+          print(match.group(1))
+          ")"
+          echo "Package version: ${package_version}"
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            echo "Tag version:     ${tag_version}"
+            if [ "${tag_version}" != "${package_version}" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} does not match adapt_agent.__version__ (${package_version}). Bump __version__ or retag."
+              exit 1
+            fi
+          else
+            echo "Manual run: publishing version ${package_version} without a tag."
+          fi
+
+          echo "version=${package_version}" >> "$GITHUB_OUTPUT"
+          # PEP 440 pre-release segments mark the GitHub Release as a pre-release.
+          if printf '%s' "${package_version}" | grep -Eq '(a|b|rc|dev)[0-9]*$'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # 2. Gate the release on exactly the checks that guard main (lint, the
+  #    3.10-3.14 test matrix, and a build smoke test) by reusing ci.yml.
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  # 3. Build once, validate hard, and publish that exact artifact.
   build:
+    name: Build and validate distributions
+    needs: [version, ci]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
         with:
-          python-version: "3.11"
-          cache: "pip"
-      - name: Install build tool
+          enable-cache: true
+
+      # --no-sources ignores any tool.uv.sources overrides, so this builds the
+      # package exactly as a consumer installing from the index would get it.
+      - name: Build sdist and wheel
+        run: uv build --no-sources
+
+      - name: Check distribution metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Verify the artifacts contain what they must
+        env:
+          EXPECTED_VERSION: ${{ needs.version.outputs.version }}
         run: |
-          python -m pip install --upgrade pip
-          pip install build
-      - name: Build distributions
-        run: python -m build
-      - name: Upload dist artifacts
+          python3 - <<'PY'
+          import glob, os, sys, tarfile, zipfile
+
+          expected = os.environ["EXPECTED_VERSION"]
+          problems = []
+
+          wheels = glob.glob("dist/*.whl")
+          sdists = glob.glob("dist/*.tar.gz")
+          if len(wheels) != 1 or len(sdists) != 1:
+              sys.exit(f"expected exactly one wheel and one sdist, got {wheels + sdists}")
+          wheel, sdist = wheels[0], sdists[0]
+
+          # The built filename is the authoritative version that will be published.
+          if f"-{expected}-" not in os.path.basename(wheel):
+              problems.append(f"wheel {os.path.basename(wheel)} is not version {expected}")
+          if f"-{expected}.tar.gz" not in os.path.basename(sdist):
+              problems.append(f"sdist {os.path.basename(sdist)} is not version {expected}")
+
+          names = zipfile.ZipFile(wheel).namelist()
+
+          # The bundled agent skill is package *data*: a packaging slip would
+          # silently ship a wheel where `adapt install skill` has nothing to
+          # install, so assert it is really in there.
+          skill_files = [n for n in names if n.startswith("adapt_agent/skills/") and n.endswith(".md")]
+          if not any(n.endswith("/SKILL.md") for n in skill_files):
+              problems.append("wheel contains no SKILL.md")
+          if not any("/references/" in n for n in skill_files):
+              problems.append("wheel contains no skill reference files")
+
+          # Typing marker and both console scripts.
+          if "adapt_agent/py.typed" not in names:
+              problems.append("wheel is missing py.typed")
+          entry_points = [n for n in names if n.endswith("entry_points.txt")]
+          if not entry_points:
+              problems.append("wheel declares no entry points")
+          else:
+              scripts = zipfile.ZipFile(wheel).read(entry_points[0]).decode()
+              for script in ("adapt =", "adapt-agent ="):
+                  if script not in scripts:
+                      problems.append(f"wheel is missing the '{script.split()[0]}' console script")
+
+          # The sdist must be able to rebuild the wheel, so it needs the skill too.
+          sdist_names = tarfile.open(sdist).getnames()
+          if not any(n.endswith("/SKILL.md") for n in sdist_names):
+              problems.append("sdist contains no SKILL.md")
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              sys.exit(1)
+
+          print(f"OK: {os.path.basename(wheel)} and {os.path.basename(sdist)} look publishable")
+          print(f"    skill files: {len(skill_files)}")
+          PY
+
+      - name: Smoke-test the wheel in a clean environment
+        run: |
+          set -euo pipefail
+          uv venv /tmp/smoke
+          VIRTUAL_ENV=/tmp/smoke uv pip install --quiet dist/*.whl
+          # Both console scripts resolve, and the version they report matches.
+          /tmp/smoke/bin/adapt --version
+          /tmp/smoke/bin/adapt-agent --version
+          # The headline flow from the README works from a bare install.
+          workdir="$(mktemp -d)"
+          cd "$workdir"
+          /tmp/smoke/bin/adapt install skill
+          test -f .claude/skills/adapt-agent/SKILL.md
+          test -f .claude/skills/adapt-agent/references/evals.md
+          echo "Smoke test passed: skill installs from a clean wheel install."
+
+      - name: Upload distributions
         uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
+          if-no-files-found: error
 
-  publish:
+  # 4a. Manual rehearsal against TestPyPI. The `testpypi` publish target is
+  #     defined under [[tool.uv.index]] in pyproject.toml, hence the checkout.
+  publish-testpypi:
+    name: Publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
     needs: build
     runs-on: ubuntu-latest
-    environment: pypi
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/adapt-agent
     permissions:
-      id-token: write
+      id-token: write # Trusted Publishing (OIDC); no API token needed.
     steps:
-      - name: Download dist artifacts
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Download distributions
         uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Publish
+        run: |
+          uv publish \
+            --index testpypi \
+            --trusted-publishing always \
+            --check-url https://test.pypi.org/simple/
+
+  # 4b. The real thing: a pushed v* tag (or an explicit manual choice).
+  publish-pypi:
+    name: Publish to PyPI
+    if: github.event_name == 'push' || inputs.target == 'pypi'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/adapt-agent
+    permissions:
+      id-token: write # Trusted Publishing (OIDC); no API token needed.
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Download distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      # `--trusted-publishing always` fails loudly if OIDC is unavailable
+      # rather than silently falling back to an anonymous upload attempt.
+      # `--check-url` makes a re-run skip files already on the index.
+      - name: Publish
+        run: |
+          uv publish \
+            --trusted-publishing always \
+            --check-url https://pypi.org/simple/
+
+  # 5. Record the release on GitHub with the same artifacts that went to PyPI.
+  github-release:
+    name: Create GitHub Release
+    if: github.event_name == 'push'
+    needs: [version, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flags=(--generate-notes --title "$TAG")
+          if [ "$PRERELEASE" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$TAG" dist/* "${flags[@]}"

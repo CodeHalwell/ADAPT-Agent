@@ -21,7 +21,7 @@ Example
 >>> guarded.execute({"messages": [{"role": "user", "content": "hi"}]})  # doctest: +SKIP
 """
 
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from adapt_agent.adapters._governed import GovernedAdapter, Runner, _extract_prompt
 from adapt_agent.exceptions import MissingDependencyError
@@ -38,6 +38,7 @@ class OpenAIAgentsAdapter(GovernedAdapter):
 
     framework_name = "OpenAI Agents"
     run_method_names = ("run_sync", "run")
+    async_run_method_names = ("run", "run_sync")
     operation = "openai_agents.run"
 
     def _resolve_runner(self, agent: Any) -> Runner | None:
@@ -49,6 +50,28 @@ class OpenAIAgentsAdapter(GovernedAdapter):
         # Otherwise treat ``agent`` as an OpenAI Agent and drive it through the
         # SDK's Runner, imported lazily so importing this module stays cheap.
         return lambda prompt: self._run_with_sdk(agent, prompt)
+
+    def _resolve_async_runner(self, agent: Any) -> Runner | None:
+        # A custom runner exposing `run`/`run_sync` is handled by the base class.
+        for name in self.async_run_method_names:
+            candidate = getattr(agent, name, None)
+            if callable(candidate):
+                return cast(Runner, candidate)
+        if callable(agent):
+            return cast(Runner, agent)
+        # A directly-wrapped SDK ``Agent`` exposes neither, so without this the
+        # base class would fall back to the *synchronous* `Runner.run_sync`
+        # lambda and `aexecute` would block the caller's event loop.
+        return lambda prompt: self._arun_with_sdk(agent, prompt)
+
+    @staticmethod
+    def _arun_with_sdk(agent: Any, prompt: Any) -> Any:
+        """Return the SDK's ``Runner.run`` coroutine for ``aexecute`` to await."""
+        try:
+            from agents import Runner
+        except ImportError as exc:  # pragma: no cover - exercised only without the dep
+            raise MissingDependencyError("openai-agents", "openai-agents") from exc
+        return Runner.run(agent, prompt)
 
     @staticmethod
     def _run_with_sdk(agent: Any, prompt: Any) -> Any:

@@ -300,3 +300,27 @@ from adapt_agent.adapters import GovernedAdapter
 
 guarded = GovernedAdapter(firewall=fw).wrap_agent(lambda payload: my_runtime(payload))
 ```
+
+## Async: `aexecute`
+
+A governed agent exposes two entry points with identical governance:
+
+```python
+result = guarded.execute(payload)          # synchronous callers
+result = await guarded.aexecute(payload)   # any async application
+```
+
+`execute` drives an async framework by running its coroutine to completion,
+which is impossible inside a running event loop — there it raises
+`AdapterError`. Since Pydantic AI, the Claude Agent SDK and Microsoft Agent
+Framework are async-native, `aexecute` is their normal path.
+
+Prefer it over offloading `execute` to a worker thread. A thread serialises
+concurrent requests behind one blocking call and severs `contextvars`, which is
+how OpenTelemetry propagates the active span — so the trace parentage is lost.
+`aexecute` awaits in the caller's loop and keeps both. A *synchronous* framework
+works through `aexecute` too, so an async app can use one entry point for every
+agent.
+
+To govern individual agents *inside* a multi-agent graph rather than at its
+boundary, see [Native framework hooks](integrations.md).

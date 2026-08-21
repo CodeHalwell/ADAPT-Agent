@@ -114,6 +114,9 @@ A pull request is ready to merge when:
 - [ ] `CHANGELOG.md` has been updated.
 - [ ] CI is green.
 
+Maintainers: see [docs/releasing.md](docs/releasing.md) for how a version tag
+publishes to PyPI.
+
 ## Commit messages
 
 We recommend [Conventional Commits](https://www.conventionalcommits.org/):
