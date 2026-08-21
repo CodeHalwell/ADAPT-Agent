@@ -101,6 +101,52 @@ def test_a_coroutine_returning_a_stream_is_drained():
     assert asyncio.run(guarded.aexecute({"messages": []}))["result"] == ["part one", "part two"]
 
 
+def test_sync_execute_also_drains_a_coroutine_returning_a_stream():
+    """The sync resolver had the same bug as its async twin.
+
+    Fixing `_aresolve_result` alone left `execute()` handing a live generator to
+    output screening, which found no text -- a firewall bypass on the path most
+    callers use. The two now share one resolver so they cannot drift again.
+    """
+
+    class Agent:
+        async def invoke(self, payload):
+            async def stream():
+                yield "all fine"
+                yield "the password is hunter2"
+
+            return stream()
+
+    guarded = LangGraphAdapter().wrap_agent(Agent())
+    assert guarded.execute({"messages": []})["result"] == [
+        "all fine",
+        "the password is hunter2",
+    ]
+
+    firewall = Firewall()
+    firewall.add_blocked_pattern(r"(?i)hunter2")
+    with pytest.raises(SecurityBlockedError):
+        LangGraphAdapter(firewall=firewall).wrap_agent(Agent()).execute({"messages": []})
+
+
+def test_sync_execute_still_refuses_to_block_a_running_loop():
+    """Routing through the async resolver must not lose the guidance a caller
+    gets for driving an async agent from inside a live loop."""
+
+    class Agent:
+        async def invoke(self, payload):
+            async def stream():
+                yield "hi"
+
+            return stream()
+
+    async def main():
+        with pytest.raises(AdapterError, match="aexecute"):
+            LangGraphAdapter().wrap_agent(Agent()).execute({"messages": []})
+
+    asyncio.run(main())
+
+
 def test_a_nested_stream_is_screened_before_it_reaches_the_caller():
     """The drain matters for governance, not only for the returned type."""
     firewall = Firewall()

@@ -113,10 +113,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UserPromptSubmit`, describing a prompt event that can never match. It now
   applies to tool-scoped events only, which is what the parameter's own
   documentation already said.
-- **A coroutine returning a stream was not drained.** `aexecute` awaited once
-  and handed the still-live async generator on, so output screening found no
-  text and the caller received a generator where the envelope documents a list.
-  The awaited value is resolved recursively.
+- **A coroutine returning a stream was not drained.** Both `execute` and
+  `aexecute` awaited once and handed the still-live async generator on, so
+  output screening found no text -- a firewall bypass for streamed content --
+  and the caller received a generator where the envelope documents a list. The
+  awaited value is resolved recursively, and the sync path now routes through
+  the same resolver as the async one rather than keeping a parallel copy that
+  could drift.
 - **A handoff target's input governance never ran.** The OpenAI Agents SDK runs
   input guardrails for the *starting* agent of a run only (`run.py` gates them
   on `current_turn == 0`), so a specialist reached by a handoff had its

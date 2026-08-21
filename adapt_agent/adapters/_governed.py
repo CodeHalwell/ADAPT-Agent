@@ -86,7 +86,14 @@ def _resolve_result(value: Any) -> Any:
     if isinstance(value, AsyncIterable):
         return _run_coro(_drain_async_gen(value), value)
     if inspect.isawaitable(value):
-        return _run_coro(_await(value), value)
+        # Through the async resolver rather than a bare await, for two reasons.
+        # The awaited value may itself be a stream -- an async run method often
+        # *returns* one rather than being one -- and draining it has to happen
+        # in the **same** loop, because `_run_coro` opens a fresh one per call
+        # and a generator created in the first is dead in the second. Sharing
+        # the resolver also stops the sync and async paths drifting apart, which
+        # is how this bug reached only one of them.
+        return _run_coro(_aresolve_result(value), value)
     if inspect.isgenerator(value):
         return list(value)
     return value
