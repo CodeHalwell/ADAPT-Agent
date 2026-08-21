@@ -308,7 +308,7 @@ every example is aggregated.
 ## Scoring structured output
 
 `extract_output_text` flattens a structured answer — a Microsoft
-`AgentRunResponse` is a recognised shape, so it becomes `.text` and the object
+`AgentResponse` is a recognised shape, so it becomes `.text` and the object
 is gone — while `output_extractor=None` unwraps nothing and scores a `repr()`.
 `extract_output_payload` is the middle path: strip the framework envelope, keep
 the payload.
@@ -320,9 +320,20 @@ report = evaluate_agent(agent, data, metrics=field_metrics(["lane", "matter", "a
 report.aggregate    # {"lane": 0.94, "matter": 0.90, "action": 0.63, "pack": 0.0}
 ```
 
-A mapping or sequence passes through, a Pydantic model becomes a dict, and a
-JSON string is parsed back into an object (including a fenced ```` ```json ````
-block). Non-JSON text degrades to text rather than erroring.
+A mapping or sequence passes through, a declared structured output — a Pydantic
+model or a dataclass — becomes a dict, and a JSON string is parsed back into an
+object (including a fenced ```` ```json ```` block). Non-JSON text degrades to
+text rather than erroring.
+
+Two shapes need naming, because both used to score 0.0 across the board:
+
+- A **LangGraph** graph built with `response_format=` returns a *state*, not an
+  answer — `{"messages": [...], "remaining_steps": N, "structured_response":
+  {...}}`. The declared output is peeled out of it; a state without that key
+  arrives whole.
+- A **single-field answer** like `{"result": "granted"}` is the answer, not an
+  envelope around one. Only a conventional key holding something *structured*
+  is peeled, so a one-column output keeps its column.
 
 `evaluate_agent` selects it automatically when **every** metric is structural
 (`json_subset`, `field_match`); mixing in a text metric keeps text extraction,

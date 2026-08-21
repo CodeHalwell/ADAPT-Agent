@@ -131,10 +131,17 @@ report.aggregate    # {"lane": 0.94, "matter": 0.90, "action": 0.63, "pack": 0.0
 ```
 
 `extract_output_payload` strips the framework envelope and keeps the payload: a
-mapping or sequence passes through, a Pydantic model becomes a dict, and a JSON
-string is parsed back into an object (including a ```` ```json ```` fenced one,
-which is how most models emit structured answers). Non-JSON text degrades to
-text rather than erroring.
+mapping or sequence passes through, a declared structured output (Pydantic model
+or dataclass) becomes a dict, and a JSON string is parsed back into an object
+(including a ```` ```json ```` fenced one, which is how most models emit
+structured answers). Non-JSON text degrades to text rather than erroring.
+
+Two shapes are easy to get wrong and both used to score 0.0 across the board. A
+**LangGraph** graph built with `response_format=` returns a *state* —
+`{"messages": [...], "remaining_steps": N, "structured_response": {...}}` — and
+the declared output is peeled out of it. A **single-field answer** like
+`{"result": "granted"}` is the answer, not an envelope: only a conventional key
+holding something *structured* is peeled.
 
 `evaluate_agent` selects it automatically when **every** metric is structural
 (`json_subset`, `field_match`). The all-or-nothing rule is deliberate: mixing a

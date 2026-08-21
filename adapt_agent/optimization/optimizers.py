@@ -167,7 +167,14 @@ class OptimizationResult:
         unexportable: dict[str, str] = {}
         for name, value in self.best_config.items():
             component, _, knob = name.partition(".")
-            if not _is_exportable(value):
+            if not knob and isinstance(value, dict):
+                # A bare name written as a top-level mapping is indistinguishable
+                # from a component section on reload, so `load_tuned_config`
+                # would return it as "<name>.<key>" and `apply()` would skip it.
+                # Ambiguous beats wrong: describe it rather than export a value
+                # that cannot come back as itself.
+                unexportable[name] = _describe(value)
+            elif not _is_exportable(value):
                 # A TOOL/SKILL parameter holds live callables or SDK objects. They
                 # cannot be written to YAML/JSON, and a string standing in for one
                 # would corrupt the agent if `apply()` later wrote it back over the

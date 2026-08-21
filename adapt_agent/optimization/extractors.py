@@ -2,7 +2,7 @@
 
 Agent frameworks rarely return plain strings: LangGraph's ``invoke`` returns the
 final state mapping, Pydantic AI's ``run_sync`` an ``AgentRunResult``, Microsoft
-Agent Framework's ``run`` an ``AgentRunResponse``, a Google ADK ``Runner`` a
+Agent Framework's ``run`` an ``AgentResponse``, a Google ADK ``Runner`` a
 stream of events, CrewAI a ``CrewOutput``, and so on. Text-level checks
 (``exact_match``, ``contains``, ``numeric_close``, an LLM-as-judge) need the
 *final response text* out of those shapes -- otherwise they end up comparing the
@@ -21,7 +21,8 @@ Recognised shapes include:
 * OpenAI Agents SDK ``RunResult`` (``.final_output``)
 * CrewAI ``CrewOutput`` (``.raw``)
 * Claude Agent SDK ``ResultMessage`` (``.result``) and content-block messages
-* Microsoft Agent Framework ``AgentRunResponse`` / ``ChatResponse``
+* Microsoft Agent Framework ``AgentResponse`` (``AgentRunResponse`` before
+  1.14) / ``ChatResponse``
   (``.text`` / ``.messages``)
 * Google ADK / GenAI events and ``Content`` objects (``.content.parts[*].text``)
 * LangChain / chat messages (``.content`` as text or content-part lists)
@@ -37,6 +38,7 @@ framework can be plugged in without touching this module.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -68,6 +70,10 @@ _MAPPING_KEYS = (
     "messages",
     "message",
 )
+
+#: Where LangGraph's ``create_react_agent(response_format=...)`` puts the
+#: declared structured output -- see ``AgentStateWithStructuredResponse``.
+_STRUCTURED_STATE_KEY = "structured_response"
 
 #: Conventional attribute names carrying the final output, tried in order.
 _ATTR_NAMES = (
@@ -134,7 +140,10 @@ def _unwrap_claude_result_message(value: Any) -> Any:
 
 
 def _is_maf_response(value: Any) -> bool:
-    """Microsoft Agent Framework ``AgentRunResponse`` / ``ChatResponse``.
+    """Microsoft Agent Framework ``AgentResponse`` / ``ChatResponse``.
+
+    ``AgentResponse`` was called ``AgentRunResponse`` before agent-framework
+    1.14; both are matched, because the check is on shape, not name.
 
     Both carry a ``messages`` list and a ``text`` convenience property that
     concatenates the text content of the messages.
@@ -305,7 +314,7 @@ def extract_output_payload(value: Any) -> Any:
     """Unwrap the framework envelope but **keep the structure**.
 
     :func:`extract_output_text` is the right default for text and number checks,
-    but it flattens a structured answer: a Microsoft ``AgentRunResponse`` is a
+    but it flattens a structured answer: a Microsoft ``AgentResponse`` is a
     recognised shape, so it becomes ``.text`` and the object is gone. The only
     escape used to be ``output_extractor=None``, which unwraps nothing at all
     and leaves a metric scoring a ``repr()``. Neither is what a structured-output
@@ -315,7 +324,11 @@ def extract_output_payload(value: Any) -> Any:
     recover the payload:
 
     * a mapping or sequence comes back unchanged;
-    * a Pydantic model (or anything with ``model_dump``/``dict``) becomes a dict;
+    * a declared structured output -- a Pydantic model or a dataclass -- becomes
+      a dict, so the field names survive for `field_match` even when one of them
+      is called ``answer`` or ``result``; framework wrappers are recognised
+      first, because several (Pydantic AI's ``AgentRunResult``, the OpenAI SDK's
+      ``RunResult``) are themselves dataclasses;
     * a JSON string is parsed back into an object, including one wrapped in a
       `````json`` fence, which is how most models emit structured answers;
     * anything that is not JSON is returned as the extracted text, so a
@@ -356,17 +369,41 @@ def _unwrap_envelope(value: Any, depth: int) -> Any:
         # A governed adapter returns an envelope -- ``execute`` wraps a non-dict
         # framework result as ``{"result": <payload>}``. Returning that as the
         # payload makes every structural metric score 0.0 against the real
-        # fields. Peel a *single* conventional key; a mapping with several keys
-        # is the answer itself, even if one of them happens to be called
-        # ``result``.
+        # fields. Peel a *single* conventional key, and only when what it holds
+        # is itself structured: an envelope wraps a payload, whereas a genuine
+        # one-field answer like ``{"result": "granted"}`` or ``{"answer":
+        # "Paris"}`` holds a scalar and must survive intact, or `field_match`
+        # would find its field gone.
+        # LangGraph is the exception to the multi-key rule: a graph built with
+        # ``response_format=`` returns a *state* -- ``{"messages": [...],
+        # "remaining_steps": N, "structured_response": <the answer>}`` -- so the
+        # single-key test below never fires and every field metric would score
+        # 0.0 against the state rather than the answer inside it.
+        declared = value.get(_STRUCTURED_STATE_KEY)
+        if declared is not None and not _is_scalar(declared):
+            return _unwrap_envelope(declared, depth - 1)
         if len(value) == 1:
             (key,) = value.keys()
-            if key in _MAPPING_KEYS:
-                return _unwrap_envelope(value[key], depth - 1)
+            inner = value[key]
+            if key in _MAPPING_KEYS and not _is_scalar(inner):
+                return _unwrap_envelope(inner, depth - 1)
         return value
     if isinstance(value, Sequence):
         return _unwrap_stream(value, depth)
     for _, predicate, unwrap in (*_CUSTOM_EXTRACTORS, *_BUILTIN_EXTRACTORS):
+        if unwrap is _unwrap_object_attrs:
+            # The catch-all matches everything, so it runs last -- after the
+            # declared-model check below. Order matters in both directions and
+            # each side has a real failure: run it first and a dataclass
+            # ``Answer(answer="Paris")`` is peeled to ``"Paris"`` by its
+            # conventional field name, losing the field `field_match` scores;
+            # run the declared-model check ahead of the *specific* extractors
+            # instead and framework results are mangled, because several are
+            # themselves declared -- Pydantic AI's ``AgentRunResult`` and the
+            # OpenAI SDK's ``RunResult`` are dataclasses, so the payload would
+            # come back as the wrapper's own fields (``output``, ``_state``,
+            # ...) rather than the answer inside it.
+            continue
         try:
             if not predicate(value):
                 continue
@@ -375,6 +412,15 @@ def _unwrap_envelope(value: Any, depth: int) -> Any:
             continue
         if inner is None or inner is value:
             continue
+        return _unwrap_envelope(inner, depth - 1)
+    # No framework wrapper recognised. A *declared* structured output -- a
+    # Pydantic model or dataclass -- is the payload itself, so convert it
+    # rather than letting the catch-all peel one of its fields.
+    declared = _declared_model_to_dict(value)
+    if declared is not None:
+        return declared
+    inner = _unwrap_object_attrs(value)
+    if inner is not None and inner is not value:
         return _unwrap_envelope(inner, depth - 1)
     return value
 
@@ -399,6 +445,29 @@ def _unwrap_stream(value: Sequence[Any], depth: int) -> Any:
         if unwrapped is not item and unwrapped is not None and unwrapped != "":
             return unwrapped
     return value
+
+
+def _is_scalar(value: Any) -> bool:
+    """Values that cannot themselves be a wrapped payload."""
+    return value is None or isinstance(value, (str, bytes, int, float, bool))
+
+
+def _declared_model_to_dict(value: Any) -> dict[str, Any] | None:
+    """Convert an object that *declares* itself structured, else ``None``.
+
+    Deliberately narrower than :func:`_model_to_dict`: only dataclasses and
+    Pydantic models (which advertise their fields) qualify. A framework result
+    object that merely happens to expose ``dict()`` must still go through the
+    registered extractors, or unwrapping would stop one layer too early.
+    """
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        try:
+            return {f.name: getattr(value, f.name, None) for f in dataclasses.fields(value)}
+        except Exception:
+            return None
+    if hasattr(value, "model_fields") or hasattr(value, "__fields__"):  # pydantic v2 / v1
+        return _model_to_dict(value)
+    return None
 
 
 def _model_to_dict(value: Any) -> dict[str, Any] | None:

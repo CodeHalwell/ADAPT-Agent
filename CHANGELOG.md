@@ -46,10 +46,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Both paths preserve index ordering, non-fatal per-example errors, and the
   `max_results` memory bound.
 - `extract_output_payload`: unwraps the framework envelope but **keeps the
-  structure** -- a mapping passes through, a Pydantic model becomes a dict, and
-  a JSON string (including a ```` ```json ```` fenced one) is parsed back into an
-  object. Previously a structured answer was either flattened to `.text` by
-  `extract_output_text` or left as a `repr()` by `output_extractor=None`.
+  structure** -- a mapping passes through, a declared structured output (Pydantic
+  model or dataclass) becomes a dict, and a JSON string (including a
+  ```` ```json ```` fenced one) is parsed back into an object. Previously a
+  structured answer was either flattened to `.text` by `extract_output_text` or
+  left as a `repr()` by `output_extractor=None`. Three shapes that would each
+  have scored 0.0 across every column are handled by name: a LangGraph
+  `response_format=` **state** (the answer is under `structured_response`,
+  beside `messages` and `remaining_steps`); a **single-field answer** like
+  `{"result": "granted"}`, which is the answer rather than an envelope around
+  one; and a declared output whose field happens to be *called* `answer` or
+  `result`, which the generic attribute peel would have reduced to its own
+  value.
 - `field_match(field, ...)` and `field_metrics([...])`: score a structured
   output per field, reported under the field's own name, so a report aggregates
   as a per-column table (`{"lane": 0.94, ..., "pack": 0.0}`) rather than one

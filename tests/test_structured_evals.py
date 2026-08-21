@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import pytest
 import yaml
@@ -66,9 +67,53 @@ def test_payload_handles_a_dataclass_output():
     class Triage:
         lane: str
 
-    # A dataclass is not a mapping and has no model_dump; it survives unchanged
-    # rather than being mangled.
-    assert extract_output_payload(Triage(lane="NOS")).lane == "NOS"
+    # A dataclass declares its fields, so it *is* the structured payload: it is
+    # converted, not peeled by one of them.
+    assert extract_output_payload(Triage(lane="NOS")) == {"lane": "NOS"}
+
+
+def test_payload_keeps_a_conventionally_named_field():
+    """Regression: a declared output whose field is named like an envelope key.
+
+    ``answer`` is in ``_ATTR_NAMES``, so the catch-all attribute extractor used
+    to peel ``Answer(answer="Paris")`` down to ``"Paris"`` -- and the field
+    `field_match("answer")` scores went missing.
+    """
+
+    @dataclasses.dataclass
+    class Answer:
+        answer: str
+        confidence: float
+
+    payload = extract_output_payload(Answer(answer="Paris", confidence=0.9))
+    assert payload == {"answer": "Paris", "confidence": 0.9}
+    assert field_match("answer")(payload, {"answer": "Paris"}) == 1.0
+
+
+def test_payload_still_peels_a_framework_result_that_is_itself_declared():
+    """Regression: the declared-model check must not outrank the extractors.
+
+    Pydantic AI's ``AgentRunResult`` and the OpenAI SDK's ``RunResult`` are both
+    *dataclasses*. Converting a declared object before trying the framework
+    extractors returns the wrapper's own fields (``output``, ``_state``, ...)
+    instead of the answer inside it, and every field check scores 0.0.
+    """
+
+    @dataclasses.dataclass
+    class Triage:
+        lane: str
+
+    @dataclasses.dataclass
+    class RunResult:  # shaped like pydantic_ai.AgentRunResult
+        output: Any
+        _state: Any = None
+
+        def all_messages(self) -> list[Any]:
+            return []
+
+    payload = extract_output_payload(RunResult(output=Triage(lane="NOS")))
+    assert payload == {"lane": "NOS"}
+    assert field_match("lane")(payload, {"lane": "NOS"}) == 1.0
 
 
 # -- field_match ---------------------------------------------------------------
@@ -284,6 +329,26 @@ def test_tuple_values_are_described_rather_than_silently_retyped(tmp_path):
     assert load_tuned_config(path) == {"a.temperature": 0.5}
 
 
+def test_a_bare_name_holding_a_mapping_is_described_not_exported(tmp_path):
+    """A bare parameter whose value is a mapping cannot round-trip.
+
+    ``{"routing": {"threshold": 0.5}}`` written at the top level is
+    indistinguishable from the ``component: {knob: value}`` nesting the loader
+    flattens, so it would come back as ``{"routing.threshold": 0.5}`` -- a
+    different parameter name than the one that won.
+    """
+    result = OptimizationResult(
+        best_config={"routing": {"threshold": 0.5}, "agent.temperature": 0.2},
+        best_score=1.0,
+        baseline_score=0.0,
+    )
+    path = tmp_path / "tuned.yaml"
+    body = result.to_config(path)
+    assert body == {"agent": {"temperature": 0.2}}
+    assert "routing" in path.read_text(encoding="utf-8"), "the dropped value must be reported"
+    assert load_tuned_config(path) == {"agent.temperature": 0.2}
+
+
 def test_a_list_of_primitives_still_exports(tmp_path):
     """The tuple exclusion must not sweep up ordinary list values."""
     result = OptimizationResult(
@@ -418,6 +483,35 @@ def test_governed_envelope_is_peeled_before_structural_scoring():
     assert field_match("lane")(extract_output_payload(envelope), {"lane": "NOS"}) == 1.0
 
 
+def test_langgraph_structured_state_is_peeled_to_the_declared_answer():
+    """A graph built with ``response_format=`` returns a *state*, not an answer.
+
+    ``AgentStateWithStructuredResponse`` is ``{"messages", "remaining_steps",
+    "structured_response"}`` -- multi-key, so the single-key envelope rule never
+    fires and the whole state reached the metric.
+    """
+    state = {
+        "messages": [],
+        "remaining_steps": 3,
+        "structured_response": {"lane": "NOS", "matter": "M1"},
+    }
+    payload = extract_output_payload(state)
+    assert payload == {"lane": "NOS", "matter": "M1"}
+    assert field_match("lane")(payload, {"lane": "NOS"}) == 1.0
+
+
+def test_a_plain_langgraph_state_is_untouched_by_the_structured_rule():
+    """Without ``response_format=`` there is no ``structured_response`` key, and
+    the state must still arrive whole."""
+    state = {"messages": [], "remaining_steps": 3}
+    assert extract_output_payload(state) == state
+    # A scalar under the key is a value, not a wrapped payload.
+    assert extract_output_payload({"structured_response": "granted", "messages": []}) == {
+        "structured_response": "granted",
+        "messages": [],
+    }
+
+
 def test_a_multi_key_mapping_is_the_answer_not_an_envelope():
     """Only a *single* conventional key is peeled -- otherwise a structured
     answer that happens to contain `result` would be mangled."""
@@ -427,6 +521,19 @@ def test_a_multi_key_mapping_is_the_answer_not_an_envelope():
 
 def test_nested_envelopes_are_peeled_to_the_payload():
     assert extract_output_payload({"result": {"output": {"lane": "NOS"}}}) == {"lane": "NOS"}
+
+
+def test_a_single_field_answer_is_not_mistaken_for_an_envelope():
+    """Regression: peeling any single conventional key eats one-field answers.
+
+    ``{"result": "granted"}`` is a complete structured answer, not a wrapper --
+    an envelope holds a *payload*, so only a non-scalar value is peeled.
+    """
+    for answer in ({"result": "granted"}, {"answer": "Paris"}, {"text": "hi"}):
+        field = next(iter(answer))
+        payload = extract_output_payload(answer)
+        assert payload == answer
+        assert field_match(field)(payload, answer) == 1.0
 
 
 def _tool_a():
