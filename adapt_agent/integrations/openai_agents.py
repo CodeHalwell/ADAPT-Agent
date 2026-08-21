@@ -28,7 +28,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from adapt_agent.core.governance import GovernanceGate
-from adapt_agent.integrations._common import build_gate, optional_import
+from adapt_agent.integrations._common import as_state, build_gate, optional_import
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from adapt_agent.adversarial import AdversarialDefense
@@ -81,7 +81,7 @@ def governance_guardrails(
 
     async def adapt_input_guardrail(context: Any, agent: Any, agent_input: Any) -> Any:
         threats = resolved.scan_input(agent_input)
-        threats.extend(f"policy:{n}" for n in resolved.policy_violations(_as_state(agent_input)))
+        threats.extend(f"policy:{n}" for n in resolved.policy_violations(as_state(agent_input)))
         return agents.GuardrailFunctionOutput(
             output_info={"agent_id": agent_id, "threats": threats},
             tripwire_triggered=bool(threats),
@@ -105,15 +105,6 @@ def governance_guardrails(
         ]
 
     return guardrails
-
-
-def _as_state(agent_input: Any) -> dict[str, Any]:
-    """Shape guardrail input into the ``AgentState`` a policy rule expects."""
-    if isinstance(agent_input, dict):
-        return agent_input
-    if isinstance(agent_input, (list, tuple)):
-        return {"messages": list(agent_input), "context": {}}
-    return {"messages": [{"role": "user", "content": agent_input}], "context": {}}
 
 
 __all__ = ["governance_guardrails"]

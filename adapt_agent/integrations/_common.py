@@ -79,4 +79,27 @@ def optional_import(module: str, extra: str, needed_for: str) -> Any:
         ) from exc
 
 
-__all__ = ["build_gate", "optional_import", "traced"]
+def as_state(messages: Any, **extra: Any) -> dict[str, Any]:
+    """Shape framework messages into the mapping a policy rule expects.
+
+    :meth:`GovernanceGate.review_input <adapt_agent.core.governance.GovernanceGate.review_input>`
+    only evaluates policy when it is given a ``state``. Every hook must pass one,
+    or a configured ``policy_enforcer`` is silently inert -- accepted, documented
+    and doing nothing, which is the worst possible failure mode for a security
+    control.
+    """
+    if isinstance(messages, dict):
+        state = dict(messages)
+        state.setdefault("messages", [])
+        state.setdefault("context", {})
+    elif isinstance(messages, (list, tuple)):
+        state = {"messages": list(messages), "context": {}}
+    elif messages is None:
+        state = {"messages": [], "context": {}}
+    else:
+        state = {"messages": [messages], "context": {}}
+    state.update(extra)
+    return state
+
+
+__all__ = ["as_state", "build_gate", "optional_import", "traced"]

@@ -353,6 +353,16 @@ def _unwrap_envelope(value: Any, depth: int) -> Any:
     if value is None or isinstance(value, (str, bytes)) or depth <= 0:
         return value
     if isinstance(value, Mapping):
+        # A governed adapter returns an envelope -- ``execute`` wraps a non-dict
+        # framework result as ``{"result": <payload>}``. Returning that as the
+        # payload makes every structural metric score 0.0 against the real
+        # fields. Peel a *single* conventional key; a mapping with several keys
+        # is the answer itself, even if one of them happens to be called
+        # ``result``.
+        if len(value) == 1:
+            (key,) = value.keys()
+            if key in _MAPPING_KEYS:
+                return _unwrap_envelope(value[key], depth - 1)
         return value
     if isinstance(value, Sequence):
         return value

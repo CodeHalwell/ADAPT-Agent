@@ -39,7 +39,7 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from adapt_agent.core.governance import GovernanceGate
-from adapt_agent.integrations._common import build_gate, traced
+from adapt_agent.integrations._common import as_state, build_gate, traced
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from adapt_agent.adversarial import AdversarialDefense
@@ -100,7 +100,9 @@ def governance_middleware(
     async def adapt_governance(context: Any, call_next: Callable[[], Awaitable[None]]) -> None:
         # ``context.messages`` is a list[Message]; Message.text is picked up by
         # the gate's structural text extraction, so no MAF import is needed.
-        resolved.review_input(list(getattr(context, "messages", []) or []))
+        messages = list(getattr(context, "messages", []) or [])
+        # `state=` is required, or a configured policy_enforcer never runs.
+        resolved.review_input(messages, state=as_state(messages))
         with traced(observer, agent_id, operation):
             await call_next()
         if screen_output:

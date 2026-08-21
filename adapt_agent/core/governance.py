@@ -104,7 +104,12 @@ def extract_texts(data: Any) -> list[str]:
                 inner = _safe_getattr(value, attr)
                 if isinstance(inner, str):
                     texts.append(inner)
-                elif isinstance(inner, (dict, list, tuple)):
+                elif inner is not None and not isinstance(inner, (int, float, bool)):
+                    # Recurse into *any* non-primitive, not just dict/list/tuple.
+                    # A Pydantic AI ``AgentRunResult.output`` holds a BaseModel,
+                    # and stopping at container types here left every field of a
+                    # structured answer unscreened -- the wrapper was walked, the
+                    # model inside it was not.
                     _walk(inner, depth + 1)
             # Structured content containers (e.g. genai ``Content.parts``) hold
             # further objects whose text we still want to scan.

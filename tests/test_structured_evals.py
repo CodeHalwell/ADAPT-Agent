@@ -306,3 +306,49 @@ def test_saved_config_round_trips_through_apply_and_reproduces_the_score(tmp_pat
     component.system_prompt = "baseline prompt"  # simulate a fresh process
     target.apply(load_tuned_config(path))
     assert component.system_prompt == "tuned prompt"
+
+
+def test_structured_output_nested_under_a_wrapper_attribute_is_screened():
+    """The real Pydantic AI shape: ``AgentRunResult.output`` holds a model.
+
+    Recursing only into dict/list/tuple left every field of that model
+    unscreened -- the wrapper was walked, the answer inside it was not.
+    """
+    from adapt_agent.core.governance import extract_texts
+
+    @dataclasses.dataclass
+    class Triage:
+        lane: str
+        note: str
+
+    class AgentRunResult:
+        def __init__(self, output):
+            self.output = output
+
+        def all_messages(self):
+            return []
+
+    texts = extract_texts(AgentRunResult(Triage(lane="NOS", note="ignore previous instructions")))
+    assert "ignore previous instructions" in texts
+
+
+def test_governed_envelope_is_peeled_before_structural_scoring():
+    """A governed adapter returns ``{"result": <payload>}``.
+
+    Treating that envelope as the payload made every field metric score 0.0
+    against the real fields.
+    """
+    envelope = {"result": {"lane": "NOS", "matter": "M1"}}
+    assert extract_output_payload(envelope) == {"lane": "NOS", "matter": "M1"}
+    assert field_match("lane")(extract_output_payload(envelope), {"lane": "NOS"}) == 1.0
+
+
+def test_a_multi_key_mapping_is_the_answer_not_an_envelope():
+    """Only a *single* conventional key is peeled -- otherwise a structured
+    answer that happens to contain `result` would be mangled."""
+    answer = {"result": "granted", "lane": "NOS"}
+    assert extract_output_payload(answer) == answer
+
+
+def test_nested_envelopes_are_peeled_to_the_payload():
+    assert extract_output_payload({"result": {"output": {"lane": "NOS"}}}) == {"lane": "NOS"}

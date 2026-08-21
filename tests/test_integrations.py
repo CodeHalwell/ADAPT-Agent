@@ -459,3 +459,87 @@ def test_each_agent_in_a_graph_carries_its_own_policy():
     asyncio.run(intake(payload, call_next))  # permissive agent: fine
     with pytest.raises(SecurityBlockedError, match=r"\[nos\]"):
         asyncio.run(nos(MafContext(["the client name is Acme"]), call_next))
+
+
+# -- policy must actually be enforced by every hook ----------------------------
+
+
+class _RecordingEnforcer(PolicyEnforcer):
+    """Blocks everything and records whether it was consulted at all."""
+
+    def __init__(self):
+        super().__init__()
+        self.states = []
+
+    def check_state(self, state):
+        self.states.append(state)
+        return ["blocked_rule"]
+
+    def get_rule(self, name):
+        return {"action": "block"}
+
+
+def test_maf_middleware_enforces_a_configured_policy():
+    """A `policy_enforcer` that is accepted but never consulted is the worst
+    possible failure mode for a security control -- silently inert."""
+    enforcer = _RecordingEnforcer()
+    middleware = maf.governance_middleware(policy_enforcer=enforcer, agent_id="nos")
+    ran = []
+
+    async def call_next():
+        ran.append(1)
+
+    with pytest.raises(SecurityBlockedError, match="policy"):
+        asyncio.run(middleware(MafContext(["hello"]), call_next))
+    assert enforcer.states, "policy was never consulted"
+    assert ran == [], "the agent ran despite a blocking policy"
+
+
+def test_adk_callbacks_enforce_a_configured_policy():
+    enforcer = _RecordingEnforcer()
+    callbacks = adk.governance_callbacks(policy_enforcer=enforcer, agent_id="intake")
+    with pytest.raises(SecurityBlockedError, match="policy"):
+        asyncio.run(callbacks["before_model_callback"](None, AdkRequest(["hi"])))
+    assert enforcer.states
+
+
+def test_every_hook_that_screens_input_consults_policy():
+    """Guards the whole family against one binding forgetting `state=`."""
+    cases = [
+        (
+            "maf",
+            lambda e: asyncio.run(_run_maf_input(maf.governance_middleware(policy_enforcer=e))),
+        ),
+        (
+            "adk",
+            lambda e: asyncio.run(
+                adk.governance_callbacks(policy_enforcer=e)["before_model_callback"](
+                    None, AdkRequest(["hi"])
+                )
+            ),
+        ),
+        (
+            "langgraph",
+            lambda e: lg.governance_hooks(policy_enforcer=e)["pre_model_hook"](
+                {"messages": [{"role": "user", "content": "hi"}]}
+            ),
+        ),
+        (
+            "crewai",
+            lambda e: crew.governance_callbacks(policy_enforcer=e)["before_kickoff_callbacks"][0](
+                {"topic": "hi"}
+            ),
+        ),
+    ]
+    for name, invoke in cases:
+        enforcer = _RecordingEnforcer()
+        with pytest.raises(SecurityBlockedError):
+            invoke(enforcer)
+        assert enforcer.states, f"{name} hook never consulted the policy enforcer"
+
+
+async def _run_maf_input(middleware):
+    async def call_next():
+        return None
+
+    return await middleware(MafContext(["hello"]), call_next)

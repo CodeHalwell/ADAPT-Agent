@@ -63,6 +63,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `policy_enforcer` passed to the Microsoft Agent Framework or Google ADK
+  hooks was silently inert.** Both called `review_input` without a `state`, and
+  the gate only evaluates policy when given one -- so the control was accepted,
+  documented, and did nothing, while `call_next()` ran on. Every hook now passes
+  a state, and a test drives all four input-screening hooks against a recording
+  enforcer so one binding cannot forget again.
+- **A structured output nested under a wrapper attribute went unscreened.** Text
+  extraction recursed only into `dict`/`list`/`tuple`, so a Pydantic AI
+  `AgentRunResult.output` holding a `BaseModel` -- the ordinary shape -- had its
+  wrapper walked and the answer inside it skipped. Any non-primitive is now
+  followed.
+- **A governed adapter's envelope defeated structural metrics.** `execute`
+  returns `{"result": <payload>}`, which `extract_output_payload` treated as the
+  payload, so every `field_match` scored 0.0 against the real fields. A single
+  conventional key is now peeled; a multi-key mapping is still treated as the
+  answer, so a structured result that happens to contain `result` is unharmed.
+- **The threaded eval path was not memory-bounded.** `evaluate(concurrency>1)`
+  materialised the whole dataset and handed it to `ThreadPoolExecutor.map`,
+  which itself submits every example up front. Replaced with bounded submission
+  that keeps at most `concurrency` runs in flight and pulls lazily, matching
+  what `aevaluate` already did.
 - **Structured outputs were almost entirely unscreened.** Text extraction only
   probed a handful of conventional attribute names (`text`, `content`,
   `output`, ...), so a Pydantic model or dataclass with fields like `lane` or

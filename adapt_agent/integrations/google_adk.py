@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 from adapt_agent.core.governance import GovernanceGate
 from adapt_agent.exceptions import SecurityBlockedError
-from adapt_agent.integrations._common import build_gate, optional_import
+from adapt_agent.integrations._common import as_state, build_gate, optional_import
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from adapt_agent.adversarial import AdversarialDefense
@@ -101,7 +101,9 @@ def governance_callbacks(
         # ``llm_request.contents`` is a list of genai Content objects whose
         # ``parts[*].text`` the gate reaches structurally -- no ADK import here.
         try:
-            resolved.review_input(getattr(llm_request, "contents", None))
+            contents = getattr(llm_request, "contents", None)
+            # `state=` is required, or a configured policy_enforcer never runs.
+            resolved.review_input(contents, state=as_state(contents))
         except SecurityBlockedError:
             if on_block == "raise":
                 raise
