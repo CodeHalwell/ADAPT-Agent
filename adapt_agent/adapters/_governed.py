@@ -141,7 +141,21 @@ def _run_coro(coro: Any, source: Any = None) -> Any:
 
 
 def _close_unawaited(value: Any) -> None:
-    """Best-effort close of a coroutine/async generator that will never be awaited."""
+    """Release a coroutine that will now never be awaited.
+
+    A coroutine must be closed explicitly or Python emits "coroutine was never
+    awaited", pointing at the framework's run method rather than at the real
+    problem (a sync call from inside a running loop).
+
+    An **async generator has no synchronous ``close()``** -- only ``aclose()``,
+    itself a coroutine that cannot be awaited from here. That is deliberately
+    fine: one reaching this path has never been started, because
+    :func:`_resolve_result` raises before iterating it, so it holds no suspended
+    frame and needs no finalization. Scheduling an ``aclose()`` task into a loop
+    that is about to unwind would trade a warning we do not have for a
+    "Task was destroyed but it is pending" that we would. Asserted by
+    ``test_execute_in_a_loop_does_not_leak_an_async_generator``.
+    """
     if value is None:
         return
     close = getattr(value, "close", None)

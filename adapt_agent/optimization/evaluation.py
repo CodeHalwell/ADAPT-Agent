@@ -17,9 +17,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from collections.abc import Awaitable, Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import Any, cast
 
 from adapt_agent.optimization.dataset import Example, GoldenDataset
@@ -340,14 +342,34 @@ class EvaluationHarness:
             return self._build_report(
                 self._run_one(runner, index, example) for index, example in enumerate(dataset)
             )
+        return self._build_report(self._threaded_results(runner, dataset, concurrency))
 
-        examples = list(enumerate(dataset))
+    def _threaded_results(
+        self, runner: Callable[[Any], Any], dataset: GoldenDataset, concurrency: int
+    ) -> Iterator[ExampleResult]:
+        """Run examples in a thread pool, yielding results in index order.
+
+        Deliberately not ``ThreadPoolExecutor.map``: that submits the *whole*
+        iterable up front (``fs = [self.submit(fn, *args) for args in ...]``),
+        holding one future per example and consuming the dataset eagerly. This
+        keeps at most ``concurrency`` runs in flight and pulls from the dataset
+        lazily, so memory stays bounded on a large dataset -- the same property
+        :meth:`aevaluate` gets from its worker pool.
+        """
+        examples = enumerate(dataset)
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            # ``map`` yields in submission order, so results stay index-ordered
-            # while still running ``concurrency`` examples at a time.
-            return self._build_report(
-                pool.map(lambda pair: self._run_one(runner, pair[0], pair[1]), examples)
+            pending: deque[Future[ExampleResult]] = deque(
+                pool.submit(self._run_one, runner, index, example)
+                for index, example in islice(examples, concurrency)
             )
+            while pending:
+                # Popping the *oldest* future preserves index ordering: results
+                # are yielded in submission order, not completion order.
+                result = pending.popleft().result()
+                nxt = next(examples, None)
+                if nxt is not None:
+                    pending.append(pool.submit(self._run_one, runner, nxt[0], nxt[1]))
+                yield result
 
     async def aevaluate(
         self, agent: Any, dataset: GoldenDataset, *, concurrency: int = 1

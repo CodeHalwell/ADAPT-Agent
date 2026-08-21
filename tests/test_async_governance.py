@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import gc
+import threading
 import time
 
 import pytest
 
 from adapt_agent.adapters import LangGraphAdapter, MicrosoftAgentFrameworkAdapter
 from adapt_agent.exceptions import AdapterError, SecurityBlockedError
-from adapt_agent.optimization.dataset import GoldenDataset
+from adapt_agent.optimization.dataset import Example, GoldenDataset
 from adapt_agent.optimization.evaluation import EvaluationHarness, aresolve_runner
 from adapt_agent.optimization.metrics import exact_match
 from adapt_agent.security import Firewall
@@ -320,3 +322,84 @@ def test_avg_latency_is_per_example_not_wall_clock_over_n():
     assert report.avg_latency == pytest.approx(delay, abs=0.015)
     # Eight examples overlapped, so the summed latency far exceeds wall clock.
     assert report.total_latency > delay * 4
+
+
+def test_execute_in_a_loop_does_not_leak_an_async_generator(recwarn):
+    """An async generator has no sync ``close()`` -- assert none is needed.
+
+    ``_resolve_result`` raises before iterating, so the generator is never
+    started and holds no suspended frame to finalize.
+    """
+
+    class Streaming:
+        async def run(self, prompt):
+            yield "a"
+            yield "b"
+
+    guarded = _guarded(Streaming())
+
+    async def main():
+        with pytest.raises(AdapterError):
+            guarded.execute(_payload("hi"))
+
+    asyncio.run(main())
+    gc.collect()
+    assert not [w for w in recwarn if issubclass(w.category, RuntimeWarning)]
+
+
+def test_threaded_evaluate_consumes_the_dataset_lazily():
+    """Bounded submission: at most ``concurrency`` examples are pulled ahead.
+
+    ``ThreadPoolExecutor.map`` would consume the whole iterable up front, so
+    this guards the memory-bounding property rather than assuming it.
+    """
+    pulled = []
+
+    class LazyDataset:
+        def __iter__(self):
+            for i in range(40):
+                pulled.append(i)
+                yield Example(inputs=f"q{i}", expected=f"a{i}")
+
+    pulled_when_first_ran = []
+
+    class Slow:
+        def invoke(self, x):
+            # How much of the dataset had been consumed by the time the first
+            # example started? Eager submission would already have drained it.
+            pulled_when_first_ran.append(len(pulled))
+            time.sleep(0.01)
+            return "a" + x[1:]
+
+    harness = EvaluationHarness([exact_match()])
+    report = harness.evaluate(Slow(), LazyDataset(), concurrency=4)
+    assert report.score == 1.0
+    assert [r.index for r in report.results] == list(range(40))
+    assert len(pulled) == 40, "every example must eventually run"
+    # The real guard: only a bounded look-ahead had been pulled when work began.
+    # `ThreadPoolExecutor.map` would report 40 here.
+    assert pulled_when_first_ran[0] <= 8, (
+        f"{pulled_when_first_ran[0]} examples were consumed before the first "
+        "one ran -- the dataset is being materialised eagerly"
+    )
+
+
+def test_threaded_evaluate_bounds_in_flight_work():
+    class Counting:
+        def __init__(self):
+            self.in_flight = 0
+            self.peak = 0
+            self._lock = threading.Lock()
+
+        def invoke(self, x):
+            with self._lock:
+                self.in_flight += 1
+                self.peak = max(self.peak, self.in_flight)
+            time.sleep(0.01)
+            with self._lock:
+                self.in_flight -= 1
+            return "a" + x[1:]
+
+    agent = Counting()
+    EvaluationHarness([exact_match()]).evaluate(agent, _dataset(30), concurrency=4)
+    assert 1 < agent.peak <= 4
