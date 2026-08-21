@@ -8,6 +8,7 @@ propagation*, survive. Both are asserted here rather than assumed.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import gc
 import threading
@@ -163,6 +164,8 @@ def test_a_blocking_sync_generator_is_drained_off_the_loop():
         beat = asyncio.ensure_future(heartbeat())
         result = await guarded.aexecute({"messages": []})
         beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat
         return ticks, result["result"]
 
     ticks, result = asyncio.run(main())
@@ -198,6 +201,8 @@ def test_aexecute_does_not_block_the_loop_on_a_sync_agent():
         beat = asyncio.ensure_future(heartbeat())
         await guarded.aexecute({"messages": []})
         beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat
         return ticks
 
     assert asyncio.run(main()) >= 3, "the event loop was blocked by the sync runner"
