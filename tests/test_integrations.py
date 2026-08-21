@@ -543,3 +543,34 @@ async def _run_maf_input(middleware):
         return None
 
     return await middleware(MafContext(["hello"]), call_next)
+
+
+def test_report_only_mode_still_audits_policy():
+    """`block_on_violation=False` must mean "record but don't refuse", not silence.
+
+    `PolicyEnforcer.check_state` is what records violations and fires warn/log
+    handlers, so skipping it in report-only mode would disable auditing
+    entirely -- gutting the rollout mode used to shake out false positives.
+    """
+    from adapt_agent.adapters import LangGraphAdapter
+
+    class Agent:
+        def invoke(self, payload):
+            return {"messages": [{"role": "assistant", "content": "ok"}]}
+
+    for blocking in (False, True):
+        enforcer = PolicyEnforcer()
+        enforcer.add_rule(
+            name="low_trust",
+            description="warn only",
+            condition="state['trust_score'] < 0.5",
+            action="warn",
+            severity="medium",
+        )
+        guarded = LangGraphAdapter(
+            policy_enforcer=enforcer, block_on_violation=blocking
+        ).wrap_agent(Agent())
+        guarded.execute({"messages": [], "trust_score": 0.1})
+        assert len(enforcer.get_violations()) == 1, (
+            f"block_on_violation={blocking} recorded no violation -- " "policy auditing was skipped"
+        )

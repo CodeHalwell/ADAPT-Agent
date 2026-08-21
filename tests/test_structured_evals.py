@@ -352,3 +352,45 @@ def test_a_multi_key_mapping_is_the_answer_not_an_envelope():
 
 def test_nested_envelopes_are_peeled_to_the_payload():
     assert extract_output_payload({"result": {"output": {"lane": "NOS"}}}) == {"lane": "NOS"}
+
+
+def _tool_a():
+    """A live tool object, as a TOOL/SKILL parameter holds."""
+
+
+def _tool_b():
+    """Another one."""
+
+
+def test_to_config_describes_live_objects_instead_of_crashing(tmp_path):
+    """The default optimizer tunes tools; those cannot be YAML/JSON encoded."""
+    result = OptimizationResult(
+        best_config={
+            "agent.tools": [_tool_a, _tool_b],
+            "agent.system_prompt": "Be brief.",
+        },
+        best_score=0.9,
+        baseline_score=0.6,
+    )
+    for suffix in ("yaml", "json"):
+        path = tmp_path / f"tuned.{suffix}"
+        body = result.to_config(path)
+        # The body holds only what applies cleanly...
+        assert body == {"agent": {"system_prompt": "Be brief."}}
+        text = path.read_text(encoding="utf-8")
+        # ...and the file still records which tools won, for the review diff.
+        assert "_tool_a" in text and "_tool_b" in text
+        # A round trip never sets a string over the real tool list.
+        assert load_tuned_config(path) == {"agent.system_prompt": "Be brief."}
+
+
+def test_unexportable_parameters_are_reported_even_without_a_header(tmp_path):
+    """Silently dropping a tuned parameter is worse than two comment lines."""
+    result = OptimizationResult(
+        best_config={"agent.tools": [_tool_a]}, best_score=1.0, baseline_score=0.0
+    )
+    path = tmp_path / "tuned.yaml"
+    result.to_config(path, header=False)
+    text = path.read_text(encoding="utf-8")
+    assert "Not exported" in text and "_tool_a" in text
+    assert "baseline=" not in text  # the provenance header really is suppressed

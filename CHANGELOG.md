@@ -63,6 +63,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Report-only mode silently disabled policy auditing.** With
+  `block_on_violation=False` the adapter skipped `policy_violations()` entirely,
+  and since `PolicyEnforcer.check_state` is what records violations and fires
+  warn/log handlers, the documented rollout mode recorded nothing at all rather
+  than recording without refusing. Policy is now evaluated whatever the blocking
+  mode; only the refusal is conditional.
+- **`to_config` crashed on tool and skill parameters.** Those hold live
+  callables, which no YAML or JSON encoder can represent, so exporting a run
+  from the default optimizer's tool stage raised. They are now listed by
+  `module:qualname` for the review diff and kept out of the config body, so the
+  file stays reloadable and `apply()` can never write a stand-in string over a
+  real tool list.
 - **A `policy_enforcer` passed to the Microsoft Agent Framework or Google ADK
   hooks was silently inert.** Both called `review_input` without a `state`, and
   the gate only evaluates policy when given one -- so the control was accepted,

@@ -140,6 +140,17 @@ class OptimizationResult:
         header; JSON has no comments, so it goes in a ``"_provenance"`` key
         which :func:`load_tuned_config` ignores.
 
+        **Live objects are described, not exported.** A ``TOOL``/``SKILL``
+        parameter holds callables or SDK objects, which no YAML or JSON encoder
+        can represent. Writing a stand-in string would be worse than useless:
+        :meth:`OptimizableAgent.apply` would later set that string over the real
+        tool list and break the agent. So such parameters are listed -- by
+        ``module:qualname``, which is what a reviewer wants to see anyway -- in a
+        comment header (YAML) or under ``_provenance.unexportable`` (JSON), and
+        left out of the config body, which therefore stays safely reloadable.
+        That listing appears even when ``header=False``: silently dropping a
+        tuned parameter is worse than two lines of comment.
+
         Args:
             path: Where to write. ``None`` returns the mapping without writing.
                 The parent directory is created if needed.
@@ -149,14 +160,25 @@ class OptimizationResult:
 
         Returns:
             The nested ``{component: {knob: value}}`` mapping (never including
-            the provenance block, so the return value is exactly the config).
+            the provenance block or unexportable parameters, so the return value
+            is exactly the config that will apply cleanly).
         """
         nested: dict[str, Any] = {}
+        unexportable: dict[str, str] = {}
         for name, value in self.best_config.items():
             component, _, knob = name.partition(".")
             if not knob:  # a bare name carries no component prefix
                 component, knob = default_component, name
-            nested.setdefault(component, {})[knob] = value
+            if _is_exportable(value):
+                nested.setdefault(component, {})[knob] = value
+            else:
+                # A TOOL/SKILL parameter holds live callables or SDK objects. They
+                # cannot be written to YAML/JSON, and a string standing in for one
+                # would corrupt the agent if `apply()` later wrote it back over the
+                # real tool list. So they are described, not exported -- the file
+                # records which were selected, for review, and stays safely
+                # reloadable.
+                unexportable[name] = _describe(value)
 
         if path is not None:
             destination = Path(path)
@@ -165,13 +187,23 @@ class OptimizationResult:
                 import json
 
                 payload = dict(nested)
-                if header:
-                    payload["_provenance"] = self._provenance()
+                provenance = self._provenance() if header else {}
+                if unexportable:
+                    provenance["unexportable"] = unexportable
+                if provenance:
+                    payload["_provenance"] = provenance
                 text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
             else:
                 import yaml
 
                 text = yaml.safe_dump(nested, sort_keys=True, allow_unicode=True, width=100)
+                if unexportable:
+                    # Reported even when `header=False`: silently dropping a
+                    # tuned parameter is worse than a couple of comment lines.
+                    text = (
+                        "# Not exported (live objects, descriptive only):\n"
+                        + "".join(f"#   {k}: {v}\n" for k, v in sorted(unexportable.items()))
+                    ) + text
                 if header:
                     provenance = self._provenance()
                     text = (
@@ -897,6 +929,28 @@ def _dedup(values: list[Any]) -> list[Any]:
                 continue
         out.append(v)
     return out
+
+
+def _is_exportable(value: Any) -> bool:
+    """Can ``value`` survive a YAML/JSON round trip as itself?"""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_is_exportable(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_exportable(v) for k, v in value.items())
+    return False
+
+
+def _describe(value: Any) -> str:
+    """A stable, readable identifier for a live object, for the review diff."""
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_describe(v) for v in value) + "]"
+    module = getattr(value, "__module__", None)
+    name = getattr(value, "__qualname__", None) or getattr(value, "__name__", None)
+    if name:
+        return f"{module}:{name}" if module else str(name)
+    return f"<{type(value).__name__}>"
 
 
 def load_tuned_config(path: str | Path) -> dict[str, Any]:

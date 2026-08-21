@@ -425,13 +425,16 @@ class _GovernedAgent:
             raise SecurityBlockedError("Input blocked by security controls", in_threats)
 
         # 2. Policy enforcement against the extracted state.
+        #
+        # Policy is evaluated *whatever* the blocking mode: `check_state` is what
+        # records violations and fires warn/log handlers, so gating the call on
+        # `block_on_violation` would turn the documented report-only rollout into
+        # silence -- no auditing at all, rather than auditing without refusal.
+        # Only the refusal itself is conditional.
         self._last_state = adapter.extract_state(input_data)
-        if adapter.block_on_violation:
-            blocking = adapter.gate.policy_violations(self._last_state)
-            if blocking:
-                raise SecurityBlockedError(
-                    "Input blocked by policy", [f"policy:{v}" for v in blocking]
-                )
+        blocking = adapter.gate.policy_violations(self._last_state)
+        if blocking and adapter.block_on_violation:
+            raise SecurityBlockedError("Input blocked by policy", [f"policy:{v}" for v in blocking])
 
         # 3. Pre-middleware.
         payload = input_data
