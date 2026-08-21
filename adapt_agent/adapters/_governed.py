@@ -477,20 +477,30 @@ class _GovernedAgent:
             self._adapter.observer.end_trace(trace_id, status="error", result=str(exc))
 
     def _after(self, trace_id: str, result: Any) -> dict[str, Any]:
-        """Stages 5-6: close the trace, post-middleware, output screening."""
+        """Stages 5-6: post-middleware, output screening, then close the trace.
+
+        The trace closes *last*, and as an error if either stage raises. Closing
+        it first recorded a successful execution for a run the caller saw fail:
+        an output block is exactly the event monitoring exists to surface, and
+        the runner's own ``try`` no longer covers this method.
+        """
         adapter = self._adapter
+        try:
+            # 5. Post-middleware.
+            if adapter.middleware is not None:
+                wrapped = adapter.middleware.process_output({"result": result})
+                result = wrapped["result"]
+
+            # 6. Output screening.
+            out_threats = adapter._screen_output(result)
+            if out_threats and adapter.block_on_violation:
+                raise SecurityBlockedError("Output blocked by security controls", out_threats)
+        except BaseException as exc:  # CancelledError derives from BaseException
+            self._trace_error(trace_id, exc)
+            raise
+
         if adapter.observer is not None:
             adapter.observer.end_trace(trace_id, status="completed")
-
-        # 5. Post-middleware.
-        if adapter.middleware is not None:
-            wrapped = adapter.middleware.process_output({"result": result})
-            result = wrapped["result"]
-
-        # 6. Output screening.
-        out_threats = adapter._screen_output(result)
-        if out_threats and adapter.block_on_violation:
-            raise SecurityBlockedError("Output blocked by security controls", out_threats)
 
         # Track state from the actual returned payload. Non-dict framework
         # results (AgentRunResult, CrewOutput, ...) are wrapped in {"result": ...}

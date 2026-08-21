@@ -78,6 +78,77 @@ def test_execute_still_works_for_sync_callers():
     assert guarded.execute(_payload("hi")) == {"result": "echo:hi"}
 
 
+def test_a_blocked_output_is_traced_as_an_error():
+    """Telemetry must not record success for a run the caller saw fail.
+
+    The span used to close as `completed` before output screening ran, so an
+    output block -- exactly the event monitoring exists to surface -- was
+    invisible in the trace.
+    """
+
+    class Observer:
+        def __init__(self):
+            self.events = []
+
+        def start_trace(self, trace_id, agent_id, operation):
+            self.events.append("start")
+
+        def end_trace(self, trace_id, status="completed", result=None):
+            self.events.append(f"end:{status}")
+
+    firewall = Firewall()
+    firewall.add_blocked_pattern(r"(?i)hunter2")
+
+    class Graph:
+        def invoke(self, payload):
+            return "the password is hunter2"
+
+    observer = Observer()
+    guarded = LangGraphAdapter(firewall=firewall, observer=observer).wrap_agent(Graph())
+    with pytest.raises(SecurityBlockedError):
+        guarded.execute({"messages": []})
+    assert observer.events == ["start", "end:error"]
+
+    # A clean run still closes as completed.
+    class Clean:
+        def invoke(self, payload):
+            return "all fine"
+
+    observer = Observer()
+    LangGraphAdapter(firewall=firewall, observer=observer).wrap_agent(Clean()).execute(
+        {"messages": []}
+    )
+    assert observer.events == ["start", "end:completed"]
+
+
+def test_a_blocked_output_is_traced_as_an_error_on_the_async_path():
+    class Observer:
+        def __init__(self):
+            self.events = []
+
+        def start_trace(self, trace_id, agent_id, operation):
+            self.events.append("start")
+
+        def end_trace(self, trace_id, status="completed", result=None):
+            self.events.append(f"end:{status}")
+
+    firewall = Firewall()
+    firewall.add_blocked_pattern(r"(?i)hunter2")
+
+    class Graph:  # a real graph exposes both; `aexecute` prefers `ainvoke`
+        def invoke(self, payload):
+            raise AssertionError("aexecute must not use the sync entry point")
+
+        async def ainvoke(self, payload):
+            return "the password is hunter2"
+
+    observer = Observer()
+    guarded = LangGraphAdapter(firewall=firewall, observer=observer).wrap_agent(Graph())
+    with pytest.raises(SecurityBlockedError):
+        asyncio.run(guarded.aexecute({"messages": []}))
+    assert observer.events == ["start", "end:error"]
+
+
 def test_aexecute_preserves_contextvars():
     """The reason a worker thread is the wrong fix.
 

@@ -56,8 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   beside `messages`; the state is identified by what LangGraph guarantees --
   `add_messages` coerces every entry to a `BaseMessage` -- so an answer that
   merely has fields of those names is not peeled); a **single-field answer** like
-  `{"result": "granted"}`, which is the answer rather than an envelope around
-  one; and a declared output whose field happens to be *called* `answer` or
+  `{"result": "granted"}` or `{"answer": {"city": "Paris"}}`, which is the
+  answer rather than an envelope around one -- a governed `execute` returns a
+  dict result untouched and wraps only a non-dict, so a conventional key is an
+  envelope only when what it holds still needs unwrapping; and a declared output
+  whose field happens to be *called* `answer` or
   `result`, which the generic attribute peel would have reduced to its own
   value. `extract_output_text` likewise leaves a declared output unchanged, so a
   per-row `field_match` dispatched by `checks` still sees its fields. A **list of
@@ -85,8 +88,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it died with the process; now the loop is optimize -> diff -> review -> commit
   and a machine-rewritten prompt cannot reach production unread.
 
+### Security
+
+- **A tool result carrying a prompt injection reached the model unscreened.**
+  Google ADK returns a tool's output under `Part.function_response.response`, a
+  mapping, never `Part.text` -- and `extract_texts` neither walked that
+  attribute nor reached it within its recursion bound, so the firewall was blind
+  on exactly the path that carries untrusted content back from the open web. The
+  identical string as a plain text part was blocked. Tool-response attributes
+  are now walked explicitly, and the bound is sized from the deepest real
+  payload (a governed ADK tool result is eight hops) rather than a guess,
+  because a security scan that stops early fails open.
+
 ### Fixed
 
+- **A blocked output was traced as a successful run.** The observer span closed
+  as `completed` before post-middleware and output screening ran, so a caller
+  received `SecurityBlockedError` while telemetry recorded success -- hiding the
+  output-policy failures monitoring exists to surface. The span now closes last,
+  and as an error when either stage raises, on both `execute` and `aexecute`.
 - **A bare parameter name did not survive the config round trip.** `to_config`
   filed a name with no `component.` prefix under a synthetic `agent` section,
   renaming it on the way out; `load_tuned_config` could not recover the original,

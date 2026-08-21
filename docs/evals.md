@@ -347,9 +347,11 @@ Two shapes need naming, because both used to score 0.0 across the board:
 - A **list of records** is the answer, not a message stream. A stream is scanned
   from the end for its final message; a list of dataclasses or models is
   returned whole.
-- A **single-field answer** like `{"result": "granted"}` is the answer, not an
-  envelope around one. Only a conventional key holding something *structured*
-  is peeled, so a one-column output keeps its column.
+- A **single-field answer** like `{"result": "granted"}` or `{"answer": {"city":
+  "Paris"}}` is the answer, not an envelope around one. A governed `execute`
+  returns a dict result untouched and wraps only a non-dict, so a conventional
+  key is an envelope only when what it holds still needs unwrapping — a
+  one-column output keeps its column whatever type it holds.
 
 `extract_output_text` leaves a declared output **unchanged** — it is not a
 wrapper around text — which is what lets a per-row `field_match` still see its

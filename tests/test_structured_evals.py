@@ -623,14 +623,47 @@ def test_structured_output_nested_under_a_wrapper_attribute_is_screened():
 
 
 def test_governed_envelope_is_peeled_before_structural_scoring():
-    """A governed adapter returns ``{"result": <payload>}``.
+    """A governed adapter wraps a non-dict result as ``{"result": <payload>}``.
 
     Treating that envelope as the payload made every field metric score 0.0
-    against the real fields.
+    against the real fields. The envelope here comes from a *real* governed
+    agent rather than being hand-written, because the two drifted once already:
+    an earlier version of this test asserted `{"result": {...}}` was peeled, a
+    shape `execute` never produces -- it returns a dict result untouched and
+    wraps only a non-dict.
     """
-    envelope = {"result": {"lane": "NOS", "matter": "M1"}}
+    from adapt_agent.adapters.langgraph import LangGraphAdapter
+
+    class Result:  # a framework result object, e.g. a Pydantic AI run result
+        def __init__(self):
+            self.output = {"lane": "NOS", "matter": "M1"}
+
+        def all_messages(self):
+            return []
+
+    class Graph:
+        def invoke(self, payload):
+            return Result()
+
+    envelope = LangGraphAdapter().wrap_agent(Graph()).execute({"messages": []})
+    assert set(envelope) == {"result"}, "the governed envelope shape has changed"
     assert extract_output_payload(envelope) == {"lane": "NOS", "matter": "M1"}
     assert field_match("lane")(extract_output_payload(envelope), {"lane": "NOS"}) == 1.0
+
+
+def test_a_dict_result_is_never_wrapped_so_it_is_never_peeled():
+    """`execute` returns a dict framework result untouched, so a single
+    conventional key holding a mapping is an *answer*, not an envelope."""
+    from adapt_agent.adapters.langgraph import LangGraphAdapter
+
+    class Graph:
+        def invoke(self, payload):
+            return {"answer": {"city": "Paris"}}
+
+    returned = LangGraphAdapter().wrap_agent(Graph()).execute({"messages": []})
+    assert returned == {"answer": {"city": "Paris"}}, "a dict result must not be wrapped"
+    assert extract_output_payload(returned) == {"answer": {"city": "Paris"}}
+    assert json_subset()(extract_output_payload(returned), returned) == 1.0
 
 
 class _Message:
@@ -694,8 +727,27 @@ def test_a_multi_key_mapping_is_the_answer_not_an_envelope():
     assert extract_output_payload(answer) == answer
 
 
-def test_nested_envelopes_are_peeled_to_the_payload():
-    assert extract_output_payload({"result": {"output": {"lane": "NOS"}}}) == {"lane": "NOS"}
+def test_a_single_field_answer_holding_a_container_survives():
+    """The scalar guard was not enough: a one-field answer whose value is a list
+    or a mapping is still an answer, and peeling it deletes the scored column."""
+    for answer in ({"result": ["A", "B"]}, {"answer": {"city": "Paris"}}, {"text": [1, 2]}):
+        field = next(iter(answer))
+        payload = extract_output_payload(answer)
+        assert payload == answer
+        assert field_match(field)(payload, answer) == 1.0
+
+
+def test_an_envelope_around_a_message_stream_is_still_peeled():
+    """A governed agent whose framework returned a *list* is wrapped too, and
+    that list is a message stream -- distinguishable from `["A", "B"]` because
+    its elements are things an extractor recognises."""
+
+    class Msg:
+        def __init__(self, content):
+            self.content, self.type = content, "ai"
+
+    envelope = {"result": [Msg("thinking"), Msg('{"lane": "NOS"}')]}
+    assert extract_output_payload(envelope) == {"lane": "NOS"}
 
 
 def test_a_single_field_answer_is_not_mistaken_for_an_envelope():

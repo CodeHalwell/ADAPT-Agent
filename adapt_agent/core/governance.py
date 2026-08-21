@@ -56,7 +56,24 @@ _RECURSE_ATTRS = (
     "parts",
     "messages",
     "tasks_output",
+    # Tool results returning to the model. A Google ADK ``Part`` carries them
+    # under ``function_response`` (older/other SDKs: ``tool_response``), whose
+    # payload is a ``response`` mapping -- never ``Part.text``. This is the
+    # highest-value injection vector there is: whatever a tool fetched from the
+    # open web arrives here, and reaches the next model call.
+    "function_response",
+    "tool_response",
+    "response",
 )
+
+
+#: Recursion bound for :func:`extract_texts`, guarding against pathological or
+#: cyclic nesting. Sized from the deepest *real* payload rather than a guess: a
+#: governed ADK tool result is ``{"result": ...} -> [Content] -> Content ->
+#: parts -> Part -> function_response -> response -> text``, which is eight
+#: hops. At the previous bound of six that text was silently dropped -- and a
+#: security scan that stops early fails open, so the headroom is deliberate.
+_MAX_WALK_DEPTH = 12
 
 
 def _safe_getattr(obj: Any, attr: str) -> Any:
@@ -83,7 +100,7 @@ def extract_texts(data: Any) -> list[str]:
     texts: list[str] = []
 
     def _walk(value: Any, depth: int = 0) -> None:
-        if depth > 6:  # bound recursion (defensive against pathological nesting)
+        if depth > _MAX_WALK_DEPTH:
             return
         if isinstance(value, str):
             texts.append(value)

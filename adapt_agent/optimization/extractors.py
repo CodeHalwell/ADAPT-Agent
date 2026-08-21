@@ -392,7 +392,17 @@ def _unwrap_envelope(value: Any, depth: int) -> Any:
             (key,) = value.keys()
             inner = value[key]
             if key in _MAPPING_KEYS and not _is_scalar(inner):
-                return _unwrap_envelope(inner, depth - 1)
+                # An envelope wraps something that still needs unwrapping. If
+                # the value inside is already the final payload, the mapping is
+                # a one-field *answer* and peeling it deletes the column a
+                # metric scores. This matches what the governed adapter
+                # actually builds: `execute` returns a dict result untouched
+                # and wraps only a non-dict, so `{"result": {...}}` is never an
+                # envelope, and `{"result": ["A", "B"]}` is one only when those
+                # elements are framework messages rather than plain values.
+                peeled = _unwrap_envelope(inner, depth - 1)
+                if peeled is not inner:
+                    return peeled
         return value
     if isinstance(value, Sequence):
         return _unwrap_stream(value, depth)
