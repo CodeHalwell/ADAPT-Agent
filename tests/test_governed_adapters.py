@@ -390,8 +390,11 @@ def test_extract_texts_ignores_primitives_and_raising_attrs():
             raise RuntimeError("boom")
 
     # Primitives must not crash or be probed; a raising property is swallowed.
-    assert _extract_texts({"a": 1, "b": None, "c": True, "d": 3.5}) == []
-    assert _extract_texts({"obj": Raises()}) == []
+    # Keys are scanned deliberately (a tool response's keys are attacker-shaped
+    # data too), so the assertion is that no *value* text appears -- not that
+    # nothing does.
+    assert _extract_texts({"a": 1, "b": None, "c": True, "d": 3.5}) == ["a", "b", "c", "d"]
+    assert _extract_texts({"obj": Raises()}) == ["obj"]
 
 
 def test_resolve_result_drains_custom_async_iterator():

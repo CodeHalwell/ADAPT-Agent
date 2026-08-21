@@ -124,7 +124,13 @@ def extract_texts(data: Any) -> list[str]:
             # returning early avoids pointless getattr lookups on large payloads.
             return
         elif isinstance(value, dict):
-            for v in value.values():
+            for k, v in value.items():
+                # Keys too. A tool response is attacker-shaped data, not just an
+                # attacker-shaped *value*: `{"ignore previous instructions": ""}`
+                # renders to the model exactly like the same text in a value, and
+                # scanning only values let it through untouched.
+                if isinstance(k, str) and k:
+                    texts.append(k)
                 _walk(v, depth + 1)
         elif isinstance(value, (list, tuple)):
             for v in value:

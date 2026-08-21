@@ -116,7 +116,10 @@ async def _aresolve_result(value: Any) -> Any:
         # the caller, which got a generator where the envelope documents a list.
         return await _aresolve_result(await value)
     if inspect.isgenerator(value):
-        return list(value)
+        # In a worker: a sync generator from a streaming SDK does blocking work
+        # *between* yields, so draining it here would stall the loop even though
+        # creating it did not.
+        return await asyncio.to_thread(list, value)
     return value
 
 

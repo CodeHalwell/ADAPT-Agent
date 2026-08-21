@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **An instruction hidden in a mapping *key* bypassed screening.** A tool
+  response is attacker-shaped data, keys included:
+  `{"ignore previous instructions": ""}` renders to the model exactly like the
+  same text in a value, but `extract_texts` walked only values -- so the
+  identical string was blocked as a value and passed untouched as a key.
+  String keys are scanned now.
+
+### Fixed
+
+- **`aevaluate` scored on the event loop.** Metrics are synchronous by
+  contract and an LLM judge's provider call is a network round trip, so agent
+  calls overlapped while their judging serialised and stalled every other
+  task -- the concurrency knob bought nothing for exactly the model-graded runs
+  it exists for. Scoring is offloaded (4 rows x 50 ms: 0.21 s -> 0.06 s).
+- **A blocking sync generator was drained on the event loop.** `aexecute`
+  offloaded *creating* a synchronous fallback runner's generator but iterated it
+  on the loop thread, so a streaming SDK that blocks between yields still
+  serialised concurrent calls (0 heartbeat ticks -> 28).
+
+
 ## [0.3.0] - 2026-08-21
 
 ### Added
