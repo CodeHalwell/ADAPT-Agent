@@ -329,11 +329,18 @@ Two shapes need naming, because both used to score 0.0 across the board:
 
 - A **LangGraph** graph built with `response_format=` returns a *state*, not an
   answer — `{"messages": [...], "remaining_steps": N, "structured_response":
-  {...}}`. The declared output is peeled out of it; a state without that key
-  arrives whole.
+  {...}}`. The declared output is peeled out of it. The whole state shape is
+  required, not just the key: on its own `structured_response` is an ordinary
+  field name, so `{"structured_response": {...}, "request_id": "42"}` keeps both
+  columns.
 - A **single-field answer** like `{"result": "granted"}` is the answer, not an
   envelope around one. Only a conventional key holding something *structured*
   is peeled, so a one-column output keeps its column.
+
+`extract_output_text` leaves a declared output **unchanged** — it is not a
+wrapper around text — which is what lets a per-row `field_match` still see its
+fields on the `checks` path, where the row decides the metric at runtime and
+text extraction is therefore the one in force.
 
 `evaluate_agent` selects it automatically when **every** metric is structural
 (`json_subset`, `field_match`); mixing in a text metric keeps text extraction,

@@ -628,6 +628,31 @@ def test_adk_policy_sees_the_callbacks_session_state():
     assert enforcer.states[0]["trust_score"] == 0.1
 
 
+def test_session_state_may_carry_its_own_messages_key():
+    """Regression: a session-state key named `messages` crashed the hook.
+
+    `context_state()` returns the app's own state mapping, whose keys are
+    arbitrary. Splatting it into `as_state(contents, **state)` collided with the
+    positional parameter, so a *benign* request raised `TypeError` before any
+    governance ran -- on both the ADK and OpenAI seams. The messages under
+    screening must also survive the merge, or a message-based rule silently
+    evaluates the session's copy instead of the request in hand.
+    """
+    enforcer = _RecordingEnforcer()
+    callbacks = adk.governance_callbacks(policy_enforcer=enforcer)
+    request = AdkRequest(["screen me"])
+
+    class Context:
+        state = {"messages": ["a stored conversation"], "trust_score": 0.1}
+
+    with pytest.raises(SecurityBlockedError):
+        asyncio.run(callbacks["before_model_callback"](Context(), request))
+
+    seen = enforcer.states[0]
+    assert seen["trust_score"] == 0.1, "the rest of the session state still reaches the rule"
+    assert seen["messages"] == request.contents, "the screened messages must win the merge"
+
+
 def test_native_hook_trace_closes_on_cancellation():
     class Observer:
         def __init__(self):

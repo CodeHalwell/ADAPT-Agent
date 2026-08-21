@@ -53,11 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left as a `repr()` by `output_extractor=None`. Three shapes that would each
   have scored 0.0 across every column are handled by name: a LangGraph
   `response_format=` **state** (the answer is under `structured_response`,
-  beside `messages` and `remaining_steps`); a **single-field answer** like
+  beside `messages` and `remaining_steps` -- the whole shape is required, so an
+  ordinary field of that name is not peeled); a **single-field answer** like
   `{"result": "granted"}`, which is the answer rather than an envelope around
   one; and a declared output whose field happens to be *called* `answer` or
   `result`, which the generic attribute peel would have reduced to its own
-  value.
+  value. `extract_output_text` likewise leaves a declared output unchanged, so a
+  per-row `field_match` dispatched by `checks` still sees its fields.
 - `field_match(field, ...)` and `field_metrics([...])`: score a structured
   output per field, reported under the field's own name, so a report aggregates
   as a per-column table (`{"lane": 0.94, ..., "pack": 0.0}`) rather than one

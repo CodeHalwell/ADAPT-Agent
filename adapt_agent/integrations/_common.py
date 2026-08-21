@@ -106,7 +106,7 @@ def context_state(context: Any) -> dict[str, Any]:
     return {}
 
 
-def as_state(messages: Any, **extra: Any) -> dict[str, Any]:
+def as_state(messages: Any, /, **extra: Any) -> dict[str, Any]:
     """Shape framework messages into the mapping a policy rule expects.
 
     :meth:`GovernanceGate.review_input <adapt_agent.core.governance.GovernanceGate.review_input>`
@@ -114,6 +114,15 @@ def as_state(messages: Any, **extra: Any) -> dict[str, Any]:
     or a configured ``policy_enforcer`` is silently inert -- accepted, documented
     and doing nothing, which is the worst possible failure mode for a security
     control.
+
+    ``extra`` is the framework's own session or runtime state, splatted in by the
+    hooks. Its keys are arbitrary -- an app is free to keep one called
+    ``messages`` -- so the first parameter is **positional-only**: named
+    ``messages`` it would collide, and every benign request through the ADK and
+    OpenAI hooks would raise ``TypeError`` before governance ever ran. For the
+    same reason the messages being *screened* win the merge: a session's own
+    ``messages`` entry must not quietly replace the ones under inspection, or a
+    message-based rule evaluates something other than the request in hand.
     """
     if isinstance(messages, dict):
         state = dict(messages)
@@ -125,7 +134,9 @@ def as_state(messages: Any, **extra: Any) -> dict[str, Any]:
         state = {"messages": [], "context": {}}
     else:
         state = {"messages": [messages], "context": {}}
+    screened = state["messages"]
     state.update(extra)
+    state["messages"] = screened
     return state
 
 

@@ -166,6 +166,60 @@ def test_field_match_is_reachable_as_a_per_row_check():
     assert metric({"lane": "OTHER"}, {"lane": "NOS"}, example) == 0.0
 
 
+def test_per_row_field_check_survives_text_extraction_of_a_declared_model():
+    """Regression: the `checks` dispatcher runs on the *text*-extracted output.
+
+    `checks()` cannot be marked structural -- the row decides at runtime -- so
+    `evaluate_agent` keeps text extraction. The generic attribute peel then
+    reduced `Answer(answer="Paris")` to `"Paris"` before the per-row
+    `field_match("answer")` ran, and the field it scores was gone.
+    """
+
+    @dataclasses.dataclass
+    class Answer:
+        answer: str
+
+    class ModelAgent:
+        def run(self, _):
+            return Answer(answer="Paris")
+
+    rows = [
+        {
+            "input": "capital of France?",
+            "expected": {"answer": "Paris"},
+            "metadata": {"check": {"name": "field_match", "field": "answer"}},
+        }
+    ]
+    assert evaluate_agent(ModelAgent(), rows, metrics=checks()).aggregate == {"checks": 1.0}
+
+
+def test_a_recognised_shape_is_still_peeled_even_though_it_is_a_model():
+    """The declared-model check must not outrank the specific extractors here
+    either: a LangChain `AIMessage` is a Pydantic model *and* a chat message,
+    and text extraction must still reach its content."""
+
+    class AIMessage:
+        model_fields = {"content": None, "type": None}  # pydantic v2 marker
+        content = "hello there"
+        type = "ai"
+
+    assert extract_output_text(AIMessage()) == "hello there"
+
+
+def test_a_declared_model_survives_text_extraction_intact():
+    """Text extraction returns anything unrecognised unchanged. A declared
+    output was the exception, and only when a field happened to be *named* like
+    an envelope -- `Answer(answer=...)` flattened while `Triage(lane=...)`
+    survived, which is no contract at all."""
+
+    @dataclasses.dataclass
+    class Answer:
+        answer: str
+
+    got = extract_output_text(Answer(answer="Paris"))
+    assert isinstance(got, Answer) and got.answer == "Paris"
+
+
 # -- automatic extractor selection --------------------------------------------
 
 
@@ -498,6 +552,18 @@ def test_langgraph_structured_state_is_peeled_to_the_declared_answer():
     payload = extract_output_payload(state)
     assert payload == {"lane": "NOS", "matter": "M1"}
     assert field_match("lane")(payload, {"lane": "NOS"}) == 1.0
+
+
+def test_structured_response_outside_a_langgraph_state_is_left_alone():
+    """Regression: the LangGraph rule must not fire on any mapping with the key.
+
+    On its own `structured_response` is an ordinary field name. Peeling
+    `{"structured_response": {...}, "request_id": "42"}` drops the sibling
+    columns -- the very loss the multi-key rule exists to prevent.
+    """
+    answer = {"structured_response": {"status": "ok"}, "request_id": "42"}
+    assert extract_output_payload(answer) == answer
+    assert field_match("request_id")(extract_output_payload(answer), answer) == 1.0
 
 
 def test_a_plain_langgraph_state_is_untouched_by_the_structured_rule():

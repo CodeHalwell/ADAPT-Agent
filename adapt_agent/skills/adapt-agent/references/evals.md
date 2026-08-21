@@ -139,9 +139,14 @@ structured answers). Non-JSON text degrades to text rather than erroring.
 Two shapes are easy to get wrong and both used to score 0.0 across the board. A
 **LangGraph** graph built with `response_format=` returns a *state* —
 `{"messages": [...], "remaining_steps": N, "structured_response": {...}}` — and
-the declared output is peeled out of it. A **single-field answer** like
-`{"result": "granted"}` is the answer, not an envelope: only a conventional key
-holding something *structured* is peeled.
+the declared output is peeled out of it; the whole state shape is required, so a
+plain `{"structured_response": {...}, "request_id": "42"}` keeps both columns. A
+**single-field answer** like `{"result": "granted"}` is the answer, not an
+envelope: only a conventional key holding something *structured* is peeled.
+
+`extract_output_text` leaves a declared output unchanged, which is what lets a
+per-row `field_match` still see its fields — on the `checks` path the row picks
+the metric at runtime, so text extraction is the one in force.
 
 `evaluate_agent` selects it automatically when **every** metric is structural
 (`json_subset`, `field_match`). The all-or-nothing rule is deliberate: mixing a

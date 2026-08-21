@@ -72,8 +72,11 @@ _MAPPING_KEYS = (
 )
 
 #: Where LangGraph's ``create_react_agent(response_format=...)`` puts the
-#: declared structured output -- see ``AgentStateWithStructuredResponse``.
+#: declared structured output -- see ``AgentStateWithStructuredResponse``, whose
+#: keys are ``messages``, ``remaining_steps`` and ``structured_response``. Both
+#: are required before the state is peeled; see :func:`_unwrap_envelope`.
 _STRUCTURED_STATE_KEY = "structured_response"
+_MESSAGES_KEY = "messages"
 
 #: Conventional attribute names carrying the final output, tried in order.
 _ATTR_NAMES = (
@@ -378,10 +381,15 @@ def _unwrap_envelope(value: Any, depth: int) -> Any:
         # ``response_format=`` returns a *state* -- ``{"messages": [...],
         # "remaining_steps": N, "structured_response": <the answer>}`` -- so the
         # single-key test below never fires and every field metric would score
-        # 0.0 against the state rather than the answer inside it.
-        declared = value.get(_STRUCTURED_STATE_KEY)
-        if declared is not None and not _is_scalar(declared):
-            return _unwrap_envelope(declared, depth - 1)
+        # 0.0 against the state rather than the answer inside it. The whole
+        # state shape is required, not just the key: on its own
+        # ``structured_response`` is an ordinary field name, and peeling
+        # ``{"structured_response": {...}, "request_id": "42"}`` would lose the
+        # sibling columns -- the very mistake the multi-key rule exists to avoid.
+        if _MESSAGES_KEY in value:
+            declared = value.get(_STRUCTURED_STATE_KEY)
+            if declared is not None and not _is_scalar(declared):
+                return _unwrap_envelope(declared, depth - 1)
         if len(value) == 1:
             (key,) = value.keys()
             inner = value[key]
@@ -452,22 +460,28 @@ def _is_scalar(value: Any) -> bool:
     return value is None or isinstance(value, (str, bytes, int, float, bool))
 
 
-def _declared_model_to_dict(value: Any) -> dict[str, Any] | None:
-    """Convert an object that *declares* itself structured, else ``None``.
+def _is_declared_model(value: Any) -> bool:
+    """Whether ``value`` *advertises* its own fields -- a dataclass or a model.
 
-    Deliberately narrower than :func:`_model_to_dict`: only dataclasses and
-    Pydantic models (which advertise their fields) qualify. A framework result
-    object that merely happens to expose ``dict()`` must still go through the
+    Deliberately narrower than "has a ``dict()`` method": a framework result
+    object that merely happens to expose one must still go through the
     registered extractors, or unwrapping would stop one layer too early.
     """
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return True
+    return hasattr(value, "model_fields") or hasattr(value, "__fields__")  # pydantic v2 / v1
+
+
+def _declared_model_to_dict(value: Any) -> dict[str, Any] | None:
+    """Convert an object that declares itself structured, else ``None``."""
+    if not _is_declared_model(value):
+        return None
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         try:
             return {f.name: getattr(value, f.name, None) for f in dataclasses.fields(value)}
         except Exception:
             return None
-    if hasattr(value, "model_fields") or hasattr(value, "__fields__"):  # pydantic v2 / v1
-        return _model_to_dict(value)
-    return None
+    return _model_to_dict(value)
 
 
 def _model_to_dict(value: Any) -> dict[str, Any] | None:
@@ -513,6 +527,8 @@ def _extract(value: Any, depth: int) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return _extract_sequence(value, depth)
     for _, predicate, unwrap in (*_CUSTOM_EXTRACTORS, *_BUILTIN_EXTRACTORS):
+        if unwrap is _unwrap_object_attrs:
+            continue  # the catch-all runs last, after the declared-model check
         try:
             if not predicate(value):
                 continue
@@ -521,6 +537,20 @@ def _extract(value: Any, depth: int) -> Any:
             continue
         if inner is None or inner is value:
             continue
+        return _extract(inner, depth - 1)
+    # A declared structured output is not a wrapper around text, so it comes
+    # back **unchanged** -- the documented behaviour for anything unrecognised,
+    # and what lets a per-row `field_match` still see its fields. Only the
+    # generic attribute peel would flatten it, and only when a field happens to
+    # be *named* like an envelope: `Answer(answer="Paris")` became `"Paris"`
+    # while `Triage(lane="NOS")` survived, which is no contract at all. The
+    # check sits after the specific extractors because plenty of recognised
+    # shapes are declared too -- a LangChain `AIMessage` is a Pydantic model,
+    # and it must still be peeled to its content.
+    if _is_declared_model(value):
+        return value
+    inner = _unwrap_object_attrs(value)
+    if inner is not None and inner is not value:
         return _extract(inner, depth - 1)
     return value
 
