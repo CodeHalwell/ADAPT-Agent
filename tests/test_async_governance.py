@@ -78,6 +78,50 @@ def test_execute_still_works_for_sync_callers():
     assert guarded.execute(_payload("hi")) == {"result": "echo:hi"}
 
 
+def test_a_coroutine_returning_a_stream_is_drained():
+    """An async run method is often a coroutine that *returns* a stream.
+
+    Stopping at the first await handed the live generator to output screening,
+    which then found no text to screen, and to the caller, which got a generator
+    where the envelope documents a materialised list.
+    """
+
+    class Agent:
+        def invoke(self, payload):
+            raise AssertionError("aexecute must not use the sync entry point")
+
+        async def ainvoke(self, payload):
+            async def stream():
+                yield "part one"
+                yield "part two"
+
+            return stream()
+
+    guarded = LangGraphAdapter().wrap_agent(Agent())
+    assert asyncio.run(guarded.aexecute({"messages": []}))["result"] == ["part one", "part two"]
+
+
+def test_a_nested_stream_is_screened_before_it_reaches_the_caller():
+    """The drain matters for governance, not only for the returned type."""
+    firewall = Firewall()
+    firewall.add_blocked_pattern(r"(?i)hunter2")
+
+    class Agent:
+        def invoke(self, payload):
+            raise AssertionError("aexecute must not use the sync entry point")
+
+        async def ainvoke(self, payload):
+            async def stream():
+                yield "all fine"
+                yield "the password is hunter2"
+
+            return stream()
+
+    guarded = LangGraphAdapter(firewall=firewall).wrap_agent(Agent())
+    with pytest.raises(SecurityBlockedError):
+        asyncio.run(guarded.aexecute({"messages": []}))
+
+
 def test_a_blocked_output_is_traced_as_an_error():
     """Telemetry must not record success for a run the caller saw fail.
 

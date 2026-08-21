@@ -355,6 +355,56 @@ def test_claude_hooks_block_tool_input_injection():
 
 
 @pytest.mark.skipif(not _installed("claude_agent_sdk"), reason="claude-agent-sdk not installed")
+def test_claude_hooks_screen_tool_results_not_only_tool_inputs():
+    """`PreToolUse` catches an injection only if the model *reuses* it.
+
+    Whatever a tool fetched from the open web returns through `PostToolUse`. If
+    the model simply reads the page and answers, nothing else ever sees that
+    content -- the same gap closed on the ADK side.
+    """
+    from adapt_agent.integrations import claude_agent as ca
+
+    hooks = ca.governance_hooks(firewall=_firewall(), agent_id="assistant")
+    assert "PostToolUse" in hooks, "a tool result must be governed by default"
+
+    callback = hooks["PostToolUse"][0].hooks[0]
+
+    def verdict(response):
+        payload = {
+            "tool_name": "WebFetch",
+            "tool_input": {"url": "http://example.test"},
+            "tool_response": response,
+        }
+        return asyncio.run(callback(payload, "id", {}))
+
+    blocked = verdict({"content": INJECTION})
+    assert blocked["decision"] == "block"
+    assert "assistant" in blocked["reason"]
+    assert verdict({"content": "the weather is fine"}) == {}
+
+
+@pytest.mark.skipif(not _installed("claude_agent_sdk"), reason="claude-agent-sdk not installed")
+def test_a_tool_matcher_is_not_attached_to_a_prompt_event():
+    """A matcher is a *tool name*, so it belongs only to tool-scoped events.
+
+    Attaching `matcher="Bash"` to `UserPromptSubmit` describes a prompt event
+    that can never match -- which would silently disable prompt screening, the
+    documented default. The factory's own docstring already said the matcher was
+    for tool-scoped events while the code applied it to every one.
+    """
+    from adapt_agent.integrations import claude_agent as ca
+
+    hooks = ca.governance_hooks(firewall=_firewall(), matcher="Bash|WebFetch")
+    assert hooks["UserPromptSubmit"][0].matcher is None
+    for event in ("PreToolUse", "PostToolUse"):
+        assert hooks[event][0].matcher == "Bash|WebFetch"
+
+    # And the prompt hook still screens with a matcher configured.
+    callback = hooks["UserPromptSubmit"][0].hooks[0]
+    assert asyncio.run(callback({"prompt": INJECTION}, "id", {}))["decision"] == "block"
+
+
+@pytest.mark.skipif(not _installed("claude_agent_sdk"), reason="claude-agent-sdk not installed")
 def test_a_claude_refusal_names_the_resolved_agent():
     """A shared gate's own label must reach the refusal reason.
 

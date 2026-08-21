@@ -103,6 +103,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Claude tool *result* was never screened.** Only `UserPromptSubmit` and
+  `PreToolUse` were governed by default, so whatever a tool fetched from the
+  open web reached the model unscreened unless it happened to be copied into a
+  *subsequent* tool call. `PostToolUse` joins the defaults -- the same gap
+  closed on the ADK side.
+- **A tool matcher silently disabled prompt screening.** `matcher=` is a tool
+  name, and it was attached to every governed event including
+  `UserPromptSubmit`, describing a prompt event that can never match. It now
+  applies to tool-scoped events only, which is what the parameter's own
+  documentation already said.
+- **A coroutine returning a stream was not drained.** `aexecute` awaited once
+  and handed the still-live async generator on, so output screening found no
+  text and the caller received a generator where the envelope documents a list.
+  The awaited value is resolved recursively.
 - **A handoff target's input governance never ran.** The OpenAI Agents SDK runs
   input guardrails for the *starting* agent of a run only (`run.py` gates them
   on `current_turn == 0`), so a specialist reached by a handoff had its

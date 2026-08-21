@@ -103,7 +103,11 @@ async def _aresolve_result(value: Any) -> Any:
     if isinstance(value, AsyncIterable):
         return [item async for item in value]
     if inspect.isawaitable(value):
-        return await value
+        # Recursively: an async run method is often a coroutine that *returns* a
+        # stream rather than being one, and stopping at the first await handed
+        # the live generator to output screening -- which found no text, and to
+        # the caller, which got a generator where the envelope documents a list.
+        return await _aresolve_result(await value)
     if inspect.isgenerator(value):
         return list(value)
     return value

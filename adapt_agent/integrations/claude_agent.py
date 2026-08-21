@@ -15,14 +15,16 @@ A hook is ``async (input, tool_use_id, context) -> HookJSONOutput``; returning
 why, which is a materially better outcome than an exception: the agent sees the
 refusal and can respond to it rather than the run dying.
 
-Two events are governed by default:
+Three events are governed by default:
 
 * ``UserPromptSubmit`` -- screens the prompt before the model sees it.
-* ``PreToolUse`` -- screens **tool inputs**. This is the one an outer wrapper
-  cannot reach at all. A Claude agent loops through many tool calls inside a
-  single ``query()``; content fetched by one tool becomes the input to the next,
-  so a prompt injection arriving in a fetched web page is caught here and
-  nowhere else.
+* ``PreToolUse`` -- screens **tool inputs**, which an outer wrapper cannot reach
+  at all.
+* ``PostToolUse`` -- screens **tool results**. A Claude agent loops through many
+  tool calls inside a single ``query()``, and whatever a tool fetched from the
+  open web comes back to the model here. ``PreToolUse`` catches an injection
+  only if the model copies it into a *subsequent* tool call; if it simply reads
+  the page and answers, nothing else sees the content.
 """
 
 from __future__ import annotations
@@ -38,7 +40,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from adapt_agent.security.firewall import Firewall
 
 #: Hook events governed unless ``events=`` narrows them.
-DEFAULT_EVENTS = ("UserPromptSubmit", "PreToolUse")
+DEFAULT_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse")
+
+#: Events whose ``matcher`` is a *tool name* (``"Bash"``, ``"Write|Edit"``).
+#: A matcher is meaningless on any other event and must not be attached to one:
+#: a tool-name matcher on ``UserPromptSubmit`` describes a prompt event that can
+#: never match, which would silently disable prompt screening.
+_TOOL_SCOPED_EVENTS = ("PreToolUse", "PostToolUse")
 
 
 def governance_hooks(
@@ -63,7 +71,10 @@ def governance_hooks(
         agent_id: Included in the block reason.
         events: Which hook events to register. Defaults to ``UserPromptSubmit``
             and ``PreToolUse``.
-        matcher: Optional matcher for tool-scoped events, e.g. ``"Bash"`` or
+        matcher: Optional tool-name matcher, applied to tool-scoped events
+            (``PreToolUse``/``PostToolUse``) only -- a prompt event has no tool
+            name, so attaching one there would filter the hook out and leave the
+            prompt unscreened. E.g. ``"Bash"`` or
             ``"Write|Edit"``. ``None`` matches everything.
 
     Returns:
@@ -101,7 +112,14 @@ def governance_hooks(
         }
 
     return {
-        event: [sdk.HookMatcher(matcher=matcher, hooks=[adapt_governance_hook])] for event in events
+        event: [
+            sdk.HookMatcher(
+                # Only a tool-scoped event has a tool name to match on.
+                matcher=matcher if event in _TOOL_SCOPED_EVENTS else None,
+                hooks=[adapt_governance_hook],
+            )
+        ]
+        for event in events
     }
 
 

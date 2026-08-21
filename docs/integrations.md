@@ -96,9 +96,17 @@ options = ClaudeAgentOptions(hooks=governance_hooks(firewall=fw))
 ```
 
 `UserPromptSubmit` screens the prompt; `PreToolUse` screens **tool inputs**,
-which an outer wrapper cannot reach at all — a Claude agent loops through many
-tool calls inside one `query()`, and content fetched by one tool becomes the
-input to the next.
+which an outer wrapper cannot reach at all; `PostToolUse` screens **tool
+results**. A Claude agent loops through many tool calls inside one `query()`,
+and whatever a tool fetched from the open web comes back through `PostToolUse` —
+`PreToolUse` alone catches an injection only if the model copies it into a
+*subsequent* tool call, so an agent that simply reads a page and answers would
+never have it screened.
+
+`matcher=` is a **tool name** (`"Bash"`, `"Write|Edit"`), so it is applied to
+`PreToolUse`/`PostToolUse` only. Attaching one to `UserPromptSubmit` would
+describe a prompt event that can never match, silently disabling prompt
+screening.
 
 Hooks return `{"decision": "block", "reason": ...}`, so the model sees the
 refusal and can respond to it rather than the run dying.
