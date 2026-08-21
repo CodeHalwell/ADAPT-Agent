@@ -488,3 +488,199 @@ def test_an_incomplete_trial_is_not_eligible_to_win() -> None:
         (1.0, False, False),
         (0.5, True, True),
     ]
+
+
+# -- completeness reaches every path that ranks on score ----------------------
+#
+# Guarding `_record` alone is not enough: it only protects the *global best*.
+# An incomplete report reaching any other comparison lets throttling steer the
+# search from a different direction.
+
+
+def _throttle_on(*inputs):
+    marked = set(inputs)
+
+    def agent(payload):
+        if payload in marked:
+            raise RuntimeError("429 Too Many Requests")
+        return "ok"
+
+    return agent
+
+
+def test_an_incomplete_baseline_is_re_run_before_seeding_the_search() -> None:
+    """The baseline never passes through `_record`, and everything is measured
+    against it. A throttled baseline sets `best_score` over its survivors, so no
+    fully-evaluated candidate can beat it and the search returns the starting
+    config -- indistinguishable from "nothing improved on your prompt".
+    """
+    from adapt_agent.optimization.optimizers import Optimizer
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+    evaluations = {"n": 0}
+
+    class _Harness(EvaluationHarness):
+        def evaluate(self, agent, data, **kwargs):
+            evaluations["n"] += 1
+            # Throttled the first time, healthy on the re-run.
+            target = _throttle_on("hard") if evaluations["n"] == 1 else (lambda p: "ok")
+            return super().evaluate(target, data, **kwargs)
+
+    class _Probe(Optimizer):
+        strategy_name = "probe"
+
+        def __init__(self, harness):
+            self.harness = harness
+            self.verbose = False
+
+        def optimize(self, *args, **kwargs):  # pragma: no cover - not exercised
+            raise NotImplementedError
+
+    harness = _Harness([exact_match()], retry=RetryPolicy(attempts=1))
+    report = _Probe(harness)._evaluate_baseline(object(), dataset)
+
+    assert evaluations["n"] == 2, "an incomplete baseline was accepted without a re-run"
+    assert report.is_complete is True
+    assert report.score == 1.0
+
+
+def test_a_baseline_that_stays_incomplete_still_returns_but_says_so(caplog) -> None:
+    """There is nothing to fall back to, so the run continues -- loudly."""
+    import logging
+
+    from adapt_agent.optimization.optimizers import Optimizer
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+
+    class _Probe(Optimizer):
+        strategy_name = "probe"
+
+        def __init__(self, harness):
+            self.harness = harness
+            self.verbose = False
+
+        def optimize(self, *args, **kwargs):  # pragma: no cover - not exercised
+            raise NotImplementedError
+
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+    probe = _Probe(harness)
+    with caplog.at_level(logging.ERROR):
+        report = probe._evaluate_baseline(_throttle_on("hard"), dataset)
+
+    assert report.is_complete is False
+    assert any("still incomplete" in r.message for r in caplog.records)
+
+
+def test_an_incomplete_candidate_is_not_bred_from_in_an_evolutionary_search() -> None:
+    """`_record` bars it from winning; this bars it from parenting.
+
+    Survivors are chosen from `_score_population`'s list, so leaving an
+    incomplete candidate in it lets a score measured over an easier subset
+    direct the whole search.
+    """
+    from adapt_agent.optimization.optimizers import EvolutionaryOptimizer, _SearchState
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+
+    class _Harness(EvaluationHarness):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.calls = 0
+
+        def evaluate(self, agent, data, **kwargs):
+            self.calls += 1
+            # First config is throttled on the hard row (scores 1.0 over one
+            # row); the second is fully evaluated and imperfect (0.5).
+            target = (
+                _throttle_on("hard")
+                if self.calls == 1
+                else (lambda p: "ok" if p == "easy" else "wrong")
+            )
+            return super().evaluate(target, data, **kwargs)
+
+    class _Target:
+        """The bare surface `_eval_config` touches."""
+
+        def restore(self, snapshot):
+            pass
+
+        def apply(self, config):
+            pass
+
+    harness = _Harness([exact_match()], retry=RetryPolicy(attempts=1))
+    optimizer = EvolutionaryOptimizer(harness=harness)
+    optimizer.verbose = False
+    optimizer._baseline_snapshot = {}
+    state = _SearchState(
+        best_config={}, best_score=0.0, best_report=None, baseline_snapshot={}, history=[]
+    )
+
+    scored = optimizer._score_population(
+        _Target(), dataset, state, [{"p": "throttled"}, {"p": "complete"}]
+    )
+
+    assert [cfg for cfg, _ in scored] == [
+        {"p": "complete"}
+    ], "the incomplete candidate survived into the breeding pool"
+    # It is still recorded in the history, just not ranked.
+    assert len(state.history) == 2
+    assert [t.complete for t in state.history] == [False, True]
+
+
+# -- metric retry honours the configured policy -------------------------------
+
+
+def test_a_provider_backed_custom_metric_is_retried() -> None:
+    """Not just `LLMJudge`: any metric may be a network call."""
+    from adapt_agent.optimization.metrics import Metric
+
+    calls = {"n": 0}
+
+    def flaky(output, expected):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RuntimeError("429 Too Many Requests")
+        return 1.0
+
+    report = EvaluationHarness([Metric("custom", flaky)], retry=FAST).evaluate(
+        lambda x: "ok", _dataset()
+    )
+    assert calls["n"] > 3, "a transient metric failure was classified but never retried"
+    assert report.score == 1.0
+    assert report.n_transient_errors == 0
+
+
+def test_a_custom_classifier_governs_metric_failures_too() -> None:
+    """`RetryPolicy(is_transient=...)` must not be bypassed for metrics."""
+    from adapt_agent.optimization.metrics import Metric
+
+    policy = RetryPolicy(
+        attempts=2,
+        initial_backoff=0.001,
+        jitter=0.0,
+        is_transient=lambda exc: "SQUELCH" in str(exc),
+    )
+
+    def squelch(output, expected):
+        raise RuntimeError("SQUELCH: provider hiccup")
+
+    report = EvaluationHarness([Metric("custom", squelch)], retry=policy).evaluate(
+        lambda x: "ok", _dataset()
+    )
+    assert report.n_transient_errors == 3, "the custom classifier was ignored"
+
+    def plain_429(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    # ...and the converse: the default classifier no longer applies.
+    narrow = EvaluationHarness([Metric("custom", plain_429)], retry=policy).evaluate(
+        lambda x: "ok", _dataset()
+    )
+    assert narrow.n_transient_errors == 0
+    assert len(narrow.failures()) == 3

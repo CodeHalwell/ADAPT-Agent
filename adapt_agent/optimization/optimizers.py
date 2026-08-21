@@ -363,7 +363,7 @@ class Optimizer:
             raise ValueError("Cannot optimize against an empty dataset")
 
         baseline_snapshot = target.snapshot()
-        baseline_report = self.harness.evaluate(target, dataset)
+        baseline_report = self._evaluate_baseline(target, dataset)
         baseline_score = baseline_report.score
         if self.verbose:
             logger.info("[%s] baseline score=%.4f", self.strategy_name, baseline_score)
@@ -430,6 +430,45 @@ class Optimizer:
             target.apply(config)
         report = self.harness.evaluate(target, dataset)
         return report
+
+    def _evaluate_baseline(
+        self, target: OptimizableAgent, dataset: GoldenDataset
+    ) -> EvaluationReport:
+        """Evaluate the starting configuration, re-running an incomplete result.
+
+        The baseline never passes through :meth:`_record`, so the completeness
+        invariant enforced there does not reach it -- and the baseline is the
+        one score every candidate is measured against. A baseline throttled on a
+        hard row scores over its survivors, sets ``best_score`` too high, and no
+        fully-evaluated candidate can beat it: the search then returns the
+        starting config as the winner, which looks like "nothing improved on
+        your prompt" rather than like a broken run.
+
+        A baseline is re-run rather than rejected, because there is nothing to
+        fall back to. If it is still incomplete the run continues -- refusing to
+        start would be worse than a noisy comparison -- but says so loudly.
+        """
+        report = self.harness.evaluate(target, dataset)
+        if report.is_complete:
+            return report
+        logger.warning(
+            "[%s] baseline scored %.4f over %d of %d rows (%d transient failures); re-running",
+            self.strategy_name,
+            report.score,
+            report.n - report.n_transient_errors,
+            report.n,
+            report.n_transient_errors,
+        )
+        retried = self.harness.evaluate(target, dataset)
+        if not retried.is_complete:
+            logger.error(
+                "[%s] baseline is still incomplete after a re-run (%d transient failures). "
+                "Every candidate is compared against it, so these results are unreliable: "
+                "lower the concurrency or wait for the provider to recover.",
+                self.strategy_name,
+                retried.n_transient_errors,
+            )
+        return retried
 
     def _record(
         self,
@@ -838,6 +877,13 @@ class EvolutionaryOptimizer(Optimizer):
             seen.add(key)
             report = self._eval_config(target, config, dataset)
             self._record(state, config, report)
+            if not report.is_complete:
+                # `_record` only guards the global best. Survivors and parents
+                # are chosen from *this* list, so an incomplete candidate left
+                # in it would breed from a score measured over an easier subset
+                # -- throttling would steer the search even while being barred
+                # from winning it.
+                continue
             scored.append((config, report.score))
         scored.sort(key=lambda cs: cs[1], reverse=True)
         return scored
@@ -871,7 +917,7 @@ class PipelineOptimizer(Optimizer):
     ) -> OptimizationResult:
         target = wrap(agent, runner=runner, components=components, parameters=parameters)
         baseline_snapshot = target.snapshot()
-        baseline_score = self.harness.evaluate(target, dataset).score
+        baseline_score = self._evaluate_baseline(target, dataset).score
 
         combined_history: list[Trial] = []
         combined_recommendations: list[str] = []

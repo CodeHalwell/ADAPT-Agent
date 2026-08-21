@@ -28,7 +28,6 @@ from adapt_agent.optimization.metrics import Metric, MetricFn, coerce_metric
 from adapt_agent.optimization.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
-    is_transient_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -581,26 +580,9 @@ class EvaluationHarness:
         scores: dict[str, float] = {}
         transient = False
         for metric in self.metrics:
-            try:
-                scores[metric.name] = metric(output, example.expected, example)
-            except Exception as exc:
-                # A metric can be a network call too -- an LLM judge is the
-                # documented default for open-ended tasks. Throttling *there*
-                # biases candidate selection exactly as throttling on the agent
-                # call does, so it gets the same treatment: the row is dropped
-                # from the score rather than counted against the agent.
-                if is_transient_error(exc):
-                    logger.warning(
-                        "Metric %s failed transiently on example %d; excluded from the "
-                        "score rather than counted against the agent: %s",
-                        metric.name,
-                        index,
-                        exc,
-                    )
-                    transient = True
-                else:
-                    logger.warning("Metric %s raised on example %d: %s", metric.name, index, exc)
-                scores[metric.name] = 0.0
+            score, metric_transient = self._score_with_metric(metric, output, example, index)
+            scores[metric.name] = score
+            transient = transient or metric_transient
 
         return ExampleResult(
             index=index,
@@ -613,6 +595,60 @@ class EvaluationHarness:
             transient=transient,
             attempts=attempts,
         )
+
+    def _score_with_metric(
+        self, metric: Metric, output: Any, example: Example, index: int
+    ) -> tuple[float, bool]:
+        """Apply one metric, retrying it on transient failures.
+
+        A metric is free to be a network call -- an LLM judge is the documented
+        default for open-ended tasks -- so throttling *here* biases candidate
+        selection exactly as throttling on the agent call does. It therefore
+        gets the same treatment, and through the same configured policy: a
+        custom ``RetryPolicy(is_transient=...)`` governs metric calls too, and a
+        provider-backed metric that is not :class:`LLMJudge` still gets its
+        retries rather than one attempt.
+
+        Returns ``(score, transient)``. A transient failure that outlives its
+        retries scores ``0.0`` *and* flags the row, so the caller can drop it
+        from the aggregate instead of counting it against the agent.
+        """
+        policy = self.retry
+        attempt = 1
+        while True:
+            try:
+                return metric(output, example.expected, example), False
+            except Exception as exc:
+                if policy.should_retry(exc, attempt):
+                    delay = policy.delay_for(exc, attempt)
+                    logger.info(
+                        "Metric %s hit a transient error on example %d (attempt %d/%d), "
+                        "retrying in %.2fs: %s",
+                        metric.name,
+                        index,
+                        attempt,
+                        policy.attempts,
+                        delay,
+                        exc,
+                    )
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+                # `should_retry` is False either because the error is not
+                # transient or because the attempts are spent; only the second
+                # marks the row, so ask the policy's own classifier which it is.
+                if policy.should_retry(exc, 0):
+                    logger.warning(
+                        "Metric %s failed transiently on example %d after %d attempt(s); "
+                        "excluded from the score rather than counted against the agent: %s",
+                        metric.name,
+                        index,
+                        attempt,
+                        exc,
+                    )
+                    return 0.0, True
+                logger.warning("Metric %s raised on example %d: %s", metric.name, index, exc)
+                return 0.0, False
 
     def _build_report(self, results_iter: Any) -> EvaluationReport:
         """Aggregate a stream of per-example results into a report."""
