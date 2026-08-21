@@ -320,11 +320,23 @@ class GovernedAdapter(BaseAdapter):
             AdapterError: If no runnable entry point can be resolved.
         """
         if not self.validate_agent(agent):
+            # An adapter with no run_method_names wraps a *callable* by design
+            # (Google ADK: a run needs session/user arguments, so there is no
+            # zero-argument method to bind). Saying "expected one of ''" there
+            # reads as a broken adapter rather than as the wrong argument.
+            expected = (
+                f"Expected one of {', '.join(self.run_method_names)!r} or a plain callable."
+                if self.run_method_names
+                else (
+                    "This adapter takes a plain callable -- one you write that performs "
+                    "the run and returns (or yields) its result -- because the framework's "
+                    "own entry point needs arguments the adapter cannot supply."
+                )
+            )
             raise AdapterError(
                 f"{type(self).__name__}.wrap_agent could not find a runnable entry "
-                f"point on the supplied object. Expected one of "
-                f"{', '.join(self.run_method_names)!r} or a plain callable. See the "
-                f"adapter docstring for the object to wrap."
+                f"point on the supplied {type(agent).__name__}. {expected} "
+                f"See the adapter docstring for the object to wrap."
             )
         return _GovernedAgent(agent, self)
 

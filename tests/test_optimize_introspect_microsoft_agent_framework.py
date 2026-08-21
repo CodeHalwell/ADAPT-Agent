@@ -1,8 +1,10 @@
 """Tests for the Microsoft Agent Framework optimization introspector.
 
-These tests use plain fake classes mimicking a Microsoft ``ChatAgent`` attribute
-shape (an ``instructions`` string, a ``chat_client`` object, a callable ``run``);
-the real ``agent_framework`` package is never imported.
+Most tests here use plain fake classes mimicking a Microsoft agent's attribute
+shape. ``test_real_agent_framework_agent_is_introspectable`` is the exception:
+it imports the real ``agent_framework`` when installed, because a fake can only
+encode what the SDK looked like when the fake was written -- which is exactly
+how the ``.client`` / ``default_options`` move slipped past this suite.
 """
 
 import importlib.util

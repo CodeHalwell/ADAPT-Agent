@@ -1,10 +1,16 @@
 """Tests for the Claude Agent SDK optimization introspector.
 
-These tests use plain fake objects mimicking the ``ClaudeAgentOptions``
-attribute shape; the real ``claude_agent_sdk`` package is never imported.
+Most tests here use plain fake objects mimicking the ``ClaudeAgentOptions``
+attribute shape. ``test_real_claude_agent_options_is_introspectable`` is the
+exception: it imports the real ``claude_agent_sdk`` when installed, because a
+fake can only ever encode what the SDK looked like when the fake was written --
+which is exactly how the ``agents`` field slipped past this suite.
 """
 
+import importlib.util
 import types
+
+import pytest
 
 from adapt_agent.optimization.introspection import detect, introspect
 from adapt_agent.optimization.introspection.claude_agent import _predicate
@@ -31,10 +37,57 @@ def test_predicate_false_for_unrelated_object() -> None:
 
 
 def test_predicate_false_for_other_framework() -> None:
-    # Other frameworks carry handoffs/agents/instructions/etc.
-    foreign = types.SimpleNamespace(system_prompt="x", allowed_tools=[], handoffs=[])
+    """A *populated* foreign marker still rejects the object.
+
+    Populated, not merely present: see
+    `test_an_unset_foreign_attribute_does_not_block_detection`.
+    """
+    foreign = types.SimpleNamespace(system_prompt="x", allowed_tools=[], handoffs=["billing_agent"])
     assert _predicate(foreign) is False
     assert detect(foreign) is None
+
+
+def test_an_unset_foreign_attribute_does_not_block_detection() -> None:
+    """`ClaudeAgentOptions` declares some foreign names itself, unset.
+
+    The SDK grew an `agents` field (default None) for subagent definitions. A
+    bare `hasattr` veto then rejected every real options object -- `detect`
+    returned None, `introspect` returned [], and the whole framework looked like
+    it had no tunable knobs. An attribute that exists but holds nothing is not
+    evidence of another framework.
+    """
+    options = types.SimpleNamespace(
+        system_prompt="You are helpful.", allowed_tools=["Read"], agents=None
+    )
+    assert _predicate(options) is True
+    assert detect(options) == "claude_agent"
+    assert any(p.kind is ParameterKind.PROMPT for p in introspect(options))
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("claude_agent_sdk") is None,
+    reason="claude-agent-sdk is not installed",
+)
+def test_real_claude_agent_options_is_introspectable() -> None:
+    """Introspect an actual SDK options object, not a fake of one.
+
+    Every fake here is a guess at the SDK's shape, and a stale guess fails
+    silently rather than loudly. This is the only test that catches the next
+    field the SDK adds.
+    """
+    import claude_agent_sdk  # type: ignore[import-not-found]
+
+    options = claude_agent_sdk.ClaudeAgentOptions(
+        system_prompt="You are helpful.", allowed_tools=["Read", "Grep"]
+    )
+    assert detect(options) == "claude_agent"
+
+    params = {p.name: p for p in introspect(options)}
+    prompt = params["agent.system_prompt"]
+    assert prompt.kind is ParameterKind.PROMPT
+    assert prompt.value == "You are helpful."
+    prompt.write("Be terse.")
+    assert options.system_prompt == "Be terse."
 
 
 def test_introspect_param_names_and_kinds() -> None:

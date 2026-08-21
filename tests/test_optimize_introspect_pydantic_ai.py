@@ -6,6 +6,10 @@ have the expected names/kinds, the system-prompt setter mutates the live object,
 and the predicate rejects unrelated objects. No network, no framework import.
 """
 
+import importlib.util
+
+import pytest
+
 from adapt_agent.optimization.introspection import detect, introspect
 from adapt_agent.optimization.introspection.pydantic_ai import _predicate
 from adapt_agent.optimization.parameters import ParameterKind
@@ -138,3 +142,33 @@ def test_public_system_prompt_attr() -> None:
     params = {p.name: p for p in introspect(agent)}
     params["agent.system_prompt"].write("new")
     assert agent.system_prompt == "new"
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("pydantic_ai") is None,
+    reason="pydantic-ai is not installed",
+)
+@pytest.mark.parametrize("kwarg", ["instructions", "system_prompt"])
+def test_a_real_agent_binds_whichever_prompt_field_it_was_built_with(kwarg: str) -> None:
+    """Pydantic AI has two prompt fields and fills only the one you used.
+
+    `Agent(system_prompt=...)` fills `_system_prompts`; `Agent(instructions=...)`
+    -- the modern spelling -- fills `_instructions` and leaves the other empty.
+    Binding `_system_prompts` unconditionally was worse than finding nothing on
+    an `instructions=` agent: the optimizer got a prompt knob whose value was
+    `''` and whose writes landed in a field the agent never reads, so a sweep
+    ran to completion and reported improvements that could not exist.
+    """
+    import pydantic_ai  # type: ignore[import-not-found]
+
+    agent = pydantic_ai.Agent("test", **{kwarg: "You are terse."})
+
+    prompts = [p for p in introspect(agent) if p.kind is ParameterKind.PROMPT]
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    assert prompt.value == "You are terse.", "bound the empty field, not the populated one"
+
+    prompt.write("Be brief.")
+    assert prompt.read() == "Be brief."
+    populated = "_instructions" if kwarg == "instructions" else "_system_prompts"
+    assert list(getattr(agent, populated)) == ["Be brief."]

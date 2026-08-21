@@ -31,9 +31,16 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from adapt_agent.optimization.retry import (
+    DEFAULT_RETRY_POLICY,
+    RetryPolicy,
+    is_transient_error,
+)
 
 if TYPE_CHECKING:
     from adapt_agent.optimization.providers import ModelProvider
@@ -211,6 +218,7 @@ class LLMJudge:
         on_error: float = 0.0,
         adversarial: bool = False,
         score_is_normalized: bool = False,
+        retry: RetryPolicy | None = None,
     ):
         # Coerce providers / names / callables to a single completion callable.
         from adapt_agent.optimization.providers import as_provider
@@ -220,6 +228,7 @@ class LLMJudge:
         else:
             self.complete = complete
         self.rubric = rubric
+        self.retry = DEFAULT_RETRY_POLICY if retry is None else retry
         self.pass_threshold = pass_threshold
         self.scale = max(1, int(scale))
         self.max_failures = max(1, int(max_failures))
@@ -498,18 +507,58 @@ class LLMJudge:
         """Call the completion function.
 
         Passes ``system`` (rubric/instructions) to the provider when supported.
-        Logs exceptions; re-raises auth/permission errors so a misconfigured key
-        fails loudly; returns ``None`` for other (transient) errors.
+
+        Three outcomes, deliberately different:
+
+        * **Auth/permission errors re-raise immediately.** A misconfigured key
+          should fail loudly, not score every example zero.
+        * **Transient errors are retried, then re-raised.** A judge's provider
+          call is a network round trip, and under concurrency a 429 there is as
+          likely as one on the agent call. Swallowing it into ``on_error``
+          scored the *candidate* zero for the *provider's* congestion -- the
+          same measurement bug the harness fixes on the agent side, reached by a
+          different route, and the one the documented optimizer example (which
+          grades with ``LLMJudge.as_metric()``) actually hits. Re-raising lets
+          the harness classify the row as transient and drop it from the score
+          instead of counting it against the prompt.
+        * **Anything else returns ``None``**, which the caller turns into
+          ``on_error`` -- a judge that reliably returns garbage is a real
+          failure of this configuration.
         """
-        try:
-            result = self._invoke(prompt, system)
-        except Exception as exc:  # noqa: BLE001 -- classify then re-raise or swallow
-            name = type(exc).__name__
-            if any(tag in name for tag in ("Authentication", "Permission", "InvalidAPIKey")):
-                logger.error("Judge completion failed with auth/permission error: %s", exc)
-                raise
-            logger.warning("Judge completion failed (transient), returning None: %s", exc)
-            return None
+        policy = self.retry
+        attempt = 1
+        while True:
+            try:
+                result = self._invoke(prompt, system)
+                break
+            except Exception as exc:  # noqa: BLE001 -- classify, then act
+                name = type(exc).__name__
+                if any(tag in name for tag in ("Authentication", "Permission", "InvalidAPIKey")):
+                    logger.error("Judge completion failed with auth/permission error: %s", exc)
+                    raise
+                if is_transient_error(exc):
+                    if policy.should_retry(exc, attempt):
+                        delay = policy.delay_for(exc, attempt)
+                        logger.info(
+                            "Judge completion hit a transient error (attempt %d/%d), "
+                            "retrying in %.2fs: %s",
+                            attempt,
+                            policy.attempts,
+                            delay,
+                            exc,
+                        )
+                        time.sleep(delay)
+                        attempt += 1
+                        continue
+                    logger.warning(
+                        "Judge completion still failing transiently after %d attempt(s); "
+                        "re-raising so the row is excluded from the score: %s",
+                        attempt,
+                        exc,
+                    )
+                    raise
+                logger.warning("Judge completion failed, returning None: %s", exc)
+                return None
         return result if isinstance(result, str) else (str(result) if result is not None else None)
 
     def _invoke(self, prompt: str, system: str | None) -> Any:

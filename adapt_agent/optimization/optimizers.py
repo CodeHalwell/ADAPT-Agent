@@ -60,6 +60,11 @@ class Trial:
     strategy: str
     accepted: bool = False
     metrics: dict[str, float] = field(default_factory=dict)
+    #: False when transient provider failures cost this trial some rows, so its
+    #: ``score`` is a mean over a subset and is not comparable with any other.
+    complete: bool = True
+    #: How many rows were dropped for transient failures.
+    n_transient_errors: int = 0
 
 
 #: Reserved top-level name: the exported file's own metadata block. A tuned
@@ -432,15 +437,39 @@ class Optimizer:
         config: dict[str, Any],
         report: EvaluationReport,
     ) -> bool:
-        """Record a trial and update the best-so-far. Returns True if accepted."""
-        accepted = report.score > state.best_score + self.min_improvement
+        """Record a trial and update the best-so-far. Returns True if accepted.
+
+        An *incomplete* trial can never be accepted, however well it scored.
+        Transient failures drop rows from the score, so an incomplete trial's
+        mean is taken over a different subset than its rivals' -- a candidate
+        that answers one easy row and gets throttled on a hard one scores 1.0
+        and would otherwise beat a fully-evaluated 0.9. Excluding throttled rows
+        stops throttling from *penalising* a candidate; refusing to crown a
+        partial trial stops it from *rewarding* one. Both are needed, or the
+        search still selects for luck, just in the opposite direction.
+        """
+        complete = report.is_complete
+        accepted = complete and report.score > state.best_score + self.min_improvement
         trial = Trial(
             config=dict(config),
             score=report.score,
             strategy=self.strategy_name,
             accepted=accepted,
             metrics=dict(report.aggregate),
+            complete=complete,
+            n_transient_errors=report.n_transient_errors,
         )
+        if not complete:
+            logger.warning(
+                "[%s] trial #%d scored %.4f over %d of %d rows (%d transient failures); "
+                "not eligible to win -- its score is not comparable with a complete trial's",
+                self.strategy_name,
+                len(state.history) + 1,
+                report.score,
+                report.n - report.n_transient_errors,
+                report.n,
+                report.n_transient_errors,
+            )
         state.history.append(trial)
         if accepted:
             state.best_config = dict(config)

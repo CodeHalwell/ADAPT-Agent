@@ -43,16 +43,24 @@ _PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions"]
 def _predicate(obj: Any) -> bool:
     """Return ``True`` when ``obj`` looks like a ``ClaudeAgentOptions`` object.
 
-    The options object exposes both ``system_prompt`` and ``allowed_tools``. We
-    explicitly reject objects belonging to other frameworks (those carrying
-    ``handoffs``/``sub_agents``/``agents``/``kickoff``/``instructions``) to avoid
-    false positives. The body never raises.
+    Carrying both ``system_prompt`` and ``allowed_tools`` is the discriminator,
+    and it is unique among the supported frameworks. Objects with a *populated*
+    ``handoffs``/``sub_agents``/``agents``/``kickoff``/``instructions`` are
+    rejected as belonging elsewhere -- populated, not merely present, because
+    the SDK's own options object declares some of those names itself. The body
+    never raises.
     """
     try:
         if not (hasattr(obj, "system_prompt") and hasattr(obj, "allowed_tools")):
             return False
         for foreign in _FOREIGN_ATTRS:
-            if hasattr(obj, foreign):
+            # Presence alone is not evidence of another framework, and treating
+            # it as such is fragile: `ClaudeAgentOptions` grew an `agents` field
+            # (defaulting to None) for subagent definitions, and a bare
+            # `hasattr` check then rejected every real options object -- so
+            # `detect` returned None and no knobs were found at all. Only a
+            # populated value counts.
+            if getattr(obj, foreign, None):
                 return False
         return True
     except Exception:

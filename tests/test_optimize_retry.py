@@ -357,3 +357,134 @@ def test_harness_concurrency_reaches_aevaluate_with_no_kwargs() -> None:
 def test_a_non_positive_concurrency_is_clamped_to_serial() -> None:
     assert EvaluationHarness([exact_match()], concurrency=0).concurrency == 1
     assert EvaluationHarness([exact_match()], concurrency=-4).concurrency == 1
+
+
+# -- transient failures in the judge / metric ---------------------------------
+#
+# Retrying only the agent call covers half the problem. An LLM judge is the
+# documented metric for open-ended tasks, and its provider call is a network
+# round trip too -- so a 429 there biases candidate selection exactly as one on
+# the agent call does, just by a different route.
+
+
+def _judge_harness(judge_fn, *, retry=FAST):
+    from adapt_agent.optimization.judge import LLMJudge
+
+    judge = LLMJudge(judge_fn, retry=retry)
+    return EvaluationHarness([judge.as_metric()], retry=retry)
+
+
+GOOD_VERDICT = '{"score": 10, "reasoning": "good"}'
+
+
+def test_a_transient_judge_failure_is_retried() -> None:
+    calls = {"n": 0}
+
+    def judge_fn(prompt, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("429 Too Many Requests")
+        return GOOD_VERDICT
+
+    report = _judge_harness(judge_fn).evaluate(lambda x: "ok", _dataset())
+    assert report.score == 1.0
+    assert report.n_transient_errors == 0
+    assert calls["n"] == 4, "the throttled judge call was not retried"
+
+
+def test_an_exhausted_transient_judge_failure_is_excluded_from_the_score() -> None:
+    """Previously the judge swallowed this into `on_error` and scored it 0.0."""
+
+    def judge_fn(prompt, **kwargs):
+        if "THROTTLE" in prompt:
+            raise RuntimeError("429 Too Many Requests")
+        return GOOD_VERDICT
+
+    dataset = GoldenDataset([Example(inputs=x, expected="ok") for x in ("a", "THROTTLE", "c")])
+    report = _judge_harness(judge_fn).evaluate(lambda x: "ok", dataset)
+    assert report.score == 1.0, "a throttled judge dragged the candidate's score down"
+    assert report.n_transient_errors == 1
+    assert report.results[1].transient is True
+    assert report.failures() == []
+
+
+def test_a_judge_that_reliably_fails_is_still_a_real_failure() -> None:
+    """Retrying is for the provider's faults, not a broken judge configuration."""
+    report = _judge_harness(lambda p, **k: "not json at all").evaluate(lambda x: "ok", _dataset())
+    assert report.score == 0.0
+    assert report.n_transient_errors == 0
+    assert len(report.failures()) == 3
+
+
+def test_auth_errors_from_the_judge_still_fail_loudly() -> None:
+    """A bad key must not be retried into a run of silent zeros."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    class AuthenticationError(Exception):
+        pass
+
+    def judge_fn(prompt, **kwargs):
+        raise AuthenticationError("bad key")
+
+    with pytest.raises(AuthenticationError):
+        LLMJudge(judge_fn, retry=FAST).score("i", "o")
+
+
+# -- optimizer: an incomplete trial cannot win --------------------------------
+
+
+def test_an_incomplete_trial_is_not_eligible_to_win() -> None:
+    """Dropping throttled rows stops throttling *penalising* a candidate.
+
+    On its own it lets throttling *reward* one instead: a candidate that answers
+    one easy row and is throttled on a hard row scores 1.0 over a single row and
+    would beat a fully-evaluated 0.9. The score is a mean over a different
+    subset, so it is not comparable at all.
+    """
+    from adapt_agent.optimization.optimizers import Optimizer
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+
+    def complete_but_imperfect(inputs):
+        return "ok" if inputs == "easy" else "wrong"
+
+    def throttled_on_the_hard_row(inputs):
+        if inputs == "hard":
+            raise RuntimeError("429 Too Many Requests")
+        return "ok"
+
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+    complete = harness.evaluate(complete_but_imperfect, dataset)
+    partial = harness.evaluate(throttled_on_the_hard_row, dataset)
+
+    assert complete.is_complete is True and complete.score == 0.5
+    assert partial.is_complete is False and partial.score == 1.0
+
+    class _State:
+        def __init__(self):
+            self.history = []
+            self.best_score = 0.0
+            self.best_config = {}
+            self.best_report = None
+
+    class _Probe(Optimizer):
+        strategy_name = "probe"
+        min_improvement = 0.0
+
+        def __init__(self):
+            self.verbose = False
+
+        def optimize(self, *args, **kwargs):  # pragma: no cover - not exercised
+            raise NotImplementedError
+
+    optimizer, state = _Probe(), _State()
+    assert optimizer._record(state, {"c": 1}, partial) is False, "a partial trial won"
+    assert state.best_score == 0.0
+    assert optimizer._record(state, {"c": 2}, complete) is True
+    assert state.best_score == 0.5
+    assert [(t.score, t.complete, t.accepted) for t in state.history] == [
+        (1.0, False, False),
+        (0.5, True, True),
+    ]

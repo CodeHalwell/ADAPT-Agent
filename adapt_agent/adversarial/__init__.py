@@ -41,20 +41,39 @@ class AdversarialDefense:
     including prompt injection, jailbreaking, and data poisoning.
     """
 
-    _INJECTION_INDICATORS = (
-        "ignore previous instructions",
-        "disregard all",
-        "new instructions:",
-        "system:",
-        "override",
+    #: Injection indicators, as regexes over :func:`_normalize`\ d text.
+    #:
+    #: These were fixed substrings, which meant one inserted word defeated them:
+    #: ``"ignore previous instructions"`` matched, while ``"ignore ALL previous
+    #: instructions"`` -- by far the more common phrasing -- did not, and neither
+    #: did ``"the"``/``"any"``/``"your"`` in the same slot. Matching the shape of
+    #: the phrase rather than one spelling of it closes that without widening
+    #: into false positives on ordinary prose.
+    _INJECTION_PATTERNS = (
+        r"\b(?:ignore|disregard|forget|override)\b[^.!?\n]{0,40}?"
+        r"\b(?:previous|prior|earlier|above|preceding|all)\b[^.!?\n]{0,40}?"
+        r"\b(?:instruction|instructions|prompt|prompts|rule|rules|direction|directions)\b",
+        r"\bdisregard\s+all\b",
+        r"\bnew\s+instructions\s*:",
+        r"(?:^|\n)\s*system\s*:",
+        # Scoped, unlike the bare "override" substring this replaces: that
+        # flagged ordinary developer prose ("override the default timeout").
+        r"\boverride\b[^.!?\n]{0,40}?"
+        r"\b(?:instruction|instructions|prompt|prompts|rule|rules|system|safety|guardrail|filter)\b",
     )
 
-    _JAILBREAK_INDICATORS = (
-        "pretend you are",
-        "roleplay as",
-        "act as if",
-        "you are now",
+    #: Jailbreak indicators, same treatment.
+    _JAILBREAK_PATTERNS = (
+        r"\bpretend\s+(?:that\s+)?you\s+(?:are|were|re)\b",
+        r"\brole[\s-]?play(?:ing)?\s+as\b",
+        r"\bact\s+as\s+(?:if|though|a|an)\b",
+        r"\byou\s+are\s+now\b",
+        r"\bdeveloper\s+mode\b",
+        r"\bdo\s+anything\s+now\b",
     )
+
+    _INJECTION_INDICATORS = tuple(re.compile(p) for p in _INJECTION_PATTERNS)
+    _JAILBREAK_INDICATORS = tuple(re.compile(p) for p in _JAILBREAK_PATTERNS)
 
     def __init__(self, max_attacks: int = 1000, max_content_length: int | None = None):
         """Initialize the AdversarialDefense.
@@ -110,16 +129,18 @@ class AdversarialDefense:
         """Return the matching injection indicator, or None."""
         normalized = prompt_normalized if prompt_normalized is not None else _normalize(prompt)
         for indicator in self._INJECTION_INDICATORS:
-            if indicator in normalized:
-                return indicator
+            match = indicator.search(normalized)
+            if match is not None:
+                return match.group(0)
         return None
 
     def _match_jailbreak(self, prompt: str, prompt_normalized: str | None = None) -> str | None:
         """Return the matching jailbreak indicator, or None."""
         normalized = prompt_normalized if prompt_normalized is not None else _normalize(prompt)
         for indicator in self._JAILBREAK_INDICATORS:
-            if indicator in normalized:
-                return indicator
+            match = indicator.search(normalized)
+            if match is not None:
+                return match.group(0)
         return None
 
     def _match_custom_pattern(

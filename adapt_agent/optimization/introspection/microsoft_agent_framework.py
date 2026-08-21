@@ -74,8 +74,14 @@ def _predicate(obj: Any) -> bool:
     """Return ``True`` when ``obj`` looks like a Microsoft Agent Framework agent.
 
     Requires a client (``.chat_client`` or ``.client``), a callable ``run``, and
-    somewhere to find a system prompt -- either an ``instructions`` attribute or
-    a ``default_options`` mapping.
+    somewhere a system prompt *could* live -- an ``instructions`` attribute, or a
+    ``default_options`` mapping.
+
+    Note the mapping is not required to contain an ``instructions`` key. An
+    agent constructed without instructions is still a Microsoft agent with a
+    tunable model and sampling settings, and refusing to claim it would leave
+    those undiscoverable rather than merely leave the prompt undiscoverable. The
+    client check below, not this one, is what keeps other frameworks out.
 
     The client requirement is load-bearing, not incidental: a Pydantic AI
     ``Agent`` also has ``.instructions`` and a callable ``run``, and carries none

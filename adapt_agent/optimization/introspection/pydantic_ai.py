@@ -57,35 +57,59 @@ def _component_name(obj: Any) -> str:
     return "agent"
 
 
+def _sequence_of_strings(value: Any) -> bool:
+    """Whether ``value`` is a non-empty sequence of strings."""
+    if not isinstance(value, (list, tuple)) or not value:
+        return False
+    return all(isinstance(item, str) for item in value)
+
+
+def _sequence_prompt_param(obj: Any, attr: str, wrap: Any, component: str) -> Parameter:
+    """Bind a prompt held as a list/tuple of strings on ``obj.<attr>``."""
+
+    def _getter() -> Any:
+        prompts = getattr(obj, attr, None)
+        if prompts is None:
+            return None
+        return "\n".join(prompts)
+
+    def _setter(value: Any) -> None:
+        setattr(obj, attr, wrap([value]))
+
+    return Parameter(
+        name="agent.system_prompt",
+        kind=ParameterKind.PROMPT,
+        value=_getter(),
+        getter=_getter,
+        setter=_setter,
+        component=component,
+        metadata={"source": f"attr:{attr}"},
+    )
+
+
 def _system_prompt_param(obj: Any, component: str) -> Parameter | None:
     """Build a prompt Parameter for the system prompt(s).
 
-    ``_system_prompts`` is a tuple, so a single element cannot be bound with a
-    working setter via the generic helpers; we hand-build the getter/setter to
-    join the tuple for reads and replace it with a one-element tuple on writes.
-    A public ``system_prompt`` string, if present instead, is bound via
-    :func:`bind_attr`.
+    Pydantic AI has *two* prompt fields and an agent uses whichever one it was
+    built with: ``Agent(system_prompt=...)`` fills ``_system_prompts`` (a tuple)
+    and ``Agent(instructions=...)`` -- the modern spelling -- fills
+    ``_instructions`` (a list), leaving the other empty. Binding
+    ``_system_prompts`` unconditionally is therefore worse than finding nothing
+    on an ``instructions=`` agent: the optimizer gets a prompt knob whose value
+    is ``''`` and whose writes land in a field the agent never reads, so a sweep
+    runs to completion and reports improvements that cannot exist. The populated
+    field wins; ``_system_prompts`` breaks the tie when both are empty.
+
+    Neither is bindable through the generic helpers -- a single element of a
+    tuple has no working setter -- so the getter/setter are hand-built: reads
+    join the sequence, writes replace it wholesale.
     """
-    if hasattr(obj, "_system_prompts"):
-
-        def _getter() -> Any:
-            prompts = getattr(obj, "_system_prompts", None)
-            if prompts is None:
-                return None
-            return "\n".join(prompts)
-
-        def _setter(value: Any) -> None:
-            obj._system_prompts = (value,)
-
-        return Parameter(
-            name="agent.system_prompt",
-            kind=ParameterKind.PROMPT,
-            value=_getter(),
-            getter=_getter,
-            setter=_setter,
-            component=component,
-            metadata={"source": "attr:_system_prompts"},
-        )
+    for attr, wrap in (("_system_prompts", tuple), ("_instructions", list)):
+        if _sequence_of_strings(getattr(obj, attr, None)):
+            return _sequence_prompt_param(obj, attr, wrap, component)
+    for attr, wrap in (("_system_prompts", tuple), ("_instructions", list)):
+        if hasattr(obj, attr):
+            return _sequence_prompt_param(obj, attr, wrap, component)
     if isinstance(getattr(obj, "system_prompt", None), str):
         return bind_attr(
             obj,

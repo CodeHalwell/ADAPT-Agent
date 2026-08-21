@@ -33,6 +33,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run from `1.000` to `0.667`. Only errors classified transient are retried; a
   genuinely broken agent still fails once and scores zero.
 
+- **Every supported framework was audited against its real SDK, all seven
+  installed together.** The suite was green throughout: each introspector was
+  tested against *fakes*, and a fake is a guess about an SDK that fails silently
+  once it goes stale -- `detect()` returns `None` or `introspect()` returns
+  `[]`, which reads as "this agent has no tunable knobs" rather than as a
+  broken walk. Four frameworks were affected:
+
+  | framework | before | after |
+  | --- | --- | --- |
+  | Microsoft Agent Framework | 0 parameters | 4 |
+  | LangGraph (any realistic graph) | 0 parameters | 4 |
+  | Claude Agent SDK | `detect()` -> `None` | 6 |
+  | Pydantic AI (`instructions=`) | prompt bound to the *empty* field | bound to the populated one |
+
+  Each now has a test that introspects a real SDK object, skipped where the SDK
+  is absent, so the next rename fails loudly.
+- **LangGraph introspected every realistic graph to nothing.** A compiled graph
+  does not hand back the callable you registered: `PregelNode.bound` is a
+  `RunnableCallable` wrapper and your node sits one hop further down at
+  `.func`. The walk stopped at `.bound` and inspected the wrapper, which
+  exposes no prompt and no model.
+- **The Claude Agent SDK was rejected by its own detector.** The predicate
+  vetoed any object *carrying* `handoffs`/`sub_agents`/`agents`/`kickoff`, and
+  `ClaudeAgentOptions` grew an `agents` field (default `None`) for subagent
+  definitions -- so every real options object was refused. Only a populated
+  value counts as evidence of another framework now.
+- **Pydantic AI's prompt knob wrote to a field the agent never reads.**
+  `Agent(system_prompt=...)` fills `_system_prompts` and `Agent(instructions=...)`
+  fills `_instructions`, leaving the other empty. Binding `_system_prompts`
+  unconditionally was worse than finding nothing on an `instructions=` agent: a
+  sweep ran to completion and reported improvements that could not exist. The
+  populated field wins.
+- **One inserted word defeated prompt-injection detection.**
+  `AdversarialDefense` matched fixed substrings, so `"ignore previous
+  instructions"` was caught while `"ignore **all** previous instructions"` --
+  the far more common phrasing -- was not, and neither were `the`/`any`/`your`
+  in the same slot. The indicators are shape-matching regexes now: 13/13 attack
+  phrasings caught where 2/13 were before, with no new false positives on
+  ordinary prose (the bare `override` substring that flagged "override the
+  default timeout" is scoped too).
+- **A throttled *judge* still scored the candidate zero.** `LLMJudge._complete`
+  swallowed transient provider errors into `on_error`, so the fix above covered
+  the agent call but not the metric -- and an LLM judge is the documented metric
+  for open-ended tasks, including the optimizer example. Judge calls are retried
+  on the same policy and re-raised when exhausted; a transient metric failure
+  marks the row transient. Auth errors still fail loudly and a judge that
+  reliably returns garbage is still a real failure.
+- **An incomplete trial could still win an optimization.** Excluding throttled
+  rows stops throttling *penalising* a candidate, but on its own it lets
+  throttling *reward* one: a candidate that answers an easy row and is throttled
+  on a hard one scores 1.0 over a single row and beat a fully-evaluated 0.9.
+  `EvaluationReport.is_complete` is new, and `Optimizer._record` refuses to
+  crown an incomplete trial, logging what was dropped.
+- **`wrap_agent` gave unusable advice for callable-only adapters.** The Google
+  ADK adapter takes a callable by design, so its error read `Expected one of ''`.
+  It now names the actual contract.
+- **A shared mutable default retry policy leaked between harnesses.**
+  `RetryPolicy` is frozen, so `harness.retry.attempts = 1` raises instead of
+  silently reconfiguring every other evaluation in the process.
+
 ### Added
 
 - **`EvaluationHarness(concurrency=)`**, a per-instance default used when a call

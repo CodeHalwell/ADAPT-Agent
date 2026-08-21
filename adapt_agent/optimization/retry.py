@@ -158,7 +158,7 @@ def retry_after_seconds(exc: BaseException) -> float | None:
     return None
 
 
-@dataclass
+@dataclass(frozen=True)
 class RetryPolicy:
     """Exponential backoff for transient provider errors.
 
@@ -177,6 +177,13 @@ class RetryPolicy:
             :func:`is_transient_error`; supply your own to widen or narrow it.
         respect_retry_after: Prefer a server-supplied ``Retry-After`` over the
             computed backoff when one is present.
+
+    Frozen on purpose. :data:`DEFAULT_RETRY_POLICY` is shared by every
+    default-constructed harness, so a mutable policy would let
+    ``harness.retry.attempts = 1`` silently reconfigure retrying for every other
+    evaluation in the process. Rebind instead -- ``harness.retry =
+    RetryPolicy(attempts=1)`` -- or build the harness with ``retry=``; mutating
+    one now raises immediately rather than leaking.
     """
 
     attempts: int = 3

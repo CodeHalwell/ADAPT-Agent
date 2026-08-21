@@ -25,7 +25,11 @@ from typing import Any, cast
 
 from adapt_agent.optimization.dataset import Example, GoldenDataset
 from adapt_agent.optimization.metrics import Metric, MetricFn, coerce_metric
-from adapt_agent.optimization.retry import DEFAULT_RETRY_POLICY, RetryPolicy
+from adapt_agent.optimization.retry import (
+    DEFAULT_RETRY_POLICY,
+    RetryPolicy,
+    is_transient_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +203,18 @@ class EvaluationReport:
         return len(self.results)
 
     @property
+    def is_complete(self) -> bool:
+        """Whether every example actually produced a score.
+
+        ``False`` means at least one row was dropped for a transient provider
+        failure, so :attr:`score` is a mean over a *subset* of the dataset.
+        Two such scores are not comparable with each other, nor with a complete
+        one -- see :meth:`Optimizer._record`, which refuses to crown an
+        incomplete trial for exactly that reason.
+        """
+        return self.n_transient_errors == 0
+
+    @property
     def avg_latency(self) -> float:
         return self.total_latency / self.n if self.results else 0.0
 
@@ -247,6 +263,7 @@ class EvaluationReport:
             "n": self.n,
             "n_errors": self.n_errors,
             "n_transient_errors": self.n_transient_errors,
+            "is_complete": self.is_complete,
             "avg_latency": self.avg_latency,
         }
 
@@ -562,11 +579,27 @@ class EvaluationHarness:
                 logger.warning("Output extractor raised on example %d: %s", index, exc)
 
         scores: dict[str, float] = {}
+        transient = False
         for metric in self.metrics:
             try:
                 scores[metric.name] = metric(output, example.expected, example)
             except Exception as exc:
-                logger.warning("Metric %s raised on example %d: %s", metric.name, index, exc)
+                # A metric can be a network call too -- an LLM judge is the
+                # documented default for open-ended tasks. Throttling *there*
+                # biases candidate selection exactly as throttling on the agent
+                # call does, so it gets the same treatment: the row is dropped
+                # from the score rather than counted against the agent.
+                if is_transient_error(exc):
+                    logger.warning(
+                        "Metric %s failed transiently on example %d; excluded from the "
+                        "score rather than counted against the agent: %s",
+                        metric.name,
+                        index,
+                        exc,
+                    )
+                    transient = True
+                else:
+                    logger.warning("Metric %s raised on example %d: %s", metric.name, index, exc)
                 scores[metric.name] = 0.0
 
         return ExampleResult(
@@ -576,6 +609,8 @@ class EvaluationHarness:
             expected=example.expected,
             scores=scores,
             latency=latency,
+            error="transient metric failure" if transient else None,
+            transient=transient,
             attempts=attempts,
         )
 
