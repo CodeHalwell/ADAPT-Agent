@@ -166,6 +166,27 @@ def _close_unawaited(value: Any) -> None:
             pass
 
 
+class GovernedEnvelope(dict):  # noqa: UP006 - a dict subclass, deliberately untyped
+    """The ``{"result": <payload>}`` wrapper `execute` puts around a non-dict.
+
+    A plain ``dict`` in every respect that matters -- equality, ``isinstance``,
+    JSON encoding, key access -- but *identifiable*, which a plain dict is not.
+    Whether ``{"result": [...]}`` is a wrapper or a genuine one-field answer
+    cannot be decided from its shape: both readings occur, and guessing wrongly
+    either deletes the answer's only column or leaves the envelope in front of
+    it. Since this wrapper is our own construct, it says so, and
+    `extract_output_payload` stops guessing.
+
+    The marker is an attribute rather than a key, so the mapping a caller sees
+    is unchanged; extraction duck-types it, so nothing imports this module.
+    """
+
+    __adapt_governed_envelope__ = True
+
+    def __init__(self, *, result: Any) -> None:
+        super().__init__(result=result)
+
+
 class GovernedAdapter(BaseAdapter):
     """Base adapter that wraps a framework agent with ADAPT-Agent governance.
 
@@ -505,7 +526,7 @@ class _GovernedAgent:
         # Track state from the actual returned payload. Non-dict framework
         # results (AgentRunResult, CrewOutput, ...) are wrapped in {"result": ...}
         # so get_state() reflects the latest execution rather than stale input.
-        output_payload = result if isinstance(result, dict) else {"result": result}
+        output_payload = result if isinstance(result, dict) else GovernedEnvelope(result=result)
         self._last_state = adapter.extract_state(output_payload)
         return output_payload
 
@@ -516,6 +537,7 @@ class _GovernedAgent:
 
 __all__ = [
     "GovernedAdapter",
+    "GovernedEnvelope",
     "_GovernedAgent",
     "_aresolve_result",
     "_extract_prompt",

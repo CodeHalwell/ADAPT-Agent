@@ -57,9 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `add_messages` coerces every entry to a `BaseMessage` -- so an answer that
   merely has fields of those names is not peeled); a **single-field answer** like
   `{"result": "granted"}` or `{"answer": {"city": "Paris"}}`, which is the
-  answer rather than an envelope around one -- a governed `execute` returns a
-  dict result untouched and wraps only a non-dict, so a conventional key is an
-  envelope only when what it holds still needs unwrapping; and a declared output
+  answer rather than an envelope around one. Shape alone cannot decide that --
+  both readings occur for `{"result": [...]}` -- so `execute` now marks its own
+  wrapper (`GovernedEnvelope`, a plain `dict` in every respect that matters but
+  identifiable), and extraction stops guessing; and a declared output
   whose field happens to be *called* `answer` or
   `result`, which the generic attribute peel would have reduced to its own
   value. `extract_output_text` likewise leaves a declared output unchanged, so a
@@ -102,6 +103,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A shared gate was labelled by the wrong agent.** Passing
+  `gate=` alongside `agent_id=` -- the advertised multi-agent setup -- returned
+  the gate unchanged, so a violation raised an error naming the *shared* gate
+  while the hook traced the same invocation under the binding's id. The binding's
+  id now wins where it is given, the gate's own label applies where it is not,
+  and the span carries whichever the error does.
 - **A blocked output was traced as a successful run.** The observer span closed
   as `completed` before post-middleware and output screening ran, so a caller
   received `SecurityBlockedError` while telemetry recorded success -- hiding the

@@ -735,6 +735,54 @@ def test_a_blocked_output_is_traced_as_an_error_in_the_middleware():
     assert run("nothing to see") == ["start", "end:completed"]
 
 
+def test_a_shared_gate_is_labelled_by_the_binding_that_uses_it():
+    """Sharing one gate across a graph is exactly when each agent needs its own
+    label. Returning the gate unchanged raised errors naming the shared gate
+    while the hook traced the same invocation under the binding's id -- one
+    violation attributed two different ways."""
+
+    class Observer:
+        def __init__(self):
+            self.ids = []
+
+        def start_trace(self, trace_id, agent_id, operation):
+            self.ids.append(agent_id)
+
+        def end_trace(self, trace_id, status="completed", result=None):
+            pass
+
+    shared = GovernanceGate(firewall=_firewall(), agent_id="shared-pool")
+
+    def run(**kwargs):
+        observer = Observer()
+        context = MafContext([])
+        middleware = maf.governance_middleware(observer=observer, **kwargs)
+
+        async def call_next():
+            context.result = "the password is hunter2"
+
+        async def main():
+            try:
+                await middleware(context, call_next)
+            except SecurityBlockedError as exc:
+                return str(exc)
+            raise AssertionError("expected a block")
+
+        return asyncio.run(main()), observer.ids
+
+    # A binding that names itself wins, and error and span agree.
+    error, ids = run(gate=shared, agent_id="researcher")
+    assert "[researcher]" in error and ids == ["researcher"]
+
+    # A binding that does not falls back to the gate's own label -- also on the
+    # span, which otherwise reported the hook's default while the error did not.
+    error, ids = run(gate=shared)
+    assert "[shared-pool]" in error and ids == ["shared-pool"]
+
+    # The shared gate itself is never mutated by a binding that borrows it.
+    assert shared.agent_id == "shared-pool"
+
+
 def test_native_hook_trace_closes_on_cancellation():
     class Observer:
         def __init__(self):

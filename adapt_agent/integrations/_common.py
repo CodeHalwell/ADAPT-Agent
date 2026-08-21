@@ -15,6 +15,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from adapt_agent.security.firewall import Firewall
 
 
+#: Default ``agent_id`` for a binding that does not name itself. A gate passed
+#: in keeps its own label unless the binding overrides it -- see `build_gate`.
+_DEFAULT_AGENT_ID = "agent"
+
+
 def build_gate(
     *,
     gate: GovernanceGate | None = None,
@@ -22,7 +27,7 @@ def build_gate(
     defense: AdversarialDefense | None = None,
     policy_enforcer: PolicyEnforcer | None = None,
     block_on_violation: bool = True,
-    agent_id: str = "agent",
+    agent_id: str = _DEFAULT_AGENT_ID,
 ) -> GovernanceGate:
     """Return the supplied gate, or build one from individual controls.
 
@@ -30,9 +35,23 @@ def build_gate(
     configured gate across several agents, or pass the controls directly for a
     one-off. Passing ``gate=`` alongside controls ignores the controls -- the
     gate already carries its own.
+
+    ``agent_id`` is the exception, because it identifies the *binding* rather
+    than the controls. Sharing one gate across a graph is exactly the case where
+    each agent needs its own label: returning the gate unchanged raised errors
+    naming the shared gate while the hook traced the same invocation under the
+    binding's id, so one violation was attributed two different ways.
     """
     if gate is not None:
-        return gate
+        if agent_id == _DEFAULT_AGENT_ID or agent_id == gate.agent_id:
+            return gate
+        return GovernanceGate(
+            firewall=gate.firewall,
+            defense=gate.defense,
+            policy_enforcer=gate.policy_enforcer,
+            block_on_violation=gate.block_on_violation,
+            agent_id=agent_id,
+        )
     return GovernanceGate(
         firewall=firewall,
         defense=defense,

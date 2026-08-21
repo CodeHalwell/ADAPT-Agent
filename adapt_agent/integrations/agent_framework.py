@@ -103,7 +103,10 @@ def governance_middleware(
         messages = list(getattr(context, "messages", []) or [])
         # `state=` is required, or a configured policy_enforcer never runs.
         resolved.review_input(messages, state=as_state(messages))
-        with traced(observer, agent_id, operation):
+        # `resolved.agent_id`, not the parameter: `build_gate` decides which
+        # label wins when a shared gate and a binding both name themselves, and
+        # the span must carry the same one the raised error does.
+        with traced(observer, resolved.agent_id, operation):
             await call_next()
             # Inside the span, not after it. A blocked result is exactly the
             # event an observer exists to surface, and screening outside the

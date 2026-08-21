@@ -73,6 +73,12 @@ _MAPPING_KEYS = (
 
 #: Where LangGraph's ``create_react_agent(response_format=...)`` puts the
 #: declared structured output -- see ``AgentStateWithStructuredResponse``.
+#: Attribute marking a governed adapter's own ``{"result": ...}`` wrapper. See
+#: ``adapt_agent.adapters._governed.GovernedEnvelope``: the shape alone cannot
+#: say whether such a mapping is a wrapper or a one-field answer, so the
+#: producer says. Duck-typed, so this module imports no adapter.
+_GOVERNED_ENVELOPE_MARKER = "__adapt_governed_envelope__"
+
 _STRUCTURED_STATE_KEY = "structured_response"
 _MESSAGES_KEY = "messages"
 
@@ -367,6 +373,13 @@ def _unwrap_envelope(value: Any, depth: int) -> Any:
     if value is None or isinstance(value, (str, bytes)) or depth <= 0:
         return value
     if isinstance(value, Mapping):
+        # A governed adapter marks its own wrapper, so the ambiguity below does
+        # not arise for one: `{"result": [...]}` from `execute` is definitively
+        # an envelope, while the identical shape from an agent is definitively
+        # an answer. Nothing is imported -- the marker is duck-typed.
+        if getattr(value, _GOVERNED_ENVELOPE_MARKER, False) and len(value) == 1:
+            (key,) = value.keys()
+            return _unwrap_envelope(value[key], depth - 1)
         # A governed adapter returns an envelope -- ``execute`` wraps a non-dict
         # framework result as ``{"result": <payload>}``. Returning that as the
         # payload makes every structural metric score 0.0 against the real

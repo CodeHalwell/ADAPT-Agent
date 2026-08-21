@@ -390,7 +390,13 @@ def test_avg_latency_is_per_example_not_wall_clock_over_n():
     report = asyncio.run(
         harness.aevaluate(SlowAsyncScorer(delay=delay), _dataset(8), concurrency=8)
     )
-    assert report.avg_latency == pytest.approx(delay, abs=0.015)
+    # The discriminating comparison is against wall-clock/n, which for eight
+    # overlapped examples would be about `delay / 8`. A tight two-sided window
+    # round-trips that meaning into a load-sensitive assertion -- a busy machine
+    # stretches each sleep -- so bound it where the meaning actually lives: far
+    # above wall-clock/n, and not absurdly above `delay`.
+    assert report.avg_latency > delay * 0.8, "avg_latency looks like wall-clock/n"
+    assert report.avg_latency < delay * 5
     # Eight examples overlapped, so the summed latency far exceeds wall clock.
     assert report.total_latency > delay * 4
 

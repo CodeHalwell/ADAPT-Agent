@@ -727,6 +727,51 @@ def test_a_multi_key_mapping_is_the_answer_not_an_envelope():
     assert extract_output_payload(answer) == answer
 
 
+def test_a_governed_envelope_is_identifiable_not_guessed():
+    """`{"result": [...]}` is a wrapper or an answer depending on who made it.
+
+    Shape cannot tell them apart, and both readings occur -- guessing wrongly
+    either deletes the answer's only column or leaves the envelope in front of
+    it. The governed adapter marks its own wrapper, so identical shapes extract
+    correctly according to provenance.
+    """
+    from adapt_agent.adapters.langgraph import LangGraphAdapter
+
+    def governed(result):
+        class Graph:
+            def invoke(self, payload):
+                return result
+
+        return LangGraphAdapter().wrap_agent(Graph()).execute({"messages": []})
+
+    records = [{"lane": "A"}, {"lane": "B"}]
+    assert extract_output_payload(governed(records)) == records
+    assert extract_output_payload(governed(["A", "B"])) == ["A", "B"]
+    assert extract_output_payload(governed("granted")) == "granted"
+
+    # The identical shapes, unmarked, are answers and keep their column.
+    assert extract_output_payload({"result": records}) == {"result": records}
+    assert extract_output_payload({"result": ["A", "B"]}) == {"result": ["A", "B"]}
+    assert extract_output_payload({"result": "granted"}) == {"result": "granted"}
+
+
+def test_the_governed_envelope_is_still_an_ordinary_mapping():
+    """The marker must cost callers nothing: it is an attribute, not a key."""
+    import json
+
+    from adapt_agent.adapters.langgraph import LangGraphAdapter
+
+    class Graph:
+        def invoke(self, payload):
+            return "hi"
+
+    envelope = LangGraphAdapter().wrap_agent(Graph()).execute({"messages": []})
+    assert envelope == {"result": "hi"}
+    assert isinstance(envelope, dict)
+    assert list(envelope) == ["result"] and envelope["result"] == "hi"
+    assert json.loads(json.dumps(envelope)) == {"result": "hi"}
+
+
 def test_a_single_field_answer_holding_a_container_survives():
     """The scalar guard was not enough: a one-field answer whose value is a list
     or a mapping is still an answer, and peeling it deletes the scored column."""
