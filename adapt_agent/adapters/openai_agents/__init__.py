@@ -38,6 +38,7 @@ class OpenAIAgentsAdapter(GovernedAdapter):
 
     framework_name = "OpenAI Agents"
     run_method_names = ("run_sync", "run")
+    async_run_method_names = ("run", "run_sync")
     operation = "openai_agents.run"
 
     def _resolve_runner(self, agent: Any) -> Runner | None:

@@ -403,3 +403,103 @@ def test_threaded_evaluate_bounds_in_flight_work():
     agent = Counting()
     EvaluationHarness([exact_match()]).evaluate(agent, _dataset(30), concurrency=4)
     assert 1 < agent.peak <= 4
+
+
+def test_aexecute_prefers_the_frameworks_async_entry_point():
+    """`aexecute` must not call the sync twin -- that blocks the loop it shares.
+
+    LangGraph, CrewAI, Pydantic AI and the OpenAI Agents SDK all expose both
+    styles, and the adapters' `run_method_names` are sync-first by design.
+    """
+    from adapt_agent.adapters import CrewAIAdapter, PydanticAIAdapter
+
+    calls = []
+
+    class Graph:
+        def invoke(self, x):
+            calls.append("invoke")
+            return {"messages": []}
+
+        async def ainvoke(self, x):
+            calls.append("ainvoke")
+            return {"messages": []}
+
+    guarded = LangGraphAdapter().wrap_agent(Graph())
+    asyncio.run(guarded.aexecute({"messages": []}))
+    assert calls == ["ainvoke"]
+
+    calls.clear()
+    guarded.execute({"messages": []})
+    assert calls == ["invoke"], "the sync path must be unchanged"
+
+    calls.clear()
+
+    class Crew:
+        def kickoff(self, x):
+            calls.append("kickoff")
+            return "r"
+
+        async def kickoff_async(self, x):
+            calls.append("kickoff_async")
+            return "r"
+
+    asyncio.run(CrewAIAdapter().wrap_agent(Crew()).aexecute({"messages": []}))
+    assert calls == ["kickoff_async"]
+
+    calls.clear()
+
+    class PydanticAgent:
+        def run_sync(self, prompt):
+            calls.append("run_sync")
+            return "r"
+
+        async def run(self, prompt):
+            calls.append("run")
+            return "r"
+
+    asyncio.run(PydanticAIAdapter().wrap_agent(PydanticAgent()).aexecute(_payload("hi")))
+    assert calls == ["run"]
+
+
+def test_aexecute_falls_back_to_the_sync_runner_when_there_is_no_async_one():
+    calls = []
+
+    class SyncOnly:
+        def invoke(self, x):
+            calls.append("invoke")
+            return {"messages": []}
+
+    asyncio.run(LangGraphAdapter().wrap_agent(SyncOnly()).aexecute({"messages": []}))
+    assert calls == ["invoke"]
+
+
+def test_cancelling_aexecute_closes_the_observer_span():
+    """`CancelledError` derives from BaseException, so `except Exception` misses
+    it and would leave the span open for the life of the process."""
+
+    class Observer:
+        def __init__(self):
+            self.events = []
+
+        def start_trace(self, trace_id, agent_id, operation):
+            self.events.append("start")
+
+        def end_trace(self, trace_id, status="completed", result=None):
+            self.events.append(f"end:{status}")
+
+    class Slow:
+        async def run(self, prompt):
+            await asyncio.sleep(10)
+
+    observer = Observer()
+    guarded = _guarded(Slow(), observer=observer)
+
+    async def main():
+        task = asyncio.ensure_future(guarded.aexecute(_payload("hi")))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+    assert observer.events == ["start", "end:error"]

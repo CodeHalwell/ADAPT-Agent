@@ -39,6 +39,7 @@ class LangGraphAdapter(GovernedAdapter):
 
     framework_name = "LangGraph"
     run_method_names = ("invoke",)
+    async_run_method_names = ("ainvoke", "invoke")
     operation = "langgraph.invoke"
 
 

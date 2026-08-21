@@ -278,7 +278,18 @@ def _resolve_metrics(
         resolved = []
         for name, spec in metrics.items():
             metric = _resolve_one(spec)
-            resolved.append(Metric(name, metric.fn, needs_example=metric.needs_example))
+            resolved.append(
+                Metric(
+                    name,
+                    metric.fn,
+                    needs_example=metric.needs_example,
+                    # Renaming must not strip the flag: dropping it here made
+                    # automatic extractor selection fall back to text, so a
+                    # model-returning agent scored 0.0 under a renamed
+                    # field_match.
+                    structural=metric.structural,
+                )
+            )
     else:
         raw_specs = list(metrics) if isinstance(metrics, (list, tuple)) else [metrics]
         resolved = [_resolve_one(spec) for spec in raw_specs]

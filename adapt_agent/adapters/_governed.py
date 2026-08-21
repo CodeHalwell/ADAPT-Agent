@@ -199,6 +199,13 @@ class GovernedAdapter(BaseAdapter):
 
     framework_name: str = "Governed"
     run_method_names: tuple[str, ...] = ("invoke",)
+    #: Run methods preferred by :meth:`_GovernedAgent.aexecute`, async-native
+    #: first. A framework exposing both styles (LangGraph ``ainvoke``/``invoke``,
+    #: CrewAI ``kickoff_async``/``kickoff``, Pydantic AI ``run``/``run_sync``)
+    #: must be driven by the async one there, or ``aexecute`` blocks the very
+    #: event loop it exists to cooperate with. Empty falls back to
+    #: :attr:`run_method_names`.
+    async_run_method_names: tuple[str, ...] = ()
     operation: str = "invoke"
 
     def __init__(
@@ -238,6 +245,19 @@ class GovernedAdapter(BaseAdapter):
         if callable(agent):
             return cast(Runner, agent)
         return None
+
+    def _resolve_async_runner(self, agent: Any) -> Runner | None:
+        """Return the runner :meth:`aexecute` should use, preferring async.
+
+        Falls back to :meth:`_resolve_runner` when the adapter declares no
+        async-specific methods or the object exposes none of them -- a purely
+        synchronous framework is still callable from ``aexecute``.
+        """
+        for name in self.async_run_method_names:
+            candidate = getattr(agent, name, None)
+            if callable(candidate):
+                return cast(Runner, candidate)
+        return self._resolve_runner(agent)
 
     def _prepare_input(self, payload: dict[str, Any]) -> Any:
         """Transform the (post-middleware) payload into the runner's argument.
@@ -354,6 +374,9 @@ class _GovernedAgent:
         self._adapter = adapter
         # ``wrap_agent`` validates the agent first, so a runner always resolves.
         self._runner: Runner = cast(Runner, adapter._resolve_runner(agent))
+        # Resolved separately so `aexecute` uses the framework's async entry
+        # point where one exists, rather than blocking on its sync twin.
+        self._arunner: Runner = cast(Runner, adapter._resolve_async_runner(agent))
         self._last_state: AgentState = {"messages": [], "context": {}}
 
     def execute(self, input_data: dict[str, Any]) -> dict[str, Any]:
@@ -377,7 +400,7 @@ class _GovernedAgent:
         try:
             raw = self._adapter._call_runner(self._runner, payload)
             result = _resolve_result(raw)
-        except Exception as exc:
+        except BaseException as exc:  # close the span on KeyboardInterrupt too
             self._trace_error(trace_id, exc)
             raise
         return self._after(trace_id, result)
@@ -402,9 +425,12 @@ class _GovernedAgent:
         """
         trace_id, payload = self._before(input_data)
         try:
-            raw = self._adapter._call_runner(self._runner, payload)
+            raw = self._adapter._call_runner(self._arunner, payload)
             result = await _aresolve_result(raw)
-        except Exception as exc:
+        except BaseException as exc:
+            # BaseException, not Exception: `asyncio.CancelledError` derives from
+            # BaseException, so a cancelled request would otherwise leave the
+            # observer span open forever.
             self._trace_error(trace_id, exc)
             raise
         return self._after(trace_id, result)
@@ -446,7 +472,7 @@ class _GovernedAgent:
             adapter.observer.start_trace(trace_id, adapter.agent_id, adapter.operation)
         return trace_id, payload
 
-    def _trace_error(self, trace_id: str, exc: Exception) -> None:
+    def _trace_error(self, trace_id: str, exc: BaseException) -> None:
         if self._adapter.observer is not None:
             self._adapter.observer.end_trace(trace_id, status="error", result=str(exc))
 

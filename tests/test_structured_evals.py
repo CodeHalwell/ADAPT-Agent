@@ -129,6 +129,28 @@ class JsonAgent:
         return Envelope('{"lane": "NOS", "matter": "M1", "action": "file", "pack": "none"}')
 
 
+class _Model:
+    """A structured output that is a model, not a JSON string."""
+
+    def model_dump(self):
+        return {"lane": "NOS", "matter": "M1", "action": "file", "pack": "none"}
+
+
+class ModelAgent:
+    def run(self, _):
+        return _ModelEnvelope()
+
+
+class _ModelEnvelope:
+    """Pydantic AI shape: a wrapper holding the model under `.output`."""
+
+    def __init__(self):
+        self.output = _Model()
+
+    def all_messages(self):
+        return []
+
+
 ROWS = [{"input": "e", "expected": {"lane": "NOS", "matter": "M1", "action": "file", "pack": "P1"}}]
 
 
@@ -157,8 +179,18 @@ def test_explicit_extractor_overrides_the_automatic_choice():
 
 
 def test_renaming_a_structural_metric_keeps_it_structural():
-    report = evaluate_agent(JsonAgent(), ROWS, metrics={"lane_acc": field_match("lane")})
+    """Renaming must not strip `structural`, or extractor selection falls back.
+
+    Deliberately uses a *model*-returning agent rather than one emitting a JSON
+    string: a JSON string is parseable by `field_match` even under text
+    extraction, so it would pass whether or not the flag survived -- which is
+    exactly why the earlier version of this test missed the bug.
+    """
+    report = evaluate_agent(ModelAgent(), ROWS, metrics={"lane_acc": field_match("lane")})
     assert report.aggregate["lane_acc"] == 1.0
+    # And the unrenamed form must agree.
+    plain = evaluate_agent(ModelAgent(), ROWS, metrics=field_match("lane"))
+    assert plain.aggregate["lane"] == 1.0
 
 
 def test_evaluate_agent_accepts_concurrency():

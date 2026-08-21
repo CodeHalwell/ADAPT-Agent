@@ -63,6 +63,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`aexecute` called the framework's *synchronous* entry point.** The runner
+  was resolved once from the sync-first `run_method_names`, so on LangGraph,
+  CrewAI, Pydantic AI and the OpenAI Agents SDK the async path invoked
+  `invoke`/`kickoff`/`run_sync` and blocked the very event loop it exists to
+  cooperate with -- while `ainvoke`/`kickoff_async`/`run` went unused. Adapters
+  now declare `async_run_method_names` and `aexecute` resolves against it,
+  falling back to the sync runner for a framework that has no async twin.
+- **A cancelled `aexecute` left its observer span open forever.**
+  `asyncio.CancelledError` derives from `BaseException`, so `except Exception`
+  never saw it and neither the error nor the completion path ran.
+- **Renaming a structural metric stripped its `structural` flag.**
+  `metrics={"lane_acc": field_match("lane")}` fell back to text extraction, so a
+  model-returning agent scored 0.0. The flag now survives both rename paths --
+  the harness's and `evaluate_agent`'s, the latter of which had been missed.
 - **Report-only mode silently disabled policy auditing.** With
   `block_on_violation=False` the adapter skipped `policy_violations()` entirely,
   and since `PolicyEnforcer.check_state` is what records violations and fires
