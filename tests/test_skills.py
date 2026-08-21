@@ -5,6 +5,7 @@ frontmatter must be valid, its internal links must resolve, and every file must
 be covered by the packaging globs so it actually reaches the wheel.
 """
 
+import ast
 import fnmatch
 import re
 import sys
@@ -899,14 +900,27 @@ def test_documented_output_extractor_values_are_usable():
     """
     import adapt_agent.evaluation as api
 
-    docs = [Path("docs/evals.md"), Path("adapt_agent/skills/adapt-agent/references/evals.md")]
-    prescribed = {
-        value
-        for path in docs
-        if path.exists()
-        for value in re.findall(r"output_extractor=([A-Za-z_\"'][\w\"']*)", path.read_text())
-    }
-    assert prescribed, "the docs no longer prescribe an extractor -- has this guard drifted?"
+    pattern = r"output_extractor=([A-Za-z_\"'][\w\"']*)"
+    prescribed: set[str] = set()
+
+    for path in (Path("docs"), Path("adapt_agent/skills")):
+        for markdown in path.rglob("*.md"):
+            prescribed.update(re.findall(pattern, markdown.read_text(encoding="utf-8")))
+
+    # Docstrings too. The first version of this guard read only the two markdown
+    # files, and the very next review round found the same unsupported string
+    # still sitting in `checks()`'s own docstring -- the guard was right and its
+    # *scope* was wrong. Source is parsed rather than grepped so that ordinary
+    # code (`output_extractor=extractor`) is not mistaken for advice.
+    for source in Path("adapt_agent").rglob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                doc = ast.get_docstring(node)
+                if doc:
+                    prescribed.update(re.findall(pattern, doc))
+
+    assert prescribed, "nothing prescribes an extractor any more -- has this guard drifted?"
 
     for value in sorted(prescribed):
         if value == "None":  # a documented, and accepted, way to unwrap nothing

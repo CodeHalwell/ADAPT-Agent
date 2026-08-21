@@ -103,6 +103,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An ADK refusal did not say which agent refused.** `on_block="refuse"`
+  returns an ordinary `LlmResponse`, so unlike the raising path it carried
+  nothing for the surrounding graph to inspect -- two specialists produced
+  byte-identical objects, though the factory documented `agent_id` as
+  identifying which one refused. The id and the threats now travel in
+  `custom_metadata["adapt_agent"]`, leaving `refusal_text` as the caller's copy
+  for the end user.
+- **One problem was reported several times.** A payload yields many texts -- a
+  request's parts, a message list, a model's fields -- so a single blocked
+  request raised `["firewall", "firewall", "firewall"]`. Threat labels are
+  de-duplicated, keeping first-seen order; the multiplicity counted texts
+  scanned, not distinct problems.
 - **A shared gate was labelled by the wrong agent.** Passing
   `gate=` alongside `agent_id=` -- the advertised multi-agent setup -- returned
   the gate unchanged, so a violation raised an error naming the *shared* gate

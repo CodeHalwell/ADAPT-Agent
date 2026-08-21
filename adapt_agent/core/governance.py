@@ -76,6 +76,21 @@ _RECURSE_ATTRS = (
 _MAX_WALK_DEPTH = 12
 
 
+def _distinct(threats: list[str]) -> list[str]:
+    """Drop repeated labels, keeping first-seen order.
+
+    One payload yields many texts -- a request's parts, a message list, a
+    model's fields -- so a single blocked request reported ``["firewall",
+    "firewall", "firewall"]``. The multiplicity counts *texts scanned*, not
+    distinct problems, and identical labels do not say anything more the second
+    time; they only make an error message and a refusal's metadata noisier.
+    """
+    seen: dict[str, None] = {}
+    for threat in threats:
+        seen.setdefault(threat, None)
+    return list(seen)
+
+
 def _safe_getattr(obj: Any, attr: str) -> Any:
     """``getattr(obj, attr, None)`` that never propagates.
 
@@ -265,7 +280,7 @@ class GovernanceGate:
                 analysis = self.defense.analyze_input(text)
                 if not analysis["is_safe"]:
                     threats.extend(analysis["threats_detected"])
-        return threats
+        return _distinct(threats)
 
     def scan_output(self, payload: Any) -> list[str]:
         """Run the firewall over an output payload, returning threats."""
@@ -275,7 +290,7 @@ class GovernanceGate:
         for text in extract_texts(payload):
             if not self.firewall.check_output(text):
                 threats.append("firewall")
-        return threats
+        return _distinct(threats)
 
     def policy_violations(self, state: Mapping[str, Any]) -> list[str]:
         """Return the names of *blocking* policy rules ``state`` violates.

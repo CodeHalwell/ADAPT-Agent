@@ -77,7 +77,8 @@ def governance_callbacks(
             session state*, so a rule gating on session data such as
             ``state['trust_score']`` sees it.
         block_on_violation: ``False`` scans and records without blocking.
-        agent_id: Named in the raised error / refusal, identifying which agent
+        agent_id: Named in the raised error, and in a refusal's
+            ``custom_metadata["adapt_agent"]``, identifying which agent
             in the tree refused.
         screen_output: Also screen the model response.
         on_block: ``"raise"`` (default) or ``"refuse"`` -- see the module
@@ -113,10 +114,10 @@ def governance_callbacks(
             # and the session state must be merged in, since that is where a rule
             # gating on `state['trust_score']` reads from.
             resolved.review_input(contents, state=as_state(contents, **context_state(context)))
-        except SecurityBlockedError:
+        except SecurityBlockedError as exc:
             if on_block == "raise":
                 raise
-            return _refusal_response(refusal_text)
+            return _refusal_response(refusal_text, resolved.agent_id, exc.threats)
         return None  # None = proceed to the model
 
     callbacks: dict[str, Any] = {"before_model_callback": before_model_callback}
@@ -126,10 +127,10 @@ def governance_callbacks(
         async def after_model_callback(context: Any, llm_response: Any) -> Any:
             try:
                 resolved.review_output(getattr(llm_response, "content", llm_response))
-            except SecurityBlockedError:
+            except SecurityBlockedError as exc:
                 if on_block == "raise":
                     raise
-                return _refusal_response(refusal_text)
+                return _refusal_response(refusal_text, resolved.agent_id, exc.threats)
             return None  # None = keep the model's own response
 
         callbacks["after_model_callback"] = after_model_callback
@@ -137,14 +138,23 @@ def governance_callbacks(
     return callbacks
 
 
-def _refusal_response(text: str) -> Any:
-    """Build an ADK ``LlmResponse`` carrying ``text``, short-circuiting the model."""
+def _refusal_response(text: str, agent_id: str, threats: list[str]) -> Any:
+    """Build an ADK ``LlmResponse`` carrying ``text``, short-circuiting the model.
+
+    The refusal is an ordinary response, so unlike the raising path it carries no
+    exception for the surrounding graph to inspect: two agents refusing for
+    different reasons produced byte-identical objects. Attribution therefore goes
+    in ``custom_metadata``, under a namespaced key so it cannot collide with the
+    app's own. It stays out of ``text`` deliberately -- that is the caller's copy
+    for the end user, and an agent id is internal topology.
+    """
     llm_response = optional_import(
         "google.adk.models.llm_response", "google-adk", "on_block='refuse'"
     )
     genai_types = optional_import("google.genai.types", "google-adk", "on_block='refuse'")
     return llm_response.LlmResponse(
-        content=genai_types.Content(role="model", parts=[genai_types.Part(text=text)])
+        content=genai_types.Content(role="model", parts=[genai_types.Part(text=text)]),
+        custom_metadata={"adapt_agent": {"agent_id": agent_id, "threats": list(threats)}},
     )
 
 

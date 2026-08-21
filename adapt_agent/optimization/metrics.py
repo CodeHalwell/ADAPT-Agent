@@ -320,8 +320,9 @@ def checks(
     time. Rows asking for a text check still get text -- each one is flattened
     individually as it is scored. The one case this cannot rescue is ``checks``
     *mixed* with a plain text metric, where the all-or-nothing rule picks text
-    extraction for the whole run; pass ``output_extractor="payload"`` if a row
-    needs structure there.
+    extraction for the whole run; pass
+    ``output_extractor=extract_output_payload`` if a row needs structure there,
+    at the cost of the text metric, which then scores a mapping.
 
     Args:
         default: Check applied when a row declares none. A built-in name, a
