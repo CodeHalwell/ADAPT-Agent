@@ -436,6 +436,7 @@ def test_report_to_dict():
         "primary_metric": "echo",
         "aggregate": {"echo": 0.5},
         "n": 2,
+        "n_evaluated": 2,
         "n_errors": 0,
         "n_transient_errors": 0,
         "is_complete": True,

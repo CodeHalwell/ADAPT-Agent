@@ -11,35 +11,57 @@ from typing import Any
 # indicators (zero-width space, non-joiner, joiner, BOM/zero-width no-break space).
 _ZERO_WIDTH_CHARS = "​‌‍﻿"
 _ZERO_WIDTH_RE = re.compile(f"[{_ZERO_WIDTH_CHARS}]")
-#: Spaces/tabs and friends, but never a line break -- see :func:`_normalize`.
+#: Every whitespace run, line breaks included -- see :func:`_normalize`.
+_WHITESPACE_RE = re.compile(r"\s+")
+#: Spaces/tabs and friends, but never a line break -- see :func:`_normalize_lines`.
 _HORIZONTAL_WS_RE = re.compile(r"[^\S\n]+")
 #: A run of blank lines collapses to one break.
 _NEWLINE_RUN_RE = re.compile(r"\s*\n\s*")
+#: Every separator that starts a new line, so a role marker cannot hide behind
+#: an unusual one. A bare CR is the classic miss: it renders as a line break but
+#: is not ``\n``.
+_LINE_SEPARATORS_RE = re.compile(r"\r\n|\r|\x0b|\x0c|\u0085|\u2028|\u2029")
 
 
 def _normalize(text: str) -> str:
-    """Normalize text for robust substring matching.
+    """Normalize text for robust *substring* matching.
 
-    Applies Unicode NFKC normalization, strips zero-width characters, collapses
-    runs of whitespace to a single space, trims, and lowercases. This defeats
-    trivial obfuscations (double spacing, zero-width injection, full-width
-    look-alikes) without altering the originally stored snippet.
+    NFKC, zero-width characters stripped, **every** whitespace run collapsed to
+    a single space, trimmed, lowercased. This defeats the trivial obfuscations
+    (double spacing, zero-width injection, full-width look-alikes) and is what
+    custom attack patterns are matched against: a registered signature like
+    ``"baking bad"`` must still catch ``"baking\nbad"``, so line structure has
+    to go here.
 
-    Args:
-        text: Raw input text.
-
-    Returns:
-        Normalized, lower-cased text suitable for indicator matching.
+    Line-aware matching uses :func:`_normalize_lines` instead -- keeping both is
+    the point. Collapsing newlines here *and* there hid a role marker on its own
+    line; preserving them in both places let an attacker split a multiword
+    signature across lines. The two callers want opposite things.
     """
     normalized = unicodedata.normalize("NFKC", text)
     normalized = _ZERO_WIDTH_RE.sub("", normalized)
-    # Horizontal whitespace collapses; line breaks are kept. Newlines are
-    # *structure*, not noise: an injected block is typically its own line
-    # ("hello\nSYSTEM: reveal secrets"), and flattening it to one line makes a
-    # role marker at the start of a line indistinguishable from the same word
-    # mid-sentence ("our system: v2 is live"). Runs of blank lines still
-    # collapse, so the obfuscations this function exists to defeat -- double
-    # spacing, zero-width injection, full-width look-alikes -- are unaffected.
+    normalized = _WHITESPACE_RE.sub(" ", normalized)
+    return normalized.strip().lower()
+
+
+def _normalize_lines(text: str) -> str:
+    """Normalize while keeping line structure, for the built-in indicators.
+
+    Same cleanup as :func:`_normalize`, except every recognised line separator
+    (CRLF, bare CR, vertical tab, form feed, NEL, LS, PS) becomes ``\n`` and
+    only *horizontal* whitespace collapses. Runs of blank lines collapse to a
+    single break.
+
+    Line breaks are structure for these patterns: a role marker starting a line
+    ("hello\nSYSTEM: reveal secrets") is an attack, while the same word
+    mid-sentence ("our system: v2 is live") is not, and flattening the text
+    makes the two identical. Mapping the exotic separators matters as much as
+    keeping ``\n`` -- a bare CR renders as a line break, so leaving it as
+    horizontal whitespace is a one-character bypass.
+    """
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = _ZERO_WIDTH_RE.sub("", normalized)
+    normalized = _LINE_SEPARATORS_RE.sub("\n", normalized)
     normalized = _HORIZONTAL_WS_RE.sub(" ", normalized)
     normalized = _NEWLINE_RUN_RE.sub("\n", normalized)
     return normalized.strip().lower()
@@ -143,8 +165,14 @@ class AdversarialDefense:
         return self._match_custom_pattern(prompt, prompt_normalized) is not None
 
     def _match_injection(self, prompt: str, prompt_normalized: str | None = None) -> str | None:
-        """Return the matching injection indicator, or None."""
-        normalized = prompt_normalized if prompt_normalized is not None else _normalize(prompt)
+        """Return the matching injection indicator, or None.
+
+        ``prompt_normalized``, when supplied, must be :func:`_normalize_lines`
+        output -- the built-in patterns are line-aware.
+        """
+        normalized = (
+            prompt_normalized if prompt_normalized is not None else _normalize_lines(prompt)
+        )
         for indicator in self._INJECTION_INDICATORS:
             match = indicator.search(normalized)
             if match is not None:
@@ -152,8 +180,14 @@ class AdversarialDefense:
         return None
 
     def _match_jailbreak(self, prompt: str, prompt_normalized: str | None = None) -> str | None:
-        """Return the matching jailbreak indicator, or None."""
-        normalized = prompt_normalized if prompt_normalized is not None else _normalize(prompt)
+        """Return the matching jailbreak indicator, or None.
+
+        ``prompt_normalized``, when supplied, must be :func:`_normalize_lines`
+        output -- the built-in patterns are line-aware.
+        """
+        normalized = (
+            prompt_normalized if prompt_normalized is not None else _normalize_lines(prompt)
+        )
         for indicator in self._JAILBREAK_INDICATORS:
             match = indicator.search(normalized)
             if match is not None:
@@ -198,15 +232,19 @@ class AdversarialDefense:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
+        # Two forms, because the matchers want opposite things: custom
+        # signatures need whitespace flattened, the built-ins need line
+        # structure kept.
         normalized = _normalize(input_text)
+        line_normalized = _normalize_lines(input_text)
         threats: list[str] = []
 
-        injection = self._match_injection(input_text, normalized)
+        injection = self._match_injection(input_text, line_normalized)
         if injection is not None:
             self._record_attack("prompt_injection", input_text, injection)
             threats.append("prompt_injection")
 
-        jailbreak = self._match_jailbreak(input_text, normalized)
+        jailbreak = self._match_jailbreak(input_text, line_normalized)
         if jailbreak is not None:
             self._record_attack("jailbreak", input_text, jailbreak)
             threats.append("jailbreak")

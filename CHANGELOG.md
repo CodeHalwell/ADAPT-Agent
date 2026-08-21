@@ -89,6 +89,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`wrap_agent` gave unusable advice for callable-only adapters.** The Google
   ADK adapter takes a callable by design, so its error read `Expected one of ''`.
   It now names the actual contract.
+- **Two normalisations, because the callers want opposite things.** Collapsing
+  newlines hid a role marker on its own line; preserving them let an attacker
+  split a registered multiword signature across lines
+  (`add_attack_pattern("baking bad")` stopped catching `baking\nbad`). The
+  built-in line-aware patterns now use `_normalize_lines`, custom signatures
+  keep the whitespace-flattening `_normalize`. Every recognised line separator
+  -- CRLF, bare CR, VT, FF, NEL, LS, PS -- maps to `\n` first, so
+  `hello\rSYSTEM: ...` no longer slips past the anchor that catches
+  `hello\nSYSTEM: ...`.
+- **An unusable baseline now aborts the run.** Logging an error and continuing
+  left an inflated `best_score` that nothing could beat, so the search returned
+  the starting configuration -- a wrong answer indistinguishable from "nothing
+  improved on your prompt". A baseline still incomplete after its re-run raises
+  `IncompleteEvaluationError` naming the remedy.
+- **Error counts got a denominator that can hold them.** `max_results` bounds
+  *stored records*, not rows run, so counting transient failures across the
+  whole dataset against `n` produced summaries like `n=1,
+  n_transient_errors=4` and made the optimizer's logging go negative.
+  `EvaluationReport.n_evaluated` and `n_scored` are the totals; `n` remains the
+  record count, and `avg_latency` is per evaluated row.
 - **Nested retry budgets multiplied.** `LLMJudge` retried internally and then
   re-raised into a harness that retried again: three attempts at each layer is
   **nine provider calls for one row**, with the backoff reset between them --

@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from adapt_agent.exceptions import IncompleteEvaluationError
 from adapt_agent.optimization.dataset import GoldenDataset
 from adapt_agent.optimization.evaluation import EvaluationHarness, EvaluationReport
 from adapt_agent.optimization.parameters import Parameter, ParameterKind
@@ -444,9 +445,11 @@ class Optimizer:
         starting config as the winner, which looks like "nothing improved on
         your prompt" rather than like a broken run.
 
-        A baseline is re-run rather than rejected, because there is nothing to
-        fall back to. If it is still incomplete the run continues -- refusing to
-        start would be worse than a noisy comparison -- but says so loudly.
+        A baseline is re-run once rather than rejected outright, because there is
+        nothing to fall back to. If it is *still* incomplete this raises: a
+        logged warning is too easy to lose in a long run's output, and the
+        failure mode it precedes is a wrong answer wearing the costume of a
+        valid one.
         """
         report = self.harness.evaluate(target, dataset)
         if report.is_complete:
@@ -455,18 +458,19 @@ class Optimizer:
             "[%s] baseline scored %.4f over %d of %d rows (%d transient failures); re-running",
             self.strategy_name,
             report.score,
-            report.n - report.n_transient_errors,
-            report.n,
+            report.n_scored,
+            report.n_evaluated,
             report.n_transient_errors,
         )
         retried = self.harness.evaluate(target, dataset)
         if not retried.is_complete:
-            logger.error(
-                "[%s] baseline is still incomplete after a re-run (%d transient failures). "
-                "Every candidate is compared against it, so these results are unreliable: "
-                "lower the concurrency or wait for the provider to recover.",
-                self.strategy_name,
-                retried.n_transient_errors,
+            raise IncompleteEvaluationError(
+                f"{self.strategy_name}: the baseline evaluation still could not score "
+                f"{retried.n_transient_errors} of {retried.n_evaluated} rows after a re-run "
+                f"(transient provider failures). Every candidate is compared against the "
+                f"baseline, so continuing would silently return the starting configuration "
+                f"as the winner. Lower the concurrency, widen the retry policy, or wait for "
+                f"the provider to recover."
             )
         return retried
 
@@ -505,8 +509,8 @@ class Optimizer:
                 self.strategy_name,
                 len(state.history) + 1,
                 report.score,
-                report.n - report.n_transient_errors,
-                report.n,
+                report.n_scored,
+                report.n_evaluated,
                 report.n_transient_errors,
             )
         state.history.append(trial)

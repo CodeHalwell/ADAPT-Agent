@@ -185,6 +185,12 @@ class EvaluationReport:
     results: list[ExampleResult] = field(default_factory=list)
     n_errors: int = 0
     n_transient_errors: int = 0
+    #: Rows actually evaluated. Differs from :attr:`n` once a dataset
+    #: exceeds ``max_results``, which bounds *stored records* only -- every
+    #: row is still run and aggregated. Use this as the denominator for the
+    #: error counts, which are also totals: ``n`` would give impossible
+    #: summaries like ``n=1, n_transient_errors=4``.
+    n_evaluated: int = 0
     total_latency: float = 0.0
     #: Default threshold used by :meth:`failures` when none is supplied. Set by
     #: the producing :class:`EvaluationHarness` from its ``failure_threshold``;
@@ -198,9 +204,27 @@ class EvaluationReport:
         """The headline score (aggregate of the primary metric, 0.0 if absent)."""
         return self.aggregate.get(self.primary_metric, 0.0)
 
+    def __post_init__(self) -> None:
+        # `n_evaluated` is set explicitly by the harness, which knows the true
+        # total even when `max_results` bounded what it kept. A report built by
+        # hand -- the dataclass is public -- has only its records to go on, and
+        # leaving the count at 0 would silently zero `avg_latency` and
+        # `n_scored` for those callers.
+        if not self.n_evaluated:
+            self.n_evaluated = len(self.results)
+
     @property
     def n(self) -> int:
+        """How many per-example records are *stored* (bounded by ``max_results``).
+
+        For the number of rows actually run, use :attr:`n_evaluated`.
+        """
         return len(self.results)
+
+    @property
+    def n_scored(self) -> int:
+        """Rows that contributed a score: evaluated, minus transient dropouts."""
+        return max(0, self.n_evaluated - self.n_transient_errors)
 
     @property
     def is_complete(self) -> bool:
@@ -216,7 +240,7 @@ class EvaluationReport:
 
     @property
     def avg_latency(self) -> float:
-        return self.total_latency / self.n if self.results else 0.0
+        return self.total_latency / self.n_evaluated if self.n_evaluated else 0.0
 
     def failures(
         self, *, metric: str | None = None, threshold: float | None = None
@@ -261,6 +285,7 @@ class EvaluationReport:
             "primary_metric": self.primary_metric,
             "aggregate": dict(self.aggregate),
             "n": self.n,
+            "n_evaluated": self.n_evaluated,
             "n_errors": self.n_errors,
             "n_transient_errors": self.n_transient_errors,
             "is_complete": self.is_complete,
@@ -690,9 +715,11 @@ class _Accumulator:
         self._unordered = False
         self._n_errors = 0
         self._n_transient_errors = 0
+        self._n_evaluated = 0
         self._total_latency = 0.0
 
     def add(self, result: ExampleResult) -> None:
+        self._n_evaluated += 1
         self._total_latency += result.latency
         if result.error is not None:
             self._n_errors += 1
@@ -724,6 +751,7 @@ class _Accumulator:
             results=self._results,
             n_errors=self._n_errors,
             n_transient_errors=self._n_transient_errors,
+            n_evaluated=self._n_evaluated,
             total_latency=self._total_latency,
             failure_threshold=self._harness.failure_threshold,
         )

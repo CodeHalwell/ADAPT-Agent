@@ -546,10 +546,14 @@ def test_an_incomplete_baseline_is_re_run_before_seeding_the_search() -> None:
     assert report.score == 1.0
 
 
-def test_a_baseline_that_stays_incomplete_still_returns_but_says_so(caplog) -> None:
-    """There is nothing to fall back to, so the run continues -- loudly."""
-    import logging
+def test_a_baseline_that_stays_incomplete_aborts_the_run() -> None:
+    """A logged warning is too easy to lose in a long run's output.
 
+    The failure it precedes is a wrong answer wearing the costume of a valid
+    one: an inflated baseline is unbeatable, so the search ends reporting the
+    starting configuration, which is indistinguishable from "nothing improved".
+    """
+    from adapt_agent.exceptions import IncompleteEvaluationError
     from adapt_agent.optimization.optimizers import Optimizer
 
     dataset = GoldenDataset(
@@ -567,12 +571,8 @@ def test_a_baseline_that_stays_incomplete_still_returns_but_says_so(caplog) -> N
             raise NotImplementedError
 
     harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
-    probe = _Probe(harness)
-    with caplog.at_level(logging.ERROR):
-        report = probe._evaluate_baseline(_throttle_on("hard"), dataset)
-
-    assert report.is_complete is False
-    assert any("still incomplete" in r.message for r in caplog.records)
+    with pytest.raises(IncompleteEvaluationError, match="baseline"):
+        _Probe(harness)._evaluate_baseline(_throttle_on("hard"), dataset)
 
 
 def test_an_incomplete_candidate_is_not_bred_from_in_an_evolutionary_search() -> None:
@@ -768,3 +768,38 @@ def test_a_custom_classifier_reaches_the_judge() -> None:
     verdict = LLMJudge(plain_429, retry=policy).score("i", "o")
     assert calls["n"] == 1
     assert verdict.score == 0.0
+
+
+# -- report denominators ------------------------------------------------------
+
+
+def test_error_counts_have_a_denominator_that_can_hold_them() -> None:
+    """`max_results` bounds *stored records*, not rows run.
+
+    Counting transient errors across the whole dataset while `n` stopped at the
+    cap produced impossible summaries -- `n=1, n_transient_errors=4` -- and made
+    the optimizer's `n - n_transient_errors` logging go negative.
+    """
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+
+    def throttled(payload):
+        raise RuntimeError("429 Too Many Requests")
+
+    report = EvaluationHarness(
+        [exact_match()], retry=RetryPolicy(attempts=1), max_results=1
+    ).evaluate(throttled, dataset)
+
+    assert report.n == 1, "the storage cap should still bound the records"
+    assert report.n_evaluated == 4
+    assert report.n_transient_errors == 4
+    assert report.n_scored == 0
+    assert report.n_evaluated >= report.n_transient_errors
+    assert report.to_dict()["n_evaluated"] == 4
+
+
+def test_avg_latency_is_per_evaluated_row_not_per_stored_record() -> None:
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness([exact_match()], max_results=1).evaluate(lambda x: "ok", dataset)
+    assert report.n == 1
+    assert report.n_evaluated == 4
+    assert report.avg_latency == pytest.approx(report.total_latency / 4)
