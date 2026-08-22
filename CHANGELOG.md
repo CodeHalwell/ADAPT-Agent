@@ -118,6 +118,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity on the rendered prompt for every shape, which is asserted against a
   captured request rather than assumed -- `\n` is the separator Pydantic AI
   itself puts between consecutive static instructions.
+- **...and then CSS strips comments while tokenizing.** `display/**/:block` is
+  a real `display:block`, and the raw text showed no declaration at all --
+  **8 of 9** probed forms wrong. Comments are removed before the declaration
+  is resolved, and replaced by a *space* rather than deleted, because a comment
+  separates tokens: `disp/**/lay` is two identifiers and not the `display`
+  property, so deleting would have spliced them and invented a declaration.
+  The order is the parsers' own -- HTML decodes the attribute value, then CSS
+  strips its comments, then the declaration is matched.
+- **A declaration did not end at the first `>`.** A doctype's public and system
+  identifiers are quoted and may contain `>`, which HTML's own parser tracks; a
+  processing instruction ends at `?>`, and a bare `>` before that is ordinary
+  data. Stopping at the first `>` cut each construct in half and left its tail
+  in front of the next content, so `<!DOCTYPE html SYSTEM "a > b">SYSTEM:`
+  parsed as `b">system` -- **7 of 11** probed forms bypassed, covering doctypes,
+  `<!ENTITY>`, and processing instructions in both XML and PHP spellings. The
+  declaration form is quote-aware now and the instruction matches its
+  terminator, each with a loose fallback for the malformed case (an identifier
+  whose quote never closes, an instruction with no `?>` anywhere, which HTML
+  reads as a bogus comment). Inner alternatives stay disjoint by first
+  character, so the parse remains linear on untrusted input -- measured, not
+  assumed.
 - **...and the style value was parsed before it was decoded.** Two parsers run
   in sequence: HTML resolves character references in an attribute value and
   hands the result to CSS, so `style="display&#58;block"` is a real

@@ -177,7 +177,30 @@ _MARKUP_TAG_RE = re.compile(
 _MARKUP_CONTAINER_RE = re.compile(r"<!--|-->|<!\[CDATA\[|\]\]>", re.IGNORECASE)
 #: Declarations and processing instructions, removed *with* their contents --
 #: unlike a comment, a doctype or an ``<?xml ?>`` header carries no prose.
-_MARKUP_DECLARATION_RE = re.compile(r"<![A-Za-z][^>]*>|<\?[^>]*\?>")
+#:
+#: Neither construct ends at the first ``>``, and reading them as though they
+#: did cut each one in half and left its tail in front of the next content:
+#: ``<!DOCTYPE html SYSTEM "a > b">SYSTEM:`` parsed as ``b">system``.
+#:
+#: A declaration is quote-aware, the way HTML's own doctype parser is -- it
+#: tracks the public and system identifiers, so a ``>`` inside one is data. A
+#: processing instruction is not about quoting at all: its data runs to ``?>``
+#: and a bare ``>`` before that is ordinary content, which is why the
+#: terminator is matched rather than the delimiter avoided.
+#:
+#: Each has a loose fallback for the malformed case -- an identifier whose
+#: quote never closes, and an instruction with no ``?>`` anywhere, which HTML
+#: reads as a bogus comment ending at the first ``>``. Same shape as the tag
+#: pattern, and ordered the same way, so well-formed input never reaches them.
+#:
+#: The inner alternatives of each strict form are disjoint by first character,
+#: so the parse stays linear on untrusted input.
+_MARKUP_DECLARATION_RE = re.compile(
+    r"<![A-Za-z](?:[^<>\"']|\"[^\"]*\"|'[^']*')*>"
+    r"|<![A-Za-z][^>]*>"
+    r"|<\?(?:[^?]|\?(?!>))*\?>"
+    r"|<\?[^>]*>"
+)
 #: A character reference: ``&lt;``, ``&#60;``, ``&#x3C;``.
 _CHARACTER_REF_RE = re.compile(r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
 
@@ -415,6 +438,12 @@ _DISPLAY_RE = re.compile(
     r"(?:^|[;\s\"'{])display\s*:\s*([\w-]+)[^;]*?(!\s*important)?\s*(?=;|$|\"|')",
     re.IGNORECASE,
 )
+#: A CSS comment, including one left unterminated -- the tokenizer closes it
+#: at the end of the block. Replaced by a *space* rather than deleted, because
+#: a comment separates tokens: ``disp/**/lay`` is two identifiers and not the
+#: ``display`` property, while ``display/**/:block`` is that property with its
+#: colon. Deleting would have merged the first pair and invented a declaration.
+_CSS_COMMENT_RE = re.compile(r"/\*.*?(?:\*/|$)", re.DOTALL)
 #: The ``hidden`` content attribute, which renders the element not at all --
 #: the same as ``display:none`` for the only question asked here.
 _HIDDEN_ATTR_RE = re.compile(r"(?<=[\s\"'])hidden(?=[\s/>=])")
@@ -464,12 +493,18 @@ def _declared_display(construct: str) -> str | None:
     an element name, so ``&#115;tyle=`` is not a ``style`` attribute and must
     not be read as one -- which is why the decode happens after the attribute
     has been located rather than over the whole construct.
+
+    CSS comments go next, in that order, because that is the order the parsers
+    run in: HTML hands a decoded string to CSS, and CSS strips comments while
+    tokenizing. ``display/**/:block`` is a real ``display:block`` and the raw
+    text showed no declaration at all.
     """
     style = _STYLE_ATTR_RE.search(construct)
     if style is not None:
         normal: str | None = None
         important: str | None = None
-        for declaration in _DISPLAY_RE.finditer(html.unescape(style.group(1))):
+        decoded = _CSS_COMMENT_RE.sub(" ", html.unescape(style.group(1)))
+        for declaration in _DISPLAY_RE.finditer(decoded):
             if declaration.group(2) is not None:
                 important = declaration.group(1)
             else:
