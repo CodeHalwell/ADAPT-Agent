@@ -1372,9 +1372,25 @@ def _selector_subjects(selector: str) -> tuple[set[str], set[str], set[str], boo
             char = compound[index]
             if char in ".#":
                 name, index = _selector_name(compound, index + 1)
-                if name:
-                    found = True
-                    (classes if char == "." else ids).add(name)
+                if not name:
+                    # `.` and `#` each *require* a name, so `.x#` is not a
+                    # selector and CSS drops the rule around it -- the same
+                    # whole-rule invalidity an empty list member carries, one
+                    # level down. Keeping the valid prefix applied the rule to
+                    # `.x` and reported ordinary prose as a marker.
+                    #
+                    # Invalidity is claimed only over what this reader actually
+                    # *reads*, which is the subject compound. `.x. .y` keeps
+                    # its boundary even though a browser drops that rule too,
+                    # because the broken compound is one this reader skips --
+                    # and extending the claim to skipped text would make the
+                    # compound split load-bearing for *removing* boundaries,
+                    # which is the direction that hides markers. Missing an
+                    # invalidity costs an over-split, which `_content_segments`
+                    # already covers by checking the unsplit line as well.
+                    return set(), set(), set(), False
+                found = True
+                (classes if char == "." else ids).add(name)
                 continue
             if char == "[":
                 index = _selector_skip(compound, index, "[", "]")
