@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The markup pass was parsing CSS out of text that had been rewritten for
+  matching.** Normalization exists so that a *match* cannot be dodged by
+  spelling: NFKC folds a full-width identifier to an ASCII keyword, the
+  zero-width strip closes a gap inside one, the whitespace collapse turns a
+  no-break space into a separator, and the text is lowercased. The prompt-
+  injection line-boundary pass then read `display` declarations out of the
+  result -- so it saw declarations the CSS parser never sees. Every fold was
+  its own bypass: `display:block;display:ｉｎｌｉｎｅ`
+  is a valid `block` followed by a declaration CSS drops, and the fold made it
+  a plain `inline` that hid a marker behind the block. Eight spellings, one
+  per fold, all in the direction that misses an attack.
+
+  Structure is now parsed from the original spelling and only *content* is
+  normalized, where it is compared. Two rules that had been quietly borrowing
+  the fold say so themselves instead: `style` and `hidden` are matched
+  ASCII-case-insensitively because HTML matches them that way, and
+  undecorating folds its own input because every rule it applies names an
+  ASCII character.
+
+- **A character a CSS escape produced was read back as syntax.**
+  `display:inline\20` is the identifier `"inline "`, which is not the keyword
+  `inline`, so CSS drops that declaration and the earlier one applies. The
+  value was decoded and *then* split on whitespace, which erased the escape's
+  own space and read the invalid value as the keyword it resembles. Splitting
+  used Python's notion of whitespace too, so `inline\xa0flow` -- one
+  identifier to CSS -- became the valid two-keyword syntax.
+
+  Values are cut into tokens and decoded in one pass now, so a character an
+  escape produced belongs to the token that spelled it and can never separate
+  two. `!` is a token of its own when it is literal, which is what tells the
+  `!important` flag from an identifier that merely starts with the character:
+  `display:inline \!important` flags nothing. The resolver returns those
+  tokens rather than a string, because a string cannot carry the distinction
+  the answer turns on.
+
 - **Three of the five exits from the metric retry loop never consumed the
   fallback note.** Consuming it was added where the note is *read* -- the two
   permanent-failure returns -- and the other three exits left it on the

@@ -332,7 +332,24 @@ def _undecorate(text: str) -> str:
 
 
 def _undecorated_content(text: str) -> str:
-    """Undecorate ``text``, then re-normalize what decoding produced.
+    """Normalize ``text``, undecorate it, then re-normalize what that produced.
+
+    Normalized on the way *in* as well as out, because undecorating is a
+    content rule and every one of its sub-rules names an ASCII character:
+    :data:`_DELIMITER` is ``":"``, and an enumerator ends in ``.``, ``)`` or
+    ``]``. A compatibility look-alike is none of those until NFKC says so, so
+    reading raw text stripped a full-width colon as ordinary punctuation --
+    ``\uff53\uff59\uff53\uff54\uff45\uff4d\uff1a`` lost its delimiter before
+    :func:`str.partition` could find one -- and left a full-width enumerator
+    unpeeled in front of a real marker. Both were markers missed.
+
+    This is where that fold belongs. It used to arrive already done, because
+    the segments came from :func:`_normalize_lines`; the markup pass then had
+    to be moved off that text -- a rewrite cannot be allowed to manufacture
+    CSS -- and every rule that had been quietly borrowing the fold broke at
+    once. Structure is read as written and content is read as folded, and each
+    now says so where it is read rather than depending on the order two
+    unrelated passes happen to run in.
 
     Normalization runs over the *raw* prompt, so every character a reference
     stands for arrives after it: ``&#83;`` is four ASCII characters when
@@ -350,7 +367,7 @@ def _undecorated_content(text: str) -> str:
     role token exactly -- ``&#83;ystem requirements: 8GB RAM`` normalizes to
     "system requirements", which is not one.
     """
-    return _normalize(_undecorate(text))
+    return _normalize(_undecorate(_normalize(text)))
 
 
 #: Elements that flow *inside* a line rather than starting a new one.
@@ -502,18 +519,14 @@ _INLINE_DISPLAYS = frozenset(
 #: A ``style`` attribute and its value. The name is guarded against
 #: ``data-style`` and friends, and the value alternatives are disjoint by their
 #: first character, so the parse stays linear on untrusted text.
-_STYLE_ATTR_RE = re.compile(r"(?<![\w-])style\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]*)")
-#: The ``!important`` flag, with the whitespace CSS tolerates -- anchored at
-#: the *end* of the value, because a declaration carries at most one and it
-#: must come last.
 #:
-#: Searching for it anywhere and deleting every occurrence made a second one
-#: vanish, so ``display:inline!important!important`` -- which CSS rejects
-#: whole, leaving the earlier declaration in force -- read as a plain
-#: ``inline``. A flag that is not terminal never applied either:
-#: ``display:!important inline`` is not an important ``inline``.
-_CSS_IMPORTANT_RE = re.compile(r"!\s*important\s*$", re.IGNORECASE)
-
+#: HTML matches an attribute name ASCII-case-insensitively, so this pattern
+#: says so itself rather than relying on a lowercasing done elsewhere for a
+#: different reason. It used to read text that :func:`_normalize_lines` had
+#: already folded, and inheriting a rule from the *matching* pipeline meant
+#: ``STYLE=`` stopped being a style attribute the moment the parse was moved
+#: off it.
+_STYLE_ATTR_RE = re.compile(r"(?<![\w-])style\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]*)", re.IGNORECASE)
 #: A CSS escape: a backslash, then either up to six hex digits naming a code
 #: point (with one optional whitespace character as the escape's own
 #: delimiter) or any single character taken literally. A backslash before a
@@ -521,6 +534,10 @@ _CSS_IMPORTANT_RE = re.compile(r"!\s*important\s*$", re.IGNORECASE)
 #: and the value keeps a character no identifier can hold -- which is the safe
 #: reading, since CSS drops that declaration too.
 _CSS_ESCAPE_RE = re.compile(r"\\(?:([0-9A-Fa-f]{1,6})[ \t\r\n\f]?|([^\n\r\f]))")
+#: The five characters CSS calls whitespace, and the only ones that separate
+#: one token from the next. Every other space-like code point is >= U+0080,
+#: which CSS spells as an ordinary identifier character.
+_CSS_WHITESPACE = " \t\r\n\f"
 #: A value must *begin* with an identifier, matched from position zero.
 #:
 #: No ``\s*``: whitespace is stripped from the raw value before decoding, so a
@@ -549,8 +566,13 @@ _DISPLAY_INSIDE = frozenset({"flow", "flow-root", "table", "flex", "grid", "ruby
 _LIST_ITEM_INSIDE = frozenset({"flow", "flow-root"})
 
 
-def _is_inline_display(value: str) -> bool:
+def _is_inline_display(tokens: list[str]) -> bool:
     """Whether a declared ``display`` keeps its box inside the line.
+
+    Takes the value already cut into tokens rather than a string to cut here.
+    A string cannot carry the distinction the answer turns on -- whitespace
+    that separates two identifiers reads exactly like whitespace an escape put
+    *inside* one -- so re-splitting here read ``inline\\20`` as the keyword.
 
     The **whole** value decides, not its first word. Reading only the first
     identifier made every trailing token invisible, so ``display:inline bogus``
@@ -569,7 +591,6 @@ def _is_inline_display(value: str) -> bool:
     Anything unrecognised is *not* inline, which is the direction that splits a
     line rather than merging two.
     """
-    tokens = value.split()
     if not tokens:
         return False
     if len(tokens) == 1:
@@ -591,6 +612,17 @@ def _is_inline_display(value: str) -> bool:
     return outside == ["inline"]
 
 
+def _decode_escape(match: re.Match[str]) -> str:
+    """The character one :data:`_CSS_ESCAPE_RE` match stands for."""
+    hexadecimal, literal = match.group(1), match.group(2)
+    if literal is not None:
+        return literal
+    code = int(hexadecimal, 16)
+    if code == 0 or 0xD800 <= code <= 0xDFFF or code > 0x10FFFF:
+        return "\ufffd"
+    return chr(code)
+
+
 def _decode_css_escapes(text: str) -> str:
     """Resolve the CSS escapes in one token.
 
@@ -603,16 +635,7 @@ def _decode_css_escapes(text: str) -> str:
     property's name, so the declaration has no delimiter.
     """
 
-    def replace(match: re.Match[str]) -> str:
-        hexadecimal, literal = match.group(1), match.group(2)
-        if literal is not None:
-            return literal
-        code = int(hexadecimal, 16)
-        if code == 0 or 0xD800 <= code <= 0xDFFF or code > 0x10FFFF:
-            return "\ufffd"
-        return chr(code)
-
-    return _CSS_ESCAPE_RE.sub(replace, text)
+    return _CSS_ESCAPE_RE.sub(_decode_escape, text)
 
 
 def _split_declaration(declaration: str) -> tuple[str, str] | None:
@@ -643,30 +666,90 @@ def _split_declaration(declaration: str) -> tuple[str, str] | None:
     return None
 
 
-def _declared_value(declaration: str, prop: str) -> tuple[str, bool] | None:
+def _css_value_tokens(value: str) -> list[str]:
+    """Cut a raw value into the tokens CSS reads it as, decoding as it goes.
+
+    Tokenizing and decoding in **one pass**, for the same reason the block is
+    cut into declarations before either half is decoded: a character an escape
+    produced belongs to the token that spelled it and can never separate two.
+    ``display:inline\\20`` is the identifier "inline " -- not the keyword
+    ``inline`` -- so CSS drops that declaration and the earlier one applies.
+    Decoding first and splitting after erased the space and read the invalid
+    value as the keyword it resembles, which hid a marker behind a block.
+
+    Separators are :data:`_CSS_WHITESPACE`, not :meth:`str.split`'s notion of
+    it. Every other space-like code point is >= U+0080 and so an ordinary
+    identifier character: ``inline\xa0flow`` is *one* identifier, and splitting
+    it in two read an invalid value as the valid two-keyword syntax.
+
+    A literal ``!`` is a token of its own, because that is what CSS makes of it
+    -- a delimiter -- and it is the only thing that tells the ``!important``
+    flag from an identifier that merely begins with the character. ``\\!`` is
+    an escape, so ``display:inline \\!important`` is two identifiers, flags
+    nothing, and is not a valid ``display`` at all.
+    """
+    tokens: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        if current:
+            tokens.append("".join(current))
+            current.clear()
+
+    index = 0
+    while index < len(value):
+        escape = _CSS_ESCAPE_RE.match(value, index)
+        if escape is not None:
+            current.append(_decode_escape(escape))
+            index = escape.end()
+            continue
+        char = value[index]
+        if char in _CSS_WHITESPACE:
+            flush()
+        elif char == "!":
+            flush()
+            tokens.append(char)
+        else:
+            current.append(char)
+        index += 1
+    flush()
+    return tokens
+
+
+def _declared_value(declaration: str, prop: str) -> tuple[list[str], bool] | None:
     """The value ``declaration`` gives ``prop``, and whether it is important.
 
-    ``None`` when the declaration names some other property, or names none.
-    Both halves are stripped *before* they are decoded and neither is stripped
-    after, because whitespace a decode produced belongs to the identifier: CSS
-    reads ``\\20 display`` as the property " display" and ``display:\\20 block``
-    as the value " block", and neither is the thing it resembles.
+    ``None`` when the declaration names some other property, or names none, or
+    gives a value that does not even begin with an identifier.
+
+    The property is stripped of :data:`_CSS_WHITESPACE` *before* it is decoded
+    and not after, because whitespace a decode produced belongs to the
+    identifier: CSS reads ``\\20 display`` as the property " display", which is
+    not the property it resembles. The value needs no stripping at all --
+    :func:`_css_value_tokens` drops the whitespace that separates tokens and
+    keeps the whitespace that is inside one, which is the same rule stated
+    once instead of twice.
+
+    ``!important`` is the declaration's flag rather than part of its value, so
+    it comes off the end of the token stream. Off the *end* only, and one of
+    them only: ``display:inline!important!important`` is a value CSS rejects
+    whole, leaving the earlier declaration in force, and deleting every
+    occurrence read it as a plain ``inline``. A flag that is not terminal never
+    applied either -- ``display:!important inline`` is not an important
+    ``inline``, and its leading ``!`` is what the identifier check rejects.
     """
     split = _split_declaration(declaration)
     if split is None:
         return None
-    if _decode_css_escapes(split[0].strip()).lower() != prop:
+    if _decode_css_escapes(split[0].strip(_CSS_WHITESPACE)).lower() != prop:
         return None
-    value = _decode_css_escapes(split[1].strip())
-    if _CSS_VALUE_RE.match(value) is None:
-        return None
-    # `!important` is the declaration's flag, not part of its value, so it
-    # comes off before the value is read as tokens -- otherwise every
-    # `display:inline !important` would look like a value with junk after it.
-    important = _CSS_IMPORTANT_RE.search(value) is not None
+    tokens = [token.lower() for token in _css_value_tokens(split[1])]
+    important = len(tokens) >= 2 and tokens[-2] == "!" and tokens[-1] == "important"
     if important:
-        value = _CSS_IMPORTANT_RE.sub(" ", value)
-    return " ".join(value.split()).lower(), important
+        tokens = tokens[:-2]
+    if not tokens or _CSS_VALUE_RE.match(tokens[0]) is None:
+        return None
+    return tokens, important
 
 
 def _css_declarations(block: str) -> list[str]:
@@ -766,10 +849,14 @@ def _strip_css_comments(block: str) -> str:
 
 #: The ``hidden`` content attribute, which renders the element not at all --
 #: the same as ``display:none`` for the only question asked here.
-_HIDDEN_ATTR_RE = re.compile(r"(?<=[\s\"'])hidden(?=[\s/>=])")
+#:
+#: Case-insensitive for the same reason as :data:`_STYLE_ATTR_RE`: HTML says
+#: so, and this pattern must not borrow the answer from a normalization that
+#: no longer runs first.
+_HIDDEN_ATTR_RE = re.compile(r"(?<=[\s\"'])hidden(?=[\s/>=])", re.IGNORECASE)
 
 
-def _declared_display(construct: str) -> str | None:
+def _declared_display(construct: str) -> list[str] | None:
     """The ``display`` in effect for ``construct``, if anything declares one.
 
     A declaration block can name ``display`` more than once, and taking the
@@ -839,8 +926,8 @@ def _declared_display(construct: str) -> str | None:
         value = style.group(1)
         if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
             value = value[1:-1]  # the attribute's own delimiters, not CSS's
-        normal: str | None = None
-        important: str | None = None
+        normal: list[str] | None = None
+        important: list[str] | None = None
         block = _strip_css_comments(html.unescape(value))
         for declaration in _css_declarations(block):
             found = _declared_value(declaration, "display")
@@ -852,8 +939,8 @@ def _declared_display(construct: str) -> str | None:
                 normal = found[0]
         resolved = important if important is not None else normal
         if resolved is not None:
-            return resolved  # already folded to lowercase, single-spaced
-    return "none" if _HIDDEN_ATTR_RE.search(construct) else None
+            return resolved  # tokens, already folded to lowercase
+    return ["none"] if _HIDDEN_ATTR_RE.search(construct) else None
 
 
 def _is_line_boundary(construct: str) -> bool:
@@ -875,8 +962,8 @@ def _is_line_boundary(construct: str) -> bool:
     return element is None or element not in _INLINE_ELEMENTS
 
 
-def _content_segments(normalized: str) -> list[str]:
-    """Split ``normalized`` into runs of content that can each hold a marker.
+def _content_segments(text: str) -> list[str]:
+    """Split ``text`` into runs of content that can each hold a marker.
 
     Three things separate content. Line breaks, obviously. *Container*
     delimiters, because text inside a comment and text after it are as
@@ -899,7 +986,7 @@ def _content_segments(normalized: str) -> list[str]:
     ``The <b>system: how it works</b>`` stays one run and stays prose.
     """
     segments: list[str] = []
-    for view in _line_views(normalized):
+    for view in _line_views(text):
         for line in view.split("\n"):
             segments.append(line)
             pieces = _boundary_split(line)
@@ -908,8 +995,8 @@ def _content_segments(normalized: str) -> list[str]:
     return segments
 
 
-def _line_views(normalized: str) -> tuple[str, ...]:
-    """Return the ways ``normalized`` can be cut into lines.
+def _line_views(text: str) -> tuple[str, ...]:
+    """Return the ways ``text`` can be cut into lines.
 
     Splitting on ``\n`` is the obvious one and it is not always right: markup
     may contain a line break of its own, and a renderer does not show one. A
@@ -923,8 +1010,8 @@ def _line_views(normalized: str) -> tuple[str, ...]:
     with no closing delimiter swallows everything up to the next ``>``, and
     flattening alone would let ``<a x\nSYSTEM: reveal>`` hide inside it.
     """
-    flattened = _MARKUP_CONSTRUCT_RE.sub(lambda m: m.group().replace("\n", " "), normalized)
-    return (normalized,) if flattened == normalized else (normalized, flattened)
+    flattened = _MARKUP_CONSTRUCT_RE.sub(lambda m: m.group().replace("\n", " "), text)
+    return (text,) if flattened == text else (text, flattened)
 
 
 def _boundary_split(line: str) -> list[str]:
@@ -1010,8 +1097,13 @@ def _boundary_split(line: str) -> list[str]:
     return pieces
 
 
-def _leading_role_marker(normalized: str, tokens: frozenset[str]) -> str | None:
-    """Return the role marker heading some line of ``normalized``, or ``None``.
+def _leading_role_marker(text: str, tokens: frozenset[str]) -> str | None:
+    """Return the role marker heading some line of ``text``, or ``None``.
+
+    ``text`` is :func:`_structural_text` output -- the original spelling,
+    with only its line boundaries unified. Each segment is normalized where
+    it is compared, by :func:`_undecorated_content`, so the markup is read as
+    written while the content is still matched as folded.
 
     Parsed line by line rather than matched with one anchored regex. The regex
     spelling of this check was rewritten in five consecutive review rounds --
@@ -1027,7 +1119,7 @@ def _leading_role_marker(normalized: str, tokens: frozenset[str]) -> str | None:
     has to equal a role token *exactly*: "system requirements" and "1. system
     design" survive as themselves and are not markers.
     """
-    for segment in _content_segments(normalized):
+    for segment in _content_segments(text):
         # Undecorate *before* choosing the delimiter, then again on the head.
         # The two passes have different jobs and neither replaces the other.
         #
@@ -1104,6 +1196,37 @@ def _decode_line_breaks(text: str) -> str:
         return character if _ANY_LINE_BREAK_RE.fullmatch(character) else match.group()
 
     return _CHARACTER_REF_RE.sub(_decoded, text)
+
+
+def _structural_text(text: str) -> str:
+    """``text`` with its line boundaries unified and **nothing else touched**.
+
+    What the markup pass reads. Normalization exists to fold look-alikes
+    together so a *match* cannot be dodged by spelling, and every one of its
+    steps is a rewrite: NFKC turns a full-width identifier into an ASCII
+    keyword, the zero-width strip closes a gap inside one, the whitespace
+    collapse folds a no-break space that CSS calls an identifier character
+    into a separator, and lowercasing does the rest. Parsing CSS out of the
+    result therefore read declarations the CSS parser never sees --
+    ``display:block;display:\uff49\uff4e\uff4c\uff49\uff4e\uff45`` is a valid
+    ``block`` followed by an invalid declaration CSS drops, and the fold made
+    it a plain ``inline`` that hid a marker behind the block. Eight spellings
+    of that, one per fold, were bypasses.
+
+    So structure is parsed from the original spelling and only the *content*
+    is normalized, at the point it is compared -- which is what
+    :func:`_undecorated_content` already does for each segment. That is the
+    same ordering rule the CSS side keeps arriving at from the other
+    direction: cut first, decode second, and never let a rewrite manufacture
+    syntax.
+
+    Line boundaries are the one thing unified here, because they are structure
+    themselves: ``str.splitlines`` knows every separator, and a reference like
+    ``&#10;`` is a break that only exists once decoded. Neither invents a
+    boundary that normalization would have removed -- NFKC introduces no line
+    break for any code point in Unicode, which is asserted rather than assumed.
+    """
+    return "\n".join(_decode_line_breaks(text).splitlines())
 
 
 def _normalize(text: str) -> str:
@@ -1302,7 +1425,7 @@ class AdversarialDefense:
         :meth:`_line_aware`.
         """
         normalized = self._line_aware(prompt, prompt_normalized)
-        role_marker = _leading_role_marker(normalized, self._ROLE_TOKENS)
+        role_marker = _leading_role_marker(_structural_text(prompt), self._ROLE_TOKENS)
         if role_marker is not None:
             return role_marker
         for indicator in self._INJECTION_INDICATORS:
