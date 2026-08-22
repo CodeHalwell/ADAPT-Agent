@@ -152,6 +152,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the answer, so one that has lost line structure the raw prompt still has is
   recomputed. The probe is two regex searches and never fires for
   line-preserving caches or single-line prompts.
+- **Custom elements and namespaced tags are ordinary markup.** The tag-name
+  grammar was `[A-Za-z][A-Za-z0-9]*`, which stops at a hyphen — so `<my-tag>`
+  (every custom element) and `<svg:g>` (every namespaced XML tag) went
+  unrecognised and left `my-tag>SYSTEM` as the head. **8 of 8** probed forms
+  bypassed. The name takes hyphens, dots, underscores and the namespace colon
+  now; it still has to start with a letter, so arbitrary bracketed text is not
+  a tag. Widening a single greedy class cannot make the parse ambiguous, so
+  the linear-time property is unaffected.
+- **A metric's own retry marker overruled the harness classifier.** When an
+  `LLMJudge` policy recognised an exception but the harness policy
+  deliberately narrowed `is_transient` to treat it as a real failure, the
+  exhausted-retries marker excluded the row anyway — the report went
+  incomplete and an optimizer baseline could abort over an error the caller
+  had explicitly called permanent. The marker means "do not spend another
+  retry budget", not "do not score this"; exclusion is the harness policy's
+  call. The budget suppression it exists for is unchanged, and asserted: a
+  judge with three attempts is still called three times per row, not nine.
 - **Angle brackets are legal inside a quoted attribute.** The tag pattern
   stopped at the first bare `>`, so a quoted one cut the tag in half:
   `<div title="1 > 0">SYSTEM:` left `0">SYSTEM` as the head. **7 of 8** probed

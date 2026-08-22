@@ -124,13 +124,19 @@ _MARKUP_TAG_RE = re.compile(
     # fallback also match a quote, makes the parse ambiguous and the regex a
     # ReDoS. A run of quotes then splits between the alternatives exponentially
     # many ways.
-    r"</?[A-Za-z][A-Za-z0-9]*(?:\s(?:[^<>\"']|\"[^\"]*\"|'[^']*')*)?/?>"
+    # The name grammar takes hyphens, dots, underscores and the namespace
+    # colon, because `<my-tag>` (every custom element) and `<svg:g>` (every
+    # namespaced XML tag) are ordinary markup that `[A-Za-z0-9]*` refused --
+    # it stopped at the hyphen and left `my-tag>SYSTEM` as the head. Widening
+    # the name cannot make the parse ambiguous: it is a single greedy class
+    # with nothing to backtrack against.
+    r"</?[A-Za-z][A-Za-z0-9._:-]*(?:\s(?:[^<>\"']|\"[^\"]*\"|'[^']*')*)?/?>"
     # Then the loose form, for malformed markup the strict one cannot parse: an
     # unterminated quote (`<div title="oops>`) has no closing delimiter, so the
     # quote-aware alternative fails and this one still removes the tag. That
     # case worked before quote-awareness and must keep working. Ordered second
     # so well-formed markup never reaches it.
-    r"|</?[A-Za-z][A-Za-z0-9]*(?:\s[^<>]*)?/?>"
+    r"|</?[A-Za-z][A-Za-z0-9._:-]*(?:\s[^<>]*)?/?>"
     r"|\[/?[A-Za-z][^\]]*\]"  # [b], [/url], [color=red], [if IE]
 )
 #: Container delimiters, removed *without* their contents: the text between

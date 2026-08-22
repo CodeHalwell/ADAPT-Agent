@@ -713,6 +713,22 @@ class EvaluationHarness:
                 # would multiply the budgets and reset the backoff, adding
                 # load exactly while the provider is throttling.
                 if retries_already_exhausted(exc):
+                    # The marker means "do not spend another budget", not
+                    # "exclude this row". Exclusion is still *this* policy's
+                    # call: a caller who narrowed `is_transient` to treat this
+                    # error as a real failure meant it, and the metric's own
+                    # classification must not overrule the harness they
+                    # configured. Only the retry is suppressed here.
+                    if not policy.should_retry(exc, 0):
+                        logger.warning(
+                            "Metric %s raised on example %d; its own retries were spent, "
+                            "but this harness does not classify it as transient, so it is "
+                            "scored as a failure: %s",
+                            metric.name,
+                            index,
+                            exc,
+                        )
+                        return 0.0, False
                     logger.warning(
                         "Metric %s failed transiently on example %d (its own retries "
                         "were already spent); excluded from the score: %s",

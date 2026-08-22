@@ -1547,3 +1547,73 @@ def test_the_message_path_classifies_a_status_the_same_way(status: int) -> None:
 @pytest.mark.parametrize("message", ["order 429 not found", "shard 529 rebalanced"])
 def test_a_bare_5xx_number_still_needs_status_context(message: str) -> None:
     assert is_transient_error(RuntimeError(message)) is False
+
+
+# -- the exhausted marker suppresses a retry, not the harness's judgement ------
+
+
+def _judge_metric_report(judge_policy, harness_policy):
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def timeouts(prompt, **kwargs):
+        raise TimeoutError("upstream timed out")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    return EvaluationHarness(
+        [LLMJudge(timeouts, retry=judge_policy).as_metric()], retry=harness_policy
+    ).evaluate(lambda x: "ok", dataset)
+
+
+def test_a_harness_that_narrows_transient_is_honoured_after_judge_retries() -> None:
+    """The marker said "already retried"; it was read as "already excluded".
+
+    A caller who narrows `is_transient` to treat `TimeoutError` as a real
+    failure means it. The judge's own classification must not overrule the
+    harness they configured -- otherwise the report goes incomplete and an
+    optimizer baseline can abort over an error the caller called permanent.
+    """
+    report = _judge_metric_report(
+        RetryPolicy(attempts=1),
+        RetryPolicy(attempts=1, is_transient=lambda exc: False),
+    )
+    assert report.is_complete is True
+    assert report.n_transient_errors == 0
+    assert len(report.failures()) == 3, "scored as an ordinary failure, as configured"
+
+
+def test_agreeing_policies_still_exclude_the_row() -> None:
+    report = _judge_metric_report(RetryPolicy(attempts=1), RetryPolicy(attempts=1))
+    assert report.is_complete is False
+    assert report.n_transient_errors == 3
+    assert report.failures() == []
+
+
+def test_a_harness_that_widens_transient_is_honoured_too() -> None:
+    """The mirror: the judge declines, the harness classifies it as transient."""
+    report = _judge_metric_report(
+        RetryPolicy(attempts=1, is_transient=lambda exc: False),
+        RetryPolicy(attempts=1, is_transient=lambda exc: True),
+    )
+    assert report.is_complete is False
+    assert report.n_transient_errors == 3
+
+
+def test_the_marker_still_stops_the_budgets_multiplying() -> None:
+    """Why the marker exists at all: without it the harness retries on top of
+    the judge's own loop, resetting the backoff exactly while a provider is
+    throttling."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    calls = {"n": 0}
+
+    def counting(prompt, **kwargs):
+        calls["n"] += 1
+        raise TimeoutError("upstream timed out")
+
+    fast = RetryPolicy(attempts=3, initial_backoff=0.001, jitter=0.0)
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    EvaluationHarness([LLMJudge(counting, retry=fast).as_metric()], retry=fast).evaluate(
+        lambda x: "ok", dataset
+    )
+
+    assert calls["n"] == 9, "3 rows x 3 judge attempts; the harness must not retry again"
