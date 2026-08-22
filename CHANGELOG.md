@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Reading an embedded stylesheet was quadratic, twice.** Both were copies
+  where a scan belonged, and both are reachable from an ordinary prompt on a
+  detector with no default length limit. `_stylesheet_text` searched a fresh
+  copy of the whole remaining suffix for a closing tag on every `<style>` it
+  found — 8,000 unterminated ones took **21s**, quadrupling with each
+  doubling. It resumes *after* each raw-text region now, which is also what
+  HTML does: nothing is a tag inside a `<style>` until `</style`. And
+  `_style_rules` sliced its own copy of the tail for every block left open at
+  the end, which `.a{content:"` repeated stacks one of per pair of quotes —
+  4,000 took **10.9s**. Only the outermost unterminated block is a rule, since
+  once inside a block a `{` is a component value rather than the start of
+  another. Seven shapes of stylesheet are now asserted linear at two sizes.
+
+- **A stylesheet rule ignored `!important` inside its own block.** The cascade
+  within one declaration block is two rules and only two — `!important` beats
+  normal, among equals the last wins — and it was implemented correctly for a
+  `style` attribute and then written a *second* time for a stylesheet rule,
+  where the copy took the last declaration whatever its flag. So
+  `.x{display:block!important;display:inline}` resolved to `inline`, hiding a
+  marker behind a block that really is one, and the mirror spelling reported
+  prose. Both readers share `_resolved_display` now.
+
+- **A selector was matched against the raw attribute value.** HTML resolves the
+  references in an attribute and *then* reads the class list out of what that
+  produced, so `class="&#120;"` is the class `x` and `class="a&#32;b"` is two
+  classes. Every escaped spelling missed. The two sides of one match now get
+  the decoder each syntax calls for — the selector `_decode_css_escapes` for
+  CSS's escapes, the attribute `html.unescape` for HTML's references — and
+  neither gets both. The class list is split on HTML's five whitespace
+  characters rather than `str.split`'s twenty-one, because a no-break space is
+  a name character to HTML and splitting there would cut one class in two.
+
 - **A provider error wrapped by an SDK was classified on the wrapper alone.**
   A provider failure almost never reaches the harness bare —
   `raise RuntimeError("agent invocation failed") from TimeoutError(...)` is the

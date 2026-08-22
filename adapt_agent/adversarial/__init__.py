@@ -1046,6 +1046,35 @@ def _tag_attributes(construct: str) -> list[tuple[str, str]]:
     return attributes
 
 
+def _resolved_display(block: str) -> list[str] | None:
+    """The ``display`` a declaration block resolves to, or ``None``.
+
+    The cascade inside one block is two rules and only two, because a block has
+    no specificity or origin to weigh: ``!important`` beats normal, and among
+    equals the last wins.
+
+    Written once and shared, which is the point. It lived inline in
+    :func:`_declared_display` and was then written a *second* time for a
+    stylesheet rule -- and the copy took the last declaration whatever its
+    flag, so ``display:block!important;display:inline`` resolved to ``inline``.
+    Wrong in both directions at once: a marker behind the block went
+    unreported, and the mirror spelling reported prose. That is the
+    list-beside-a-rule pattern in its most avoidable shape, since here the rule
+    was already implemented correctly ten lines away.
+    """
+    normal: list[str] | None = None
+    important: list[str] | None = None
+    for declaration in _css_declarations(_strip_css_comments(block)):
+        found = _declared_value(declaration, "display")
+        if found is None:
+            continue
+        if found[1]:
+            important = found[0]
+        else:
+            normal = found[0]
+    return important if important is not None else normal
+
+
 def _declared_display(construct: str) -> list[str] | None:
     """The ``display`` in effect for ``construct``, if anything declares one.
 
@@ -1117,18 +1146,7 @@ def _declared_display(construct: str) -> list[str] | None:
     # -- an attribute has no specificity or origin to weigh it against.
     style = next((value for name, value in attributes if name == "style"), None)
     if style is not None:
-        normal: list[str] | None = None
-        important: list[str] | None = None
-        block = _strip_css_comments(html.unescape(style))
-        for declaration in _css_declarations(block):
-            found = _declared_value(declaration, "display")
-            if found is None:
-                continue
-            if found[1]:
-                important = found[0]
-            else:
-                normal = found[0]
-        resolved = important if important is not None else normal
+        resolved = _resolved_display(html.unescape(style))
         if resolved is not None:
             return resolved  # tokens, already folded to lowercase
     return ["none"] if any(name == "hidden" for name, _ in attributes) else None
@@ -1158,16 +1176,33 @@ def _stylesheet_text(text: str) -> str:
     it the other way, because HTML answers it differently for the two.
     """
     sheets: list[str] = []
-    for match in _MARKUP_CONSTRUCT_RE.finditer(text):
+    index = 0
+    end = len(text)
+    while index < end:
+        match = _MARKUP_CONSTRUCT_RE.search(text, index)
+        if match is None:
+            break
+        index = match.end()
         construct = match.group()
         if _CLOSING_CONSTRUCT_RE.match(construct):
             continue
         name = _ELEMENT_NAME_RE.match(construct)
         if name is None or _ascii_lower(name.group(1)) != "style":
             continue
-        rest = text[match.end() :]
-        close = _STYLE_CLOSE_RE.search(rest)
-        sheets.append(rest if close is None else rest[: close.start()])
+        close = _STYLE_CLOSE_RE.search(text, index)
+        stop = end if close is None else close.start()
+        sheets.append(text[index:stop])
+        # Resume *after* the raw-text region rather than inside it. Both halves
+        # of that matter. It is what HTML does -- nothing is a tag inside a raw
+        # text element until `</style` -- and it is what keeps this linear: the
+        # first version searched a fresh copy of the whole remaining suffix for
+        # every `<style>` it found, so a prompt of unterminated ones was
+        # quadratic in its length. 8,000 of them took 21s, quadrupling with
+        # each doubling, on a detector with no default length limit. Each
+        # character is examined a bounded number of times now, and an
+        # unterminated `<style>` swallows the rest of the text exactly once,
+        # which is also what a browser does with it.
+        index = stop
     return "\n".join(sheets)
 
 
@@ -1210,6 +1245,16 @@ def _style_rules(sheet: str) -> list[tuple[str, str]]:
             quote = char
             index += 1
             continue
+        if char == ";":
+            # A declaration ends here, so a selector after it starts clean. The
+            # prelude of a *nested* rule would otherwise carry the enclosing
+            # block's declarations with it -- `.x{color:red; .y{...` gave the
+            # inner rule the prelude `color:red; .y`, which still resolved to
+            # `.y` only because the subject is the rightmost compound. Correct
+            # by luck is the thing to remove while it is still visible.
+            index += 1
+            start = index
+            continue
         if char == "{":
             stack.append((sheet[start:index], index + 1))
         elif char == "}":
@@ -1222,10 +1267,51 @@ def _style_rules(sheet: str) -> list[tuple[str, str]]:
             continue
         index += 1
         start = index
-    while stack:  # unterminated: the tokenizer closes it at the end of the sheet
-        prelude, body = stack.pop()
-        if not prelude.lstrip(_CSS_WHITESPACE).startswith("@"):
-            rules.append((prelude, sheet[body:]))
+    if stack:
+        # Whatever is still open runs to the end of the sheet, where the
+        # tokenizer closes it. Every entry is a rule -- a nested one is still a
+        # rule, and dropping the inner levels would lose the boundary a
+        # `display` declared there really draws.
+        #
+        # But giving each entry `sheet[body:]` is quadratic, which is how this
+        # was found: `.a{content:"` repeated stacks one unclosed block per pair
+        # of quotes, and copying the remaining sheet for each took 10.9s at
+        # 4,000 of them, quadrupling with every doubling.
+        #
+        # The tail is split by *level* instead, in one pass. Depth only ever
+        # increases inside it -- a `}` would have closed a block, and then that
+        # block would not be on the stack -- so each `{` ends one level's text
+        # and starts the next, and every character lands in exactly one piece.
+        # That is also what the text means: a declaration belongs to the
+        # innermost block that encloses it. Linear, and exact rather than a
+        # compromise.
+        pieces: list[str] = []
+        start = index = stack[0][1]
+        quote = ""
+        while index < end:
+            char = sheet[index]
+            if char == "\\":
+                index += 2
+                continue
+            if quote:
+                if char == quote:
+                    quote = ""
+                index += 1
+                continue
+            if char in "\"'":
+                quote = char
+            elif char == "{":
+                pieces.append(sheet[start:index])
+                start = index + 1
+            index += 1
+        pieces.append(sheet[start:])
+        # `strict=False` deliberately: the two are the same length by
+        # construction -- one piece per level, and one level per entry --
+        # but this reads untrusted text, and a scan that disagreed with
+        # itself should drop a rule rather than raise out of a detector.
+        for (prelude, _), level in zip(stack, pieces, strict=False):
+            if not prelude.lstrip(_CSS_WHITESPACE).startswith("@"):
+                rules.append((prelude, level))
     return rules
 
 
@@ -1300,7 +1386,7 @@ def _selector_subjects(selector: str) -> tuple[set[str], set[str], set[str], boo
 def _selector_subject_compounds(selector: str) -> list[str]:
     """The rightmost compound of each selector in a comma-separated list."""
     compounds: list[str] = []
-    subject = 0
+    subject = pending = 0
     depth = 0
     quote = ""
     index = 0
@@ -1309,6 +1395,9 @@ def _selector_subject_compounds(selector: str) -> list[str]:
         char = selector[index]
         if char == "\\":
             index = _selector_escape(selector, index)
+            # An escape is a name character, so it commits the pending compound
+            # the way any other one does.
+            subject = pending
             continue
         if quote:
             if char == quote:
@@ -1322,14 +1411,32 @@ def _selector_subject_compounds(selector: str) -> list[str]:
         elif depth == 0:
             if char == ",":
                 compounds.append(selector[subject:index])
-                subject = index + 1
-            elif char in _CSS_WHITESPACE or char in ">+~":
-                # A combinator, so whatever follows starts a new compound and
-                # becomes the subject unless another combinator follows it.
-                subject = index + 1
+                subject = pending = index + 1
+                index += 1
+                continue
+            if char in _CSS_WHITESPACE or char in ">+~":
+                # A combinator *offers* the next position as the subject; it
+                # only becomes one once a real character arrives there. A
+                # trailing one is not a combinator at all -- `.x/**/` is the
+                # selector `.x`, because a comment separates tokens and there
+                # is no token after it. Committing on sight instead left the
+                # subject empty, which the old empty-list fallback then read as
+                # "matches anything" and split every construct in the prompt.
+                pending = index + 1
+                index += 1
+                continue
+        subject = pending
         index += 1
     compounds.append(selector[subject:])
-    return [compound for compound in compounds if compound.strip(_CSS_WHITESPACE)] or [""]
+    # An empty selector is invalid and matches nothing, so it contributes no
+    # subjects -- *not* the "could match anything" answer an empty compound
+    # gets. The two look alike and mean opposite things: a compound with no
+    # type, class or id (`*`, an attribute selector, a bare pseudo-class) is a
+    # real selector whose subject this reader cannot narrow, while no compound
+    # at all is not a selector. Conflating them made `.&#120;{display:block}`
+    # split every construct in the prompt, because the `;` inside the reference
+    # ends the prelude and leaves nothing in front of the brace.
+    return [compound for compound in compounds if compound.strip(_CSS_WHITESPACE)]
 
 
 def _selector_escape(text: str, index: int) -> int:
@@ -1426,11 +1533,7 @@ def _stylesheet_blocks(text: str) -> _StylesheetBlocks:
     ids: set[str] = set()
     anything = False
     for prelude, block in _style_rules(_stylesheet_text(text)):
-        declared = None
-        for declaration in _css_declarations(_strip_css_comments(block)):
-            found = _declared_value(declaration, "display")
-            if found is not None:
-                declared = found[0]
+        declared = _resolved_display(block)
         if declared is None or _is_inline_display(declared):
             continue
         rule_types, rule_classes, rule_ids, rule_anything = _selector_subjects(
@@ -1461,12 +1564,45 @@ def _stylesheet_makes_block(construct: str, element: str | None, blocks: _Styles
     if element is not None and element in blocks.types:
         return True
     for name, value in _tag_attributes(construct):
+        # Decoded first, and split second. HTML resolves the references in an
+        # attribute value and *then* reads the class list out of what that
+        # produced, so `class="&#120;"` is the class `x` and `class="a&#32;b"`
+        # is two classes. Comparing the raw text missed every escaped spelling.
+        #
+        # This is the mirror of the rule one function over: a `<style>` element
+        # is raw text and decodes nothing, while an attribute value decodes.
+        # Two sides of one match, and HTML answers them differently -- so the
+        # selector side is decoded by `_decode_css_escapes` for CSS's escapes
+        # and the attribute side by `html.unescape` for HTML's references,
+        # each with the decoder its own syntax calls for.
         if name == "class" and blocks.classes:
-            if any(token in blocks.classes for token in value.split()):
+            if any(token in blocks.classes for token in _class_tokens(html.unescape(value))):
                 return True
-        elif name == "id" and value in blocks.ids:
+        elif name == "id" and html.unescape(value) in blocks.ids:
             return True
     return False
+
+
+def _class_tokens(value: str) -> list[str]:
+    """The class names in a decoded ``class`` attribute.
+
+    Split on HTML's five whitespace characters rather than :meth:`str.split`,
+    which treats sixteen more code points as separators -- a no-break space is
+    part of a class name to HTML and would otherwise cut one in two. The same
+    distinction that made ``style\xa0=`` an attribute named ``style\xa0``.
+    """
+    tokens: list[str] = []
+    current: list[str] = []
+    for char in value:
+        if char in _HTML_WHITESPACE:
+            if current:
+                tokens.append("".join(current))
+                current = []
+            continue
+        current.append(char)
+    if current:
+        tokens.append("".join(current))
+    return tokens
 
 
 def _is_line_boundary(construct: str, blocks: _StylesheetBlocks = _NO_STYLESHEET) -> bool:
