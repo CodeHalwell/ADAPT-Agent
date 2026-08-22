@@ -152,6 +152,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the answer, so one that has lost line structure the raw prompt still has is
   recomputed. The probe is two regex searches and never fires for
   line-preserving caches or single-line prompts.
+- **Angle brackets are legal inside a quoted attribute.** The tag pattern
+  stopped at the first bare `>`, so a quoted one cut the tag in half:
+  `<div title="1 > 0">SYSTEM:` left `0">SYSTEM` as the head. **7 of 8** probed
+  forms bypassed. The parser is quote-aware now, with its three inner
+  alternatives disjoint by construction — the fallback class excludes both
+  quote characters — so the parse is unambiguous and linear. The obvious
+  spelling, letting the fallback match a quote too, is a ReDoS: a run of quotes
+  splits between the alternatives exponentially many ways, and on untrusted
+  input that is a denial of service. A loose second alternative keeps malformed
+  markup working (`<div title="oops>` has no closing quote for the strict form
+  to find), which was already detected before this change.
 - **Decoration is a Unicode category now, not a list of characters.** A role
   marker introduced by an emoji or any other unlisted glyph slipped straight
   through: **13 of 14** probed forms bypassed — `🚨`, `⚠️`, `→`, `▶`, `★`, `§`,

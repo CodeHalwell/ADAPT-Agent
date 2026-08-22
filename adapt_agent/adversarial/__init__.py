@@ -113,7 +113,24 @@ _ORDERED_LIST_RE = re.compile(r"^[ \t]*\d{1,3}[.)\]]")
 #: "The system" and stays prose. Anchoring would have caught the first and
 #: missed the second.
 _MARKUP_TAG_RE = re.compile(
-    r"</?[A-Za-z][A-Za-z0-9]*(?:\s[^<>]*)?/?>"  # <div>, </p>, <span class="x">, <br/>
+    # Quote-aware first: `>` and `<` are legal inside a quoted attribute, and a
+    # pattern that stopped at the first bare `>` cut the tag in half --
+    # `<div title="1 > 0">SYSTEM:` left `0">SYSTEM` as the head.
+    #
+    # The three inner alternatives are mutually exclusive by construction: the
+    # fallback class excludes *both* quote characters, so at any position
+    # exactly one alternative can start and the match is linear. That matters
+    # here -- this runs on untrusted text, and the obvious spelling, letting the
+    # fallback also match a quote, makes the parse ambiguous and the regex a
+    # ReDoS. A run of quotes then splits between the alternatives exponentially
+    # many ways.
+    r"</?[A-Za-z][A-Za-z0-9]*(?:\s(?:[^<>\"']|\"[^\"]*\"|'[^']*')*)?/?>"
+    # Then the loose form, for malformed markup the strict one cannot parse: an
+    # unterminated quote (`<div title="oops>`) has no closing delimiter, so the
+    # quote-aware alternative fails and this one still removes the tag. That
+    # case worked before quote-awareness and must keep working. Ordered second
+    # so well-formed markup never reaches it.
+    r"|</?[A-Za-z][A-Za-z0-9]*(?:\s[^<>]*)?/?>"
     r"|\[/?[A-Za-z][^\]]*\]"  # [b], [/url], [color=red], [if IE]
 )
 #: Container delimiters, removed *without* their contents: the text between
