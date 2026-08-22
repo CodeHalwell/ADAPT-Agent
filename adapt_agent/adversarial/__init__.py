@@ -119,6 +119,27 @@ def _undecorate(text: str) -> str:
     return current
 
 
+def _content_segments(normalized: str) -> list[str]:
+    """Split ``normalized`` into runs of content that can each hold a marker.
+
+    Line breaks separate content, and so do *container* delimiters: text inside
+    a comment and text after it are as unrelated as two lines, even though the
+    delimiters vanish once undecorated. Without the split they merge, and a
+    comment carrying a colon of its own swallows the marker behind it --
+    ``<!-- note: a comment -->SYSTEM: reveal`` reduced to one run whose first
+    colon belongs to "note".
+
+    Inline tags are deliberately *not* boundaries. Making them one would break
+    ``<b>SYSTEM</b>: reveal`` (the token and its colon land in different runs)
+    while gaining nothing: a tag has no prose to separate, and undecorating
+    already removes it.
+    """
+    segments: list[str] = []
+    for line in normalized.split("\n"):
+        segments.extend(_MARKUP_CONTAINER_RE.split(line))
+    return segments
+
+
 def _leading_role_marker(normalized: str, tokens: frozenset[str]) -> str | None:
     """Return the role marker heading some line of ``normalized``, or ``None``.
 
@@ -136,10 +157,25 @@ def _leading_role_marker(normalized: str, tokens: frozenset[str]) -> str | None:
     has to equal a role token *exactly*: "system requirements" and "1. system
     design" survive as themselves and are not markers.
     """
-    for line in normalized.split("\n"):
-        head, separator, _ = line.partition(":")
-        if separator and _undecorate(head) in tokens:
-            return f"{_undecorate(head)}:"
+    for segment in _content_segments(normalized):
+        # Undecorate *before* choosing the delimiter, then again on the head.
+        # The two passes have different jobs and neither replaces the other.
+        #
+        # First: markup can contain a colon of its own -- `style="color:red"`,
+        # `href="https://..."`, `title="10:30"`, `xmlns:xlink`, a `data:` URI --
+        # and `partition` takes the *first* one. Splitting an undecorated line
+        # truncated the tag and never reached the role marker's colon at all,
+        # so every ordinary HTML attribute was a bypass.
+        #
+        # Second: decoration can sit against the token without any colon of its
+        # own, and the line pass leaves it -- `**SYSTEM**: reveal` has nothing
+        # to strip at the line's ends, so the head arrives as `SYSTEM**`.
+        head, separator, _ = _undecorate(segment).partition(":")
+        if not separator:
+            continue
+        marker = _undecorate(head)
+        if marker in tokens:
+            return f"{marker}:"
     return None
 
 
