@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Case-insensitive matching against HTML and CSS literals used Python's
+  Unicode folding.** Both specs are **ASCII** case-insensitive, and exactly
+  three characters differ: U+017F folds to `s`, U+212A to `k`, and
+  U+0130/U+0131 to `i`. Each one reached a literal this module matches. A
+  long-s spelling of `style` was read as a `style` attribute, so a
+  `display:inline` no browser applies took a line boundary away; and
+  `inline-bloc` + U+212A was read as the `inline-block` keyword, so a marker
+  hid behind an earlier `display:block`. A no-break space was the same bug in a
+  third spelling: `\s` is sixteen characters HTML does not call whitespace, so
+  `style\xa0=` was read as a `style` attribute rather than as an attribute
+  named `style\xa0`.
+
+  Every comparison states its own rule now — `_ascii_lower` for a fold,
+  `_ascii_ci` for a pattern, `_HTML_WHITESPACE` for a separator. `re.ASCII`
+  would not do: it also makes `\w` ASCII-only, and the lookbehind that stops
+  `data-style` reading as a `style` attribute needs `\w` to stay Unicode. The
+  set of aliasing characters is derived over the whole of Unicode in a test
+  rather than listed, so a future Unicode release fails the guard instead of
+  quietly shrinking it.
+
+- **A line break inside a closed markup construct was still offered as a
+  line.** The text was scanned twice, flattened *and* raw, so a newline falling
+  inside a tag or a declaration exposed the construct's interior as content:
+  `<div title="note\nSYSTEM: settings">hello` was reported while
+  `<div title="SYSTEM: reveal">hello` was clean. That is an accident of where
+  the breaks are rather than a rule about what a reader sees — and it also
+  flagged ordinary prose, `<div title="Our\nsystem: v2 is live">`.
+
+  Only the flattened view is scanned now. The raw view had been added to stop
+  an unterminated construct swallowing a marker, and measurement retired that
+  argument: an unterminated construct matches nothing, so nothing is flattened
+  and the raw text is what gets scanned regardless. This does not narrow what
+  the module reads of hidden text — a comment's interior is still its own run
+  and `hidden` is still honoured for any value, because the content of a hidden
+  element is text a model reads. An attribute value is markup metadata, which
+  nothing else here scans.
+
 - **A note recorded against an exception was shared by every concurrent
   propagation of that object.** The declared fallback and the exhausted-retries
   mark are both keyed by the exception alone, and an exception instance is

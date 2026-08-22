@@ -4,12 +4,48 @@ from __future__ import annotations
 
 import html
 import re
+import string
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
 # Zero-width / invisible characters frequently used to obfuscate attack
 # indicators (zero-width space, non-joiner, joiner, BOM/zero-width no-break space).
+#: HTML and CSS are **ASCII** case-insensitive, and Python is not. Exactly
+#: three characters make the difference, and each reaches a literal this module
+#: matches: U+017F folds to ``s`` -- so ``\u017ftyle`` was read as a ``style``
+#: attribute -- U+212A to ``k``, so ``inline-bloc\u212a`` was read as the
+#: ``inline-block`` keyword and hid a marker behind a block, and U+0130/U+0131
+#: to ``i``. A browser recognises none of them.
+#:
+#: So every case-insensitive comparison here states ASCII itself rather than
+#: borrowing Python's: :func:`_ascii_lower` for a fold, :func:`_ascii_ci` for a
+#: pattern. ``re.ASCII`` would serve for a pattern, but it also makes ``\w``
+#: ASCII-only, and the lookbehind that keeps ``data-style`` from reading as a
+#: ``style`` attribute needs ``\w`` to stay Unicode -- one flag cannot mean
+#: both things.
+_ASCII_CASE = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def _ascii_lower(text: str) -> str:
+    """``text`` with A-Z folded and every other character left alone."""
+    return text.translate(_ASCII_CASE)
+
+
+def _ascii_ci(literal: str) -> str:
+    """A pattern matching ``literal`` ASCII-case-insensitively, and only so."""
+    return "".join(
+        f"[{char.lower()}{char.upper()}]" if char.isascii() and char.isalpha() else re.escape(char)
+        for char in literal
+    )
+
+
+#: The five characters HTML calls whitespace. ``\s`` is sixteen more, and each
+#: of those is an ordinary name character to an HTML tokenizer -- so
+#: ``style\xa0=`` names an attribute ``style\xa0`` and not a ``style`` at all,
+#: and reading one there was the same bypass in a third spelling.
+_HTML_WHITESPACE = " \t\n\f\r"
+
 _ZERO_WIDTH_CHARS = "​‌‍﻿"
 _ZERO_WIDTH_RE = re.compile(f"[{_ZERO_WIDTH_CHARS}]")
 #: Every whitespace run, line breaks included -- see :func:`_normalize`.
@@ -220,6 +256,17 @@ _CHARACTER_REF_RE = re.compile(
 #: Every markup construct except character references -- the constructs that
 #: are *structure*. A character reference is content: ``&amp;`` renders as a
 #: character in the middle of a line, never as a break.
+#:
+#: ``re.IGNORECASE`` stays here, unlike everywhere else in this module, and
+#: for a reason that took removing it to find: it is not folding a literal --
+#: the only one is ``CDATA``, which spells none of the three letters Unicode
+#: can alias. It is widening ``[A-Za-z]``, which under that flag also admits
+#: U+017F, U+212A and U+0130/U+0131. HTML admits those in a tag name too, so
+#: taking the flag away stopped ``<mar\u212a>`` being markup at all: it was
+#: left in the text rather than removed, which is the direction that hides a
+#: marker rather than the one that invents one. The name class is narrower
+#: than HTML's either way, and this keeps the three characters that a fold
+#: elsewhere in this module would otherwise be the only reason to think about.
 #:
 #: One alternation rather than a rule at a time, so both users get a single
 #: left-to-right scan. The alternatives stay unambiguous: they are separated
@@ -444,6 +491,12 @@ _INLINE_ELEMENTS = frozenset(
 #: The element name at the front of a matched construct, if it has one.
 #: Comments, CDATA sections and declarations have none and are always
 #: boundaries -- they carry no prose that could continue a line.
+#: Note the class is ASCII, so the name handed to :func:`_ascii_lower` is
+#: already ASCII and that fold cannot change an answer here -- mutating it
+#: back to ``str.lower`` fails nothing, which is how this got noticed. It
+#: stays for uniformity: the class is narrower than HTML's, which takes
+#: almost anything after the first letter, and widening it would make the
+#: fold live.
 _ELEMENT_NAME_RE = re.compile(r"[<\[]\s*/?\s*([A-Za-z][A-Za-z0-9._:-]*)")
 
 #: A construct that *closes* an element rather than opening one.
@@ -526,7 +579,10 @@ _INLINE_DISPLAYS = frozenset(
 #: already folded, and inheriting a rule from the *matching* pipeline meant
 #: ``STYLE=`` stopped being a style attribute the moment the parse was moved
 #: off it.
-_STYLE_ATTR_RE = re.compile(r"(?<![\w-])style\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]*)", re.IGNORECASE)
+_STYLE_ATTR_RE = re.compile(
+    rf"(?<![\w-]){_ascii_ci('style')}[{_HTML_WHITESPACE}]*=[{_HTML_WHITESPACE}]*"
+    rf"(\"[^\"]*\"|'[^']*'|[^{_HTML_WHITESPACE}>]*)"
+)
 #: A CSS escape: a backslash, then either up to six hex digits naming a code
 #: point (with one optional whitespace character as the escape's own
 #: delimiter) or any single character taken literally. A backslash before a
@@ -741,9 +797,9 @@ def _declared_value(declaration: str, prop: str) -> tuple[list[str], bool] | Non
     split = _split_declaration(declaration)
     if split is None:
         return None
-    if _decode_css_escapes(split[0].strip(_CSS_WHITESPACE)).lower() != prop:
+    if _ascii_lower(_decode_css_escapes(split[0].strip(_CSS_WHITESPACE))) != prop:
         return None
-    tokens = [token.lower() for token in _css_value_tokens(split[1])]
+    tokens = [_ascii_lower(token) for token in _css_value_tokens(split[1])]
     important = len(tokens) >= 2 and tokens[-2] == "!" and tokens[-1] == "important"
     if important:
         tokens = tokens[:-2]
@@ -853,7 +909,9 @@ def _strip_css_comments(block: str) -> str:
 #: Case-insensitive for the same reason as :data:`_STYLE_ATTR_RE`: HTML says
 #: so, and this pattern must not borrow the answer from a normalization that
 #: no longer runs first.
-_HIDDEN_ATTR_RE = re.compile(r"(?<=[\s\"'])hidden(?=[\s/>=])", re.IGNORECASE)
+_HIDDEN_ATTR_RE = re.compile(
+    rf"(?<=[{_HTML_WHITESPACE}\"'])" + _ascii_ci("hidden") + rf"(?=[{_HTML_WHITESPACE}/>=])"
+)
 
 
 def _declared_display(construct: str) -> list[str] | None:
@@ -953,7 +1011,7 @@ def _is_line_boundary(construct: str) -> bool:
     on ordinary prose.
     """
     name = _ELEMENT_NAME_RE.match(construct)
-    element = name.group(1).lower() if name is not None else None
+    element = _ascii_lower(name.group(1)) if name is not None else None
     if element in _FORCED_BREAK_ELEMENTS:
         return True
     display = _declared_display(construct)
@@ -986,32 +1044,43 @@ def _content_segments(text: str) -> list[str]:
     ``The <b>system: how it works</b>`` stays one run and stays prose.
     """
     segments: list[str] = []
-    for view in _line_views(text):
-        for line in view.split("\n"):
-            segments.append(line)
-            pieces = _boundary_split(line)
-            if len(pieces) > 1:
-                segments.extend(pieces)
+    for line in _rendered_lines(text).split("\n"):
+        segments.append(line)
+        pieces = _boundary_split(line)
+        if len(pieces) > 1:
+            segments.extend(pieces)
     return segments
 
 
-def _line_views(text: str) -> tuple[str, ...]:
-    """Return the ways ``text`` can be cut into lines.
+def _rendered_lines(text: str) -> str:
+    """``text`` with the line breaks *inside* markup constructs flattened.
 
-    Splitting on ``\n`` is the obvious one and it is not always right: markup
-    may contain a line break of its own, and a renderer does not show one. A
-    tag written across two lines put its own tail in front of the next line's
-    content, and the head then belonged to an attribute --
-    ``<div\ntitle="x">SYSTEM: reveal`` parsed as ``title="x">system``.
+    A renderer does not show a break that falls inside a tag, a comment
+    delimiter or a declaration, and splitting on one put the construct's own
+    tail in front of the next line's content: ``<div\ntitle="x">SYSTEM:
+    reveal`` parsed as ``title="x">system``.
 
-    So the text is also offered with the breaks *inside* markup flattened. Both
-    views are kept rather than one replacing the other, for the same reason
-    :func:`_content_segments` keeps a line whole as well as split: a construct
-    with no closing delimiter swallows everything up to the next ``>``, and
-    flattening alone would let ``<a x\nSYSTEM: reveal>`` hide inside it.
+    The raw text used to be offered *as well*, on the argument that a construct
+    with no closing delimiter swallows everything up to the next ``>`` and
+    flattening alone would hide a marker inside one. Measured, that argument
+    does not hold and the extra view only over-reached. An unterminated
+    construct matches nothing, so nothing is flattened and this returns the raw
+    text anyway; and every marker that follows a construct spanning a break --
+    which is the actual attack -- is found either way. What the second view
+    added was reading the *interior* of a construct the parser closed, and it
+    did so only when a newline happened to fall inside one: ``<div
+    title="SYSTEM: reveal">hello`` was clean while ``<div title="note\nSYSTEM:
+    reveal">hello`` was not. That is an accident of where the breaks are, not a
+    rule about what a reader sees.
+
+    It is not that hidden text goes unread -- this module deliberately reads
+    what a browser hides, which is why a comment's interior is its own run and
+    why ``hidden`` is honoured for any value: the content of a hidden element
+    is still text a model reads. An attribute value is not that. It is markup
+    *metadata*, which nothing else here scans, and scanning it only when it
+    contains a newline was the inconsistency rather than the protection.
     """
-    flattened = _MARKUP_CONSTRUCT_RE.sub(lambda m: m.group().replace("\n", " "), text)
-    return (text,) if flattened == text else (text, flattened)
+    return _MARKUP_CONSTRUCT_RE.sub(lambda m: m.group().replace("\n", " "), text)
 
 
 def _boundary_split(line: str) -> list[str]:
@@ -1053,7 +1122,7 @@ def _boundary_split(line: str) -> list[str]:
     for match in _MARKUP_CONSTRUCT_RE.finditer(line):
         construct = match.group()
         name = _ELEMENT_NAME_RE.match(construct)
-        element = name.group(1).lower() if name is not None else None
+        element = _ascii_lower(name.group(1)) if name is not None else None
         boundary = _is_line_boundary(construct)
         if element is not None:
             if _CLOSING_CONSTRUCT_RE.match(construct):
