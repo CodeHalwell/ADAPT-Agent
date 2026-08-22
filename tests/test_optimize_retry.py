@@ -2428,3 +2428,230 @@ def test_collection_nests_so_a_dispatcher_does_not_switch_it_off() -> None:
         note_declared_fallback(exc, 0.7)
         assert declared_fallback(exc) == pytest.approx(0.7)
     assert collecting_a_declared_fallback() is False
+
+
+# -- a wrapper carries none of the evidence its cause does -------------------
+
+
+class _Throttled(Exception):
+    """A provider error the way a provider raises it."""
+
+    status_code = 429
+
+
+def _raised_from(outer: BaseException, inner: BaseException) -> BaseException:
+    """``outer`` with ``inner`` as its explicit ``__cause__``."""
+    try:
+        raise inner
+    except BaseException as cause:  # noqa: BLE001 - a stop signal is one of the cases
+        try:
+            raise outer from cause
+        except BaseException as wrapper:  # noqa: BLE001 - same
+            return wrapper
+
+
+def _raised_during(outer: BaseException, inner: BaseException) -> BaseException:
+    """``outer`` raised while handling ``inner``, so only ``__context__`` is set."""
+    try:
+        raise inner
+    except BaseException:  # noqa: BLE001 - same
+        try:
+            raise outer
+        except BaseException as wrapper:  # noqa: BLE001 - same
+            return wrapper
+
+
+def _raised_from_none(outer: BaseException, inner: BaseException) -> BaseException:
+    """``outer`` raised while handling ``inner``, with the context suppressed."""
+    try:
+        raise inner
+    except BaseException:  # noqa: BLE001 - same
+        try:
+            raise outer from None
+        except BaseException as wrapper:  # noqa: BLE001 - same
+            return wrapper
+
+
+WRAPPED_TRANSIENT = [
+    ("explicit cause, timeout", _raised_from, TimeoutError("timed out")),
+    ("explicit cause, 429", _raised_from, _Throttled("slow down")),
+    ("implicit context, timeout", _raised_during, TimeoutError("timed out")),
+    ("implicit context, 429", _raised_during, _Throttled("slow down")),
+]
+
+
+@pytest.mark.parametrize(("label", "wrap", "inner"), WRAPPED_TRANSIENT)
+def test_a_wrapped_provider_error_is_still_transient(label, wrap, inner) -> None:
+    """An SDK almost never lets a provider error reach the harness bare.
+
+    `raise RuntimeError("agent invocation failed") from TimeoutError(...)` is
+    the ordinary shape, and every question this module asks was asked of the
+    wrapper alone: the outer type is a `RuntimeError`, it carries no status and
+    its message says nothing. So a throttled call scored an **earned zero**,
+    counted against the agent, in a report that still called itself complete --
+    the exact measurement bias this release exists to remove, arriving through
+    the shape most likely to occur in practice.
+    """
+    assert is_transient_error(inner) is True, label
+    assert is_transient_error(wrap(RuntimeError("agent invocation failed"), inner)) is True, label
+
+
+def test_the_chain_is_followed_to_any_depth() -> None:
+    """A framework wrapping an SDK wrapping a provider is two layers, not one."""
+    inner: BaseException = _Throttled("slow down")
+    for layer in range(4):
+        inner = _raised_from(RuntimeError(f"layer {layer}"), inner)
+    assert is_transient_error(inner) is True
+
+
+def test_raise_from_none_hides_what_it_says_it_hides() -> None:
+    """Which links count is Python's rule, not one invented here.
+
+    `raise X from None` sets no cause and suppresses the context, which is
+    exactly the chain a traceback prints. Reading the suppressed context anyway
+    would retry a failure whose author said the cause is irrelevant.
+    """
+    wrapped = _raised_from_none(RuntimeError("agent invocation failed"), _Throttled("slow down"))
+    assert wrapped.__cause__ is None
+    assert wrapped.__suppress_context__ is True
+    assert is_transient_error(wrapped) is False
+
+
+STOP_SIGNALS = [KeyboardInterrupt(), SystemExit(1), asyncio.CancelledError()]
+
+
+@pytest.mark.parametrize("signal", STOP_SIGNALS)
+@pytest.mark.parametrize("wrap", [_raised_from, _raised_during])
+def test_a_stop_signal_anywhere_in_the_chain_is_never_transient(wrap, signal) -> None:
+    """ "Stop" does not become "try again" by being wrapped, in either position."""
+    assert is_transient_error(wrap(RuntimeError("timed out"), signal)) is False
+    assert is_transient_error(wrap(signal, _Throttled("slow down"))) is False
+
+
+def test_a_wrapped_deterministic_defect_stays_permanent() -> None:
+    """The direction that matters most, and the one chaining could have broken.
+
+    Retrying a bug then *excluding* the row hides the defect the run exists to
+    surface. Each link is judged on its own, so the deterministic-type guard
+    still speaks for the link it was written for -- and the two messages are
+    never read as one, which would let either link's wording speak for the
+    other.
+    """
+    assert (
+        is_transient_error(
+            _raised_from(RuntimeError("agent invocation failed"), ValueError("bad config"))
+        )
+        is False
+    )
+    assert (
+        is_transient_error(
+            _raised_from(
+                RuntimeError("agent invocation failed"), ValueError("timeout must be positive")
+            )
+        )
+        is False
+    )
+    # ...and a genuinely transient cause under a deterministic wrapper still is
+    assert (
+        is_transient_error(_raised_from(ValueError("bad config"), _Throttled("slow down"))) is True
+    )
+
+
+def test_a_cyclic_chain_terminates() -> None:
+    """Cycle-safe by *identity*, for the reason the note table is.
+
+    An exception may define `__eq__` without `__hash__`, so a set of the
+    objects themselves is not available; and two distinct errors that compare
+    equal are still two links. The walk holds every exception it has seen, so
+    an `id` cannot be reused underneath it.
+    """
+    first = RuntimeError("a")
+    second = RuntimeError("b")
+    first.__cause__ = second
+    second.__cause__ = first
+    assert is_transient_error(first) is False  # terminates, rather than hanging
+    looped = RuntimeError("self")
+    looped.__context__ = looped
+    assert is_transient_error(looped) is False
+
+
+class _Unhashable(Exception):
+    """Equality without a hash -- the shape a `set` of the objects cannot hold.
+
+    The same shape that broke the exhausted-retries marker's `WeakSet` two
+    review rounds ago, which is why the chain walk was written to key by `id`
+    from the start. It measured *zero* until this existed: the cycle test above
+    uses a `RuntimeError`, which is hashable, so keying by the object worked
+    perfectly well for it. Each property covered alone, their product covered
+    by nobody -- again.
+    """
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Unhashable)
+
+
+def test_an_unhashable_link_does_not_break_the_walk() -> None:
+    """Keyed by `id`, so an exception that refuses to be hashed is still a link.
+
+    Identity is also the right key on its own terms: two distinct errors that
+    compare equal are still two separate links in one chain.
+    """
+    wrapped = _raised_from(_Unhashable("wrapper"), _Throttled("slow down"))
+    assert is_transient_error(wrapped) is True
+    # ...and an unhashable link deeper in, under a hashable wrapper
+    deeper = _raised_from(RuntimeError("outer"), _raised_from(_Unhashable("mid"), TimeoutError()))
+    assert is_transient_error(deeper) is True
+
+
+def test_the_servers_requested_wait_survives_being_wrapped() -> None:
+    """The same rule, and the quieter half of the same bug.
+
+    Losing the classification scores an earned zero; losing `Retry-After` only
+    makes the backoff guess, so it retries sooner than the server asked. Same
+    cause: the wrapper carries neither the attribute nor the response.
+    """
+    inner = _Throttled("slow down")
+    inner.retry_after = 7
+    assert retry_after_seconds(inner) == 7.0
+    assert retry_after_seconds(_raised_from(RuntimeError("wrapped"), inner)) == 7.0
+
+
+def test_a_wrapped_throttle_is_retried_and_left_out_of_the_score() -> None:
+    """End to end, which is where the bias was: before this, all three of these
+    agents were indistinguishable -- one call, an earned zero, `is_complete`
+    true, and a row in `failures()` handed to a proposer as a case the
+    instruction got wrong.
+    """
+    dataset = GoldenDataset([Example(inputs="a", expected="ok")])
+    calls = {"n": 0}
+
+    def wrapping_agent(_text: str) -> str:
+        calls["n"] += 1
+        try:
+            raise _Throttled("slow down")
+        except _Throttled as exc:
+            raise RuntimeError("agent invocation failed") from exc
+
+    harness = EvaluationHarness(metrics={"exact": exact_match()}, retry=FAST)
+    report = harness.evaluate(wrapping_agent, dataset)
+    assert calls["n"] == FAST.attempts
+    assert report.n_transient_errors == 1
+    assert report.is_complete is False
+    assert report.failures() == []
+
+    calls["n"] = 0
+
+    def defective_agent(_text: str) -> str:
+        calls["n"] += 1
+        try:
+            raise ValueError("bad config")
+        except ValueError as exc:
+            raise RuntimeError("agent invocation failed") from exc
+
+    report = harness.evaluate(defective_agent, dataset)
+    assert calls["n"] == 1  # not retried
+    assert report.n_transient_errors == 0
+    assert report.is_complete is True
+    assert len(report.failures()) == 1

@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A provider error wrapped by an SDK was classified on the wrapper alone.**
+  A provider failure almost never reaches the harness bare —
+  `raise RuntimeError("agent invocation failed") from TimeoutError(...)` is the
+  ordinary shape — and every question this module asks was asked of the outer
+  exception, which carries no status, no telling type name and no telling
+  message. So a throttled call scored an **earned zero**, counted against the
+  agent, in a report that still called itself complete, with the row handed to
+  an LLM proposer as a case the instruction got wrong. That is the measurement
+  bias this release exists to remove, arriving through the shape most likely to
+  occur in practice.
+
+  `is_transient_error` and `retry_after_seconds` now read the whole exception
+  chain. Which links count is Python's own rule rather than one invented here:
+  `__cause__` always, and `__context__` only while `__suppress_context__` is
+  false — exactly the chain a traceback prints, so `raise X from None` hides
+  what it says it hides. Each link is judged on its own, so a
+  `RuntimeError("agent invocation failed")` wrapping a `ValueError("bad
+  config")` stays permanent and the defect is still surfaced; a *stop* signal
+  anywhere in the chain vetoes, because "stop" does not become "try again" by
+  being wrapped. Cycle-safe by identity, for the same reason the exception-note
+  table is: an exception may define `__eq__` without `__hash__`.
+
+- **An embedded stylesheet was not read at all.**
+  `<style>.x{display:block}</style>hello<span class=x>` renders the span as a
+  block and puts a role marker after it at the head of a line, but only the
+  `style` *attribute* was consulted — so every class-, id- and type-selector
+  rule was invisible, and rich text carrying a stylesheet was a general bypass.
+
+  Rules are now read from every `<style>` element, and an element is a boundary
+  when a block-making rule can reach it. Soundness without a matching engine
+  comes from one property: the **rightmost compound is a selector's subject**,
+  so dropping everything left of the last combinator yields a superset of what
+  the rule matches — `main > .x` is read as every `.x`. Because it is a
+  superset it may only **add** a boundary, never remove one, which also settles
+  `!important` for free. A `<style>` element is raw text, so nothing inside is
+  decoded — unlike an attribute value, because HTML answers that question
+  differently for the two. Type names fold ASCII-case-insensitively and classes
+  and ids do not, matching standards mode. At-rule bodies are descended into in
+  the same single pass, so `@media` nesting stays linear rather than quadratic
+  in the length of untrusted input.
+
 - **`style` and `hidden` were read wherever they appeared in a construct, not
   where HTML starts an attribute.** Both were regex searches over the whole
   construct, so text sitting *inside an earlier attribute's value* was read as

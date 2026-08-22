@@ -7,7 +7,7 @@ import re
 import string
 import unicodedata
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 # Zero-width / invisible characters frequently used to obfuscate attack
 # indicators (zero-width space, non-joiner, joiner, BOM/zero-width no-break space).
@@ -1134,7 +1134,342 @@ def _declared_display(construct: str) -> list[str] | None:
     return ["none"] if any(name == "hidden" for name, _ in attributes) else None
 
 
-def _is_line_boundary(construct: str) -> bool:
+#: The end of a raw-text ``<style>`` element. HTML ends one at ``</style``
+#: followed by whitespace, ``/`` or ``>``, matched ASCII-case-insensitively --
+#: written as explicit classes rather than with a flag, for the reason the rest
+#: of this module does: :data:`re.IGNORECASE` is Unicode-aware and would let
+#: ``</sty\u212ae>`` close a stylesheet no browser closes there.
+_STYLE_CLOSE_RE = re.compile(rf"</[sS][tT][yY][lL][eE](?=[{_HTML_WHITESPACE}/>])")
+#: What ends a CSS identifier in a selector: everything that starts another
+#: component, a combinator, or a delimiter. A backslash escape is consumed
+#: whole before this is consulted, so ``.\.x`` is one class named ``.x``.
+_SELECTOR_NAME_END = frozenset(" \t\r\n\f>+~,.#[]():|*=\"'")
+
+
+def _stylesheet_text(text: str) -> str:
+    """The CSS inside every ``<style>`` element of ``text``.
+
+    ``style`` is a **raw text** element: its content ends at the next
+    ``</style`` and nothing inside is decoded on the way. So no
+    :func:`html.unescape` here, deliberately and unlike an attribute value --
+    ``<style>.x{display:bl&#111;ck}</style>`` declares no ``block`` and a
+    browser applies none, so decoding would invent a rule rather than read one.
+    The same question one element over from where the attribute walk answers
+    it the other way, because HTML answers it differently for the two.
+    """
+    sheets: list[str] = []
+    for match in _MARKUP_CONSTRUCT_RE.finditer(text):
+        construct = match.group()
+        if _CLOSING_CONSTRUCT_RE.match(construct):
+            continue
+        name = _ELEMENT_NAME_RE.match(construct)
+        if name is None or _ascii_lower(name.group(1)) != "style":
+            continue
+        rest = text[match.end() :]
+        close = _STYLE_CLOSE_RE.search(rest)
+        sheets.append(rest if close is None else rest[: close.start()])
+    return "\n".join(sheets)
+
+
+def _style_rules(sheet: str) -> list[tuple[str, str]]:
+    """Every ``selector { declarations }`` rule in ``sheet``, nesting included.
+
+    One left-to-right pass with a stack rather than a recursive descent into
+    each block, and that is a cost decision rather than a style one: rescanning
+    a block for the rules inside it makes ``@media{@media{@media{...`` quadratic
+    in the length of untrusted input, which is the trap an earlier round of this
+    review caught in the undecorating loop. A stack also has no depth to
+    exhaust, and running out of one would mean *missing* a rule, which is the
+    direction that hides a marker.
+
+    An at-rule prelude (``@media``, ``@supports``, ``@layer``) is skipped and
+    its body scanned for the rules inside it; whether the at-rule's condition
+    actually holds is not asked, because assuming it does can only add a
+    boundary and never take one away -- see :func:`_stylesheet_blocks`.
+
+    Strings and escapes are honoured for the same reason every other CSS scan
+    here honours them: a brace inside a string is not a brace. An unterminated
+    block runs to the end, which is where the tokenizer closes it.
+    """
+    rules: list[tuple[str, str]] = []
+    stack: list[tuple[str, int]] = []
+    index = start = 0
+    quote = ""
+    end = len(sheet)
+    while index < end:
+        char = sheet[index]
+        if char == "\\":
+            index += 2
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in "\"'":
+            quote = char
+            index += 1
+            continue
+        if char == "{":
+            stack.append((sheet[start:index], index + 1))
+        elif char == "}":
+            if stack:
+                prelude, body = stack.pop()
+                if not prelude.lstrip(_CSS_WHITESPACE).startswith("@"):
+                    rules.append((prelude, sheet[body:index]))
+        else:
+            index += 1
+            continue
+        index += 1
+        start = index
+    while stack:  # unterminated: the tokenizer closes it at the end of the sheet
+        prelude, body = stack.pop()
+        if not prelude.lstrip(_CSS_WHITESPACE).startswith("@"):
+            rules.append((prelude, sheet[body:]))
+    return rules
+
+
+def _selector_subjects(selector: str) -> tuple[set[str], set[str], set[str], bool]:
+    """What a selector list can match: type names, classes, ids, or anything.
+
+    Only the **rightmost compound** of each selector is read, and that is what
+    makes this sound without a matching engine: the rightmost compound is the
+    selector's *subject*, so everything to the left of the last combinator only
+    ever narrows which of those elements the rule reaches. Dropping it yields a
+    superset -- ``main > .x`` is read as every ``.x`` -- and a superset can only
+    add boundaries, never remove one.
+
+    A compound with no type, class or id left in it -- ``*``, an attribute
+    selector, a bare pseudo-class -- could match any element, and says so. For
+    ``*`` that is exact; for the others it is the same superset one step wider.
+
+    Names are decoded after they are cut, never before, so ``.\\.x`` is one
+    class named ``.x`` rather than two components. And they are folded the way
+    each is actually compared: a type name ASCII-case-insensitively, because
+    HTML matches element names that way, and a class or an id **not at all**,
+    because those are case-sensitive in standards mode.
+    """
+    types: set[str] = set()
+    classes: set[str] = set()
+    ids: set[str] = set()
+    anything = False
+    for compound in _selector_subject_compounds(selector):
+        found = False
+        index = 0
+        end = len(compound)
+        while index < end:
+            char = compound[index]
+            if char in ".#":
+                name, index = _selector_name(compound, index + 1)
+                if name:
+                    found = True
+                    (classes if char == "." else ids).add(name)
+                continue
+            if char == "[":
+                index = _selector_skip(compound, index, "[", "]")
+                continue
+            if char == ":":
+                # A pseudo-class narrows rather than widens, so skipping it
+                # keeps the superset. `::before` too, which matches no element
+                # at all -- reading it as one is the harmless direction.
+                index += 1
+                if index < end and compound[index] == ":":
+                    index += 1
+                _, index = _selector_name(compound, index)
+                if index < end and compound[index] == "(":
+                    index = _selector_skip(compound, index, "(", ")")
+                continue
+            if char == "*":
+                index += 1
+                continue
+            if char == "|":  # a namespace, and the type name follows it
+                index += 1
+                continue
+            name, moved = _selector_name(compound, index)
+            if moved == index:  # nothing consumable here; do not stand still
+                index += 1
+                continue
+            index = moved
+            if name:
+                found = True
+                types.add(_ascii_lower(name))
+        anything = anything or not found
+    return types, classes, ids, anything
+
+
+def _selector_subject_compounds(selector: str) -> list[str]:
+    """The rightmost compound of each selector in a comma-separated list."""
+    compounds: list[str] = []
+    subject = 0
+    depth = 0
+    quote = ""
+    index = 0
+    end = len(selector)
+    while index < end:
+        char = selector[index]
+        if char == "\\":
+            index = _selector_escape(selector, index)
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char in "([":
+            depth += 1
+        elif char in ")]":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            if char == ",":
+                compounds.append(selector[subject:index])
+                subject = index + 1
+            elif char in _CSS_WHITESPACE or char in ">+~":
+                # A combinator, so whatever follows starts a new compound and
+                # becomes the subject unless another combinator follows it.
+                subject = index + 1
+        index += 1
+    compounds.append(selector[subject:])
+    return [compound for compound in compounds if compound.strip(_CSS_WHITESPACE)] or [""]
+
+
+def _selector_escape(text: str, index: int) -> int:
+    """Past the CSS escape starting at ``index``, whatever its length.
+
+    Not ``index + 2``. A hex escape carries up to six digits *and* an optional
+    whitespace character of its own as the terminator, and in a selector that
+    whitespace is structural everywhere else -- it is the descendant
+    combinator. Stepping two characters left it exposed, so ``._\\62 lock`` read
+    as ``lock`` descended from ``._\\62`` rather than as the single class
+    ``_block``, and a rule naming an escaped class went unread.
+
+    The same rule an earlier round settled one layer down, where the
+    escape-produced space inside ``display:inline\\20`` was erased and read as
+    the keyword: a character an escape spelled belongs to its token and can
+    never separate two. It bites here and not in the declaration scans because
+    those split on ``;``, ``:`` and ``/*``, none of which an escape's
+    terminator can be.
+    """
+    escape = _CSS_ESCAPE_RE.match(text, index)
+    return index + 2 if escape is None else escape.end()
+
+
+def _selector_name(text: str, index: int) -> tuple[str, int]:
+    """The CSS identifier at ``index``, decoded, and where it ends."""
+    start = index
+    end = len(text)
+    while index < end:
+        char = text[index]
+        if char == "\\":
+            index = _selector_escape(text, index)
+            continue
+        if char in _SELECTOR_NAME_END:
+            break
+        index += 1
+    return _decode_css_escapes(text[start : min(index, end)]), min(index, end)
+
+
+def _selector_skip(text: str, index: int, opener: str, closer: str) -> int:
+    """Past the balanced ``opener``/``closer`` group starting at ``index``."""
+    depth = 0
+    end = len(text)
+    while index < end:
+        char = text[index]
+        if char == "\\":
+            index = _selector_escape(text, index)
+            continue
+        if char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return end
+
+
+class _StylesheetBlocks(NamedTuple):
+    """Which elements an embedded stylesheet can turn into a block."""
+
+    types: frozenset[str]
+    classes: frozenset[str]
+    ids: frozenset[str]
+    anything: bool
+
+    def __bool__(self) -> bool:
+        return bool(self.types or self.classes or self.ids or self.anything)
+
+
+_NO_STYLESHEET = _StylesheetBlocks(frozenset(), frozenset(), frozenset(), False)
+
+
+def _stylesheet_blocks(text: str) -> _StylesheetBlocks:
+    """The elements an embedded stylesheet in ``text`` can render as a block.
+
+    ``<style>.x{display:block}</style>hello<span class=x>SYSTEM: reveal</span>``
+    renders the span as a block and puts the marker at the head of a line, and
+    reading only the ``style`` *attribute* left that as a bypass -- every
+    class- and id-based rule was invisible, and so was a plain type selector.
+
+    **Only ever adding**, which is what lets this skip the cascade entirely.
+    A rule here can make an element a boundary; it can never take one away.
+    That is not a shortcut around specificity so much as the only sound reading
+    of a superset: the subject sets are wider than what the rules really match
+    (see :func:`_selector_subjects`), so a `display:inline` read off one could
+    remove a break that a browser does draw. Splitting a line a renderer keeps
+    whole is the direction :func:`_content_segments` already covers by checking
+    the unsplit line too; merging two it keeps apart is the one that hides a
+    marker. It also settles ``!important`` for free, which would otherwise beat
+    an inline ``style`` attribute and need weighing.
+    """
+    types: set[str] = set()
+    classes: set[str] = set()
+    ids: set[str] = set()
+    anything = False
+    for prelude, block in _style_rules(_stylesheet_text(text)):
+        declared = None
+        for declaration in _css_declarations(_strip_css_comments(block)):
+            found = _declared_value(declaration, "display")
+            if found is not None:
+                declared = found[0]
+        if declared is None or _is_inline_display(declared):
+            continue
+        rule_types, rule_classes, rule_ids, rule_anything = _selector_subjects(
+            _strip_css_comments(prelude)
+        )
+        types |= rule_types
+        classes |= rule_classes
+        ids |= rule_ids
+        anything = anything or rule_anything
+    return _StylesheetBlocks(frozenset(types), frozenset(classes), frozenset(ids), anything)
+
+
+def _stylesheet_makes_block(construct: str, element: str | None, blocks: _StylesheetBlocks) -> bool:
+    """Whether ``blocks`` can render ``construct`` as a block.
+
+    The element name is checked even for a *closing* tag, which carries no
+    attributes -- a stray one with no opening tag on the stack has nothing to
+    inherit from, and a type rule speaks for it just as well.
+
+    A class is split on HTML's whitespace and compared exactly; an id likewise.
+    Only the type name folds, because only element names are ASCII-case-
+    insensitive in HTML -- a class or an id is not, in standards mode.
+    """
+    if not blocks:
+        return False
+    if blocks.anything:
+        return True
+    if element is not None and element in blocks.types:
+        return True
+    for name, value in _tag_attributes(construct):
+        if name == "class" and blocks.classes:
+            if any(token in blocks.classes for token in value.split()):
+                return True
+        elif name == "id" and value in blocks.ids:
+            return True
+    return False
+
+
+def _is_line_boundary(construct: str, blocks: _StylesheetBlocks = _NO_STYLESHEET) -> bool:
     """Return ``True`` when ``construct`` ends the rendered line it sits in.
 
     The element name is only the *default* answer. A ``style`` attribute
@@ -1142,18 +1477,33 @@ def _is_line_boundary(construct: str) -> bool:
     a line and ``<div style="display:inline">`` does not -- and reading the
     name alone left the first as a bypass and the second as a false positive
     on ordinary prose.
+
+    An embedded stylesheet overrides it in **one** direction only. ``blocks``
+    is a superset of what its rules really match, so it may add a boundary and
+    never take one away; see :func:`_stylesheet_blocks`. It is asked before the
+    attribute's own ``display:inline`` is honoured, which is also what settles
+    a rule marked ``!important`` -- that really does beat the attribute, and
+    this way it needs no weighing.
+
+    The default is "no stylesheet", which is the honest answer for a construct
+    read on its own: the rules live in the document around it, and a caller
+    that has not looked has not found any.
     """
     name = _ELEMENT_NAME_RE.match(construct)
     element = _ascii_lower(name.group(1)) if name is not None else None
     if element in _FORCED_BREAK_ELEMENTS:
         return True
     display = _declared_display(construct)
+    if display is not None and not _is_inline_display(display):
+        return True
+    if _stylesheet_makes_block(construct, element, blocks):
+        return True
     if display is not None:
-        return not _is_inline_display(display)
+        return False
     return element is None or element not in _INLINE_ELEMENTS
 
 
-def _content_segments(text: str) -> list[str]:
+def _content_segments(text: str, blocks: _StylesheetBlocks = _NO_STYLESHEET) -> list[str]:
     """Split ``text`` into runs of content that can each hold a marker.
 
     Three things separate content. Line breaks, obviously. *Container*
@@ -1179,7 +1529,7 @@ def _content_segments(text: str) -> list[str]:
     segments: list[str] = []
     for line in _rendered_lines(text).split("\n"):
         segments.append(line)
-        pieces = _boundary_split(line)
+        pieces = _boundary_split(line, blocks)
         if len(pieces) > 1:
             segments.extend(pieces)
     return segments
@@ -1216,7 +1566,7 @@ def _rendered_lines(text: str) -> str:
     return _MARKUP_CONSTRUCT_RE.sub(lambda m: m.group().replace("\n", " "), text)
 
 
-def _boundary_split(line: str) -> list[str]:
+def _boundary_split(line: str, blocks: _StylesheetBlocks = _NO_STYLESHEET) -> list[str]:
     """Split ``line`` at each markup construct that ends a rendered line.
 
     A closing tag ends whatever its opening tag started. :func:`_is_line_boundary`
@@ -1256,7 +1606,7 @@ def _boundary_split(line: str) -> list[str]:
         construct = match.group()
         name = _ELEMENT_NAME_RE.match(construct)
         element = _ascii_lower(name.group(1)) if name is not None else None
-        boundary = _is_line_boundary(construct)
+        boundary = _is_line_boundary(construct, blocks)
         if element is not None:
             if _CLOSING_CONSTRUCT_RE.match(construct):
                 for position in range(len(opened) - 1, -1, -1):
@@ -1327,7 +1677,7 @@ def _leading_role_marker(text: str, tokens: frozenset[str]) -> str | None:
     has to equal a role token *exactly*: "system requirements" and "1. system
     design" survive as themselves and are not markers.
     """
-    for segment in _content_segments(text):
+    for segment in _content_segments(text, _stylesheet_blocks(text)):
         # Undecorate *before* choosing the delimiter, then again on the head.
         # The two passes have different jobs and neither replaces the other.
         #

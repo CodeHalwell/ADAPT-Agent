@@ -175,25 +175,88 @@ def _type_names(exc: BaseException) -> list[str]:
     return [cls.__name__.replace("_", "").lower() for cls in type(exc).__mro__]
 
 
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """``exc`` and everything it was raised from, outermost first.
+
+    A provider error almost never reaches the harness bare. An SDK or a
+    framework catches it and re-raises its own::
+
+        raise RuntimeError("agent invocation failed") from TimeoutError(...)
+
+    and every question this module asks -- is it transient, did the server ask
+    for a wait -- was asked of the wrapper alone, which knows neither. The
+    outer type is `RuntimeError`, it carries no status and its message says
+    nothing, so a throttled call scored an **earned zero** and the report
+    still called itself complete. That is the measurement bias this module
+    exists to remove, arriving through the one shape most likely to occur in
+    practice.
+
+    Which links count is Python's own rule rather than one invented here:
+    ``__cause__`` always, because ``raise X from Y`` is an author saying so,
+    and ``__context__`` only while ``__suppress_context__`` is false, which is
+    exactly the chain a traceback prints. ``raise X from None`` therefore
+    hides what it says it hides.
+
+    Cycle-safe by identity, and identity rather than equality for the same
+    reason the note table is: an exception may define ``__eq__`` without
+    ``__hash__``, and two distinct errors that compare equal are still two
+    links. The list holds every exception it has seen, so an ``id`` cannot be
+    reused underneath the walk.
+    """
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        cause = current.__cause__
+        if cause is not None:
+            pending.append(cause)
+        context = current.__context__
+        if context is not None and not current.__suppress_context__:
+            pending.append(context)
+    return chain
+
+
 def is_transient_error(exc: BaseException) -> bool:
     """Return ``True`` when ``exc`` looks like throttling or a transient fault.
 
-    Checked in order of decreasing reliability: an explicit HTTP status, then
-    the exception's type name, then its message. Never imports a provider SDK.
+    Asked of every link in :func:`_exception_chain`, because a wrapper carries
+    none of the evidence its cause does. Any link that looks transient makes
+    the failure transient; a *stop* signal anywhere makes it permanent, since
+    "stop" does not become "try again" by being wrapped.
+
+    Each link is judged in order of decreasing reliability: an explicit HTTP
+    status, then the exception's type name, then its message. Never imports a
+    provider SDK.
+    """
+    chain = _exception_chain(exc)
+    for link in chain:
+        # `stop` does not become `try again` by being wrapped, so this vetoes
+        # from anywhere in the chain rather than only from the outermost link.
+        if isinstance(link, (KeyboardInterrupt, SystemExit)):
+            return False
+        if type(link).__name__ == "CancelledError":
+            return False
+    return any(_link_is_transient(link) for link in chain)
+
+
+def _link_is_transient(exc: BaseException) -> bool:
+    """Whether this one exception, read alone, looks transient.
 
     The message is only consulted for exceptions that could plausibly be
     provider-shaped -- see :data:`_DETERMINISTIC_TYPES`. A provider that signals
     throttling with a bare :class:`ValueError` and nothing else to go on would
     be missed; pass ``RetryPolicy(is_transient=...)`` for that.
 
-    A :class:`KeyboardInterrupt` / :class:`SystemExit` / ``CancelledError`` is
-    never transient -- those mean *stop*, not *try again*.
+    Judged per link rather than over a joined message, which matters in the
+    direction that hides bugs: a `RuntimeError("agent invocation failed")`
+    wrapping a `ValueError("bad config")` must stay permanent, and reading the
+    two together would let either one's wording speak for the other.
     """
-    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-        return False
-    if type(exc).__name__ == "CancelledError":
-        return False
-
     status = _status_of(exc)
     if status is not None:
         return _status_is_transient(status)
@@ -224,14 +287,21 @@ def retry_after_seconds(exc: BaseException) -> float | None:
     form returns ``None`` so the caller falls back to its own backoff. Negative
     or absurd values are rejected rather than trusted.
     """
-    candidates: list[Any] = [getattr(exc, "retry_after", None)]
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None)
-    if headers is not None:
-        try:
-            candidates.append(headers.get("retry-after", headers.get("Retry-After")))
-        except Exception:  # a headers object that does not behave like a mapping
-            pass
+    candidates: list[Any] = []
+    # The whole chain, for the reason `is_transient_error` reads it: the
+    # server's requested wait rides on the provider error, and the wrapper an
+    # SDK raises from it carries neither the attribute nor the response. Losing
+    # it is quieter than losing the classification -- the backoff falls back to
+    # its own guess and retries sooner than asked -- but it is the same bug.
+    for link in _exception_chain(exc):
+        candidates.append(getattr(link, "retry_after", None))
+        response = getattr(link, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            try:
+                candidates.append(headers.get("retry-after", headers.get("Retry-After")))
+            except Exception:  # a headers object that does not behave like a mapping
+                pass
 
     for value in candidates:
         if isinstance(value, bool) or value is None:
