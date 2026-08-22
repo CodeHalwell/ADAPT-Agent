@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import random
 import re
+import threading
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 #: Non-5xx status codes worth retrying: throttling, request timeouts, a
 #: conflict worth a second attempt, and Early Hints replay.
@@ -336,6 +337,14 @@ _EXHAUSTED_MARKER = "__adapt_retries_exhausted__"
 #: the provider is throttling.
 _MISSING = object()
 
+#: Guards *creating* a note's per-thread table, which is the one compound step
+#: in this module: read whether the exception already carries one, and attach
+#: one if not. Without it two threads unwinding the same instance can each
+#: attach a fresh table and one silently discards the other's note. Nothing
+#: else needs it -- a single attribute read, a dict lookup and a dict store are
+#: each atomic, and past creation every thread touches only its own key.
+_NOTE_LOCK = threading.Lock()
+
 
 class _ExceptionNote:
     """One value recorded against one exception, by whichever means it takes.
@@ -345,45 +354,102 @@ class _ExceptionNote:
     right, and a second hand-rolled copy would be a second chance to get one of
     them wrong -- which is the failure this module has already been caught by
     elsewhere.
+
+    **One value per thread, not per exception.** A note belongs to one
+    propagation, and a propagation is one raise caught one or more frames up
+    the *same call stack* -- so the exception object alone is the wrong key the
+    moment two stacks unwind the same instance at once. An instance is
+    routinely shared: ``Mock(side_effect=exc)`` raises the same object every
+    call, and a module-level sentinel is an ordinary thing to raise. With
+    ``concurrency > 1`` two rows then read each other's notes, measured as one
+    row scoring the *other* row's declared fallback -- a corrupted report
+    rather than one mis-scored cell, which is what the sequential version of
+    this bug already cost twice.
+
+    The thread is the exact scope for both concurrency paths, because both put
+    the raise and the catch on one thread and two simultaneous propagations on
+    two: :meth:`~adapt_agent.optimization.evaluation.EvaluationHarness.evaluate`
+    runs each example in a ``ThreadPoolExecutor`` worker, and ``aevaluate``
+    hands each to :func:`asyncio.to_thread`. Two coroutines sharing a thread
+    could not interleave here in any case -- there is no ``await`` between the
+    note and the consume at the top of the ``except`` block, so the window
+    holds no suspension point.
+
+    Liveness is unchanged, which is why the table hangs off the exception
+    rather than off a :class:`threading.local`: a thread-local table keyed by
+    ``id`` would outlive any note that is set and never consumed, and the
+    address could then be reused by an unrelated exception -- reintroducing, in
+    a harder-to-see place, exactly the leak that consuming was added to stop.
+    Here the table dies with the exception it is attached to.
     """
 
     __slots__ = ("_attribute", "_by_identity")
 
     def __init__(self, attribute: str) -> None:
         self._attribute = attribute
-        self._by_identity: dict[int, tuple[weakref.ref[BaseException], Any]] = {}
+        self._by_identity: dict[int, tuple[weakref.ref[BaseException], dict[int, Any]]] = {}
 
-    def set(self, exc: BaseException, value: Any) -> None:
-        try:
-            setattr(exc, self._attribute, value)
-            return
-        except Exception:  # an exception type that refuses attributes
-            pass
-        key = id(exc)
-
-        def _forget(_dead: object, key: int = key) -> None:
-            self._by_identity.pop(key, None)
-
-        try:
-            self._by_identity[key] = (weakref.ref(exc, _forget), value)
-        except TypeError:  # no `__weakref__` slot *and* no settable attribute
-            pass
-
-    def get(self, exc: BaseException, default: Any = None) -> Any:
+    def _table(self, exc: BaseException) -> dict[int, Any] | None:
+        """The per-thread table ``exc`` already carries, or ``None``."""
         carried = getattr(exc, self._attribute, _MISSING)
         if carried is not _MISSING:
-            return carried
+            # Only this class ever writes the attribute, and only a table.
+            return cast("dict[int, Any]", carried)
         entry = self._by_identity.get(id(exc))
         if entry is not None and entry[0]() is exc:
             return entry[1]
-        return default
+        return None
+
+    def _writable_table(self, exc: BaseException) -> dict[int, Any] | None:
+        """The per-thread table, attaching one if this exception has none.
+
+        Checked once outside the lock and again inside it: attaching is the
+        only compound step here, and the published object is an empty dict that
+        every thread then writes a different key of, so a reader that beat the
+        lock sees a table that is valid either way.
+        """
+        table = self._table(exc)
+        if table is not None:
+            return table
+        with _NOTE_LOCK:
+            table = self._table(exc)
+            if table is not None:
+                return table
+            fresh: dict[int, Any] = {}
+            try:
+                setattr(exc, self._attribute, fresh)
+                return fresh
+            except Exception:  # an exception type that refuses attributes
+                pass
+            key = id(exc)
+
+            def _forget(_dead: object, key: int = key) -> None:
+                # Deliberately takes no lock: it runs at collection time, from
+                # whatever thread happens to drop the last reference, and a
+                # single `pop` needs none.
+                self._by_identity.pop(key, None)
+
+            try:
+                self._by_identity[key] = (weakref.ref(exc, _forget), fresh)
+                return fresh
+            except TypeError:  # no `__weakref__` slot *and* no settable attribute
+                return None
+
+    def set(self, exc: BaseException, value: Any) -> None:
+        table = self._writable_table(exc)
+        if table is not None:
+            table[threading.get_ident()] = value
+
+    def get(self, exc: BaseException, default: Any = None) -> Any:
+        table = self._table(exc)
+        if table is None:
+            return default
+        return table.get(threading.get_ident(), default)
 
     def clear(self, exc: BaseException) -> None:
-        try:
-            delattr(exc, self._attribute)
-        except Exception:  # never set, or an exception that refuses attributes
-            pass
-        self._by_identity.pop(id(exc), None)
+        table = self._table(exc)
+        if table is not None:
+            table.pop(threading.get_ident(), None)
 
     def consume(self, exc: BaseException, default: Any = None) -> Any:
         """Read the note and remove it, so it cannot answer for a later raise."""

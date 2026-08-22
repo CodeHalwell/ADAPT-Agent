@@ -1791,7 +1791,7 @@ def test_an_id_reused_after_collection_is_not_mistaken_for_a_marked_error() -> N
     del dead
     assert reference() is None, "the referent should be gone"
 
-    table[id(successor)] = (reference, True)
+    table[id(successor)] = (reference, {threading.get_ident(): True})
     try:
         assert retries_already_exhausted(successor) is False
     finally:
@@ -2098,3 +2098,217 @@ def test_a_permanent_exit_still_consumes_it_too() -> None:
     score, left = _leaks_through(always, _PERMANENT_POLICY)
     assert score == pytest.approx(0.2)
     assert left is None
+
+
+# -- round 39: a note belongs to one propagation, and so to one thread ---------
+
+
+def _crosstalk(note, consume, values):
+    """Every propagation notes, *then* every one reads. What each gets back.
+
+    A barrier rather than a sleep, so the interleaving is the one being tested
+    rather than the one the scheduler happened to produce: without it the
+    window between noting and consuming is a handful of bytecodes and the race
+    reproduces about once in two hundred runs, which is a flaky test rather
+    than a guard.
+    """
+    import threading
+
+    shared = TimeoutError("429 Too Many Requests")
+    gate = threading.Barrier(len(values), timeout=10)
+    got: dict[str, object] = {}
+
+    def run(label: str, value: object) -> None:
+        note(shared, value)
+        gate.wait()
+        got[label] = consume(shared)
+
+    threads = [threading.Thread(target=run, args=item) for item in values.items()]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    return got
+
+
+def test_two_propagations_of_one_instance_do_not_share_a_fallback_note() -> None:
+    """`Mock(side_effect=exc)` raises one object every call, and a sentinel is
+    an ordinary thing to raise -- so under concurrency two metrics really can
+    unwind the same instance at once.
+
+    Keyed by the exception alone, one propagation read the other's note and
+    consumed it first: measured `{'b': 0.7, 'a': None}` where `a` declared
+    `0.7` and `b` declared `0.2`. Both wrong, and the one that lost its note
+    falls back to the *wrapper's* `on_error`, which for a dispatcher is
+    nothing at all.
+    """
+    from adapt_agent.optimization.retry import (
+        consume_declared_fallback,
+        note_declared_fallback,
+    )
+
+    got = _crosstalk(note_declared_fallback, consume_declared_fallback, {"a": 0.7, "b": 0.2})
+    assert got == {"a": 0.7, "b": 0.2}
+
+
+def test_two_propagations_of_one_instance_do_not_share_the_exhausted_mark() -> None:
+    """The same store, so the same defect: one propagation consumed the other's
+    mark and the loser spent a retry budget a lower layer had already spent.
+
+    Reported for the fallback note only. They are one class because they are
+    one mechanism -- which is the whole reason that mechanism is written once.
+    """
+    from adapt_agent.optimization.retry import (
+        consume_retries_exhausted,
+        mark_retries_exhausted,
+    )
+
+    got = _crosstalk(
+        lambda exc, _value: mark_retries_exhausted(exc),
+        consume_retries_exhausted,
+        {"spent": True, "also-spent": True},
+    )
+    assert got == {"spent": True, "also-spent": True}
+
+
+def test_concurrent_rows_each_score_their_own_declared_fallback() -> None:
+    """End to end, and deterministic for the same reason as `_crosstalk`.
+
+    The barrier sits in the dispatcher's own `except`, which is where both
+    propagations have noted and neither has yet consumed. Catching and
+    re-raising in a dispatcher is ordinary, so this is the real path rather
+    than a probe of the primitives.
+    """
+    import threading
+
+    from adapt_agent.optimization.dataset import Example, GoldenDataset
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import Metric
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    shared = TimeoutError("429 Too Many Requests")
+    gate = threading.Barrier(2, timeout=10)
+
+    def raiser(output: object, expected: object) -> float:
+        raise shared
+
+    inner = {
+        "a": Metric("inner-a", raiser, on_error=0.7),
+        "b": Metric("inner-b", raiser, on_error=0.2),
+    }
+
+    def dispatch(output: object, expected: object) -> float:
+        # What `checks` does: route the row to the scorer it declares. The
+        # harness only ever holds this wrapper, whose own `on_error` is None.
+        try:
+            return inner[expected](output, expected)
+        except Exception:
+            gate.wait()  # both have noted; neither has consumed
+            raise
+
+    report = EvaluationHarness(
+        [Metric("dispatch", dispatch)],
+        retry=RetryPolicy(attempts=1, is_transient=lambda exc: False),
+        concurrency=2,
+    ).evaluate(
+        lambda x: "out",
+        GoldenDataset([Example(inputs="1", expected="a"), Example(inputs="2", expected="b")]),
+    )
+    assert {r.expected: round(r.scores["dispatch"], 3) for r in report.results} == {
+        "a": 0.7,
+        "b": 0.2,
+    }
+
+
+def test_a_note_is_invisible_to_a_thread_that_did_not_take_it() -> None:
+    """The rule stated on its own, without a race to arrange."""
+    import threading
+
+    from adapt_agent.optimization.retry import declared_fallback, note_declared_fallback
+
+    shared = TimeoutError("429 Too Many Requests")
+    note_declared_fallback(shared, 0.7)
+    seen: list[float | None] = []
+    elsewhere = threading.Thread(target=lambda: seen.append(declared_fallback(shared)))
+    elsewhere.start()
+    elsewhere.join(timeout=10)
+    assert seen == [None]
+    assert declared_fallback(shared) == 0.7  # ...and still here, for this one
+
+
+def test_a_per_thread_table_still_dies_with_its_exception() -> None:
+    """Why the table hangs off the exception rather than off a thread-local.
+
+    A thread-local table keyed by `id` would outlive every note that is set and
+    never consumed, and the address could then be reused by an unrelated
+    exception -- the leak consuming was added to stop, moved somewhere harder
+    to see.
+    """
+    import gc
+    import weakref
+
+    from adapt_agent.optimization.retry import _DECLARED_FALLBACK, note_declared_fallback
+
+    class Carrier(Exception):  # takes the attribute, and can be watched
+        pass
+
+    exc = Carrier("429 Too Many Requests")
+    before = len(_DECLARED_FALLBACK._by_identity)
+    note_declared_fallback(exc, 0.7)
+
+    # The table hangs off the exception...
+    assert exc.__adapt_declared_fallback__ == {threading.get_ident(): 0.7}
+    # ...and nothing global holds either of them, so noting cannot outlive or
+    # retain what it was noted against.
+    assert len(_DECLARED_FALLBACK._by_identity) == before
+    watch = weakref.ref(exc)
+    del exc
+    gc.collect()
+    assert watch() is None
+
+
+def test_only_one_thread_ever_attaches_a_table_to_one_exception() -> None:
+    """Attaching is this module's one compound step, and the lock is what makes
+    it atomic. Both halves matter: without the lock, two threads each attach a
+    fresh table and whichever lands second silently discards the first's note;
+    with the lock but without the re-check inside it, the same thing happens
+    one step later.
+
+    Deterministic rather than probabilistic. The exception's own `__setattr__`
+    holds the attaching thread until a short barrier times out, which is far
+    longer than the other thread needs to pass the fast check and block on the
+    lock -- so a *second* entry to `__setattr__` is the failure, rather than an
+    unlucky interleaving being the only way to see one.
+    """
+    from adapt_agent.optimization.retry import _DECLARED_FALLBACK, note_declared_fallback
+
+    attribute = _DECLARED_FALLBACK._attribute
+    attaching = threading.Barrier(2, timeout=0.25)
+    start = threading.Barrier(2, timeout=10)
+    entered: list[int] = []
+
+    class Watched(Exception):
+        def __setattr__(self, name: str, value: object) -> None:
+            if name == attribute:
+                entered.append(threading.get_ident())
+                try:
+                    attaching.wait()  # a second thread here means no exclusion
+                except threading.BrokenBarrierError:
+                    pass
+            object.__setattr__(self, name, value)
+
+    shared = Watched("429 Too Many Requests")
+
+    def run(value: float) -> None:
+        start.wait()
+        note_declared_fallback(shared, value)
+
+    threads = [threading.Thread(target=run, args=(value,)) for value in (0.7, 0.2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(entered) == 1
+    # ...and both notes survived, which is what the exclusion is for
+    assert sorted(getattr(shared, attribute).values()) == [0.2, 0.7]

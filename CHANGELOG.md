@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A note recorded against an exception was shared by every concurrent
+  propagation of that object.** The declared fallback and the exhausted-retries
+  mark are both keyed by the exception alone, and an exception instance is
+  routinely shared -- `Mock(side_effect=exc)` raises the same object every
+  call, and a module-level sentinel is an ordinary thing to raise. With
+  `concurrency > 1`, two rows unwinding that instance at once read each other's
+  notes: measured deterministically, two metrics declaring `0.7` and `0.2` came
+  back as `{'b': 0.7, 'a': None}`, and the one that loses its note falls back to
+  the *wrapper's* `on_error`, which for a dispatcher is nothing at all. End to
+  end, one row scored the other row's fallback.
+
+  A note belongs to one propagation, and a propagation is one raise caught
+  further up the **same call stack** -- so it is now keyed by thread as well as
+  by exception. That is the exact scope for both concurrency paths: `evaluate`
+  runs each example in a `ThreadPoolExecutor` worker and `aevaluate` hands each
+  to `asyncio.to_thread`, so the raise and the catch always share a thread and
+  two simultaneous propagations never do. The per-thread table still hangs off
+  the exception rather than off a `threading.local`, so it dies with the
+  exception it belongs to: a thread-local table keyed by `id` would outlive any
+  note that is set and never consumed, and a reused address would then inherit
+  it -- the same leak consuming was added to stop, moved somewhere harder to
+  see.
+
 - **The markup pass was parsing CSS out of text that had been rewritten for
   matching.** Normalization exists so that a *match* cannot be dodged by
   spelling: NFKC folds a full-width identifier to an ASCII keyword, the
