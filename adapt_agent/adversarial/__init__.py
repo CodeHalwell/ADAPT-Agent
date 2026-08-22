@@ -1361,7 +1361,10 @@ def _selector_subjects(selector: str) -> tuple[set[str], set[str], set[str], boo
     classes: set[str] = set()
     ids: set[str] = set()
     anything = False
-    for compound in _selector_subject_compounds(selector):
+    subjects = _selector_subject_compounds(selector)
+    if subjects is None:  # an invalid list is a rule a browser never applies
+        return types, classes, ids, anything
+    for compound in subjects:
         found = False
         index = 0
         end = len(compound)
@@ -1405,8 +1408,26 @@ def _selector_subjects(selector: str) -> tuple[set[str], set[str], set[str], boo
     return types, classes, ids, anything
 
 
-def _selector_subject_compounds(selector: str) -> list[str]:
-    """The rightmost compound of each selector in a comma-separated list."""
+def _selector_subject_compounds(selector: str) -> list[str] | None:
+    """The rightmost compound of each selector in a list, or ``None``.
+
+    ``None`` means the selector list is **invalid**, which in CSS is not a
+    property of the member that is wrong but of the whole rule: one bad
+    entry invalidates every entry beside it, and a browser drops the rule
+    entirely. Skipping only the empty member kept the others, so
+    ``.x,{display:block}`` applied to ``.x`` and reported ordinary prose as
+    a marker in five spellings -- a leading, trailing or doubled comma, a
+    whitespace-only member, and one holding nothing but a comment.
+
+    This is the one rule here that *removes* boundaries, which is the
+    direction that hides markers, so it is deliberately narrow: an empty
+    member is the only invalidity it claims to detect. Validating the rest
+    of the Selectors grammar would be a much larger surface to be wrong
+    about, and being wrong there costs a missed marker rather than an
+    over-split. It is also safe in the way that matters: an attacker gains
+    nothing from a rule a browser also drops, because the block box it
+    would have drawn does not exist either.
+    """
     compounds: list[str] = []
     subject = pending = 0
     depth = 0
@@ -1450,15 +1471,17 @@ def _selector_subject_compounds(selector: str) -> list[str]:
         subject = pending
         index += 1
     compounds.append(selector[subject:])
-    # An empty selector is invalid and matches nothing, so it contributes no
-    # subjects -- *not* the "could match anything" answer an empty compound
-    # gets. The two look alike and mean opposite things: a compound with no
-    # type, class or id (`*`, an attribute selector, a bare pseudo-class) is a
-    # real selector whose subject this reader cannot narrow, while no compound
-    # at all is not a selector. Conflating them made `.&#120;{display:block}`
-    # split every construct in the prompt, because the `;` inside the reference
-    # ends the prelude and leaves nothing in front of the brace.
-    return [compound for compound in compounds if compound.strip(_CSS_WHITESPACE)]
+    # An empty member is not a member to skip; it invalidates the list. Note
+    # the distinction it must not be confused with: a compound with no type,
+    # class or id (`*`, an attribute selector, a bare pseudo-class) is a real
+    # selector whose subject this reader cannot narrow, and says "anything";
+    # *no* compound at all is not a selector. Reading the second as the first
+    # made `.&#120;{display:block}` split every construct in the prompt,
+    # because the `;` inside the reference ends the prelude and leaves nothing
+    # in front of the brace.
+    if any(not compound.strip(_CSS_WHITESPACE) for compound in compounds):
+        return None
+    return compounds
 
 
 def _selector_escape(text: str, index: int) -> int:

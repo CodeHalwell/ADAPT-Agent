@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An empty member in a selector list invalidated only itself.** In CSS an
+  invalid selector is a property of the *rule*, not of the member that is
+  wrong: one bad entry drops every entry beside it and a browser applies none
+  of them. Skipping just the empty one kept the others, so
+  `<style>.x,{display:block}</style>` applied to `.x` and reported ordinary
+  prose as a line-leading role marker. Five spellings reached it — a leading,
+  trailing or doubled comma, a whitespace-only member, and one holding nothing
+  but a comment — and the universal form `*,` was the worst of them, claiming
+  every element rather than none.
+
+  The check is deliberately narrow, because this is the one rule in this
+  reader that *removes* boundaries and that is the direction which hides
+  markers: an empty member is the only invalidity it claims to detect, and
+  validating the rest of the Selectors grammar would be a far larger surface
+  to be wrong about. Eighteen valid spellings are pinned alongside — a comma
+  inside a quoted attribute value, an unquoted escaped one, `:not()`, `:is()`,
+  a comment, and both orders of an ordinary two-member list — because an
+  over-eager test here would cost a missed marker rather than an over-split.
+
+  Those rows also closed a gap they did not open. Every bracketed one carried
+  a *comma*, because the comma is what the finding was about — and a comma
+  read inside a group only widens the subject set, which still draws the
+  boundary. Whitespace and `>+~` are the other two characters the depth
+  counter hides, and those move the subject instead: read at top level,
+  `.x:not(.a .b)` becomes the compound `.b)` and the class `x` is gone
+  entirely. `.x:not(.a>.b)` and `.x[data-a = b]` do the same. Those three are
+  pinned now, by their exact subject sets rather than by detection, because a
+  widening is invisible end to end.
+
+- **Three cost guards measured the scheduler, not the code.** Each asserts a
+  *ratio* between two input sizes, and each took one sample per size — at
+  absolute times small enough (23ms) that a hundred milliseconds of
+  interference from a neighbouring test built the ratio. They passed alone and
+  flaked in full-suite runs. They now take the quickest of three runs at each
+  size, through one shared helper: noise only ever *adds* time, so the minimum
+  is the robust estimator, while a genuine quadratic is quadratic in every run
+  and still fails. Verified by reintroducing both quadratics the guards exist
+  for — the 21s suffix copy and the 10.9s per-level tail copy — and confirming
+  each is still caught.
+
 - **A brace inside a CSS comment closed a stylesheet rule.** `_style_rules`
   honoured escapes and quotes and knew nothing about comments, so
   `<style>.x{/* } */display:block}</style>` resolved to nothing at all and the
