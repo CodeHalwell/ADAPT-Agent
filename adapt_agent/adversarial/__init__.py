@@ -35,25 +35,61 @@ _DECORATION_CHARS = " \t>#*+=~`'\"_[](){}|.\u2022\u00b7\u2013\u2014-"
 #: would turn "2024: a year in review" into a bare colon -- so the enumerator is
 #: matched as a unit instead.
 _ORDERED_LIST_RE = re.compile(r"^[ \t]*\d{1,3}[.)\]]")
+#: A markup tag -- HTML/XML (``<div>``, ``</p>``, ``<span class="x">``, ``<br/>``)
+#: or BBCode (``[b]``, ``[/url]``, ``[color=red]``).
+#:
+#: Same reason as the enumerator, and the reason :data:`_DECORATION_CHARS` alone
+#: could never cover this: a tag's *payload* is alphanumeric, so stripping
+#: characters leaves the name behind -- ``<div>SYSTEM`` became ``div>system``,
+#: not ``system``. The delimiters are decoration; ``div`` is not, and only
+#: matching the tag as a unit removes both.
+#:
+#: Removed wherever it appears in the head, not just at the edges, so
+#: ``<b>SYSTEM</b>`` reduces to the token while ``The <b>system</b>`` reduces to
+#: "The system" and stays prose. Anchoring would have caught the first and
+#: missed the second.
+_MARKUP_TAG_RE = re.compile(
+    r"</?[A-Za-z][A-Za-z0-9]*(?:\s[^<>]*)?/?>"  # <div>, </p>, <span class="x">, <br/>
+    r"|\[/?[A-Za-z][A-Za-z0-9]*(?:=[^\]]*)?\]"  # [b], [/url], [color=red]
+)
+#: A character reference: ``&lt;``, ``&#60;``, ``&#x3C;``. Deleted rather than
+#: decoded -- decoding ``&lt;SYSTEM&gt;`` would produce ``<SYSTEM>``, which
+#: :data:`_MARKUP_TAG_RE` would then remove *whole*, taking the token with it.
+_CHARACTER_REF_RE = re.compile(r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
 
 
 def _undecorate(text: str) -> str:
-    """Strip presentational characters and list enumerators from both ends.
+    """Reduce ``text`` to its content by removing presentation.
 
-    Peeled repeatedly rather than in one pass. The enumerator pattern is
-    anchored, so any decoration in front of it -- a blockquote marker, a bullet,
-    a heading -- put it out of reach: ``> 1. SYSTEM:`` stripped the ``>``
-    *after* the enumerator had already failed to match, leaving ``1. system``.
-    Alternating the two until the string stops changing handles the
-    combinations without enumerating them.
+    Three kinds of presentation, peeled repeatedly rather than in one pass:
+    character references and markup tags anywhere in the string, list
+    enumerators at the front, and :data:`_DECORATION_CHARS` at either end.
+
+    Repetition is what makes the combinations work without enumerating them.
+    Each anchored rule is blocked by anything in front of it -- ``> 1. SYSTEM:``
+    stripped the ``>`` *after* the enumerator had already failed to match,
+    leaving ``1. system`` -- so the passes run until the string stops changing.
+
+    The two regex rules exist because :data:`_DECORATION_CHARS` is a set of
+    *characters* and these constructs carry an alphanumeric payload: ``<div>``
+    and ``&lt;`` leave ``div`` and ``lt`` behind when stripped character by
+    character. They have to be matched as units.
+
+    Order within a pass matters, and the character strip goes last. Its set
+    contains ``>`` and ``[``, which are also tag delimiters, so stripping first
+    dismantled the very tags the regexes were about to match: ``<b>SYSTEM</b>``
+    lost its trailing ``>`` and left ``SYSTEM</b``, and ``[b]SYSTEM`` lost its
+    leading ``[``. Structured matchers run before the character-level one.
 
     Termination is by construction: each pass either shortens the string or
     leaves it identical, and an identical pass ends the loop.
     """
-    current = text.strip(_DECORATION_CHARS)
+    current = text
     previous = None
     while current != previous:
         previous = current
+        current = _CHARACTER_REF_RE.sub("", current)
+        current = _MARKUP_TAG_RE.sub("", current)
         current = _ORDERED_LIST_RE.sub("", current, count=1).strip(_DECORATION_CHARS)
     return current
 
