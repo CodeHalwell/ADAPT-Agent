@@ -334,34 +334,93 @@ _EXHAUSTED_MARKER = "__adapt_retries_exhausted__"
 #: then spends its own budget on an error a judge already retried, so one row
 #: makes nine provider calls instead of three, piling on load precisely while
 #: the provider is throttling.
-_EXHAUSTED_FALLBACK: dict[int, weakref.ref[BaseException]] = {}
+_MISSING = object()
+
+
+class _ExceptionNote:
+    """One value recorded against one exception, by whichever means it takes.
+
+    Written once and shared, rather than open-coded per marker. The two
+    mechanisms and the identity keying above took three review rounds to get
+    right, and a second hand-rolled copy would be a second chance to get one of
+    them wrong -- which is the failure this module has already been caught by
+    elsewhere.
+    """
+
+    __slots__ = ("_attribute", "_by_identity")
+
+    def __init__(self, attribute: str) -> None:
+        self._attribute = attribute
+        self._by_identity: dict[int, tuple[weakref.ref[BaseException], Any]] = {}
+
+    def set(self, exc: BaseException, value: Any) -> None:
+        try:
+            setattr(exc, self._attribute, value)
+            return
+        except Exception:  # an exception type that refuses attributes
+            pass
+        key = id(exc)
+
+        def _forget(_dead: object, key: int = key) -> None:
+            self._by_identity.pop(key, None)
+
+        try:
+            self._by_identity[key] = (weakref.ref(exc, _forget), value)
+        except TypeError:  # no `__weakref__` slot *and* no settable attribute
+            pass
+
+    def get(self, exc: BaseException, default: Any = None) -> Any:
+        carried = getattr(exc, self._attribute, _MISSING)
+        if carried is not _MISSING:
+            return carried
+        entry = self._by_identity.get(id(exc))
+        if entry is not None and entry[0]() is exc:
+            return entry[1]
+        return default
+
+
+_EXHAUSTED = _ExceptionNote(_EXHAUSTED_MARKER)
+
+#: The fallback score declared by the metric that actually raised.
+#:
+#: A metric can dispatch to another -- :func:`~adapt_agent.optimization.metrics.checks`
+#: routes each row to the scorer that row declares -- and the fallback belongs
+#: to the failure rather than to whatever is wrapped around it. Reading only
+#: the outermost metric's ``on_error`` meant a judge configured with ``0.7``
+#: scored ``0.7`` when used directly and ``0.0`` through the documented
+#: per-row dispatcher, which puts the contract back where the previous round
+#: found it: true on one path and not the other.
+_DECLARED_FALLBACK = _ExceptionNote("__adapt_declared_fallback__")
 
 
 def mark_retries_exhausted(exc: BaseException) -> BaseException:
     """Record that ``exc`` already used up a retry budget. Returns ``exc``."""
-    try:
-        setattr(exc, _EXHAUSTED_MARKER, True)
-        return exc
-    except Exception:  # an exception type that refuses attributes
-        pass
-    key = id(exc)
-
-    def _forget(_dead: object, key: int = key) -> None:
-        _EXHAUSTED_FALLBACK.pop(key, None)
-
-    try:
-        _EXHAUSTED_FALLBACK[key] = weakref.ref(exc, _forget)
-    except TypeError:  # no `__weakref__` slot *and* no settable attribute
-        pass
+    _EXHAUSTED.set(exc, True)
     return exc
 
 
 def retries_already_exhausted(exc: BaseException) -> bool:
     """Whether a lower layer already spent this error's retries."""
-    if getattr(exc, _EXHAUSTED_MARKER, False):
-        return True
-    reference = _EXHAUSTED_FALLBACK.get(id(exc))
-    return reference is not None and reference() is exc
+    return bool(_EXHAUSTED.get(exc, False))
+
+
+def note_declared_fallback(exc: BaseException, score: float) -> BaseException:
+    """Record the fallback declared by the metric raising ``exc``.
+
+    The **innermost** declaration wins, so this never overwrites one already
+    carried: the metric nearest the failure is the one whose documented
+    fallback answers for it, and an outer wrapper's is only reached when the
+    inner declares nothing.
+    """
+    if _DECLARED_FALLBACK.get(exc, None) is None:
+        _DECLARED_FALLBACK.set(exc, float(score))
+    return exc
+
+
+def declared_fallback(exc: BaseException) -> float | None:
+    """The fallback carried by ``exc``, or ``None`` if it carries none."""
+    carried = _DECLARED_FALLBACK.get(exc, None)
+    return None if carried is None else float(carried)
 
 
 #: Used when a harness is constructed without an explicit policy.
@@ -372,6 +431,8 @@ __all__ = [
     "RetryPolicy",
     "mark_retries_exhausted",
     "retries_already_exhausted",
+    "note_declared_fallback",
+    "declared_fallback",
     "DEFAULT_RETRY_POLICY",
     "is_transient_error",
     "retry_after_seconds",

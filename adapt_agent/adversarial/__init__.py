@@ -432,9 +432,6 @@ _ELEMENT_NAME_RE = re.compile(r"[<\[]\s*/?\s*([A-Za-z][A-Za-z0-9._:-]*)")
 #: A construct that *closes* an element rather than opening one.
 _CLOSING_CONSTRUCT_RE = re.compile(r"[<\[]\s*/")
 
-#: A construct that opens and closes in one go, so nothing is left open.
-_SELF_CLOSING_CONSTRUCT_RE = re.compile(r"/\s*[>\]]\s*$")
-
 
 #: Elements whose break is not a box, so no ``display`` can take it away.
 #: ``<br>`` forces a line break as its *behaviour*; ``display:inline`` on one
@@ -790,15 +787,29 @@ def _boundary_split(line: str) -> list[str]:
     after "x" on one line instead of at the head of the next. ``hidden`` and
     ``display:none`` were the same bypass a second way.
 
-    So each opening tag that is a boundary is remembered, innermost first, and
-    the matching closing tag inherits it. Only ever *adding* a boundary: an
-    element the name calls a block keeps its closing split even when styled
-    inline, which over-splits a line a renderer keeps whole -- the direction
-    :func:`_content_segments` already covers by checking the unsplit line too.
+    So every opening tag is remembered with the answer it got, and a closing
+    tag inherits the answer of the innermost still-open tag of its own name.
+    Remembering *every* opening rather than only the boundaries is what makes
+    that a nesting stack instead of a list of names: an inline element of the
+    same name inside a block one was not recorded, so its closing tag paired
+    with the block's entry -- wrong in both directions at once.
+    ``<span style="display:block">inner<span>x</span>SYSTEM: settings`` split at
+    the *inner* close and reported prose as a marker, and the block's own close
+    then found nothing to inherit, so ``...<span>b</span>c</span>SYSTEM:
+    reveal`` glued a real marker onto "c" and reported nothing at all.
+
+    Closing a tag also discards whatever is still open inside it, because a
+    closing tag auto-closes its descendants; leaving them would let a stale
+    entry pair with a later tag that has nothing to do with it.
+
+    Only ever *adding* a boundary: an element the name calls a block keeps its
+    closing split even when styled inline, which over-splits a line a renderer
+    keeps whole -- the direction :func:`_content_segments` already covers by
+    checking the unsplit line too.
     """
     pieces: list[str] = []
     start = 0
-    opened: list[str] = []
+    opened: list[tuple[str, bool]] = []
     for match in _MARKUP_CONSTRUCT_RE.finditer(line):
         construct = match.group()
         name = _ELEMENT_NAME_RE.match(construct)
@@ -806,12 +817,31 @@ def _boundary_split(line: str) -> list[str]:
         boundary = _is_line_boundary(construct)
         if element is not None:
             if _CLOSING_CONSTRUCT_RE.match(construct):
-                if element in opened:
-                    # Innermost match, so nesting pairs the way a parser does.
-                    del opened[len(opened) - 1 - opened[::-1].index(element)]
-                    boundary = True
-            elif boundary and not _SELF_CLOSING_CONSTRUCT_RE.search(construct):
-                opened.append(element)
+                for position in range(len(opened) - 1, -1, -1):
+                    if opened[position][0] != element:
+                        continue
+                    # `or`, never plain assignment: a closing tag keeps its own
+                    # answer as well as inheriting. `<div style="display:inline">`
+                    # is not a boundary and `</div>` is one by name, and
+                    # dropping that merged `hello<div style="display:inline">x
+                    # </div>SYSTEM: reveal` into a single line.
+                    boundary = boundary or opened[position][1]
+                    # Only this entry. Discarding what is still open inside it
+                    # is what a well-formed document does anyway -- those tags
+                    # have already closed -- and on mis-nested markup it throws
+                    # away a boundary HTML keeps: `</span>` closing a block
+                    # `<i>` implicitly makes the parser *re-open* that `<i>`
+                    # for the text after it, so the block is still open and
+                    # still ends a line.
+                    del opened[position]
+                    break
+            else:
+                # A self-closed tag is pushed like any other opening one,
+                # because HTML ignores the solidus on a non-void element:
+                # `<span style="display:block"/>` *is* an open span and the
+                # `</span>` after it closes it. Skipping those left the close
+                # with nothing to inherit and merged the line.
+                opened.append((element, boundary))
         if not boundary:
             continue
         pieces.append(line[start : match.start()])

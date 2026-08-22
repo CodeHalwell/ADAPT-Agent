@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A closing tag paired with the wrong opening element.** The stack that lets
+  a closing tag inherit its opening tag's boundary held only the openings that
+  *were* boundaries, which is not a nesting stack: an inline element of the
+  same name inside a block one was never recorded, so its closing tag paired
+  with the block's entry. Wrong in both directions at once --
+  `<span style="display:block">inner<span>x</span>SYSTEM: settings` split at the
+  *inner* close and reported prose as a marker, and the block's own close then
+  found nothing to inherit, so `...<span>b</span>c</span>SYSTEM: reveal` glued a
+  real marker onto "c" and reported nothing at all. **6 of 10** probed forms
+  wrong. Every opening is remembered now, with the answer it got, and a closing
+  tag inherits the innermost still-open one of its own name.
+
+  Three neighbouring choices the reported case does not reach were wrong too,
+  found by mutating the new code rather than by review. A closing tag keeps its
+  *own* answer as well as inheriting, or `<div style="display:inline">x</div>`
+  stops ending a line and merges the marker after it. Closing a tag no longer
+  discards what is still open inside it: `</span>` closing a block `<i>`
+  implicitly makes HTML *re-open* that `<i>` for the following text, so the
+  block is still open and still ends a line. And a self-closed non-void element
+  is treated as open, because HTML ignores the solidus there --
+  `<span style="display:block"/>` is an open span and the `</span>` after it
+  closes it.
+- **A fallback declared by a dispatched metric was ignored.**
+  `~adapt_agent.optimization.metrics.checks` routes each row to the scorer that
+  row declares, so the harness only ever holds the dispatcher -- whose
+  `on_error` says nothing about the metric that actually raised. An
+  `LLMJudge(on_error=0.7)` therefore scored `0.7` used directly and `0.0`
+  through the documented per-row dispatcher, which is the same contract split
+  the previous round closed, reopened one layer down.
+
+  The fallback belongs to the failure, so it now travels with it: a metric
+  notes its declared fallback on the exception it lets escape, and the harness
+  prefers what the failure carries over what the outermost metric declares.
+  That covers any depth of wrapping rather than the one dispatcher reported,
+  and the innermost declaration wins, since the metric nearest the failure is
+  the one that answers for it. A metric that declares nothing still scores
+  `0.0`; a transient failure is still excluded rather than given the fallback.
+
+  The marking machinery is now written once and shared with the
+  exhausted-retries marker rather than hand-rolled a second time. Its two
+  mechanisms, and the identity keying that makes them safe, took three review
+  rounds to get right, and a second copy would have been a second chance to get
+  one of them wrong.
+
 - **A CSS identifier escape hid a `display` declaration.** `\62 ` is the
   identifier character `b`, so `style="display:\62 lock"` is a real
   `display:block` and the raw text spells no `block` at all -- an inline

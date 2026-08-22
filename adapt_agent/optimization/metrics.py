@@ -21,6 +21,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from .extractors import extract_output_text
+from .retry import note_declared_fallback
 
 #: A bare metric function. Either ``(output, expected)`` or, for example-aware
 #: metrics wrapped in :class:`Metric`, ``(output, expected, example)``.
@@ -71,10 +72,22 @@ class Metric:
         self.on_error = None if on_error is None else _clamp(on_error)
 
     def __call__(self, output: Any, expected: Any, example: Any = None) -> float:
-        if self.needs_example:
-            raw = self.fn(output, expected, example)
-        else:
-            raw = self.fn(output, expected)
+        try:
+            if self.needs_example:
+                raw = self.fn(output, expected, example)
+            else:
+                raw = self.fn(output, expected)
+        except Exception as exc:
+            # The fallback belongs to the failure, so it travels with it. A
+            # metric can dispatch to another -- `checks` routes each row to the
+            # scorer that row declares -- and the harness only ever sees the
+            # outermost one, whose `on_error` says nothing about the metric
+            # that actually raised. Noting it here covers any depth of
+            # wrapping, and `note_declared_fallback` keeps the innermost:
+            # the metric nearest the failure is the one that answers for it.
+            if self.on_error is not None:
+                note_declared_fallback(exc, self.on_error)
+            raise
         return _clamp(raw)
 
     def renamed(self, name: str) -> Metric:

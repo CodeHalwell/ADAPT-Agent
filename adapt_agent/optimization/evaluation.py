@@ -28,6 +28,7 @@ from adapt_agent.optimization.metrics import Metric, MetricFn, coerce_metric
 from adapt_agent.optimization.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
+    declared_fallback,
     retries_already_exhausted,
 )
 
@@ -720,7 +721,19 @@ class EvaluationHarness:
         # Read once, and duck-typed, since a metric need only be callable with
         # a name -- a caller's own object is not required to have the field.
         declared = getattr(metric, "on_error", None)
-        permanent = 0.0 if declared is None else max(0.0, min(1.0, float(declared)))
+
+        def _permanent(exc: BaseException) -> float:
+            # What the failure itself carries wins over what the outermost
+            # metric declares. A metric can dispatch to another, and the
+            # harness only ever holds the wrapper: `checks` routing a row to
+            # `LLMJudge(on_error=0.7)` has `on_error=None` of its own, so
+            # reading the wrapper scored that judge 0.0 here and 0.7 on a
+            # direct call -- the same contract split the previous round closed,
+            # reopened one layer down.
+            carried = declared_fallback(exc)
+            fallback = declared if carried is None else carried
+            return 0.0 if fallback is None else max(0.0, min(1.0, float(fallback)))
+
         attempt = 1
         while True:
             try:
@@ -746,7 +759,7 @@ class EvaluationHarness:
                             index,
                             exc,
                         )
-                        return permanent, False
+                        return _permanent(exc), False
                     logger.warning(
                         "Metric %s failed transiently on example %d (its own retries "
                         "were already spent); excluded from the score: %s",
@@ -784,7 +797,7 @@ class EvaluationHarness:
                     )
                     return 0.0, True
                 logger.warning("Metric %s raised on example %d: %s", metric.name, index, exc)
-                return permanent, False
+                return _permanent(exc), False
 
     def _build_report(self, results_iter: Any) -> EvaluationReport:
         """Aggregate a stream of per-example results into a report."""

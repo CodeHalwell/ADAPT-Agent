@@ -604,3 +604,115 @@ def test_a_renamed_judge_metric_scores_its_own_fallback() -> None:
 
     assert listed.score == 0.7
     assert mapped.score == 0.7, "a mapping key must not reset the declared fallback"
+
+
+# -- a fallback belongs to the failure, not to the wrapper around it -----------
+#
+# `checks` routes each row to the scorer that row declares, so the harness only
+# ever holds the dispatcher, whose `on_error` says nothing about the metric
+# that actually raised.
+
+
+def _always_raises(output, expected):
+    raise ValueError("this check is broken")
+
+
+def test_checks_carries_the_dispatched_metrics_fallback() -> None:
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    report = EvaluationHarness(
+        [checks(default=Metric("inner", _always_raises, on_error=0.4))],
+        retry=RetryPolicy(attempts=1),
+    ).evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+    assert report.score == 0.4
+
+
+def test_a_judge_dispatched_by_checks_scores_the_same_as_one_used_directly() -> None:
+    """The reported path, and the whole point of the contract."""
+    from adapt_agent.optimization.judge import LLMJudge
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    def broken(prompt, **kwargs):
+        raise ValueError("the judge template is malformed")
+
+    judge = LLMJudge(broken, retry=RetryPolicy(attempts=1), on_error=0.7)
+    policy = RetryPolicy(attempts=1)
+
+    direct = EvaluationHarness([judge.as_metric()], retry=policy).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    dispatched = EvaluationHarness([checks(judge=judge)], retry=policy).evaluate(
+        lambda x: "ok",
+        GoldenDataset([Example(inputs="a", expected="ok", metadata={"check": "judge"})]),
+    )
+    assert direct.score == 0.7
+    assert dispatched.score == direct.score
+
+
+def test_a_dispatched_metric_with_no_fallback_still_scores_zero() -> None:
+    """The widening must not invent a fallback where nobody declared one."""
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    report = EvaluationHarness(
+        [checks(default=Metric("inner", _always_raises))], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+    assert report.score == 0.0
+
+
+def test_the_innermost_declaration_answers_for_the_failure() -> None:
+    """A wrapper's own fallback is reached only when the inner declares none."""
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    policy = RetryPolicy(attempts=1)
+    rows = GoldenDataset([Example(inputs="a", expected="ok")])
+
+    inner_wins = checks(default=Metric("inner", _always_raises, on_error=0.4))
+    inner_wins.on_error = 0.9
+    assert EvaluationHarness([inner_wins], retry=policy).evaluate(lambda x: "ok", rows).score == 0.4
+
+    outer_only = checks(default=Metric("inner", _always_raises))
+    outer_only.on_error = 0.9
+    assert EvaluationHarness([outer_only], retry=policy).evaluate(lambda x: "ok", rows).score == 0.9
+
+
+def test_a_carried_fallback_is_clamped_like_any_other_score() -> None:
+    """`on_error` is a public attribute, so it can be set past the range."""
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    policy = RetryPolicy(attempts=1)
+    rows = GoldenDataset([Example(inputs="a", expected="ok")])
+
+    inner = Metric("inner", _always_raises)
+    inner.on_error = 5.0
+    assert (
+        EvaluationHarness([checks(default=inner)], retry=policy)
+        .evaluate(lambda x: "ok", rows)
+        .score
+        == 1.0
+    )
+
+    inner.on_error = -3.0
+    assert (
+        EvaluationHarness([checks(default=inner)], retry=policy)
+        .evaluate(lambda x: "ok", rows)
+        .score
+        == 0.0
+    )
+
+
+def test_a_permanent_failure_is_still_a_failure_with_a_fallback() -> None:
+    """The fallback is what to *record*, not permission to ignore the row."""
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    report = EvaluationHarness(
+        [checks(default=Metric("inner", _always_raises, on_error=0.4))],
+        retry=RetryPolicy(attempts=1),
+    ).evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+    assert report.n_transient_errors == 0
+    assert report.is_complete is True

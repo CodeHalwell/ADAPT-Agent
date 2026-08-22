@@ -1782,32 +1782,33 @@ def test_an_id_reused_after_collection_is_not_mistaken_for_a_marked_error() -> N
     """
     import weakref
 
-    from adapt_agent.optimization.retry import _EXHAUSTED_FALLBACK, retries_already_exhausted
+    from adapt_agent.optimization.retry import _EXHAUSTED, retries_already_exhausted
 
+    table = _EXHAUSTED._by_identity
     dead = RefusesAttributesAndUnhashable("429 Too Many Requests")
     reference = weakref.ref(dead)
     successor = RefusesAttributesAndUnhashable("a completely unrelated error")
     del dead
     assert reference() is None, "the referent should be gone"
 
-    _EXHAUSTED_FALLBACK[id(successor)] = reference
+    table[id(successor)] = (reference, True)
     try:
         assert retries_already_exhausted(successor) is False
     finally:
-        _EXHAUSTED_FALLBACK.pop(id(successor), None)
+        table.pop(id(successor), None)
 
 
 def test_the_marker_table_does_not_retain_the_exceptions_it_marks() -> None:
     """It is a process-lifetime table, so a strong reference would be a leak."""
     import gc
 
-    from adapt_agent.optimization.retry import _EXHAUSTED_FALLBACK, mark_retries_exhausted
+    from adapt_agent.optimization.retry import _EXHAUSTED, mark_retries_exhausted
 
-    before = len(_EXHAUSTED_FALLBACK)
+    before = len(_EXHAUSTED._by_identity)
     for _ in range(200):
         mark_retries_exhausted(RefusesAttributesAndUnhashable("429 Too Many Requests"))
     gc.collect()
-    assert len(_EXHAUSTED_FALLBACK) == before
+    assert len(_EXHAUSTED._by_identity) == before
 
 
 # -- a documented fallback means the same thing through a harness --------------
