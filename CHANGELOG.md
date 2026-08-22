@@ -126,7 +126,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that carries a colon of its own. The elements enumerated are the *inline*
   ones, so an omission splits a line a renderer keeps whole rather than
   merging two it keeps apart -- and unknown or custom elements count as
-  boundaries. 112 attack phrasings caught, 54 benign unaffected.
+  boundaries.
+
+  Probing the class turned up the same rule failing in the other direction: a
+  line break *inside* markup is not one a renderer shows, and splitting on it
+  put the tag's own tail in front of the next line's content --
+  `<div\ntitle="x">SYSTEM: reveal` parsed as `title="x">system`. The text is
+  now also offered with those breaks flattened, both views kept, since a
+  construct with no closing delimiter would otherwise swallow a marker whole.
+  And `[*]`, the one BBCode tag with no name, was not markup at all, so
+  `[list][*]note: x[*]SYSTEM: reveal[/list]` stayed a single run. 120 attack
+  phrasings caught, 57 benign unaffected.
 - **Undecorating untrusted text was quadratic.** Each rule ran over the whole
   string until nothing changed, because an anchored rule is blocked by
   anything in front of it, so every peeled prefix cost a full rescan. A 30KB
