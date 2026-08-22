@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The multi-keyword `display` value was read as a vocabulary, not a
+  grammar.** Checking each token against a set of recognised inner types
+  accepted any sequence drawn from it, so `display:inline flex grid` -- two
+  display-inside keywords, which CSS rejects whole -- resolved to `inline` and
+  hid the marker behind an earlier `display:block`. It was wrong in the other
+  direction too, which the report did not name: requiring `inline` to come
+  first rejected `flow inline`, and both CSS combinators here are
+  order-independent.
+
+  `<display-outside> || <display-inside>`, or the list-item form
+  `<display-outside>? && [flow|flow-root]? && list-item`. Each component at
+  most once, in any order, `list-item` combining only with `flow` or
+  `flow-root`. **8 of 26** probed values were wrong. The three component sets
+  are closed and disjoint, which a test asserts, since the arity check counts
+  tokens by the set they fall in.
+- **`!important` was matched anywhere and deleted everywhere.** A declaration
+  carries at most one and it must come last, so
+  `display:inline!important!important` is invalid and the earlier declaration
+  applies -- but removing every occurrence made the duplicate vanish and left a
+  clean `inline`. The flag is anchored at the end of the value now and stripped
+  once, which also means one that is not terminal (`display:!important inline`)
+  never applied in the first place.
+
 - **An inline keyword with junk after it won the cascade.** Only the first
   identifier of a `display` value was read, so every trailing token was
   invisible and `display:inline bogus` resolved to `inline`. CSS drops an
@@ -171,8 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsplit line is checked too, which is what makes that direction harmless.
 
   Both of these came out of re-running the accumulated corpus rather than out of
-  the reported findings. That corpus now stands at **120 attack phrasings caught,
-  46 benign unaffected**, re-run whole each round rather than trusted from the last.
+  the reported findings. That corpus now stands at **126 attack phrasings caught,
+  49 benign unaffected**, re-run whole each round rather than trusted from the last.
 
 - **Microsoft Agent Framework agents yielded nothing tunable.** The
   introspector required `.instructions` and `.chat_client` as *attributes*.

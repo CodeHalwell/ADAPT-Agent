@@ -469,8 +469,16 @@ _INLINE_DISPLAYS = frozenset(
 #: ``data-style`` and friends, and the value alternatives are disjoint by their
 #: first character, so the parse stays linear on untrusted text.
 _STYLE_ATTR_RE = re.compile(r"(?<![\w-])style\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]*)")
-#: ``!important`` on a declaration, with the whitespace CSS tolerates.
-_CSS_IMPORTANT_RE = re.compile(r"!\s*important", re.IGNORECASE)
+#: The ``!important`` flag, with the whitespace CSS tolerates -- anchored at
+#: the *end* of the value, because a declaration carries at most one and it
+#: must come last.
+#:
+#: Searching for it anywhere and deleting every occurrence made a second one
+#: vanish, so ``display:inline!important!important`` -- which CSS rejects
+#: whole, leaving the earlier declaration in force -- read as a plain
+#: ``inline``. A flag that is not terminal never applied either:
+#: ``display:!important inline`` is not an important ``inline``.
+_CSS_IMPORTANT_RE = re.compile(r"!\s*important\s*$", re.IGNORECASE)
 
 #: A CSS escape: a backslash, then either up to six hex digits naming a code
 #: point (with one optional whitespace character as the escape's own
@@ -488,16 +496,23 @@ _CSS_ESCAPE_RE = re.compile(r"\\(?:([0-9A-Fa-f]{1,6})[ \t\r\n\f]?|([^\n\r\f]))")
 #: :func:`_is_inline_display`, because the rest of the value is not optional.
 _CSS_VALUE_RE = re.compile(r"[\w-]+")
 
-#: The *inner* display types, which the two-value syntax pairs with an outer
-#: one: ``display: inline flow-root`` is a real inline box.
+#: The three components of the multi-keyword ``display`` grammar. Closed sets
+#: from the spec, and disjoint -- which a test asserts, since the arity check
+#: below counts tokens by which set they fall in.
 #:
-#: A closed grammar rather than an open vocabulary, which is what makes this a
-#: different thing from the list-beside-a-rule shape elsewhere in this module.
-#: It also fails in the harmless direction if the spec ever grows one: an inner
-#: keyword missing from here makes the value not-inline, which splits a line a
-#: renderer keeps whole -- the same direction :data:`_INLINE_DISPLAYS` is
-#: enumerated in, and covered by checking the unsplit line too.
-_INNER_DISPLAYS = frozenset({"flow", "flow-root", "list-item", "table", "flex", "grid", "ruby"})
+#: ``<display-outside> || <display-inside>``, or the list-item form
+#: ``<display-outside>? && [ flow | flow-root ]? && list-item``. Both
+#: combinators are **order-independent** and admit each component **at most
+#: once**, and both of those are load-bearing: taking any sequence drawn from
+#: the sets accepted ``inline flex grid`` -- two inside types, which CSS
+#: rejects whole so the *earlier* declaration applies -- while requiring
+#: ``inline`` to come first rejected ``flow inline``, which is valid and
+#: genuinely inline. Wrong in both directions, from reading a grammar as a
+#: vocabulary.
+_DISPLAY_OUTSIDE = frozenset({"block", "inline", "run-in"})
+_DISPLAY_INSIDE = frozenset({"flow", "flow-root", "table", "flex", "grid", "ruby"})
+#: The only inside types ``list-item`` combines with.
+_LIST_ITEM_INSIDE = frozenset({"flow", "flow-root"})
 
 
 def _is_inline_display(value: str) -> bool:
@@ -521,11 +536,25 @@ def _is_inline_display(value: str) -> bool:
     line rather than merging two.
     """
     tokens = value.split()
-    if not tokens or tokens[0] not in _INLINE_DISPLAYS:
+    if not tokens:
         return False
     if len(tokens) == 1:
-        return True
-    return tokens[0] == "inline" and all(token in _INNER_DISPLAYS for token in tokens[1:])
+        return tokens[0] in _INLINE_DISPLAYS
+    outside = [token for token in tokens if token in _DISPLAY_OUTSIDE]
+    inside = [token for token in tokens if token in _DISPLAY_INSIDE]
+    list_item = [token for token in tokens if token == "list-item"]
+    if len(outside) + len(inside) + len(list_item) != len(tokens):
+        return False  # a token belonging to no component at all
+    if len(inside) > 1 or len(list_item) > 1:
+        return False  # a component given twice
+    if list_item and inside and inside[0] not in _LIST_ITEM_INSIDE:
+        return False  # `list-item` combines only with flow / flow-root
+    # And exactly one outside keyword, which has to be `inline`. That equality
+    # carries the outside component's arity too, which is why there is no
+    # `len(outside) > 1` beside the others: a repeated or mixed outside list
+    # can never equal `["inline"]`. Mutating those two away changed nothing,
+    # so they are gone rather than left reading as though they did work.
+    return outside == ["inline"]
 
 
 def _decode_css_escapes(text: str) -> str:
