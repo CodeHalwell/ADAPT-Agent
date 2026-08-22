@@ -195,6 +195,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exclusion is driven by `transient_metrics` alone; the row flag now speaks
   only for completeness. A transient failure of the *agent call* names every
   metric, since there is no output for any of them to measure.
+- **`IncompleteEvaluationError` was not exported.** It was the only one of six
+  exceptions missing from `adapt_agent.exceptions.__all__`, so
+  `from adapt_agent.exceptions import *` and documentation tooling could not
+  reach the exception the optimizer deliberately raises — a caller on that
+  supported surface had no way to catch it specifically. Completeness of
+  `__all__` is now asserted as a rule over the module rather than as one more
+  name in a list, since a list is what went stale.
 - **A harness-level retry classifier never reached a judge used as a metric.**
   `LLMJudge._complete` consumed anything *its own* policy did not recognise into
   `on_error`, so a caller who configured `RetryPolicy(is_transient=...)` on the

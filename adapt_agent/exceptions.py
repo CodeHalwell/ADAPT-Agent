@@ -49,6 +49,7 @@ __all__ = [
     "SkillError",
     "AdapterError",
     "MissingDependencyError",
+    "IncompleteEvaluationError",
 ]
 
 
