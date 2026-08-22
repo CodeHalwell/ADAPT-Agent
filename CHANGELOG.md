@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`style` and `hidden` were read wherever they appeared in a construct, not
+  where HTML starts an attribute.** Both were regex searches over the whole
+  construct, so text sitting *inside an earlier attribute's value* was read as
+  the element's own:
+  `<span title="style='display:inline'" style="display:block">` resolved to
+  `inline` where HTML applies the `block`, which took away the break a block
+  box makes and hid the role marker behind it. Wrong in the other direction
+  too — `title="a hidden b"` read an ordinary sentence as a hidden element —
+  and wrong again for every construct that has no attributes at all: a
+  doctype, a processing instruction, BBCode, and a *closing* tag, whose
+  attributes HTML ignores. Measured over 78 combinations: 14 bypasses and 12
+  false positives.
+
+  Attributes are now walked the way HTML's tokenizer walks them — name, then
+  a value that is quoted, unquoted or absent — and only on a start tag. It is
+  the rule the CSS layer already applies one level down, where a property name
+  is only a property name at the start of a declaration; HTML hands CSS a
+  value, so the same mistake was available twice. Checked against
+  `html.parser` over 635 tag spellings.
+
+  Three rules that used to be spelled out in those patterns are structural
+  now, each having been its own fix once: `data-style` is a different name
+  rather than a match a lookbehind has to veto, `STYLE=` still folds because
+  HTML matches an attribute name ASCII-case-insensitively, and `style\xa0=`
+  names an attribute `style\xa0` because a name ends at HTML's five
+  whitespace characters and no other space-like code point.
+
+- **An incomplete tag declared a style it does not have.** A quoted attribute
+  value with no closing quote never ends, so HTML keeps consuming past the `>`
+  and the tag never completes — it reads no attributes at all. The loose
+  fallback in `_MARKUP_TAG_RE` still matches one so the tag comes out of the
+  text, but the value it handed over stopped where HTML does not. The trailing
+  `>` normally lands *in* that value and makes the declaration invalid, which
+  hid this — until an unterminated CSS comment swallowed it:
+  `<div style="display:inline/*>` resolved to a clean `inline` and took the
+  block's boundary away. Such a tag now falls back to its element name, which
+  over-splits rather than merging.
+
 - **A metric called directly recorded a fallback note nothing would consume.**
   The note is a side channel between two frames — the metric that raises and
   the harness that catches — so a direct `Metric(on_error=0.7)("out", "ok")`

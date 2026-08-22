@@ -19,25 +19,26 @@ from typing import Any
 #: to ``i``. A browser recognises none of them.
 #:
 #: So every case-insensitive comparison here states ASCII itself rather than
-#: borrowing Python's: :func:`_ascii_lower` for a fold, :func:`_ascii_ci` for a
-#: pattern. ``re.ASCII`` would serve for a pattern, but it also makes ``\w``
-#: ASCII-only, and the lookbehind that keeps ``data-style`` from reading as a
-#: ``style`` attribute needs ``\w`` to stay Unicode -- one flag cannot mean
-#: both things.
+#: borrowing Python's, and each one is now a fold on a name this module has
+#: already cut out for itself -- :func:`_tag_attributes` reads an attribute
+#: name whole and folds it here, rather than matching a case-insensitive
+#: literal somewhere in a construct. That retired the last two patterns that
+#: needed a flag, and with them the argument against ``re.ASCII``: it would
+#: have served for a literal, but it also makes ``\w`` ASCII-only, and the
+#: lookbehind that kept ``data-style`` from reading as a ``style`` attribute
+#: needed ``\w`` to stay Unicode -- one flag could not mean both things. The
+#: lookbehind is gone too; a name read whole is never a suffix of another.
+#:
+#: :mod:`html.parser` is worth naming as the counter-example, because it is
+#: the obvious thing to reach for and it folds an attribute name with
+#: :meth:`str.lower`: it reads ``sty\u212ae=`` as a ``style`` attribute,
+#: which no browser does.
 _ASCII_CASE = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 
 def _ascii_lower(text: str) -> str:
     """``text`` with A-Z folded and every other character left alone."""
     return text.translate(_ASCII_CASE)
-
-
-def _ascii_ci(literal: str) -> str:
-    """A pattern matching ``literal`` ASCII-case-insensitively, and only so."""
-    return "".join(
-        f"[{char.lower()}{char.upper()}]" if char.isascii() and char.isalpha() else re.escape(char)
-        for char in literal
-    )
 
 
 #: The five characters HTML calls whitespace. ``\s`` is sixteen more, and each
@@ -612,20 +613,6 @@ _INLINE_DISPLAYS = frozenset(
     }
 )
 
-#: A ``style`` attribute and its value. The name is guarded against
-#: ``data-style`` and friends, and the value alternatives are disjoint by their
-#: first character, so the parse stays linear on untrusted text.
-#:
-#: HTML matches an attribute name ASCII-case-insensitively, so this pattern
-#: says so itself rather than relying on a lowercasing done elsewhere for a
-#: different reason. It used to read text that :func:`_normalize_lines` had
-#: already folded, and inheriting a rule from the *matching* pipeline meant
-#: ``STYLE=`` stopped being a style attribute the moment the parse was moved
-#: off it.
-_STYLE_ATTR_RE = re.compile(
-    rf"(?<![\w-]){_ascii_ci('style')}[{_HTML_WHITESPACE}]*=[{_HTML_WHITESPACE}]*"
-    rf"(\"[^\"]*\"|'[^']*'|[^{_HTML_WHITESPACE}>]*)"
-)
 #: A CSS escape: a backslash, then either up to six hex digits naming a code
 #: point (with one optional whitespace character as the escape's own
 #: delimiter) or any single character taken literally. A backslash before a
@@ -946,15 +933,117 @@ def _strip_css_comments(block: str) -> str:
     return "".join(out)
 
 
-#: The ``hidden`` content attribute, which renders the element not at all --
-#: the same as ``display:none`` for the only question asked here.
+#: A start tag, up to the end of its element name. HTML gives attributes to a
+#: start tag and to nothing else, so matching this is also the question of
+#: whether there are any attributes to read at all.
 #:
-#: Case-insensitive for the same reason as :data:`_STYLE_ATTR_RE`: HTML says
-#: so, and this pattern must not borrow the answer from a normalization that
-#: no longer runs first.
-_HIDDEN_ATTR_RE = re.compile(
-    rf"(?<=[{_HTML_WHITESPACE}\"'])" + _ascii_ci("hidden") + rf"(?=[{_HTML_WHITESPACE}/>=])"
-)
+#: ``<`` must be followed *directly* by a letter, because ``< div>`` is text
+#: rather than a tag, and the name then runs to whitespace, ``/`` or ``>`` --
+#: HTML's own rule rather than this module's narrower element-name class.
+#: The two answer different questions and must not be shared:
+#: :data:`_ELEMENT_NAME_RE` asks "which element is this?" and deliberately
+#: stops at the first character it excludes, while this one asks "where do
+#: the attributes begin?", and a name HTML reads further into puts them
+#: somewhere else.
+_START_TAG_RE = re.compile(rf"<[A-Za-z][^{_HTML_WHITESPACE}/>]*")
+#: What ends an attribute name, per HTML's own tokenizer.
+_ATTRIBUTE_NAME_END = _HTML_WHITESPACE + "/>="
+
+
+def _tag_attributes(construct: str) -> list[tuple[str, str]]:
+    """The attributes HTML reads from ``construct``, in order, names folded.
+
+    An attribute name is only an attribute name where HTML *starts* one. The
+    two patterns this replaced searched the whole construct for their own
+    name, so text sitting inside an earlier attribute's value was read as the
+    element's own: ``<span title="style='display:inline'" style="display:block">``
+    resolved to ``inline`` where HTML applies the ``block``, which took away
+    the break a block box makes and hid the marker behind it. Wrong in the
+    other direction too -- ``title="a hidden b"`` read an ordinary sentence as
+    a hidden element -- and wrong again for every construct that has no
+    attributes at all: a doctype, a processing instruction, BBCode, and a
+    *closing* tag, whose attributes HTML ignores. Nine bypasses and three
+    false positives between them, and no list of attribute names would have
+    closed one of them. It is the rule :func:`_css_declarations` already
+    applies one level down, where a property name is only a property name at
+    the start of a declaration; HTML hands CSS a value, so the same mistake
+    was available twice.
+
+    Three rules that used to be spelled out in those patterns are structural
+    here instead, and each of the three was its own finding once:
+
+    * ``data-style`` is not ``style``, because the name is read whole rather
+      than matched behind a lookbehind that had to know about it.
+    * ``STYLE=`` *is* ``style``, because HTML matches an attribute name
+      ASCII-case-insensitively -- said here rather than borrowed from a
+      normalization that no longer runs first.
+    * ``style\xa0=`` is an attribute *named* ``style\xa0``, because a name
+      ends at HTML's five whitespace characters and at no other space-like
+      code point.
+
+    Duplicates are kept rather than collapsed, so the caller can take the
+    first as HTML does. A boolean attribute gets ``""``, which is what HTML
+    gives it, and is why ``hidden`` is looked for by name rather than value.
+
+    One left-to-right pass with no backtracking: each character is examined
+    once, including the ones :meth:`str.find` skips to reach a closing quote.
+    """
+    tag = _START_TAG_RE.match(construct)
+    if tag is None:
+        return []
+    attributes: list[tuple[str, str]] = []
+    index, end = tag.end(), len(construct)
+    while index < end:
+        char = construct[index]
+        if char in _HTML_WHITESPACE or char == "/":
+            index += 1  # HTML ignores a solidus sitting between attributes
+            continue
+        if char == ">":
+            break
+        start = index
+        # Always consume one character first. A ``=`` here is the first
+        # character of the *name* rather than a delimiter -- HTML says so --
+        # and taking it unconditionally is also what stops this loop standing
+        # still on a character the name class excludes.
+        index += 1
+        while index < end and construct[index] not in _ATTRIBUTE_NAME_END:
+            index += 1
+        name = _ascii_lower(construct[start:index])
+        while index < end and construct[index] in _HTML_WHITESPACE:
+            index += 1
+        value = ""
+        if index < end and construct[index] == "=":
+            index += 1
+            while index < end and construct[index] in _HTML_WHITESPACE:
+                index += 1
+            if index < end and construct[index] in "\"'":
+                # The quotes delimit the value for HTML and are no part of it,
+                # so they come off here rather than being handed to CSS.
+                quote = construct[index]
+                close = construct.find(quote, index + 1)
+                if close < 0:
+                    # No closing quote, so this tag never completes: HTML keeps
+                    # consuming past the `>` looking for one and reads no
+                    # attributes at all. `_MARKUP_TAG_RE` still matches it, on
+                    # a loose alternative that ends at the first `>` so the tag
+                    # is removed from the text -- but the value it would hand
+                    # over is a fiction that stops where HTML does not, and
+                    # reading one was a bypass. The `>` it ends at is inside
+                    # the value, and looks like the junk that makes a
+                    # declaration invalid until a `/*` swallows it:
+                    # ``<div style="display:inline/*>`` resolved to a clean
+                    # `inline` and took the block's boundary away. Falling back
+                    # to the element name over-splits instead.
+                    return []
+                value = construct[index + 1 : close]
+                index = close + 1
+            else:
+                start = index
+                while index < end and construct[index] not in _HTML_WHITESPACE + ">":
+                    index += 1
+                value = construct[start:index]
+        attributes.append((name, value))
+    return attributes
 
 
 def _declared_display(construct: str) -> list[str] | None:
@@ -1013,7 +1102,8 @@ def _declared_display(construct: str) -> list[str] | None:
     ``display`` anywhere read the contents of a quoted value as a declaration
     of its own -- ``--x: "; display:inline"`` is a custom property holding a
     string, and CSS never sees a ``display`` in it. The attribute's own quotes
-    come off first: they delimit the value for HTML and are not part of the CSS.
+    are already gone: :func:`_tag_attributes` takes them off, because they
+    delimit the value for HTML and are no part of the CSS it hands over.
 
     Every one of those cuts is made on an *unescaped* character, and each half
     is decoded only once the cut is made -- see :func:`_decode_css_escapes`. A
@@ -1022,14 +1112,14 @@ def _declared_display(construct: str) -> list[str] | None:
     ``display:\\62 lock`` is a real ``display:block`` that the raw text spells
     with no ``block`` in it at all.
     """
-    style = _STYLE_ATTR_RE.search(construct)
+    attributes = _tag_attributes(construct)
+    # The *first* `style`, because HTML keeps that one and ignores any repeat
+    # -- an attribute has no specificity or origin to weigh it against.
+    style = next((value for name, value in attributes if name == "style"), None)
     if style is not None:
-        value = style.group(1)
-        if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
-            value = value[1:-1]  # the attribute's own delimiters, not CSS's
         normal: list[str] | None = None
         important: list[str] | None = None
-        block = _strip_css_comments(html.unescape(value))
+        block = _strip_css_comments(html.unescape(style))
         for declaration in _css_declarations(block):
             found = _declared_value(declaration, "display")
             if found is None:
@@ -1041,7 +1131,7 @@ def _declared_display(construct: str) -> list[str] | None:
         resolved = important if important is not None else normal
         if resolved is not None:
             return resolved  # tokens, already folded to lowercase
-    return ["none"] if _HIDDEN_ATTR_RE.search(construct) else None
+    return ["none"] if any(name == "hidden" for name, _ in attributes) else None
 
 
 def _is_line_boundary(construct: str) -> bool:
