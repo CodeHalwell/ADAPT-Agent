@@ -1319,3 +1319,56 @@ def test_the_transient_ratio_denominator_is_documented_as_n_evaluated() -> None:
 
     doc = EvaluationReport.__doc__ or ""
     assert "n_evaluated" in doc and "never ``n``" in doc
+
+
+# -- the retry policy has to reach every documented judge ----------------------
+
+
+def _provider_judge_classes():
+    import adapt_agent.optimization.judges as judges
+
+    return [
+        getattr(judges, name)
+        for name in dir(judges)
+        if name.endswith("Judge") and name not in {"LLMJudge", "ProviderJudge"}
+    ]
+
+
+@pytest.mark.parametrize("judge_cls", _provider_judge_classes(), ids=lambda c: c.__name__)
+def test_every_provider_judge_accepts_the_retry_policy(judge_cls) -> None:
+    """`retry=` was silently forwarded to the *provider*, which rejects it.
+
+    `_JUDGE_KW` in judges.py listed the judge-side options by hand and its own
+    comment claimed "everything except complete" -- but `retry` was missing, so
+    `AnthropicJudge(retry=...)` raised TypeError and the option this release
+    adds was unreachable from all 13 provider judges.
+    """
+    judge = judge_cls(retry=RetryPolicy(attempts=1))
+    assert judge.retry.attempts == 1
+
+
+def test_judge_and_provider_constructors_share_no_parameter_names() -> None:
+    """The invariant the derived `_JUDGE_KW` rests on.
+
+    `_split_kwargs` routes by name, so a name on both constructors would
+    silently go to the judge and never reach the provider. Deriving the list
+    makes staleness impossible but not ambiguity -- this pins the rest.
+    """
+    import inspect
+
+    from adapt_agent.optimization.judge import LLMJudge
+    from adapt_agent.optimization.providers import ModelProvider
+
+    judge_params = set(inspect.signature(LLMJudge.__init__).parameters) - {"self"}
+    provider_params = set(inspect.signature(ModelProvider.__init__).parameters) - {"self"}
+    assert judge_params & provider_params == set()
+
+
+def test_the_judge_kwarg_list_is_derived_not_hand_written() -> None:
+    import inspect
+
+    import adapt_agent.optimization.judges as judges
+    from adapt_agent.optimization.judge import LLMJudge
+
+    expected = set(inspect.signature(LLMJudge.__init__).parameters) - {"self", "complete"}
+    assert set(judges._JUDGE_KW) == expected

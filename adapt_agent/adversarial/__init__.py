@@ -21,6 +21,9 @@ _NEWLINE_RUN_RE = re.compile(r"\s*\n\s*")
 #: an unusual one. A bare CR is the classic miss: it renders as a line break but
 #: is not ``\n``.
 _LINE_SEPARATORS_RE = re.compile(r"\r\n|\r|\x0b|\x0c|\u0085|\u2028|\u2029")
+#: Any line break at all, used only to tell whether a caller-supplied cache
+#: still has the line structure the role parser needs.
+_ANY_LINE_BREAK_RE = re.compile(r"[\n\r\x0b\x0c\u0085\u2028\u2029]")
 #: Purely presentational characters that can *surround* text on a line --
 #: Markdown headings and blockquotes, list bullets, emphasis, code spans, table
 #: cells, quotes. Stripped from both ends of a line's head, because emphasis
@@ -191,7 +194,9 @@ class AdversarialDefense:
 
         Args:
             prompt: Input prompt to analyze.
-            prompt_normalized: Optional pre-computed normalized prompt.
+            prompt_normalized: Optional pre-computed :func:`_normalize_lines`
+                output. One that collapsed the line boundaries is recomputed:
+                a cache must not change the answer.
 
         Returns:
             True if an injection indicator is present, False otherwise.
@@ -203,7 +208,9 @@ class AdversarialDefense:
 
         Args:
             prompt: Input prompt to analyze.
-            prompt_normalized: Optional pre-computed normalized prompt.
+            prompt_normalized: Optional pre-computed :func:`_normalize_lines`
+                output. One that collapsed the line boundaries is recomputed:
+                a cache must not change the answer.
 
         Returns:
             True if a jailbreak indicator is present, False otherwise.
@@ -222,15 +229,37 @@ class AdversarialDefense:
         """
         return self._match_custom_pattern(prompt, prompt_normalized) is not None
 
+    @staticmethod
+    def _line_aware(prompt: str, prompt_normalized: str | None) -> str:
+        """Return line-preserving normalized text, recomputing a stale cache.
+
+        ``prompt_normalized`` is public, and before the built-in patterns became
+        line-aware its contract was :func:`_normalize` output -- whitespace
+        collapsed, line boundaries gone. A caller still passing that would get a
+        silently weaker check than one who passed nothing, which is the wrong
+        failure mode for a security control: a cache is an optimization and must
+        never change the answer.
+
+        So a cache that has lost line structure the raw prompt still has is
+        recomputed. The probe is two regex searches, and it never fires for the
+        internal callers (which pass :func:`_normalize_lines` output) or for
+        single-line prompts.
+        """
+        if prompt_normalized is None:
+            return _normalize_lines(prompt)
+        if not _ANY_LINE_BREAK_RE.search(prompt_normalized) and _ANY_LINE_BREAK_RE.search(prompt):
+            return _normalize_lines(prompt)
+        return prompt_normalized
+
     def _match_injection(self, prompt: str, prompt_normalized: str | None = None) -> str | None:
         """Return the matching injection indicator, or None.
 
-        ``prompt_normalized``, when supplied, must be :func:`_normalize_lines`
-        output -- the built-in patterns are line-aware.
+        ``prompt_normalized``, when supplied, should be :func:`_normalize_lines`
+        output -- the built-in patterns are line-aware. A cache that collapsed
+        the line boundaries is recomputed rather than honoured; see
+        :meth:`_line_aware`.
         """
-        normalized = (
-            prompt_normalized if prompt_normalized is not None else _normalize_lines(prompt)
-        )
+        normalized = self._line_aware(prompt, prompt_normalized)
         role_marker = _leading_role_marker(normalized, self._ROLE_TOKENS)
         if role_marker is not None:
             return role_marker
@@ -243,12 +272,12 @@ class AdversarialDefense:
     def _match_jailbreak(self, prompt: str, prompt_normalized: str | None = None) -> str | None:
         """Return the matching jailbreak indicator, or None.
 
-        ``prompt_normalized``, when supplied, must be :func:`_normalize_lines`
-        output -- the built-in patterns are line-aware.
+        ``prompt_normalized``, when supplied, should be :func:`_normalize_lines`
+        output -- the built-in patterns are line-aware. A cache that collapsed
+        the line boundaries is recomputed rather than honoured; see
+        :meth:`_line_aware`.
         """
-        normalized = (
-            prompt_normalized if prompt_normalized is not None else _normalize_lines(prompt)
-        )
+        normalized = self._line_aware(prompt, prompt_normalized)
         for indicator in self._JAILBREAK_INDICATORS:
             match = indicator.search(normalized)
             if match is not None:

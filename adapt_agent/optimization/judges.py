@@ -25,6 +25,7 @@ Example::
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 from adapt_agent.optimization.judge import _DEFAULT_RUBRIC, LLMJudge
@@ -44,20 +45,22 @@ from adapt_agent.optimization.providers import (
     TogetherProvider,
 )
 
-# Judge-level keyword arguments (everything except ``complete``), shared by the
-# provider-specific constructors so their signatures stay consistent. These are
-# forwarded verbatim to :class:`LLMJudge`; ``adversarial`` and
-# ``score_is_normalized`` are the adversarial-grading / pre-normalized-score knobs
-# defined on the ``LLMJudge`` base.
-_JUDGE_KW = (
-    "rubric",
-    "pass_threshold",
-    "scale",
-    "max_failures",
-    "on_error",
-    "adversarial",
-    "score_is_normalized",
-)
+# Judge-level keyword arguments (everything except ``complete``, which the
+# provider-specific constructors supply themselves), shared by those
+# constructors so their signatures stay consistent. Forwarded verbatim to
+# :class:`LLMJudge`.
+#
+# Read off the signature rather than listed by hand. The hand-written list said
+# "everything except ``complete``" while silently omitting ``retry`` -- so
+# ``AnthropicJudge(retry=...)`` forwarded it to the *provider* and raised
+# ``TypeError``, making the option unreachable from all 13 provider judges. A
+# list that has to be updated in a second file every time the base gains an
+# option will fall behind again; derived, it cannot.
+#
+# Safe because the two constructors share no parameter names -- there is a test
+# pinning that, since an overlap would silently route an argument to the wrong
+# one.
+_JUDGE_KW = frozenset(inspect.signature(LLMJudge.__init__).parameters) - {"self", "complete"}
 
 
 def _split_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
