@@ -180,7 +180,10 @@ class EvaluationReport:
             limits scores the same as one that did not -- otherwise whichever
             candidate was evaluated while the provider was busiest would score
             lowest, and an optimizer would select for luck. Compare it against
-            ``n`` to judge whether a run is trustworthy at all.
+            :attr:`n_evaluated`, never ``n`` -- ``n`` counts *stored records*
+            and is capped by ``max_results``, so it can read ``n=1,
+            n_transient_errors=4``. :attr:`is_complete` answers the same
+            question directly.
         total_latency: Wall-clock seconds summed across example runs.
     """
 

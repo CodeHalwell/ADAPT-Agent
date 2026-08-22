@@ -1291,3 +1291,31 @@ def test_a_throttled_metric_is_not_reported_as_a_failing_case() -> None:
     assert report.below("secondary", 1.0) == []
     # A metric that really did score badly is still reported.
     assert len(report.below("exact_match", 2.0)) == 4
+
+
+def test_the_transient_ratio_denominator_is_documented_as_n_evaluated() -> None:
+    """`n` counts *stored* records, so it is the wrong denominator.
+
+    Both the report docstring and the skill reference recommended comparing
+    `n_transient_errors` against `n` -- ten lines above a field comment warning
+    that this gives "impossible summaries like n=1, n_transient_errors=4".
+    Under `max_results` it does exactly that.
+    """
+    from adapt_agent.optimization.evaluation import EvaluationReport
+
+    def throttled(payload):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [exact_match()], retry=RetryPolicy(attempts=1), max_results=1
+    ).evaluate(throttled, dataset)
+
+    assert report.n == 1, "max_results bounds stored records"
+    assert report.n_evaluated == 4, "but every row was run"
+    assert report.n_transient_errors == 4
+    assert report.n_transient_errors > report.n, "the ratio `n` would give is impossible"
+    assert report.is_complete is False
+
+    doc = EvaluationReport.__doc__ or ""
+    assert "n_evaluated" in doc and "never ``n``" in doc

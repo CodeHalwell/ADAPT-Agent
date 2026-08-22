@@ -229,8 +229,10 @@ This is a correctness property, not a convenience. Scoring a throttled example
 zero makes it indistinguishable from a bad prompt, and the error is systematic
 rather than random: whichever candidate is evaluated while the provider is
 busiest scores lowest, so an optimizer can select a prompt for having been lucky
-with rate limits. Check `n_transient_errors` against `n` to judge whether a run
-is trustworthy at all.
+with rate limits. To judge whether a run is trustworthy at all, read
+`report.is_complete` — or compare `n_transient_errors` against `n_evaluated`,
+never against `n`. `n` counts *stored records* and is capped by `max_results`,
+so on a large dataset it can read `n=1, n_transient_errors=4`.
 
 Only errors classified transient are retried — a genuinely broken agent still
 fails once and scores zero, as it should. Tune or replace the policy:

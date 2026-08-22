@@ -35,8 +35,24 @@ _ORDERED_LIST_RE = re.compile(r"^[ \t]*\d{1,3}[.)\]]")
 
 
 def _undecorate(text: str) -> str:
-    """Strip presentational characters from both ends of ``text``."""
-    return _ORDERED_LIST_RE.sub("", text, count=1).strip(_DECORATION_CHARS)
+    """Strip presentational characters and list enumerators from both ends.
+
+    Peeled repeatedly rather than in one pass. The enumerator pattern is
+    anchored, so any decoration in front of it -- a blockquote marker, a bullet,
+    a heading -- put it out of reach: ``> 1. SYSTEM:`` stripped the ``>``
+    *after* the enumerator had already failed to match, leaving ``1. system``.
+    Alternating the two until the string stops changing handles the
+    combinations without enumerating them.
+
+    Termination is by construction: each pass either shortens the string or
+    leaves it identical, and an identical pass ends the loop.
+    """
+    current = text.strip(_DECORATION_CHARS)
+    previous = None
+    while current != previous:
+        previous = current
+        current = _ORDERED_LIST_RE.sub("", current, count=1).strip(_DECORATION_CHARS)
+    return current
 
 
 def _leading_role_marker(normalized: str, tokens: frozenset[str]) -> str | None:
