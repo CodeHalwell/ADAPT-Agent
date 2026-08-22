@@ -28,7 +28,7 @@ import threading
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 #: Non-5xx status codes worth retrying: throttling, request timeouts, a
 #: conflict worth a second attempt, and Early Hints replay.
@@ -504,6 +504,68 @@ def consume_retries_exhausted(exc: BaseException) -> bool:
     return bool(_EXHAUSTED.consume(exc, False))
 
 
+#: Whether a consumer for declared fallbacks is on this thread's stack.
+#:
+#: A note is a side channel between two frames -- the metric that raises and
+#: the harness that catches -- so writing one where the second frame does not
+#: exist leaves it on the exception with nothing to take it off. A *direct*
+#: call is exactly that: `Metric(on_error=0.7)("out", "ok")` raising a reusable
+#: exception left `0.7` attached, and a later harness evaluation of a metric
+#: declaring `0.2` consumed the stale note and scored `0.7`. Three earlier
+#: rounds scoped this note's lifetime -- consumed as read, once at the block's
+#: entrance, per thread -- and none of them asked whether it should be written
+#: at all.
+#:
+#: The judge's exhausted mark never had this problem, and the difference is the
+#: fix: it is stamped only under `propagate_transient`, which is set only by
+#: `as_metric()` -- the one path with a harness to read it.
+_COLLECTING = threading.local()
+
+
+class collecting_declared_fallbacks:  # noqa: N801 - it reads as a statement
+    """Record declared fallbacks while this is active, and not otherwise.
+
+    Nested rather than flat, because a metric may dispatch to another and the
+    inner call must not switch collection off on the way out -- so each `with`
+    saves and restores, and every use needs its own instance.
+
+    Hand-written rather than :func:`contextlib.contextmanager`, which is the
+    obvious spelling and **substitutes the exception** for exactly the class of
+    error this module exists to handle. Its ``__exit__`` throws the exception
+    into the generator and then assigns ``exc.__traceback__`` at Python level;
+    an exception that refuses attributes -- a frozen dataclass, an immutable
+    provider error -- raises ``AttributeError: __traceback__`` from its own
+    ``__setattr__``, and *that* is what propagates. Measured: a marked
+    ``RefusesAttributes`` came out of the block as an unmarked
+    ``AttributeError``, so the harness spent a second retry budget and scored
+    the row a hard zero instead of excluding it.
+
+    And it is **version dependent**: 3.12 and 3.14 substitute, 3.10 does
+    not -- the assignment is not in that release's ``contextlib``. A hazard
+    on the interpreters most people run and a quiet no-op on the oldest one
+    supported here, which is the worst shape a bug can have. A class
+    ``__exit__`` touches the exception not at all.
+    """
+
+    __slots__ = ("_previous",)
+
+    def __enter__(self) -> None:
+        self._previous = getattr(_COLLECTING, "active", False)
+        _COLLECTING.active = True
+
+    def __exit__(self, *_exc_info: object) -> Literal[False]:
+        # `Literal[False]`, not `bool`: a truthy return suppresses the
+        # metric's exception inside the harness's `while True`, which does
+        # not fail -- it loops forever. mypy makes the same point.
+        _COLLECTING.active = self._previous
+        return False
+
+
+def collecting_a_declared_fallback() -> bool:
+    """Whether anything on this stack will consume a note that is written."""
+    return bool(getattr(_COLLECTING, "active", False))
+
+
 def note_declared_fallback(exc: BaseException, score: float) -> BaseException:
     """Record the fallback declared by the metric raising ``exc``.
 
@@ -511,7 +573,13 @@ def note_declared_fallback(exc: BaseException, score: float) -> BaseException:
     carried: the metric nearest the failure is the one whose documented
     fallback answers for it, and an outer wrapper's is only reached when the
     inner declares nothing.
+
+    A no-op unless something is collecting -- see :data:`_COLLECTING`. A note
+    with no consumer is not merely useless: it outlives the call that made it
+    and answers for the next failure of the same exception object.
     """
+    if not collecting_a_declared_fallback():
+        return exc
     if _DECLARED_FALLBACK.get(exc, None) is None:
         _DECLARED_FALLBACK.set(exc, float(score))
     return exc

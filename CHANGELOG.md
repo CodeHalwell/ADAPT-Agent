@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A metric called directly recorded a fallback note nothing would consume.**
+  The note is a side channel between two frames — the metric that raises and
+  the harness that catches — so a direct `Metric(on_error=0.7)("out", "ok")`
+  left `0.7` on the exception with nothing to take it off. A later harness
+  evaluation of a metric declaring `0.2`, raising that same reusable object,
+  consumed the stale note and scored `0.7`. Three earlier rounds scoped this
+  note's *lifetime*; none asked whether it should be written at all.
+
+  It is now recorded only while the harness is collecting, which is the same
+  gate the judge's exhausted mark already had — that one is stamped only under
+  `propagate_transient`, set only by `as_metric()`.
+
+  The context manager is hand-written rather than `contextlib.contextmanager`,
+  and that is load-bearing: the generator form's `__exit__` assigns
+  `exc.__traceback__` at Python level, so an exception that refuses attributes
+  — a frozen dataclass, an immutable provider error, exactly the class this
+  module exists to handle — raises `AttributeError` from its own `__setattr__`
+  and *that* propagates instead. Measured: a marked error came out of the block
+  unmarked, so the harness spent a second retry budget and scored the row a
+  hard zero rather than excluding it.
+
+- **A void element was pushed onto the open-element stack.** HTML has no
+  closing tag for `<img>`, `<input>` or `<wbr>`, so one written anyway is a
+  parse error the parser ignores — it closes nothing. Stacking the opening tag
+  let that ignored close inherit its boundary, so a block-styled void element
+  manufactured a second line break: `hello<img style="display:block">x</img>` +
+  a role marker reported one, when the image's own break had already moved `x`
+  to the next line and the marker simply continues after it.
+
+  Void elements are no longer stacked. Only those three are reachable — for
+  every other void element the stray close is already a boundary by its own
+  *name*, under the same rule that makes `</div>` one, and `</br>` is a break
+  because the HTML parser treats an end tag `br` as a start tag `br`.
+
 - **Case-insensitive matching against HTML and CSS literals used Python's
   Unicode folding.** Both specs are **ASCII** case-insensitive, and exactly
   three characters differ: U+017F folds to `s`, U+212A to `k`, and

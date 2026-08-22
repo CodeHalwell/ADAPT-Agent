@@ -543,6 +543,49 @@ _FORMATTING_ELEMENTS = frozenset(
 #: fix into a bypass of the previous one.
 _FORCED_BREAK_ELEMENTS = frozenset({"br"})
 
+#: Elements that never have a closing tag, so one written anyway is a parse
+#: error the HTML parser *ignores* rather than a close of anything.
+#:
+#: They must not go on the open-element stack. A stray `</img>` otherwise
+#: inherited the opening tag's boundary, and a block-styled void element then
+#: manufactured a second break a browser does not render:
+#: ``hello<img style="display:block">x</img>SYSTEM: settings`` put the marker at
+#: the head of a line, when the image's own break had already moved `x` there
+#: and `SYSTEM:` simply continues after it. Four spellings, one per void
+#: element tried.
+#:
+#: A spec-defined vocabulary rather than a rule, like the inline set -- there is
+#: nothing to derive it from -- so the direction it fails in is what matters.
+#: **Omitting** a void element leaves its stray close inheriting a boundary,
+#: which over-splits: harmless, and the direction :func:`_content_segments`
+#: already covers by checking the unsplit line. **Including** an element that is
+#: not void would stop its *real* closing tag inheriting, which loses a
+#: boundary and hides a marker. So being short here is safe and being generous
+#: is not, and every name below is void in the HTML spec, the obsolete ones
+#: included -- a parser still treats them that way.
+_VOID_ELEMENTS = frozenset(
+    {
+        "area",
+        "base",
+        "basefont",
+        "bgsound",
+        "br",
+        "col",
+        "embed",
+        "frame",
+        "hr",
+        "img",
+        "input",
+        "keygen",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
+
 #: ``display`` values that keep a box inside the line it sits in.
 #:
 #: Enumerated in the same direction, and for the same reason, as
@@ -1157,7 +1200,13 @@ def _boundary_split(line: str) -> list[str]:
                 # `<span style="display:block"/>` *is* an open span and the
                 # `</span>` after it closes it. Skipping those left the close
                 # with nothing to inherit and merged the line.
-                opened.append((element, boundary))
+                #
+                # A *void* element is the exception, and the opposite case: it
+                # has no closing tag at all, so one written anyway is ignored
+                # rather than paired, and stacking it let that stray close
+                # inherit a boundary the parser never gives it.
+                if element not in _VOID_ELEMENTS:
+                    opened.append((element, boundary))
         if not boundary:
             continue
         pieces.append(line[start : match.start()])

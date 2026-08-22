@@ -28,6 +28,7 @@ from adapt_agent.optimization.metrics import Metric, MetricFn, coerce_metric
 from adapt_agent.optimization.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
+    collecting_declared_fallbacks,
     consume_declared_fallback,
     consume_retries_exhausted,
 )
@@ -736,7 +737,12 @@ class EvaluationHarness:
         attempt = 1
         while True:
             try:
-                return metric(output, example.expected, example), False
+                # Notes are collected only here, where this block will
+                # consume them -- a note written with no consumer outlives
+                # the call and answers for the next failure of the same
+                # exception object.
+                with collecting_declared_fallbacks():
+                    return metric(output, example.expected, example), False
             except Exception as exc:
                 # Both notes this attempt may carry come off here, once,
                 # whatever happens next -- because five paths leave this block

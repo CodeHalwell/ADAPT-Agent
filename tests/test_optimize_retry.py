@@ -22,6 +22,7 @@ from adapt_agent.optimization.metrics import exact_match
 from adapt_agent.optimization.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
+    collecting_declared_fallbacks,
     is_transient_error,
     retry_after_seconds,
 )
@@ -1931,14 +1932,16 @@ def test_the_note_does_not_outlive_the_propagation_that_set_it() -> None:
     )
 
     error = ValueError("boom")
-    note_declared_fallback(error, 0.7)
+    with collecting_declared_fallbacks():
+        note_declared_fallback(error, 0.7)
     assert declared_fallback(error) == pytest.approx(0.7)
     assert consume_declared_fallback(error) == pytest.approx(0.7)
     assert declared_fallback(error) is None
     # ...and a second consume finds nothing rather than repeating itself
     assert consume_declared_fallback(error) is None
     # a later declaration on the same object is its own, not the old one
-    note_declared_fallback(error, 0.2)
+    with collecting_declared_fallbacks():
+        note_declared_fallback(error, 0.2)
     assert consume_declared_fallback(error) == pytest.approx(0.2)
 
 
@@ -1951,7 +1954,8 @@ def test_the_note_is_cleared_for_an_exception_that_refuses_attributes() -> None:
     )
 
     error = RefusesAttributesAndUnhashable("boom")
-    note_declared_fallback(error, 0.7)
+    with collecting_declared_fallbacks():
+        note_declared_fallback(error, 0.7)
     assert declared_fallback(error) == pytest.approx(0.7)
     assert consume_declared_fallback(error) == pytest.approx(0.7)
     assert declared_fallback(error) is None
@@ -2119,7 +2123,8 @@ def _crosstalk(note, consume, values):
     got: dict[str, object] = {}
 
     def run(label: str, value: object) -> None:
-        note(shared, value)
+        with collecting_declared_fallbacks():
+            note(shared, value)
         gate.wait()
         got[label] = consume(shared)
 
@@ -2227,7 +2232,8 @@ def test_a_note_is_invisible_to_a_thread_that_did_not_take_it() -> None:
     from adapt_agent.optimization.retry import declared_fallback, note_declared_fallback
 
     shared = TimeoutError("429 Too Many Requests")
-    note_declared_fallback(shared, 0.7)
+    with collecting_declared_fallbacks():
+        note_declared_fallback(shared, 0.7)
     seen: list[float | None] = []
     elsewhere = threading.Thread(target=lambda: seen.append(declared_fallback(shared)))
     elsewhere.start()
@@ -2254,7 +2260,8 @@ def test_a_per_thread_table_still_dies_with_its_exception() -> None:
 
     exc = Carrier("429 Too Many Requests")
     before = len(_DECLARED_FALLBACK._by_identity)
-    note_declared_fallback(exc, 0.7)
+    with collecting_declared_fallbacks():
+        note_declared_fallback(exc, 0.7)
 
     # The table hangs off the exception...
     assert exc.__adapt_declared_fallback__ == {threading.get_ident(): 0.7}
@@ -2301,7 +2308,8 @@ def test_only_one_thread_ever_attaches_a_table_to_one_exception() -> None:
 
     def run(value: float) -> None:
         start.wait()
-        note_declared_fallback(shared, value)
+        with collecting_declared_fallbacks():
+            note_declared_fallback(shared, value)
 
     threads = [threading.Thread(target=run, args=(value,)) for value in (0.7, 0.2)]
     for thread in threads:
@@ -2312,3 +2320,111 @@ def test_only_one_thread_ever_attaches_a_table_to_one_exception() -> None:
     assert len(entered) == 1
     # ...and both notes survived, which is what the exclusion is for
     assert sorted(getattr(shared, attribute).values()) == [0.2, 0.7]
+
+
+# -- round 41: a note is only written where something will consume it ----------
+
+
+def test_a_direct_metric_call_leaves_no_note_behind() -> None:
+    """A note is a side channel between two frames — the metric that raises and
+    the harness that catches. Called directly, the second frame does not exist,
+    so writing one left it on the exception with nothing to take it off.
+
+    Three earlier rounds scoped this note's *lifetime* — consumed as read, once
+    at the block's entrance, per thread — and none of them asked whether it
+    should be written at all.
+    """
+    from unittest.mock import Mock
+
+    from adapt_agent.optimization.metrics import Metric
+    from adapt_agent.optimization.retry import declared_fallback
+
+    shared = TimeoutError("429 Too Many Requests")
+    raiser = Mock(side_effect=shared)
+    permanent = RetryPolicy(attempts=1, is_transient=lambda exc: False)
+    rows = GoldenDataset([Example(inputs="a", expected="ok")])
+
+    try:
+        Metric("direct", lambda o, e: raiser(), on_error=0.7)("out", "ok")
+    except Exception:
+        pass
+    assert declared_fallback(shared) is None
+
+    # ...so the next metric to raise that same object scores its own fallback
+    report = EvaluationHarness(
+        [Metric("later", lambda o, e: raiser(), on_error=0.2)], retry=permanent
+    ).evaluate(lambda x: "out", rows)
+    assert report.aggregate["later"] == pytest.approx(0.2)
+
+
+def test_the_collector_does_not_substitute_the_exception_it_wraps() -> None:
+    """Why this context manager is hand-written rather than a generator.
+
+    `contextlib.contextmanager`'s `__exit__` throws the exception into the
+    generator and then assigns `exc.__traceback__` — a *Python-level* attribute
+    set. An exception that refuses attributes raises `AttributeError` from its
+    own `__setattr__`, and that is what propagates instead. It is precisely the
+    class of error this module exists to handle, and the substituted exception
+    carries none of the marks the original did: the harness spent a second
+    retry budget and scored the row a hard zero rather than excluding it.
+
+    The half that matters is asserted everywhere; the counterexample is version
+    dependent and says so. Measured: 3.12 and 3.14 substitute, **3.10 does
+    not** -- the assignment is not in that release's `contextlib`. So the
+    generator form is a hazard on the interpreters most people run and a quiet
+    no-op on the oldest one this package supports, which is the worst shape for
+    a bug to have and the reason this is pinned rather than remembered.
+    """
+    import contextlib
+    import sys
+    from collections.abc import Iterator
+
+    from adapt_agent.optimization.retry import mark_retries_exhausted, retries_already_exhausted
+
+    def raise_marked() -> None:
+        raise mark_retries_exhausted(RefusesAttributes("429 Too Many Requests"))
+
+    # Ours, on every interpreter: the exception arrives as itself, marks intact.
+    with pytest.raises(RefusesAttributes) as caught:
+        with collecting_declared_fallbacks():
+            raise_marked()
+    assert retries_already_exhausted(caught.value) is True
+
+    if sys.version_info < (3, 12):  # pragma: no cover - measured, not assumed
+        return
+
+    @contextlib.contextmanager
+    def generator_based() -> Iterator[None]:
+        yield
+
+    with pytest.raises(AttributeError, match="__traceback__"):
+        with generator_based():
+            raise_marked()
+
+
+def test_collection_nests_so_a_dispatcher_does_not_switch_it_off() -> None:
+    """A metric may call another, and the inner `with` must not end collection
+    for the outer one on the way out."""
+    from adapt_agent.optimization.retry import (
+        collecting_a_declared_fallback,
+        declared_fallback,
+        note_declared_fallback,
+    )
+
+    # It must also not swallow. A truthy `__exit__` would suppress the metric's
+    # exception inside the harness's `while True`, which does not fail -- it
+    # loops forever, and a hanging guard is worse than none. Pinned here, where
+    # it fails in microseconds.
+    with pytest.raises(ValueError, match="boom"):
+        with collecting_declared_fallbacks():
+            raise ValueError("boom")
+
+    assert collecting_a_declared_fallback() is False
+    with collecting_declared_fallbacks():
+        with collecting_declared_fallbacks():
+            assert collecting_a_declared_fallback() is True
+        assert collecting_a_declared_fallback() is True
+        exc = TimeoutError("429 Too Many Requests")
+        note_declared_fallback(exc, 0.7)
+        assert declared_fallback(exc) == pytest.approx(0.7)
+    assert collecting_a_declared_fallback() is False
