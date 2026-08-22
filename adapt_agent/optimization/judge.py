@@ -490,6 +490,13 @@ class LLMJudge:
         The returned metric needs the full :class:`~adapt_agent.optimization.dataset.Example`
         (for the input and any per-example ``criteria`` in metadata) and is
         therefore evaluated by the harness with example context.
+
+        It also carries this judge's ``on_error`` forward. The adapter
+        re-raises a grading failure so the harness can classify it, and once
+        the harness has ruled the error *permanent* the question the fallback
+        answers is settled -- so it applies, and ``on_error=0.7`` means the
+        same thing through a harness as it does on a direct call. Only the
+        classification was ever the harness's to make.
         """
         # Imported lazily to avoid a circular import at module load time.
         from adapt_agent.optimization.metrics import Metric
@@ -510,7 +517,7 @@ class LLMJudge:
                 propagate_transient=True,
             ).score
 
-        return Metric(name, _fn, needs_example=True)
+        return Metric(name, _fn, needs_example=True, on_error=self.on_error)
 
     # -- internals -------------------------------------------------------------
 

@@ -711,8 +711,21 @@ class EvaluationHarness:
         Returns ``(score, transient)``. A transient failure that outlives its
         retries scores ``0.0`` *and* flags the row, so the caller can drop it
         from the aggregate instead of counting it against the agent.
+
+        A *permanent* failure scores whatever the metric declares in
+        ``on_error``, and ``0.0`` when it declares nothing. That is the whole
+        of the fallback's remit: the adapter re-raises so the harness can
+        classify the error, and once the harness has ruled it permanent the
+        classification is settled and the metric's documented fallback is the
+        right answer. Substituting a hard ``0.0`` there made
+        ``LLMJudge(on_error=0.7)`` mean one thing on a direct call and another
+        through a harness.
         """
         policy = self.retry
+        # Read once, and duck-typed, since a metric need only be callable with
+        # a name -- a caller's own object is not required to have the field.
+        declared = getattr(metric, "on_error", None)
+        permanent = 0.0 if declared is None else max(0.0, min(1.0, float(declared)))
         attempt = 1
         while True:
             try:
@@ -738,7 +751,7 @@ class EvaluationHarness:
                             index,
                             exc,
                         )
-                        return 0.0, False
+                        return permanent, False
                     logger.warning(
                         "Metric %s failed transiently on example %d (its own retries "
                         "were already spent); excluded from the score: %s",
@@ -776,7 +789,7 @@ class EvaluationHarness:
                     )
                     return 0.0, True
                 logger.warning("Metric %s raised on example %d: %s", metric.name, index, exc)
-                return 0.0, False
+                return permanent, False
 
     def _build_report(self, results_iter: Any) -> EvaluationReport:
         """Aggregate a stream of per-example results into a report."""

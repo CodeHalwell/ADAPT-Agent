@@ -1808,3 +1808,65 @@ def test_the_marker_table_does_not_retain_the_exceptions_it_marks() -> None:
         mark_retries_exhausted(RefusesAttributesAndUnhashable("429 Too Many Requests"))
     gc.collect()
     assert len(_EXHAUSTED_FALLBACK) == before
+
+
+# -- a documented fallback means the same thing through a harness --------------
+
+
+def test_a_judge_fallback_survives_the_harness() -> None:
+    """`on_error` answers "what does a grading failure score".
+
+    The adapter re-raises so the harness can classify the error; once the
+    harness has ruled it *permanent*, the classification is settled and the
+    judge's documented fallback is the answer. Substituting a hard `0.0` made
+    `on_error=0.7` mean one thing on a direct call and another through a
+    harness.
+    """
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def broken(prompt, **kwargs):
+        raise ValueError("the judge template is malformed")
+
+    judge = LLMJudge(broken, retry=RetryPolicy(attempts=1), on_error=0.7)
+    assert judge.score("i", "o").score == 0.7
+
+    report = EvaluationHarness([judge.as_metric()], retry=RetryPolicy(attempts=1)).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    assert report.score == 0.7
+    assert report.n_transient_errors == 0, "a malformed template is not throttling"
+
+
+def test_a_metric_with_no_fallback_still_scores_zero() -> None:
+    from adapt_agent.optimization.metrics import Metric
+
+    def broken(output, expected):
+        raise ValueError("not a provider fault")
+
+    report = EvaluationHarness([Metric("custom", broken)], retry=RetryPolicy(attempts=1)).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    assert report.score == 0.0
+
+
+def test_a_transient_failure_ignores_the_fallback() -> None:
+    """That row is excluded, so no score it carries would be read anyway."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def throttled(prompt, **kwargs):
+        raise RuntimeError("429 Too Many Requests")
+
+    judge = LLMJudge(throttled, retry=RetryPolicy(attempts=1), on_error=0.7)
+    report = EvaluationHarness([judge.as_metric()], retry=RetryPolicy(attempts=1)).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    assert report.n_transient_errors == 1
+    assert report.is_complete is False
+
+
+def test_a_declared_fallback_is_clamped() -> None:
+    from adapt_agent.optimization.metrics import Metric
+
+    assert Metric("m", lambda o, e: 1.0, on_error=5.0).on_error == 1.0
+    assert Metric("m", lambda o, e: 1.0, on_error=-2.0).on_error == 0.0
+    assert Metric("m", lambda o, e: 1.0).on_error is None

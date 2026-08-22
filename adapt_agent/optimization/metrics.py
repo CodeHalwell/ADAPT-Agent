@@ -40,15 +40,34 @@ class Metric:
             :func:`~adapt_agent.optimization.extractors.extract_output_payload`
             over ``extract_output_text``, so the structure a structural metric
             needs is not flattened away before it runs.
+        on_error: Score to record when this metric fails *permanently* -- it
+            raised, and the harness classified the error as a real failure
+            rather than throttling. ``None`` means no opinion, and the harness
+            records ``0.0``.
+
+            This exists because a metric can have a documented fallback of its
+            own: :meth:`~adapt_agent.optimization.judge.LLMJudge.as_metric`
+            sets it from the judge's ``on_error``, so a judge configured with
+            ``on_error=0.7`` scores a grading failure the same whether it is
+            called directly or through a harness. A transient failure ignores
+            this: that row is excluded from the aggregate, so no score it could
+            carry would be read.
     """
 
     def __init__(
-        self, name: str, fn: MetricFn, *, needs_example: bool = False, structural: bool = False
+        self,
+        name: str,
+        fn: MetricFn,
+        *,
+        needs_example: bool = False,
+        structural: bool = False,
+        on_error: float | None = None,
     ):
         self.name = name
         self.fn = fn
         self.needs_example = needs_example
         self.structural = structural
+        self.on_error = None if on_error is None else _clamp(on_error)
 
     def __call__(self, output: Any, expected: Any, example: Any = None) -> float:
         if self.needs_example:
