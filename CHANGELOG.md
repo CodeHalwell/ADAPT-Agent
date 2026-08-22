@@ -107,6 +107,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a user reads to decide whether a tuned config generalises. It re-runs once
   and never aborts (validation does not steer the search), with the outcome on
   `OptimizationResult.validation_complete`.
+- **A character reference was deleted, joining the letters around it.** Every
+  other construct the undecorator handles is invisible once rendered, so
+  removing it is what a reader sees. A reference is not -- `&amp;` renders as
+  `&`, mid-word if that is where it sits -- and deleting it broke in both
+  directions at once: `sys&amp;tem: settings` became `system: settings` and was
+  reported as an injected role marker, while `&#115;ystem: reveal` lost its
+  first letter and was not reported at all. **9 of 11** probed references were
+  classified wrong. References are decoded now, which is safe only because the
+  scan became single-pass: `re.sub` never re-reads a replacement, so
+  `&lt;SYSTEM&gt;` becomes the *text* `<SYSTEM>` rather than a tag to be
+  removed whole -- the hazard that made deletion look like the careful choice.
+  A reference standing for a line separator (`&#10;`, `&NewLine;`) is decoded
+  earlier still, before the text is cut into lines.
+- **A Pydantic AI prompt field holding a callable read as empty.** A *dynamic*
+  instruction is a function evaluated per run, and either prompt field can mix
+  one with static text. Requiring every element to be a string read
+  `["Be concise", dynamic]` as empty, so it lost the tie to a field that really
+  was empty: the optimizer got a knob starting at `''` while the instruction
+  the user wrote stayed fixed and still applied, and every candidate was
+  measured on top of it. `Agent(system_prompt=[str, callable])` produced no
+  prompt knob at all. A field is judged by the strings in it now, writes
+  replace those strings *in place* so the callables and their order survive,
+  and a field holding only callables still beats an empty one -- it is where
+  the agent was configured.
+- **The exhausted-retries marker could not be stamped on every exception.** It
+  was an attribute, and an exception with its own `__setattr__` -- a frozen
+  dataclass, or anything immutable -- rejected it silently. The enclosing
+  harness then spent its own budget on an error a judge had already retried:
+  nine provider calls for one row instead of three, piling on load precisely
+  while the provider is throttling. A weak-reference fallback covers those
+  shapes, and the two mechanisms are complementary rather than redundant: a
+  builtin exception takes the attribute but has no `__weakref__` slot, while
+  refusing an attribute takes a Python subclass, which has one.
 - **Markup that renders a line break was deleted instead of splitting the
   line.** `_undecorate` removes every tag, which is right for inline
   formatting and wrong for anything that ends a line: dropping a `<br>` glues

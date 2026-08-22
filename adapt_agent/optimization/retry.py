@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import random
 import re
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -309,18 +310,46 @@ class RetryPolicy:
 _EXHAUSTED_MARKER = "__adapt_retries_exhausted__"
 
 
+#: Exceptions that refused the marker attribute, held weakly so marking one
+#: cannot keep it alive.
+#:
+#: Two mechanisms because neither alone covers every exception, and between
+#: them they cover all of it. A *builtin* exception takes the attribute but has
+#: no ``__weakref__`` slot; refusing an attribute takes a Python-level
+#: ``__setattr__``, which takes a Python subclass, which gets ``__weakref__``.
+#: So the shapes the attribute misses are exactly the shapes a weak reference
+#: reaches -- a frozen-dataclass or otherwise immutable provider exception is
+#: the realistic case, and it is weak-referenceable by construction.
+#:
+#: Silently dropping the marker is not a cosmetic loss: the enclosing harness
+#: then spends its own budget on an error a judge already retried, so one row
+#: makes nine provider calls instead of three, piling on load precisely while
+#: the provider is throttling.
+_EXHAUSTED_FALLBACK: weakref.WeakSet[BaseException] = weakref.WeakSet()
+
+
 def mark_retries_exhausted(exc: BaseException) -> BaseException:
     """Record that ``exc`` already used up a retry budget. Returns ``exc``."""
     try:
         setattr(exc, _EXHAUSTED_MARKER, True)
+        return exc
     except Exception:  # an exception type that refuses attributes
+        pass
+    try:
+        _EXHAUSTED_FALLBACK.add(exc)
+    except Exception:  # unhashable, or no weak reference support either
         pass
     return exc
 
 
 def retries_already_exhausted(exc: BaseException) -> bool:
     """Whether a lower layer already spent this error's retries."""
-    return bool(getattr(exc, _EXHAUSTED_MARKER, False))
+    if getattr(exc, _EXHAUSTED_MARKER, False):
+        return True
+    try:
+        return exc in _EXHAUSTED_FALLBACK
+    except Exception:  # unhashable: it was never added either
+        return False
 
 
 #: Used when a harness is constructed without an explicit policy.

@@ -10,6 +10,7 @@ scores lowest -- so an optimizer can select a prompt for having been lucky.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import threading
 import time
 
@@ -1617,3 +1618,91 @@ def test_the_marker_still_stops_the_budgets_multiplying() -> None:
     )
 
     assert calls["n"] == 9, "3 rows x 3 judge attempts; the harness must not retry again"
+
+
+# -- the marker cannot depend on mutating the provider's exception -------------
+#
+# `mark_retries_exhausted` stamped an attribute and swallowed the failure if
+# the exception refused it. That is not a rare shape: an exception built on a
+# frozen dataclass, or any class with its own `__setattr__`, rejects the stamp,
+# and the budgets then multiply exactly as they did before the marker existed.
+#
+# Two mechanisms cover it, and between them every exception shape. A *builtin*
+# exception takes the attribute but has no `__weakref__` slot; refusing an
+# attribute takes a Python-level `__setattr__`, which takes a Python subclass,
+# which gets `__weakref__`. The gaps are complementary, not overlapping.
+
+
+class RefusesAttributes(RuntimeError):
+    """An exception that rejects attribute assignment, as a frozen one does."""
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(name)
+
+
+@dataclasses.dataclass(frozen=True)
+class FrozenError(Exception):
+    detail: str
+
+    def __str__(self) -> str:
+        return self.detail
+
+
+class UnhashableError(RuntimeError):
+    def __eq__(self, other: object) -> bool:
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("429 Too Many Requests"),
+        RefusesAttributes("429 Too Many Requests"),
+        FrozenError("429 Too Many Requests"),
+        UnhashableError("429 Too Many Requests"),
+    ],
+    ids=["builtin", "refuses-setattr", "frozen-dataclass", "unhashable"],
+)
+def test_the_exhausted_marker_survives_every_exception_shape(exc: BaseException) -> None:
+    from adapt_agent.optimization.retry import (
+        mark_retries_exhausted,
+        retries_already_exhausted,
+    )
+
+    assert retries_already_exhausted(exc) is False
+    mark_retries_exhausted(exc)
+    assert retries_already_exhausted(exc) is True
+
+
+def test_marking_one_exception_does_not_mark_another() -> None:
+    """The fallback is keyed on the object, not on its type or its message."""
+    from adapt_agent.optimization.retry import (
+        mark_retries_exhausted,
+        retries_already_exhausted,
+    )
+
+    marked = RefusesAttributes("429 Too Many Requests")
+    mark_retries_exhausted(marked)
+    assert retries_already_exhausted(RefusesAttributes("429 Too Many Requests")) is False
+
+
+def test_budgets_do_not_multiply_on_an_exception_that_refuses_the_marker() -> None:
+    """The measurable consequence: nine provider calls for one row, not three."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    calls = {"n": 0}
+
+    def always_throttled(prompt, **kwargs):
+        calls["n"] += 1
+        raise RefusesAttributes("429 Too Many Requests")
+
+    policy = RetryPolicy(attempts=3, initial_backoff=0.001, jitter=0.0)
+    harness = EvaluationHarness(
+        [LLMJudge(always_throttled, retry=policy).as_metric()], retry=policy
+    )
+    report = harness.evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+
+    assert calls["n"] == 3, f"retried at both layers: {calls['n']} provider calls for one row"
+    assert report.n_transient_errors == 1

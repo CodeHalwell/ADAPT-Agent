@@ -57,24 +57,60 @@ def _component_name(obj: Any) -> str:
     return "agent"
 
 
-def _sequence_of_strings(value: Any) -> bool:
-    """Whether ``value`` is a non-empty sequence of strings."""
-    if not isinstance(value, (list, tuple)) or not value:
-        return False
-    return all(isinstance(item, str) for item in value)
+#: The two fields a Pydantic AI agent can hold a prompt in, in tie-break
+#: order, with the sequence type each one expects back.
+_PROMPT_FIELDS = (("_system_prompts", tuple), ("_instructions", list))
+
+
+def _string_elements(value: Any) -> list[str]:
+    """The string members of a prompt sequence, in order.
+
+    Either field may hold callables as well as strings: a *dynamic* instruction
+    is a function evaluated per run. Only the strings are static text, and only
+    static text is something an optimizer can tune -- so a field is judged by
+    the strings in it, not by whether every element is one.
+
+    Requiring *all* elements to be strings read a mixed list as empty, which
+    then lost the tie to a genuinely empty field.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _is_populated(value: Any) -> bool:
+    """Whether ``value`` is a non-empty prompt sequence, of anything."""
+    return isinstance(value, (list, tuple)) and bool(value)
 
 
 def _sequence_prompt_param(obj: Any, attr: str, wrap: Any, component: str) -> Parameter:
-    """Bind a prompt held as a list/tuple of strings on ``obj.<attr>``."""
+    """Bind the static prompt text held in the sequence at ``obj.<attr>``.
+
+    Reads join the string elements; writes replace them with the new text *in
+    place*, leaving any callables where they were. Replacing the sequence
+    wholesale would delete the agent's dynamic instructions, and joining it
+    wholesale would raise on the first callable.
+    """
 
     def _getter() -> Any:
         prompts = getattr(obj, attr, None)
         if prompts is None:
             return None
-        return "\n".join(prompts)
+        return "\n".join(_string_elements(prompts))
 
     def _setter(value: Any) -> None:
-        setattr(obj, attr, wrap([value]))
+        replaced: list[Any] = []
+        placed = False
+        for item in getattr(obj, attr, None) or ():
+            if isinstance(item, str):
+                if not placed:
+                    replaced.append(value)
+                    placed = True
+            else:
+                replaced.append(item)
+        if not placed:
+            replaced.insert(0, value)
+        setattr(obj, attr, wrap(replaced))
 
     return Parameter(
         name="agent.system_prompt",
@@ -95,19 +131,28 @@ def _system_prompt_param(obj: Any, component: str) -> Parameter | None:
     and ``Agent(instructions=...)`` -- the modern spelling -- fills
     ``_instructions`` (a list), leaving the other empty. Binding
     ``_system_prompts`` unconditionally is therefore worse than finding nothing
-    on an ``instructions=`` agent: the optimizer gets a prompt knob whose value
-    is ``''`` and whose writes land in a field the agent never reads, so a sweep
-    runs to completion and reports improvements that cannot exist. The populated
-    field wins; ``_system_prompts`` breaks the tie when both are empty.
+    on an ``instructions=`` agent: the optimizer gets a prompt knob starting at
+    ``''`` while the instruction the user actually wrote stays fixed and still
+    applies, so every candidate is measured on top of it and the knob never
+    tunes the prompt the agent runs on.
+
+    Three tiers, because "populated" turned out to have two meanings. The
+    field holding **static text** wins -- judged by the strings in it, so a
+    list mixing an instruction with a dynamic callable counts, which it did
+    not when every element had to be a string. Failing that, a field populated
+    with *only* callables wins, since that is the field the agent was
+    configured through and a new prompt belongs beside its siblings. Failing
+    both, ``_system_prompts`` breaks the tie and the knob starts empty --
+    correct, because then there is no prompt to tune, only one to introduce.
 
     Neither is bindable through the generic helpers -- a single element of a
-    tuple has no working setter -- so the getter/setter are hand-built: reads
-    join the sequence, writes replace it wholesale.
+    sequence has no working setter -- so the getter/setter are hand-built.
     """
-    for attr, wrap in (("_system_prompts", tuple), ("_instructions", list)):
-        if _sequence_of_strings(getattr(obj, attr, None)):
-            return _sequence_prompt_param(obj, attr, wrap, component)
-    for attr, wrap in (("_system_prompts", tuple), ("_instructions", list)):
+    for populated in (_string_elements, _is_populated):
+        for attr, wrap in _PROMPT_FIELDS:
+            if populated(getattr(obj, attr, None)):
+                return _sequence_prompt_param(obj, attr, wrap, component)
+    for attr, wrap in _PROMPT_FIELDS:
         if hasattr(obj, attr):
             return _sequence_prompt_param(obj, attr, wrap, component)
     if isinstance(getattr(obj, "system_prompt", None), str):

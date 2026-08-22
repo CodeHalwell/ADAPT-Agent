@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import unicodedata
 from datetime import datetime, timezone
@@ -163,9 +164,7 @@ _MARKUP_CONTAINER_RE = re.compile(r"<!--|-->|<!\[CDATA\[|\]\]>", re.IGNORECASE)
 #: Declarations and processing instructions, removed *with* their contents --
 #: unlike a comment, a doctype or an ``<?xml ?>`` header carries no prose.
 _MARKUP_DECLARATION_RE = re.compile(r"<![A-Za-z][^>]*>|<\?[^>]*\?>")
-#: A character reference: ``&lt;``, ``&#60;``, ``&#x3C;``. Deleted rather than
-#: decoded -- decoding ``&lt;SYSTEM&gt;`` would produce ``<SYSTEM>``, which
-#: :data:`_MARKUP_TAG_RE` would then remove *whole*, taking the token with it.
+#: A character reference: ``&lt;``, ``&#60;``, ``&#x3C;``.
 _CHARACTER_REF_RE = re.compile(r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
 
 #: Every markup construct except character references -- the constructs that
@@ -188,16 +187,42 @@ _MARKUP_CONSTRUCT_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: Everything :func:`_undecorate` removes, in the old pass order.
+#: Everything :func:`_undecorate` rewrites, in the old pass order.
 #:
 #: These four rules used to be four substitutions inside a fixpoint loop. As
 #: one pattern they are a single scan, which is both linear and the more
 #: faithful model: a tokenizer decides what a construct is once, at the
 #: position it starts, and never rejoins the text around one it removed.
+#:
+#: The reference alternative is captured so :func:`_undecorated_construct` can
+#: tell it from the rest, because it is the one that leaves something behind.
 _MARKUP_RE = re.compile(
-    "|".join((_CHARACTER_REF_RE.pattern, _MARKUP_CONSTRUCT_RE.pattern)),
+    "|".join((f"(?P<reference>{_CHARACTER_REF_RE.pattern})", _MARKUP_CONSTRUCT_RE.pattern)),
     re.IGNORECASE,
 )
+
+
+def _undecorated_construct(match: re.Match[str]) -> str:
+    """Replace one markup construct with what a reader would see in its place.
+
+    Nothing, for a tag or a container delimiter. For a character reference,
+    **the character it stands for** -- a reference is content, not
+    presentation: `&amp;` renders as `&`, in the middle of a word if that is
+    where it sits.
+
+    Deleting them instead joined the letters on either side, which broke both
+    ways. `sys&amp;tem: settings` became `system: settings` and was reported as
+    an injected role marker, and `&#115;ystem: reveal` lost its first letter and
+    was not. Six of eleven probed references were classified wrong.
+
+    Decoding is only safe because the scan is single-pass: :meth:`re.sub` never
+    re-reads what a replacement produced, so `&lt;SYSTEM&gt;` becomes the
+    *text* `<SYSTEM>` rather than a tag to be removed whole -- which is the
+    hazard that made deletion look like the careful choice under the old
+    fixpoint loop.
+    """
+    reference = match.group("reference")
+    return html.unescape(reference) if reference is not None else ""
 
 
 def _undecorate(text: str) -> str:
@@ -205,7 +230,8 @@ def _undecorate(text: str) -> str:
 
     Four kinds of presentation: character references, markup tags and
     container delimiters anywhere in the string, list enumerators at the front,
-    and presentation characters at either end.
+    and presentation characters at either end. References are *decoded* rather
+    than dropped -- see :func:`_undecorated_construct` -- everything else goes.
 
     Containers (``<!-- -->``, ``<![CDATA[ ]]>``) lose their delimiters but keep
     their contents; tags and declarations go whole. The difference is whether
@@ -242,7 +268,7 @@ def _undecorate(text: str) -> str:
     what one pass leaves. Rerunning until stable removed the rejoined ``<b>``
     too and returned nothing at all.
     """
-    body = _MARKUP_RE.sub("", text)
+    body = _MARKUP_RE.sub(_undecorated_construct, text)
     start = 0
     while start < len(body):
         if _is_decoration(body[start]):
@@ -442,6 +468,30 @@ def _leading_role_marker(normalized: str, tokens: frozenset[str]) -> str | None:
     return None
 
 
+def _decode_line_breaks(text: str) -> str:
+    """Decode the character references that stand for a line separator.
+
+    A line break can be written as `&#10;`, `&#xD;` or `&NewLine;`, and it
+    renders as a break either way -- so the normalisers have to see one before
+    they decide where the lines are. `hello&#10;SYSTEM: reveal` was a single
+    line whose head was "hellosystem".
+
+    Only the references that decode *to a separator* are touched, which is the
+    rule stated rather than a list of spellings. Decoding the rest here would
+    be actively wrong: `&lt;b&gt;SYSTEM:` renders as the literal text
+    `<b>SYSTEM:`, and turning it into real markup would let the tag matcher
+    remove `<b>` and manufacture a marker out of prose. The rest are decoded
+    later, by :func:`_undecorated_construct`, where a single-pass scan makes
+    that safe.
+    """
+
+    def _decoded(match: re.Match[str]) -> str:
+        character = html.unescape(match.group())
+        return character if _ANY_LINE_BREAK_RE.fullmatch(character) else match.group()
+
+    return _CHARACTER_REF_RE.sub(_decoded, text)
+
+
 def _normalize(text: str) -> str:
     """Normalize text for robust *substring* matching.
 
@@ -457,7 +507,7 @@ def _normalize(text: str) -> str:
     line; preserving them in both places let an attacker split a multiword
     signature across lines. The two callers want opposite things.
     """
-    normalized = unicodedata.normalize("NFKC", text)
+    normalized = unicodedata.normalize("NFKC", _decode_line_breaks(text))
     normalized = _ZERO_WIDTH_RE.sub("", normalized)
     normalized = _WHITESPACE_RE.sub(" ", normalized)
     return normalized.strip().lower()
@@ -478,7 +528,7 @@ def _normalize_lines(text: str) -> str:
     keeping ``\n`` -- a bare CR renders as a line break, so leaving it as
     horizontal whitespace is a one-character bypass.
     """
-    normalized = unicodedata.normalize("NFKC", text)
+    normalized = unicodedata.normalize("NFKC", _decode_line_breaks(text))
     normalized = _ZERO_WIDTH_RE.sub("", normalized)
     normalized = _LINE_SEPARATORS_RE.sub("\n", normalized)
     normalized = _HORIZONTAL_WS_RE.sub(" ", normalized)
