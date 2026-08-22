@@ -436,7 +436,12 @@ def test_report_to_dict():
         "primary_metric": "echo",
         "aggregate": {"echo": 0.5},
         "n": 2,
+        "n_evaluated": 2,
         "n_errors": 0,
+        "n_transient_errors": 0,
+        "is_complete": True,
+        "partial_metrics": [],
+        "metric_samples": {"echo": 2},
         "avg_latency": report.avg_latency,
     }
     # aggregate is a copy, not the same object.
@@ -525,3 +530,189 @@ def test_harness_output_extractor_applies_per_example_checks():
 
     report = harness.evaluate(agent, data)
     assert report.aggregate["checks"] == 1.0
+
+
+# -- renaming a metric carries everything it holds -----------------------------
+#
+# The mapping form renames each entry after its key. Both places that do it
+# used to rebuild the metric from a hand-written list of fields, and that list
+# went stale twice: `structural` once, then `on_error` the round it was added.
+
+
+def test_renaming_carries_every_field_a_metric_has() -> None:
+    """Exhaustive by construction, so a field added later is covered too.
+
+    Comparing the whole instance dict rather than naming the fields is the
+    point: a list of fields in the test would go stale exactly as the list in
+    the code did.
+    """
+    source = Metric(
+        "original",
+        lambda output, expected, example: 1.0,
+        needs_example=True,
+        structural=True,
+        on_error=0.7,
+    )
+    clone = source.renamed("renamed")
+
+    assert clone.name == "renamed"
+    assert {k: v for k, v in vars(clone).items() if k != "name"} == {
+        k: v for k, v in vars(source).items() if k != "name"
+    }
+    # ...and it is a copy, not the same object wearing a new name.
+    assert clone is not source
+    assert source.name == "original"
+
+
+def test_a_renamed_metric_keeps_its_subclass() -> None:
+    """Rebuilding through `Metric(...)` flattened one; copying does not."""
+
+    class CountingMetric(Metric):
+        pass
+
+    clone = CountingMetric("original", lambda o, e: 1.0).renamed("renamed")
+    assert isinstance(clone, CountingMetric)
+
+
+def test_the_harness_renames_without_dropping_a_fallback() -> None:
+    """The reported path: a mapping key must not silently reset `on_error`."""
+    source = Metric("original", lambda o, e: 1.0, structural=True, on_error=0.7)
+    (clone,) = EvaluationHarness._normalize_metrics({"renamed": source})
+
+    assert clone.name == "renamed"
+    assert clone.on_error == 0.7
+    assert clone.structural is True
+
+
+def test_a_renamed_judge_metric_scores_its_own_fallback() -> None:
+    """End to end, because the two halves of this were fixed a round apart."""
+    from adapt_agent.optimization.judge import LLMJudge
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    def broken(prompt, **kwargs):
+        raise ValueError("the judge template is malformed")
+
+    judge = LLMJudge(broken, retry=RetryPolicy(attempts=1), on_error=0.7)
+    data = GoldenDataset([Example(inputs="a", expected="ok")])
+
+    listed = EvaluationHarness([judge.as_metric()], retry=RetryPolicy(attempts=1)).evaluate(
+        lambda x: "ok", data
+    )
+    mapped = EvaluationHarness(
+        {"renamed": judge.as_metric()}, retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", data)
+
+    assert listed.score == 0.7
+    assert mapped.score == 0.7, "a mapping key must not reset the declared fallback"
+
+
+# -- a fallback belongs to the failure, not to the wrapper around it -----------
+#
+# `checks` routes each row to the scorer that row declares, so the harness only
+# ever holds the dispatcher, whose `on_error` says nothing about the metric
+# that actually raised.
+
+
+def _always_raises(output, expected):
+    raise ValueError("this check is broken")
+
+
+def test_checks_carries_the_dispatched_metrics_fallback() -> None:
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    report = EvaluationHarness(
+        [checks(default=Metric("inner", _always_raises, on_error=0.4))],
+        retry=RetryPolicy(attempts=1),
+    ).evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+    assert report.score == 0.4
+
+
+def test_a_judge_dispatched_by_checks_scores_the_same_as_one_used_directly() -> None:
+    """The reported path, and the whole point of the contract."""
+    from adapt_agent.optimization.judge import LLMJudge
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    def broken(prompt, **kwargs):
+        raise ValueError("the judge template is malformed")
+
+    judge = LLMJudge(broken, retry=RetryPolicy(attempts=1), on_error=0.7)
+    policy = RetryPolicy(attempts=1)
+
+    direct = EvaluationHarness([judge.as_metric()], retry=policy).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    dispatched = EvaluationHarness([checks(judge=judge)], retry=policy).evaluate(
+        lambda x: "ok",
+        GoldenDataset([Example(inputs="a", expected="ok", metadata={"check": "judge"})]),
+    )
+    assert direct.score == 0.7
+    assert dispatched.score == direct.score
+
+
+def test_a_dispatched_metric_with_no_fallback_still_scores_zero() -> None:
+    """The widening must not invent a fallback where nobody declared one."""
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    report = EvaluationHarness(
+        [checks(default=Metric("inner", _always_raises))], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+    assert report.score == 0.0
+
+
+def test_the_innermost_declaration_answers_for_the_failure() -> None:
+    """A wrapper's own fallback is reached only when the inner declares none."""
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    policy = RetryPolicy(attempts=1)
+    rows = GoldenDataset([Example(inputs="a", expected="ok")])
+
+    inner_wins = checks(default=Metric("inner", _always_raises, on_error=0.4))
+    inner_wins.on_error = 0.9
+    assert EvaluationHarness([inner_wins], retry=policy).evaluate(lambda x: "ok", rows).score == 0.4
+
+    outer_only = checks(default=Metric("inner", _always_raises))
+    outer_only.on_error = 0.9
+    assert EvaluationHarness([outer_only], retry=policy).evaluate(lambda x: "ok", rows).score == 0.9
+
+
+def test_a_carried_fallback_is_clamped_like_any_other_score() -> None:
+    """`on_error` is a public attribute, so it can be set past the range."""
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    policy = RetryPolicy(attempts=1)
+    rows = GoldenDataset([Example(inputs="a", expected="ok")])
+
+    inner = Metric("inner", _always_raises)
+    inner.on_error = 5.0
+    assert (
+        EvaluationHarness([checks(default=inner)], retry=policy)
+        .evaluate(lambda x: "ok", rows)
+        .score
+        == 1.0
+    )
+
+    inner.on_error = -3.0
+    assert (
+        EvaluationHarness([checks(default=inner)], retry=policy)
+        .evaluate(lambda x: "ok", rows)
+        .score
+        == 0.0
+    )
+
+
+def test_a_permanent_failure_is_still_a_failure_with_a_fallback() -> None:
+    """The fallback is what to *record*, not permission to ignore the row."""
+    from adapt_agent.optimization.metrics import checks
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    report = EvaluationHarness(
+        [checks(default=Metric("inner", _always_raises, on_error=0.4))],
+        retry=RetryPolicy(attempts=1),
+    ).evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+    assert report.n_transient_errors == 0
+    assert report.is_complete is True

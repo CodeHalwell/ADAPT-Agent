@@ -1,0 +1,2657 @@
+"""Tests for transient-error retry and the harness-level concurrency default.
+
+The bug these guard against is a *measurement* bug, not a crash: under
+concurrency, provider throttling is expected, and scoring a throttled example
+zero makes it indistinguishable from a bad prompt. Worse, it biases
+systematically -- whichever candidate is evaluated while the provider is busiest
+scores lowest -- so an optimizer can select a prompt for having been lucky.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import threading
+import time
+
+import pytest
+
+from adapt_agent.optimization.dataset import Example, GoldenDataset
+from adapt_agent.optimization.evaluation import EvaluationHarness
+from adapt_agent.optimization.metrics import exact_match
+from adapt_agent.optimization.retry import (
+    DEFAULT_RETRY_POLICY,
+    RetryPolicy,
+    collecting_declared_fallbacks,
+    is_transient_error,
+    retry_after_seconds,
+)
+
+#: Backoff small enough to keep the suite fast, deterministic (no jitter).
+FAST = RetryPolicy(attempts=3, initial_backoff=0.001, jitter=0.0)
+
+
+def _dataset() -> GoldenDataset:
+    return GoldenDataset([Example(inputs=x, expected="ok") for x in ("a", "boom", "c")])
+
+
+# -- classification -----------------------------------------------------------
+
+
+class _Response:
+    def __init__(self, status: int, headers: dict | None = None) -> None:
+        self.status_code = status
+        self.headers = headers or {}
+
+
+@pytest.mark.parametrize("status", [408, 409, 425, 429, 500, 502, 503, 504])
+def test_transient_http_statuses_are_recognised(status: int) -> None:
+    exc = RuntimeError("upstream said no")
+    exc.status_code = status  # type: ignore[attr-defined]
+    assert is_transient_error(exc) is True
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+def test_client_error_statuses_are_not_transient(status: int) -> None:
+    """A 400 means *your request* is wrong; retrying it just wastes quota."""
+    exc = RuntimeError("bad request")
+    exc.status_code = status  # type: ignore[attr-defined]
+    assert is_transient_error(exc) is False
+
+
+def test_status_on_an_attached_response_is_found() -> None:
+    exc = RuntimeError("nope")
+    exc.response = _Response(429)  # type: ignore[attr-defined]
+    assert is_transient_error(exc) is True
+
+
+def test_an_explicit_status_beats_a_misleading_message() -> None:
+    """A 400 whose text happens to mention a timeout is still not transient."""
+    exc = RuntimeError("request timed out while validating")
+    exc.status_code = 400  # type: ignore[attr-defined]
+    assert is_transient_error(exc) is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["RateLimitError", "APITimeoutError", "ServiceUnavailableError", "ThrottlingException"],
+)
+def test_provider_exception_type_names_are_recognised(name: str) -> None:
+    """No provider SDK is imported; classification is by duck-typed name."""
+    exc = type(name, (Exception,), {})("something went wrong")
+    assert is_transient_error(exc) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "429 Too Many Requests",
+        "Rate limit reached for gpt-4o",
+        "The server is overloaded, please try again",
+        "503 Service Unavailable",
+        "Connection reset by peer",
+    ],
+)
+def test_transient_messages_are_recognised(message: str) -> None:
+    assert is_transient_error(RuntimeError(message)) is True
+
+
+def test_an_ordinary_agent_failure_is_not_transient() -> None:
+    assert is_transient_error(ValueError("the model returned malformed JSON")) is False
+
+
+def test_a_bare_number_in_a_message_does_not_trip_classification() -> None:
+    """`429` is matched as a word, so a token count can't masquerade as throttling."""
+    assert is_transient_error(ValueError("produced 1429 tokens, over budget")) is False
+
+
+def test_stop_signals_are_never_transient() -> None:
+    assert is_transient_error(KeyboardInterrupt()) is False
+    assert is_transient_error(SystemExit()) is False
+    assert is_transient_error(asyncio.CancelledError()) is False
+
+
+def test_retry_after_is_read_from_attribute_and_header() -> None:
+    attr = RuntimeError("slow down")
+    attr.retry_after = 2.5  # type: ignore[attr-defined]
+    assert retry_after_seconds(attr) == 2.5
+
+    header = RuntimeError("slow down")
+    header.response = _Response(429, {"retry-after": "7"})  # type: ignore[attr-defined]
+    assert retry_after_seconds(header) == 7.0
+
+
+def test_an_unparseable_or_absurd_retry_after_is_ignored() -> None:
+    http_date = RuntimeError("slow down")
+    http_date.retry_after = "Wed, 21 Oct 2026 07:28:00 GMT"  # type: ignore[attr-defined]
+    assert retry_after_seconds(http_date) is None
+
+    absurd = RuntimeError("slow down")
+    absurd.retry_after = 99_999  # type: ignore[attr-defined]
+    assert retry_after_seconds(absurd) is None
+
+
+def test_retry_after_is_preferred_over_computed_backoff_but_capped() -> None:
+    policy = RetryPolicy(initial_backoff=0.5, max_backoff=5.0, jitter=0.0)
+    exc = RuntimeError("slow down")
+    exc.retry_after = 3.0  # type: ignore[attr-defined]
+    assert policy.delay_for(exc, 1) == 3.0
+
+    exc.retry_after = 120.0  # type: ignore[attr-defined]
+    assert policy.delay_for(exc, 1) == 5.0
+
+
+def test_backoff_grows_and_is_capped() -> None:
+    policy = RetryPolicy(initial_backoff=1.0, multiplier=2.0, max_backoff=5.0, jitter=0.0)
+    plain = RuntimeError("429")
+    assert [policy.delay_for(plain, n) for n in (1, 2, 3, 4)] == [1.0, 2.0, 4.0, 5.0]
+
+
+def test_a_broken_custom_classifier_does_not_abort_the_run() -> None:
+    def explode(exc: BaseException) -> bool:
+        raise RuntimeError("classifier is broken")
+
+    policy = RetryPolicy(attempts=3, is_transient=explode)
+    assert policy.should_retry(RuntimeError("429"), 1) is False
+
+
+# -- harness behaviour --------------------------------------------------------
+
+
+def test_a_transient_failure_is_retried_and_recovers() -> None:
+    state = {"n": 0}
+
+    def flaky(inputs):
+        if inputs == "boom":
+            state["n"] += 1
+            if state["n"] < 3:
+                raise RuntimeError("429 Too Many Requests")
+        return "ok"
+
+    report = EvaluationHarness([exact_match()], retry=FAST).evaluate(flaky, _dataset())
+    assert report.score == 1.0
+    assert report.n_errors == 0
+    assert [r.attempts for r in report.results] == [1, 3, 1]
+
+
+def test_an_exhausted_transient_failure_is_excluded_from_the_score() -> None:
+    """The measurement bug: without this the score is 2/3, not 2/2.
+
+    A throttled example contributes a zero it did not earn, so the candidate
+    that happened to run while the provider was busiest scores lowest.
+    """
+
+    def throttled(inputs):
+        if inputs == "boom":
+            raise RuntimeError("429 Too Many Requests")
+        return "ok"
+
+    report = EvaluationHarness([exact_match()], retry=FAST).evaluate(throttled, _dataset())
+    assert report.score == 1.0
+    assert report.n_errors == 1
+    assert report.n_transient_errors == 1
+    assert report.to_dict()["n_transient_errors"] == 1
+    # ...and it is not offered to a proposer as a case the prompt gets wrong.
+    assert report.failures() == []
+    assert report.results[1].transient is True
+    assert report.results[1].attempts == 3
+
+
+def test_a_broken_agent_still_scores_zero_and_is_not_retried() -> None:
+    """Retrying is for the provider's faults, not the agent's."""
+    calls = {"n": 0}
+
+    def broken(inputs):
+        calls["n"] += 1
+        if inputs == "boom":
+            raise ValueError("the model returned malformed JSON")
+        return "ok"
+
+    report = EvaluationHarness([exact_match()], retry=FAST).evaluate(broken, _dataset())
+    assert report.score == pytest.approx(2 / 3)
+    assert report.n_errors == 1
+    assert report.n_transient_errors == 0
+    assert len(report.failures()) == 1
+    assert calls["n"] == 3, "a non-transient failure must not be retried"
+
+
+def test_attempts_one_still_classifies_without_retrying() -> None:
+    calls = {"n": 0}
+
+    def throttled(inputs):
+        calls["n"] += 1
+        if inputs == "boom":
+            raise RuntimeError("429 Too Many Requests")
+        return "ok"
+
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+    report = harness.evaluate(throttled, _dataset())
+    assert calls["n"] == 3, "attempts=1 means one try per example"
+    assert report.n_transient_errors == 1
+    assert report.score == 1.0
+
+
+def test_the_default_harness_retries_transient_errors() -> None:
+    """Opt-out, not opt-in: the silent-corruption default is the one being fixed."""
+    assert DEFAULT_RETRY_POLICY.attempts >= 2
+    assert EvaluationHarness([exact_match()]).retry is DEFAULT_RETRY_POLICY
+
+
+def test_async_transient_failure_is_retried_without_blocking_the_loop() -> None:
+    delay = 0.05
+
+    class Agent:
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def run(self, inputs):
+            if inputs == "boom":
+                self.n += 1
+                if self.n < 2:
+                    raise RuntimeError("429 Too Many Requests")
+            return "ok"
+
+    harness = EvaluationHarness(
+        [exact_match()], retry=RetryPolicy(attempts=3, initial_backoff=delay, jitter=0.0)
+    )
+
+    async def main():
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(delay / 10)
+                ticks += 1
+
+        beat = asyncio.ensure_future(heartbeat())
+        report = await harness.aevaluate(Agent(), _dataset())
+        beat.cancel()
+        with __import__("contextlib").suppress(asyncio.CancelledError):
+            await beat
+        return report, ticks
+
+    report, ticks = asyncio.run(main())
+    assert report.score == 1.0
+    assert [r.attempts for r in report.results] == [1, 2, 1]
+    assert ticks >= 5, "the backoff blocked the event loop (time.sleep instead of asyncio.sleep)"
+
+
+def test_async_exhausted_transient_failure_is_excluded_from_the_score() -> None:
+    class Agent:
+        async def run(self, inputs):
+            if inputs == "boom":
+                raise RuntimeError("429 Too Many Requests")
+            return "ok"
+
+    harness = EvaluationHarness([exact_match()], retry=FAST)
+    report = asyncio.run(harness.aevaluate(Agent(), _dataset()))
+    assert report.score == 1.0
+    assert report.n_transient_errors == 1
+    assert report.failures() == []
+
+
+# -- concurrency default ------------------------------------------------------
+
+
+def _tracking_agent(delay: float = 0.05):
+    """Return an agent plus a dict recording the peak number in flight."""
+    stats = {"live": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def agent(inputs):
+        with lock:
+            stats["live"] += 1
+            stats["peak"] = max(stats["peak"], stats["live"])
+        time.sleep(delay)
+        with lock:
+            stats["live"] -= 1
+        return "ok"
+
+    return agent, stats
+
+
+def test_harness_concurrency_reaches_a_call_site_that_passes_no_kwargs() -> None:
+    """This is the optimizer path.
+
+    `Optimizer` calls `self.harness.evaluate(target, dataset)` with no keyword
+    arguments, so a per-call `concurrency=` can never reach it -- and that is
+    exactly the path that needs it, being `max_evals x len(dataset)` round trips
+    rather than a single pass.
+    """
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(8)])
+
+    agent, stats = _tracking_agent()
+    EvaluationHarness([exact_match()], concurrency=4).evaluate(agent, dataset)
+    assert stats["peak"] > 1, "the harness-level concurrency default never reached evaluate()"
+    assert stats["peak"] <= 4
+
+    agent, stats = _tracking_agent()
+    EvaluationHarness([exact_match()]).evaluate(agent, dataset)
+    assert stats["peak"] == 1, "the default must stay strictly serial"
+
+
+def test_a_per_call_concurrency_overrides_the_instance_default() -> None:
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(6)])
+    agent, stats = _tracking_agent()
+    EvaluationHarness([exact_match()], concurrency=4).evaluate(agent, dataset, concurrency=1)
+    assert stats["peak"] == 1
+
+
+def test_harness_concurrency_reaches_aevaluate_with_no_kwargs() -> None:
+    delay = 0.05
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(6)])
+
+    class Agent:
+        async def run(self, inputs):
+            await asyncio.sleep(delay)
+            return "ok"
+
+    harness = EvaluationHarness([exact_match()], concurrency=6)
+    started = time.perf_counter()
+    report = asyncio.run(harness.aevaluate(Agent(), dataset))
+    elapsed = time.perf_counter() - started
+
+    assert report.score == 1.0
+    assert elapsed < delay * len(dataset) * 0.6, "aevaluate ignored the harness concurrency default"
+
+
+def test_a_non_positive_concurrency_is_clamped_to_serial() -> None:
+    assert EvaluationHarness([exact_match()], concurrency=0).concurrency == 1
+    assert EvaluationHarness([exact_match()], concurrency=-4).concurrency == 1
+
+
+# -- transient failures in the judge / metric ---------------------------------
+#
+# Retrying only the agent call covers half the problem. An LLM judge is the
+# documented metric for open-ended tasks, and its provider call is a network
+# round trip too -- so a 429 there biases candidate selection exactly as one on
+# the agent call does, just by a different route.
+
+
+def _judge_harness(judge_fn, *, retry=FAST):
+    from adapt_agent.optimization.judge import LLMJudge
+
+    judge = LLMJudge(judge_fn, retry=retry)
+    return EvaluationHarness([judge.as_metric()], retry=retry)
+
+
+GOOD_VERDICT = '{"score": 10, "reasoning": "good"}'
+
+
+def test_a_transient_judge_failure_is_retried() -> None:
+    calls = {"n": 0}
+
+    def judge_fn(prompt, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("429 Too Many Requests")
+        return GOOD_VERDICT
+
+    report = _judge_harness(judge_fn).evaluate(lambda x: "ok", _dataset())
+    assert report.score == 1.0
+    assert report.n_transient_errors == 0
+    assert calls["n"] == 4, "the throttled judge call was not retried"
+
+
+def test_an_exhausted_transient_judge_failure_is_excluded_from_the_score() -> None:
+    """Previously the judge swallowed this into `on_error` and scored it 0.0."""
+
+    def judge_fn(prompt, **kwargs):
+        if "THROTTLE" in prompt:
+            raise RuntimeError("429 Too Many Requests")
+        return GOOD_VERDICT
+
+    dataset = GoldenDataset([Example(inputs=x, expected="ok") for x in ("a", "THROTTLE", "c")])
+    report = _judge_harness(judge_fn).evaluate(lambda x: "ok", dataset)
+    assert report.score == 1.0, "a throttled judge dragged the candidate's score down"
+    assert report.n_transient_errors == 1
+    assert report.results[1].transient is True
+    assert report.failures() == []
+
+
+def test_a_judge_that_reliably_fails_is_still_a_real_failure() -> None:
+    """Retrying is for the provider's faults, not a broken judge configuration."""
+    report = _judge_harness(lambda p, **k: "not json at all").evaluate(lambda x: "ok", _dataset())
+    assert report.score == 0.0
+    assert report.n_transient_errors == 0
+    assert len(report.failures()) == 3
+
+
+def test_auth_errors_from_the_judge_still_fail_loudly() -> None:
+    """A bad key must not be retried into a run of silent zeros."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    class AuthenticationError(Exception):
+        pass
+
+    def judge_fn(prompt, **kwargs):
+        raise AuthenticationError("bad key")
+
+    with pytest.raises(AuthenticationError):
+        LLMJudge(judge_fn, retry=FAST).score("i", "o")
+
+
+# -- optimizer: an incomplete trial cannot win --------------------------------
+
+
+def test_an_incomplete_trial_is_not_eligible_to_win() -> None:
+    """Dropping throttled rows stops throttling *penalising* a candidate.
+
+    On its own it lets throttling *reward* one instead: a candidate that answers
+    one easy row and is throttled on a hard row scores 1.0 over a single row and
+    would beat a fully-evaluated 0.9. The score is a mean over a different
+    subset, so it is not comparable at all.
+    """
+    from adapt_agent.optimization.optimizers import Optimizer
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+
+    def complete_but_imperfect(inputs):
+        return "ok" if inputs == "easy" else "wrong"
+
+    def throttled_on_the_hard_row(inputs):
+        if inputs == "hard":
+            raise RuntimeError("429 Too Many Requests")
+        return "ok"
+
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+    complete = harness.evaluate(complete_but_imperfect, dataset)
+    partial = harness.evaluate(throttled_on_the_hard_row, dataset)
+
+    assert complete.is_complete is True and complete.score == 0.5
+    assert partial.is_complete is False and partial.score == 1.0
+
+    class _State:
+        def __init__(self):
+            self.history = []
+            self.best_score = 0.0
+            self.best_config = {}
+            self.best_report = None
+
+    class _Probe(Optimizer):
+        strategy_name = "probe"
+        min_improvement = 0.0
+
+        def __init__(self):
+            self.verbose = False
+
+        def optimize(self, *args, **kwargs):  # pragma: no cover - not exercised
+            raise NotImplementedError
+
+    optimizer, state = _Probe(), _State()
+    assert optimizer._record(state, {"c": 1}, partial) is False, "a partial trial won"
+    assert state.best_score == 0.0
+    assert optimizer._record(state, {"c": 2}, complete) is True
+    assert state.best_score == 0.5
+    assert [(t.score, t.complete, t.accepted) for t in state.history] == [
+        (1.0, False, False),
+        (0.5, True, True),
+    ]
+
+
+# -- completeness reaches every path that ranks on score ----------------------
+#
+# Guarding `_record` alone is not enough: it only protects the *global best*.
+# An incomplete report reaching any other comparison lets throttling steer the
+# search from a different direction.
+
+
+def _throttle_on(*inputs):
+    marked = set(inputs)
+
+    def agent(payload):
+        if payload in marked:
+            raise RuntimeError("429 Too Many Requests")
+        return "ok"
+
+    return agent
+
+
+def test_an_incomplete_baseline_is_re_run_before_seeding_the_search() -> None:
+    """The baseline never passes through `_record`, and everything is measured
+    against it. A throttled baseline sets `best_score` over its survivors, so no
+    fully-evaluated candidate can beat it and the search returns the starting
+    config -- indistinguishable from "nothing improved on your prompt".
+    """
+    from adapt_agent.optimization.optimizers import Optimizer
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+    evaluations = {"n": 0}
+
+    class _Harness(EvaluationHarness):
+        def evaluate(self, agent, data, **kwargs):
+            evaluations["n"] += 1
+            # Throttled the first time, healthy on the re-run.
+            target = _throttle_on("hard") if evaluations["n"] == 1 else (lambda p: "ok")
+            return super().evaluate(target, data, **kwargs)
+
+    class _Probe(Optimizer):
+        strategy_name = "probe"
+
+        def __init__(self, harness):
+            self.harness = harness
+            self.verbose = False
+
+        def optimize(self, *args, **kwargs):  # pragma: no cover - not exercised
+            raise NotImplementedError
+
+    harness = _Harness([exact_match()], retry=RetryPolicy(attempts=1))
+    report = _Probe(harness)._evaluate_baseline(object(), dataset)
+
+    assert evaluations["n"] == 2, "an incomplete baseline was accepted without a re-run"
+    assert report.is_complete is True
+    assert report.score == 1.0
+
+
+def test_a_baseline_that_stays_incomplete_aborts_the_run() -> None:
+    """A logged warning is too easy to lose in a long run's output.
+
+    The failure it precedes is a wrong answer wearing the costume of a valid
+    one: an inflated baseline is unbeatable, so the search ends reporting the
+    starting configuration, which is indistinguishable from "nothing improved".
+    """
+    from adapt_agent.exceptions import IncompleteEvaluationError
+    from adapt_agent.optimization.optimizers import Optimizer
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+
+    class _Probe(Optimizer):
+        strategy_name = "probe"
+
+        def __init__(self, harness):
+            self.harness = harness
+            self.verbose = False
+
+        def optimize(self, *args, **kwargs):  # pragma: no cover - not exercised
+            raise NotImplementedError
+
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+    with pytest.raises(IncompleteEvaluationError, match="baseline"):
+        _Probe(harness)._evaluate_baseline(_throttle_on("hard"), dataset)
+
+
+def test_an_incomplete_candidate_is_not_bred_from_in_an_evolutionary_search() -> None:
+    """`_record` bars it from winning; this bars it from parenting.
+
+    Survivors are chosen from `_score_population`'s list, so leaving an
+    incomplete candidate in it lets a score measured over an easier subset
+    direct the whole search.
+    """
+    from adapt_agent.optimization.optimizers import EvolutionaryOptimizer, _SearchState
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+
+    class _Harness(EvaluationHarness):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.calls = 0
+
+        def evaluate(self, agent, data, **kwargs):
+            self.calls += 1
+            # First config is throttled on the hard row (scores 1.0 over one
+            # row); the second is fully evaluated and imperfect (0.5).
+            target = (
+                _throttle_on("hard")
+                if self.calls == 1
+                else (lambda p: "ok" if p == "easy" else "wrong")
+            )
+            return super().evaluate(target, data, **kwargs)
+
+    class _Target:
+        """The bare surface `_eval_config` touches."""
+
+        def restore(self, snapshot):
+            pass
+
+        def apply(self, config):
+            pass
+
+    harness = _Harness([exact_match()], retry=RetryPolicy(attempts=1))
+    optimizer = EvolutionaryOptimizer(harness=harness)
+    optimizer.verbose = False
+    optimizer._baseline_snapshot = {}
+    state = _SearchState(
+        best_config={}, best_score=0.0, best_report=None, baseline_snapshot={}, history=[]
+    )
+
+    scored = optimizer._score_population(
+        _Target(), dataset, state, [{"p": "throttled"}, {"p": "complete"}]
+    )
+
+    assert [cfg for cfg, _ in scored] == [
+        {"p": "complete"}
+    ], "the incomplete candidate survived into the breeding pool"
+    # It is still recorded in the history, just not ranked.
+    assert len(state.history) == 2
+    assert [t.complete for t in state.history] == [False, True]
+
+
+# -- metric retry honours the configured policy -------------------------------
+
+
+def test_a_provider_backed_custom_metric_is_retried() -> None:
+    """Not just `LLMJudge`: any metric may be a network call."""
+    from adapt_agent.optimization.metrics import Metric
+
+    calls = {"n": 0}
+
+    def flaky(output, expected):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RuntimeError("429 Too Many Requests")
+        return 1.0
+
+    report = EvaluationHarness([Metric("custom", flaky)], retry=FAST).evaluate(
+        lambda x: "ok", _dataset()
+    )
+    assert calls["n"] > 3, "a transient metric failure was classified but never retried"
+    assert report.score == 1.0
+    assert report.n_transient_errors == 0
+
+
+def test_a_custom_classifier_governs_metric_failures_too() -> None:
+    """`RetryPolicy(is_transient=...)` must not be bypassed for metrics."""
+    from adapt_agent.optimization.metrics import Metric
+
+    policy = RetryPolicy(
+        attempts=2,
+        initial_backoff=0.001,
+        jitter=0.0,
+        is_transient=lambda exc: "SQUELCH" in str(exc),
+    )
+
+    def squelch(output, expected):
+        raise RuntimeError("SQUELCH: provider hiccup")
+
+    report = EvaluationHarness([Metric("custom", squelch)], retry=policy).evaluate(
+        lambda x: "ok", _dataset()
+    )
+    assert report.n_transient_errors == 3, "the custom classifier was ignored"
+
+    def plain_429(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    # ...and the converse: the default classifier no longer applies.
+    narrow = EvaluationHarness([Metric("custom", plain_429)], retry=policy).evaluate(
+        lambda x: "ok", _dataset()
+    )
+    assert narrow.n_transient_errors == 0
+    assert len(narrow.failures()) == 3
+
+
+# -- nested retry budgets must not multiply -----------------------------------
+
+
+def test_a_judge_and_the_harness_do_not_each_spend_a_retry_budget() -> None:
+    """Three attempts at two layers is nine provider calls for one row.
+
+    Worse than wasteful: the backoff resets between the layers, so the load
+    lands hardest exactly while the provider is throttling.
+    """
+    from adapt_agent.optimization.judge import LLMJudge
+
+    calls = {"n": 0}
+
+    def always_throttled(prompt, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("429 Too Many Requests")
+
+    policy = RetryPolicy(attempts=3, initial_backoff=0.001, jitter=0.0)
+    harness = EvaluationHarness(
+        [LLMJudge(always_throttled, retry=policy).as_metric()], retry=policy
+    )
+    report = harness.evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+
+    assert calls["n"] == 3, f"retried at both layers: {calls['n']} provider calls for one row"
+    assert report.n_transient_errors == 1
+    assert report.failures() == []
+
+
+def test_a_metric_without_its_own_retries_is_still_retried_by_the_harness() -> None:
+    """The marker must not switch retrying off for ordinary metrics."""
+    from adapt_agent.optimization.metrics import Metric
+
+    calls = {"n": 0}
+
+    def flaky(output, expected):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RuntimeError("429 Too Many Requests")
+        return 1.0
+
+    EvaluationHarness([Metric("custom", flaky)], retry=FAST).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    assert calls["n"] == 3
+
+
+def test_a_custom_classifier_reaches_the_judge() -> None:
+    """`RetryPolicy(is_transient=...)` governs the judge's own classification.
+
+    Gating on the module-level default meant a custom classifier never reached
+    it. Observable two ways, since `score()` keeps its `on_error` fallback: the
+    retry count, and whether the metric adapter propagates.
+    """
+    from adapt_agent.optimization.judge import LLMJudge
+
+    policy = RetryPolicy(
+        attempts=2,
+        initial_backoff=0.001,
+        jitter=0.0,
+        is_transient=lambda exc: "SQUELCH" in str(exc),
+    )
+
+    calls = {"n": 0}
+
+    def squelch(prompt, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("SQUELCH: provider hiccup")
+
+    # Classified transient by the custom policy -> retried, then excluded.
+    judge = LLMJudge(squelch, retry=policy)
+    report = EvaluationHarness([judge.as_metric()], retry=policy).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    assert calls["n"] == 2, "the custom classifier never reached the judge"
+    assert report.n_transient_errors == 1
+
+    # ...and the converse: a 429 is *not* transient under that policy, so it is
+    # tried once and collapses to on_error rather than being excluded.
+    calls["n"] = 0
+
+    def plain_429(prompt, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("429 Too Many Requests")
+
+    other = LLMJudge(plain_429, retry=policy)
+    other_report = EvaluationHarness([other.as_metric()], retry=policy).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    assert calls["n"] == 1
+    assert other_report.n_transient_errors == 0
+
+
+# -- report denominators ------------------------------------------------------
+
+
+def test_error_counts_have_a_denominator_that_can_hold_them() -> None:
+    """`max_results` bounds *stored records*, not rows run.
+
+    Counting transient errors across the whole dataset while `n` stopped at the
+    cap produced impossible summaries -- `n=1, n_transient_errors=4` -- and made
+    the optimizer's `n - n_transient_errors` logging go negative.
+    """
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+
+    def throttled(payload):
+        raise RuntimeError("429 Too Many Requests")
+
+    report = EvaluationHarness(
+        [exact_match()], retry=RetryPolicy(attempts=1), max_results=1
+    ).evaluate(throttled, dataset)
+
+    assert report.n == 1, "the storage cap should still bound the records"
+    assert report.n_evaluated == 4
+    assert report.n_transient_errors == 4
+    assert report.n_scored == 0
+    assert report.n_evaluated >= report.n_transient_errors
+    assert report.to_dict()["n_evaluated"] == 4
+
+
+def test_avg_latency_is_per_evaluated_row_not_per_stored_record() -> None:
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness([exact_match()], max_results=1).evaluate(lambda x: "ok", dataset)
+    assert report.n == 1
+    assert report.n_evaluated == 4
+    assert report.avg_latency == pytest.approx(report.total_latency / 4)
+
+
+# -- transient failures are scoped to what actually failed --------------------
+
+
+def test_a_throttled_secondary_metric_does_not_erase_the_primary() -> None:
+    """Marking the whole row transient deleted a primary score that computed fine.
+
+    With the completeness gate in place that is not just a lost sample: the row
+    counts as unscored, so a run graded by `exact_match` plus a secondary judge
+    could be rejected -- or abort at the baseline -- because the *judge* was
+    throttled.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    harness = EvaluationHarness(
+        [exact_match(), Metric("secondary", throttled)], retry=RetryPolicy(attempts=1)
+    )
+    report = harness.evaluate(lambda x: "ok", _dataset())
+
+    assert report.aggregate["exact_match"] == 1.0
+    assert report.score == 1.0
+    assert report.n_transient_errors == 0
+    assert report.is_complete is True
+    assert report.results[0].transient_metrics == ("secondary",)
+
+
+def test_a_throttled_primary_metric_still_makes_the_row_unusable() -> None:
+    """The primary is the number the optimizer ranks on, so a gap there counts."""
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    harness = EvaluationHarness(
+        [Metric("primary", throttled), exact_match()], retry=RetryPolicy(attempts=1)
+    )
+    report = harness.evaluate(lambda x: "ok", _dataset())
+
+    assert report.n_transient_errors == 3
+    assert report.is_complete is False
+
+
+def test_a_standalone_judge_keeps_its_documented_fallback() -> None:
+    """Propagation is for the metric adapter only.
+
+    `score()`, `critique()` and friends have no harness behind them to catch an
+    exception, so turning them into raisers was an unannounced breaking change.
+    """
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def throttled(prompt, **kwargs):
+        raise RuntimeError("429 Too Many Requests")
+
+    judge = LLMJudge(throttled, retry=RetryPolicy(attempts=1), on_error=0.0)
+    assert judge.score("i", "o").score == 0.0
+    assert judge.critique("i", "o") == ""
+
+
+def test_the_metric_adapter_still_propagates_so_the_row_is_excluded() -> None:
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def throttled(prompt, **kwargs):
+        raise RuntimeError("429 Too Many Requests")
+
+    judge = LLMJudge(throttled, retry=RetryPolicy(attempts=1))
+    report = EvaluationHarness([judge.as_metric()], retry=RetryPolicy(attempts=1)).evaluate(
+        lambda x: "ok", _dataset()
+    )
+    assert report.n_transient_errors == 3, "the metric adapter stopped propagating"
+    assert report.failures() == []
+
+
+# -- partial aggregates and validation are visible, not silent ----------------
+
+
+def test_a_partial_secondary_aggregate_is_visible() -> None:
+    """`is_complete` speaks for the primary, so a secondary needs its own signal.
+
+    Scoping transient failures to the failing metric stopped a throttled
+    secondary erasing the primary -- but left its mean computed over whichever
+    rows survived, in a report claiming `is_complete=True` and zero transient
+    errors.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    calls = {"n": 0}
+
+    def flaky(output, expected):
+        calls["n"] += 1
+        if calls["n"] % 2 == 0:
+            raise RuntimeError("429 Too Many Requests")
+        return 1.0
+
+    report = EvaluationHarness(
+        [exact_match(), Metric("secondary", flaky)], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.is_complete is True, "the primary scored fine"
+    assert report.n_evaluated == 4
+    assert report.metric_samples == {"exact_match": 4, "secondary": 2}
+    assert report.transient_by_metric == {"secondary": 2}
+    assert report.partial_metrics == ["secondary"]
+    assert report.to_dict()["partial_metrics"] == ["secondary"]
+
+
+def test_nothing_is_partial_when_no_metric_was_throttled() -> None:
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    report = EvaluationHarness([exact_match()]).evaluate(lambda x: "ok", dataset)
+    assert report.partial_metrics == []
+    assert report.metric_samples == {"exact_match": 3}
+
+
+def test_an_incomplete_validation_pass_is_reported_not_hidden() -> None:
+    """Validation does not steer the search, so it re-runs but never aborts.
+
+    It must not be reported as if it were whole, though: it is the number a
+    user reads to decide whether the tuned config generalises.
+    """
+    from adapt_agent.optimization.optimizers import Optimizer
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+
+    class _Probe(Optimizer):
+        strategy_name = "probe"
+
+        def __init__(self, harness):
+            self.harness = harness
+            self.verbose = False
+
+        def optimize(self, *args, **kwargs):  # pragma: no cover - not exercised
+            raise NotImplementedError
+
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+    report = _Probe(harness)._evaluate_validation(_throttle_on("hard"), dataset)
+
+    assert report.is_complete is False, "a partial validation is still returned"
+    assert report.n_transient_errors == 1
+
+
+def test_a_validation_pass_that_recovers_on_the_re_run_is_complete() -> None:
+    from adapt_agent.optimization.optimizers import Optimizer
+
+    dataset = GoldenDataset(
+        [Example(inputs="easy", expected="ok"), Example(inputs="hard", expected="ok")]
+    )
+    evaluations = {"n": 0}
+
+    class _Harness(EvaluationHarness):
+        def evaluate(self, agent, data, **kwargs):
+            evaluations["n"] += 1
+            target = _throttle_on("hard") if evaluations["n"] == 1 else (lambda p: "ok")
+            return super().evaluate(target, data, **kwargs)
+
+    class _Probe(Optimizer):
+        strategy_name = "probe"
+
+        def __init__(self, harness):
+            self.harness = harness
+            self.verbose = False
+
+        def optimize(self, *args, **kwargs):  # pragma: no cover - not exercised
+            raise NotImplementedError
+
+    harness = _Harness([exact_match()], retry=RetryPolicy(attempts=1))
+    report = _Probe(harness)._evaluate_validation(object(), dataset)
+
+    assert evaluations["n"] == 2
+    assert report.is_complete is True
+
+
+def _tunable_agent(throttle_on: set[str], *, throttle_times: int | None = None):
+    """A minimal optimizable agent that throttles on the named inputs.
+
+    One prompt knob with two candidates, so the search has something to do and
+    `optimize()` runs end to end. `throttle_times` bounds how many times each
+    named input throttles before it starts succeeding -- that is what separates
+    a re-running validation path from a single-shot one.
+    """
+    from adapt_agent.optimization.parameters import Parameter, ParameterKind
+    from adapt_agent.optimization.target import wrap
+
+    state = {"prompt": "BAD"}
+    thrown: dict[str, int] = {}
+
+    def runner(question: str) -> str:
+        if question in throttle_on:
+            seen = thrown.get(question, 0)
+            if throttle_times is None or seen < throttle_times:
+                thrown[question] = seen + 1
+                raise RuntimeError("429 Too Many Requests")
+        return "ok" if state["prompt"] == "GOOD" else "wrong"
+
+    parameter = Parameter(
+        name="prompt",
+        kind=ParameterKind.PROMPT,
+        candidates=["BAD", "GOOD"],
+        getter=lambda: state["prompt"],
+        setter=lambda v: state.__setitem__("prompt", v),
+    )
+    return wrap(runner, runner=runner, parameters=[parameter])
+
+
+def _build_optimizer(name: str, harness):
+    """`GridSearchOptimizer` directly, and the same wrapped in a pipeline.
+
+    Both override `optimize()`, so both need their own validation wiring.
+    """
+    import adapt_agent.optimization.optimizers as optimizers
+
+    grid = optimizers.GridSearchOptimizer(harness, seed=0)
+    if name == "GridSearchOptimizer":
+        return grid
+    return optimizers.PipelineOptimizer(harness, [grid])
+
+
+@pytest.mark.parametrize("optimizer_name", ["GridSearchOptimizer", "PipelineOptimizer"])
+def test_optimize_surfaces_an_incomplete_validation_end_to_end(optimizer_name: str) -> None:
+    """The wiring, not just the helper.
+
+    `_evaluate_validation` had its own tests while both `optimize()` methods
+    still called `harness.evaluate` directly -- so the helper was correct and
+    unreachable, which is the shape of the original finding. This drives the
+    public entry point and reads the flag off the result.
+    """
+    train = GoldenDataset([Example(inputs="q0", expected="ok")])
+    val = GoldenDataset(
+        [Example(inputs="v_ok", expected="ok"), Example(inputs="v_throttled", expected="ok")]
+    )
+    agent = _tunable_agent({"v_throttled"})
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+
+    result = _build_optimizer(optimizer_name, harness).optimize(agent, train, val_dataset=val)
+
+    assert result.validation_complete is False, "a partial validation reported as whole"
+    assert result.validation_score is not None, "the partial score is still returned"
+
+
+@pytest.mark.parametrize("optimizer_name", ["GridSearchOptimizer", "PipelineOptimizer"])
+def test_optimize_reports_a_clean_validation_as_complete(optimizer_name: str) -> None:
+    train = GoldenDataset([Example(inputs="v_ok", expected="ok")])
+    val = GoldenDataset([Example(inputs="v_ok", expected="ok")])
+    agent = _tunable_agent(set())
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+
+    result = _build_optimizer(optimizer_name, harness).optimize(agent, train, val_dataset=val)
+
+    assert result.validation_complete is True
+
+
+@pytest.mark.parametrize("optimizer_name", ["GridSearchOptimizer", "PipelineOptimizer"])
+def test_optimize_re_runs_a_throttled_validation_pass(optimizer_name: str) -> None:
+    """The assertion that separates the two paths.
+
+    A permanently throttled hold-out reports `validation_complete=False` whether
+    `optimize()` calls `_evaluate_validation` or `harness.evaluate` directly, so
+    that alone does not pin the wiring. Only the re-run does: this row fails once
+    and then succeeds, so a single-shot call reports it partial forever.
+    """
+    train = GoldenDataset([Example(inputs="v_ok", expected="ok")])
+    val = GoldenDataset(
+        [Example(inputs="v_ok", expected="ok"), Example(inputs="v_flaky", expected="ok")]
+    )
+    # `attempts=1` means no in-harness retry, so recovery can only come from the
+    # optimizer re-running the whole pass.
+    agent = _tunable_agent({"v_flaky"}, throttle_times=1)
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+
+    result = _build_optimizer(optimizer_name, harness).optimize(agent, train, val_dataset=val)
+
+    assert result.validation_complete is True, "validation did not go through _evaluate_validation"
+
+
+# -- exclusion is per metric in *both* directions ------------------------------
+
+
+def test_a_throttled_primary_does_not_discard_a_good_secondary() -> None:
+    """The mirror of the round-five fix, and the same mistake in reverse.
+
+    Scoping transient failures to the failing metric stopped a throttled
+    *secondary* erasing the primary. The whole-row branch still discarded every
+    metric when the *primary* was the one throttled -- so a secondary that
+    measured all four rows perfectly reported a mean of 0.0 over no samples.
+    An unearned zero is not a measurement; neither is discarding an earned one.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [Metric("primary", throttled), exact_match()], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.aggregate["exact_match"] == 1.0, "a valid measurement was thrown away"
+    assert report.metric_samples == {"exact_match": 4}
+    assert report.transient_by_metric == {"primary": 4}
+    assert report.partial_metrics == ["primary"]
+    # The primary is still unmeasurable, so the run is still not comparable.
+    assert report.is_complete is False
+    assert report.n_transient_errors == 4
+
+
+def test_a_throttled_agent_call_loses_every_metric() -> None:
+    """No output means nothing for any metric to measure.
+
+    `transient_metrics` is the single source of truth for per-metric exclusion,
+    so a whole-row failure has to name them all rather than leave the
+    accumulator inferring it from the row flag.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled_agent(payload):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [exact_match(), Metric("secondary", lambda o, e: 1.0)], retry=RetryPolicy(attempts=1)
+    ).evaluate(throttled_agent, dataset)
+
+    assert report.metric_samples == {}, "a metric was credited for a row that never ran"
+    assert report.transient_by_metric == {"exact_match": 4, "secondary": 4}
+    assert report.is_complete is False
+
+
+def test_a_permanent_agent_failure_still_earns_its_zeros() -> None:
+    """The exclusion is for *transient* failures only -- a broken agent scores 0."""
+
+    def broken(payload):
+        raise ValueError("bad prompt")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1)).evaluate(
+        broken, dataset
+    )
+
+    assert report.aggregate["exact_match"] == 0.0
+    assert report.metric_samples == {"exact_match": 4}
+    assert report.n_errors == 4
+    assert report.n_transient_errors == 0
+    assert report.is_complete is True
+    assert len(report.failures()) == 4
+
+
+def test_validation_completeness_survives_serialisation() -> None:
+    """`validation_complete` exists to be read later, so it has to be written down.
+
+    A persisted result or a provenance header outlives the run's logs; a partial
+    validation score that serialises identically to a whole one is back to being
+    invisible.
+    """
+    from adapt_agent.optimization.optimizers import OptimizationResult
+
+    partial = OptimizationResult(
+        best_config={"p": "x"},
+        best_score=1.0,
+        baseline_score=0.0,
+        baseline_config={},
+        history=[],
+        validation_score=0.5,
+        validation_complete=False,
+    )
+    assert partial.to_dict()["validation_complete"] is False
+    assert partial._provenance()["validation_complete"] is False
+
+    whole = OptimizationResult(
+        best_config={},
+        best_score=1.0,
+        baseline_score=0.0,
+        baseline_config={},
+        history=[],
+        validation_score=0.5,
+    )
+    assert whole.to_dict()["validation_complete"] is True
+    assert whole._provenance()["validation_complete"] is True
+
+
+# -- the message is the weakest signal, so it speaks for the least -------------
+
+#: Deterministic defects whose text happens to mention a transient-sounding
+#: word. Retrying these wastes the budget and then drops the row from the
+#: score, hiding the very bug the run exists to surface.
+DETERMINISTIC_DEFECTS = [
+    ValueError("timeout must be positive"),
+    ValueError("invalid timeout value"),
+    ValueError("request timed out is not a valid state name"),
+    ValueError("connection reset is not a supported enum member"),
+    ValueError("order 500 not found"),
+    ValueError("customer overloaded the cart with 200 items"),
+    TypeError("expected int for timeout, got str"),
+    KeyError("timeout"),
+    AssertionError("expected 429 items, got 3"),
+    IndexError("429"),
+]
+
+#: Status numbers need status *context*. A bare number in a message is data.
+BARE_NUMBERS = [
+    "order 429 not found",
+    "expected 500 tokens, got 3",
+    "batch 503 complete",
+    "user 408 deleted",
+]
+
+STATUS_PHRASINGS = [
+    "429 Too Many Requests",
+    "Error code: 429",
+    "HTTP 503",
+    "status 500",
+    "(status code: 429)",
+    "503 Service Unavailable",
+    "504",
+]
+
+
+@pytest.mark.parametrize("exc", DETERMINISTIC_DEFECTS, ids=lambda e: type(e).__name__ + str(e)[:24])
+def test_a_deterministic_defect_is_not_transient(exc: Exception) -> None:
+    assert is_transient_error(exc) is False
+
+
+@pytest.mark.parametrize("message", BARE_NUMBERS)
+def test_a_bare_status_number_is_not_status_context(message: str) -> None:
+    assert is_transient_error(RuntimeError(message)) is False
+
+
+@pytest.mark.parametrize("message", STATUS_PHRASINGS)
+def test_a_status_number_in_context_is_still_transient(message: str) -> None:
+    assert is_transient_error(RuntimeError(message)) is True
+
+
+def test_a_provider_subclass_of_a_builtin_keeps_message_matching() -> None:
+    """The gate is on the *exact* type, not `isinstance`.
+
+    A provider that subclasses `ValueError` for its own errors is not the
+    deterministic builtin the gate excludes, and its message is still the best
+    evidence available.
+    """
+
+    class ProviderError(ValueError):
+        pass
+
+    assert is_transient_error(ProviderError("Error code: 429")) is True
+    assert is_transient_error(ValueError("Error code: 429")) is False
+
+
+def test_the_escape_hatch_still_reaches_what_the_default_declines() -> None:
+    """A provider signalling throttling with a bare ValueError is documented as
+    out of scope for the default, so the custom predicate has to cover it."""
+    policy = RetryPolicy(attempts=2, is_transient=lambda exc: "throttled" in str(exc))
+    assert policy.should_retry(ValueError("throttled by quota"), 1) is True
+
+
+def test_a_throttled_metric_is_not_reported_as_a_failing_case() -> None:
+    """`failures()` feeds an LLM proposer "cases your instruction gets wrong".
+
+    Row-level transient status speaks for the primary, so selecting on a
+    throttled *secondary* returned every row it never measured -- placeholder
+    zeros presented as evidence against the agent.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [exact_match(), Metric("secondary", throttled)], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.failures() == []
+    assert report.failures(metric="secondary") == [], "throttling reported as agent failure"
+    assert report.below("secondary", 1.0) == []
+    # A metric that really did score badly is still reported.
+    assert len(report.below("exact_match", 2.0)) == 4
+
+
+def test_the_transient_ratio_denominator_is_documented_as_n_evaluated() -> None:
+    """`n` counts *stored* records, so it is the wrong denominator.
+
+    Both the report docstring and the skill reference recommended comparing
+    `n_transient_errors` against `n` -- ten lines above a field comment warning
+    that this gives "impossible summaries like n=1, n_transient_errors=4".
+    Under `max_results` it does exactly that.
+    """
+    from adapt_agent.optimization.evaluation import EvaluationReport
+
+    def throttled(payload):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [exact_match()], retry=RetryPolicy(attempts=1), max_results=1
+    ).evaluate(throttled, dataset)
+
+    assert report.n == 1, "max_results bounds stored records"
+    assert report.n_evaluated == 4, "but every row was run"
+    assert report.n_transient_errors == 4
+    assert report.n_transient_errors > report.n, "the ratio `n` would give is impossible"
+    assert report.is_complete is False
+
+    doc = EvaluationReport.__doc__ or ""
+    assert "n_evaluated" in doc and "never ``n``" in doc
+
+
+# -- the retry policy has to reach every documented judge ----------------------
+
+
+def _provider_judge_classes():
+    import adapt_agent.optimization.judges as judges
+
+    return [
+        getattr(judges, name)
+        for name in dir(judges)
+        if name.endswith("Judge") and name not in {"LLMJudge", "ProviderJudge"}
+    ]
+
+
+@pytest.mark.parametrize("judge_cls", _provider_judge_classes(), ids=lambda c: c.__name__)
+def test_every_provider_judge_accepts_the_retry_policy(judge_cls) -> None:
+    """`retry=` was silently forwarded to the *provider*, which rejects it.
+
+    `_JUDGE_KW` in judges.py listed the judge-side options by hand and its own
+    comment claimed "everything except complete" -- but `retry` was missing, so
+    `AnthropicJudge(retry=...)` raised TypeError and the option this release
+    adds was unreachable from all 13 provider judges.
+    """
+    judge = judge_cls(retry=RetryPolicy(attempts=1))
+    assert judge.retry.attempts == 1
+
+
+def test_judge_and_provider_constructors_share_no_parameter_names() -> None:
+    """The invariant the derived `_JUDGE_KW` rests on.
+
+    `_split_kwargs` routes by name, so a name on both constructors would
+    silently go to the judge and never reach the provider. Deriving the list
+    makes staleness impossible but not ambiguity -- this pins the rest.
+    """
+    import inspect
+
+    from adapt_agent.optimization.judge import LLMJudge
+    from adapt_agent.optimization.providers import ModelProvider
+
+    judge_params = set(inspect.signature(LLMJudge.__init__).parameters) - {"self"}
+    provider_params = set(inspect.signature(ModelProvider.__init__).parameters) - {"self"}
+    assert judge_params & provider_params == set()
+
+
+def test_the_judge_kwarg_list_is_derived_not_hand_written() -> None:
+    import inspect
+
+    import adapt_agent.optimization.judges as judges
+    from adapt_agent.optimization.judge import LLMJudge
+
+    expected = set(inspect.signature(LLMJudge.__init__).parameters) - {"self", "complete"}
+    assert set(judges._JUDGE_KW) == expected
+
+
+def test_a_throttled_primary_does_not_hide_a_real_secondary_failure() -> None:
+    """The complement of the previous fix, and the same asymmetry again.
+
+    Scoping the *exclusion* to `transient_metrics` stopped throttling being
+    reported as an agent failure. But `failures()` still keyed its skip off
+    `r.transient` and `r.error`, which speak for the primary -- so a secondary
+    that measured every row and genuinely scored 0.3 was dropped, while
+    `below()` returned those same rows. Two selectors disagreeing on the same
+    data, with the one used by proposers hiding real failures.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [Metric("primary", throttled), Metric("secondary", lambda o, e: 0.3)],
+        retry=RetryPolicy(attempts=1),
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert len(report.failures(metric="secondary")) == 4, "a real failure was hidden"
+    assert len(report.below("secondary", 1.0)) == 4
+    assert report.failures(metric="primary") == [], "the throttled metric has no failures to report"
+
+
+def test_a_transient_primary_does_not_force_include_a_healthy_secondary() -> None:
+    """`r.error` holds a marker, not an agent failure, on a throttled row.
+
+    Dropping the `r.transient` skip without also scoping the error
+    force-include would swing the bug the other way: every row listed as a
+    failure of a secondary that scored perfectly.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [Metric("primary", throttled), exact_match()], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.results[0].error == "transient metric failure", "the marker is still set"
+    assert report.failures(metric="exact_match") == []
+
+
+def test_a_permanent_agent_error_still_force_includes_every_metric() -> None:
+    """Scoping the error check must not lose the genuine-failure case."""
+    from adapt_agent.optimization.metrics import Metric
+
+    def broken(payload):
+        raise ValueError("bad prompt")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [exact_match(), Metric("secondary", lambda o, e: 1.0)], retry=RetryPolicy(attempts=1)
+    ).evaluate(broken, dataset)
+
+    # Force-included on the error even though `secondary` would have scored 1.0.
+    assert len(report.failures()) == 4
+    assert len(report.failures(metric="secondary")) == 4
+
+
+# -- the harness owns classification on the metric path ------------------------
+
+
+class _QuotaFault(Exception):
+    """A provider-specific fault only a custom classifier would recognise."""
+
+
+def test_the_harness_classifier_reaches_a_judge_used_as_a_metric() -> None:
+    """A classifier on the harness alone never got a say.
+
+    `LLMJudge._complete` consumed anything *its own* policy did not recognise
+    into `on_error`, so a caller who configured `RetryPolicy(is_transient=...)`
+    on the harness -- the documented place to configure metric retry -- had a
+    provider fault scored as an earned zero, `is_complete=True`, and the rows
+    handed to a proposer as failures.
+    """
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def quota_exhausted(prompt, **kwargs):
+        raise _QuotaFault("monthly quota exhausted")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    report = EvaluationHarness(
+        [LLMJudge(quota_exhausted).as_metric()],
+        retry=RetryPolicy(attempts=1, is_transient=lambda exc: isinstance(exc, _QuotaFault)),
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.n_transient_errors == 3, "the harness classifier still never ran"
+    assert report.is_complete is False
+    assert report.failures() == [], "a provider fault reported as the agent's failure"
+
+
+def test_neither_classifier_recognising_it_is_still_an_earned_zero() -> None:
+    """Propagating must not turn every judge exception into a transient one."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def broken(prompt, **kwargs):
+        raise _QuotaFault("the judge is misconfigured")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    report = EvaluationHarness(
+        [LLMJudge(broken).as_metric()], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.n_transient_errors == 0
+    assert report.is_complete is True
+    assert len(report.failures()) == 3
+
+
+def test_a_standalone_judge_is_unaffected_by_the_propagating_path() -> None:
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def broken(prompt, **kwargs):
+        raise _QuotaFault("the judge is misconfigured")
+
+    judge = LLMJudge(broken, on_error=0.25)
+    assert judge.score("i", "o").score == 0.25
+    assert judge.critique("i", "o") == ""
+
+
+# -- the 5xx family, as a range ------------------------------------------------
+
+
+class _StatusResponse:
+    def __init__(self, status: int) -> None:
+        self.status_code = status
+
+
+class _StatusError(Exception):
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HTTP {status}")
+        self.response = _StatusResponse(status)
+
+
+#: 529 is how Anthropic reports an overloaded model, 52x is the Cloudflare
+#: gateway block, and 507/508/509 are ordinary server faults. All were scored as
+#: earned zeros while the constant's own docstring claimed "the 5xx family".
+RETRYABLE_STATUSES = [408, 409, 425, 429, 500, 502, 503, 504, 507, 508, 509, 520, 522, 524, 529]
+
+#: Deterministic properties of the request: a retry sends the same thing to the
+#: same server and gets the same answer.
+PERMANENT_STATUSES = [400, 401, 403, 404, 422, 501, 505]
+
+
+@pytest.mark.parametrize("status", RETRYABLE_STATUSES)
+def test_a_server_side_status_is_transient(status: int) -> None:
+    assert is_transient_error(_StatusError(status)) is True
+
+
+@pytest.mark.parametrize("status", PERMANENT_STATUSES)
+def test_a_client_side_or_deterministic_status_is_not(status: int) -> None:
+    assert is_transient_error(_StatusError(status)) is False
+
+
+@pytest.mark.parametrize("status", RETRYABLE_STATUSES + PERMANENT_STATUSES)
+def test_the_message_path_classifies_a_status_the_same_way(status: int) -> None:
+    """A message saying "Error code: 529" must agree with a response carrying 529.
+
+    The two are separate spellings of one rule -- a set and a regex alternation
+    -- and they drifted apart once already.
+    """
+    from adapt_agent.optimization.retry import _status_is_transient
+
+    assert is_transient_error(RuntimeError(f"Error code: {status}")) is _status_is_transient(status)
+
+
+@pytest.mark.parametrize("message", ["order 429 not found", "shard 529 rebalanced"])
+def test_a_bare_5xx_number_still_needs_status_context(message: str) -> None:
+    assert is_transient_error(RuntimeError(message)) is False
+
+
+# -- the exhausted marker suppresses a retry, not the harness's judgement ------
+
+
+def _judge_metric_report(judge_policy, harness_policy):
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def timeouts(prompt, **kwargs):
+        raise TimeoutError("upstream timed out")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    return EvaluationHarness(
+        [LLMJudge(timeouts, retry=judge_policy).as_metric()], retry=harness_policy
+    ).evaluate(lambda x: "ok", dataset)
+
+
+def test_a_harness_that_narrows_transient_is_honoured_after_judge_retries() -> None:
+    """The marker said "already retried"; it was read as "already excluded".
+
+    A caller who narrows `is_transient` to treat `TimeoutError` as a real
+    failure means it. The judge's own classification must not overrule the
+    harness they configured -- otherwise the report goes incomplete and an
+    optimizer baseline can abort over an error the caller called permanent.
+    """
+    report = _judge_metric_report(
+        RetryPolicy(attempts=1),
+        RetryPolicy(attempts=1, is_transient=lambda exc: False),
+    )
+    assert report.is_complete is True
+    assert report.n_transient_errors == 0
+    assert len(report.failures()) == 3, "scored as an ordinary failure, as configured"
+
+
+def test_agreeing_policies_still_exclude_the_row() -> None:
+    report = _judge_metric_report(RetryPolicy(attempts=1), RetryPolicy(attempts=1))
+    assert report.is_complete is False
+    assert report.n_transient_errors == 3
+    assert report.failures() == []
+
+
+def test_a_harness_that_widens_transient_is_honoured_too() -> None:
+    """The mirror: the judge declines, the harness classifies it as transient."""
+    report = _judge_metric_report(
+        RetryPolicy(attempts=1, is_transient=lambda exc: False),
+        RetryPolicy(attempts=1, is_transient=lambda exc: True),
+    )
+    assert report.is_complete is False
+    assert report.n_transient_errors == 3
+
+
+def test_the_marker_still_stops_the_budgets_multiplying() -> None:
+    """Why the marker exists at all: without it the harness retries on top of
+    the judge's own loop, resetting the backoff exactly while a provider is
+    throttling."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    calls = {"n": 0}
+
+    def counting(prompt, **kwargs):
+        calls["n"] += 1
+        raise TimeoutError("upstream timed out")
+
+    fast = RetryPolicy(attempts=3, initial_backoff=0.001, jitter=0.0)
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    EvaluationHarness([LLMJudge(counting, retry=fast).as_metric()], retry=fast).evaluate(
+        lambda x: "ok", dataset
+    )
+
+    assert calls["n"] == 9, "3 rows x 3 judge attempts; the harness must not retry again"
+
+
+# -- the marker cannot depend on mutating the provider's exception -------------
+#
+# `mark_retries_exhausted` stamped an attribute and swallowed the failure if
+# the exception refused it. That is not a rare shape: an exception built on a
+# frozen dataclass, or any class with its own `__setattr__`, rejects the stamp,
+# and the budgets then multiply exactly as they did before the marker existed.
+#
+# Two mechanisms cover it, and between them every exception shape. A *builtin*
+# exception takes the attribute but has no `__weakref__` slot; refusing an
+# attribute takes a Python-level `__setattr__`, which takes a Python subclass,
+# which gets `__weakref__`. The gaps are complementary, not overlapping.
+
+
+class RefusesAttributes(RuntimeError):
+    """An exception that rejects attribute assignment, as a frozen one does."""
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(name)
+
+
+@dataclasses.dataclass(frozen=True)
+class FrozenError(Exception):
+    detail: str
+
+    def __str__(self) -> str:
+        return self.detail
+
+
+class UnhashableError(RuntimeError):
+    def __eq__(self, other: object) -> bool:
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+class RefusesAttributesAndUnhashable(RuntimeError):
+    """Both awkward properties at once, which is where the first fix fell through.
+
+    Each one alone was covered -- the attribute path handles an unhashable
+    exception, the fallback handles one that refuses attributes -- and their
+    intersection was covered by neither, because the fallback was a `WeakSet`
+    and a set hashes what it stores.
+    """
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(name)
+
+    def __eq__(self, other: object) -> bool:
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("429 Too Many Requests"),
+        RefusesAttributes("429 Too Many Requests"),
+        FrozenError("429 Too Many Requests"),
+        UnhashableError("429 Too Many Requests"),
+        RefusesAttributesAndUnhashable("429 Too Many Requests"),
+    ],
+    ids=[
+        "builtin",
+        "refuses-setattr",
+        "frozen-dataclass",
+        "unhashable",
+        "refuses-setattr-and-unhashable",
+    ],
+)
+def test_the_exhausted_marker_survives_every_exception_shape(exc: BaseException) -> None:
+    from adapt_agent.optimization.retry import (
+        mark_retries_exhausted,
+        retries_already_exhausted,
+    )
+
+    assert retries_already_exhausted(exc) is False
+    mark_retries_exhausted(exc)
+    assert retries_already_exhausted(exc) is True
+
+
+def test_marking_one_exception_does_not_mark_another() -> None:
+    """The fallback is keyed on the object, not on its type or its message."""
+    from adapt_agent.optimization.retry import (
+        mark_retries_exhausted,
+        retries_already_exhausted,
+    )
+
+    marked = RefusesAttributes("429 Too Many Requests")
+    mark_retries_exhausted(marked)
+    assert retries_already_exhausted(RefusesAttributes("429 Too Many Requests")) is False
+
+
+def test_budgets_do_not_multiply_on_an_exception_that_refuses_the_marker() -> None:
+    """The measurable consequence: nine provider calls for one row, not three."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    calls = {"n": 0}
+
+    def always_throttled(prompt, **kwargs):
+        calls["n"] += 1
+        raise RefusesAttributes("429 Too Many Requests")
+
+    policy = RetryPolicy(attempts=3, initial_backoff=0.001, jitter=0.0)
+    harness = EvaluationHarness(
+        [LLMJudge(always_throttled, retry=policy).as_metric()], retry=policy
+    )
+    report = harness.evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+
+    assert calls["n"] == 3, f"retried at both layers: {calls['n']} provider calls for one row"
+    assert report.n_transient_errors == 1
+
+
+def test_budgets_do_not_multiply_on_an_unhashable_immutable_error() -> None:
+    """The measurable consequence of the intersection shape falling through."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    calls = {"n": 0}
+
+    def always_throttled(prompt, **kwargs):
+        calls["n"] += 1
+        raise RefusesAttributesAndUnhashable("429 Too Many Requests")
+
+    policy = RetryPolicy(attempts=3, initial_backoff=0.001, jitter=0.0)
+    harness = EvaluationHarness(
+        [LLMJudge(always_throttled, retry=policy).as_metric()], retry=policy
+    )
+    report = harness.evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+
+    assert calls["n"] == 3, f"retried at both layers: {calls['n']} provider calls for one row"
+    assert report.n_transient_errors == 1
+
+
+def test_marking_is_by_identity_not_equality() -> None:
+    """Two exceptions that compare equal are still two separate retry budgets."""
+    from adapt_agent.optimization.retry import (
+        mark_retries_exhausted,
+        retries_already_exhausted,
+    )
+
+    @dataclasses.dataclass(frozen=True)
+    class Equal(Exception):
+        detail: str
+
+    marked = Equal("429 Too Many Requests")
+    twin = Equal("429 Too Many Requests")
+    assert marked == twin
+    mark_retries_exhausted(marked)
+    assert retries_already_exhausted(marked) is True
+    assert retries_already_exhausted(twin) is False
+
+
+def test_an_id_reused_after_collection_is_not_mistaken_for_a_marked_error() -> None:
+    """`id` is only unique among *live* objects, so the entry is re-checked.
+
+    Racing a real collection against a real allocation is not something a test
+    can do deterministically, so the invariant is asserted directly: a stale
+    entry -- one whose referent is already gone -- must never answer for
+    whatever now occupies that address.
+    """
+    import weakref
+
+    from adapt_agent.optimization.retry import _EXHAUSTED, retries_already_exhausted
+
+    table = _EXHAUSTED._by_identity
+    dead = RefusesAttributesAndUnhashable("429 Too Many Requests")
+    reference = weakref.ref(dead)
+    successor = RefusesAttributesAndUnhashable("a completely unrelated error")
+    del dead
+    assert reference() is None, "the referent should be gone"
+
+    table[id(successor)] = (reference, {threading.get_ident(): True})
+    try:
+        assert retries_already_exhausted(successor) is False
+    finally:
+        table.pop(id(successor), None)
+
+
+def test_the_marker_table_does_not_retain_the_exceptions_it_marks() -> None:
+    """It is a process-lifetime table, so a strong reference would be a leak."""
+    import gc
+
+    from adapt_agent.optimization.retry import _EXHAUSTED, mark_retries_exhausted
+
+    before = len(_EXHAUSTED._by_identity)
+    for _ in range(200):
+        mark_retries_exhausted(RefusesAttributesAndUnhashable("429 Too Many Requests"))
+    gc.collect()
+    assert len(_EXHAUSTED._by_identity) == before
+
+
+# -- a documented fallback means the same thing through a harness --------------
+
+
+def test_a_judge_fallback_survives_the_harness() -> None:
+    """`on_error` answers "what does a grading failure score".
+
+    The adapter re-raises so the harness can classify the error; once the
+    harness has ruled it *permanent*, the classification is settled and the
+    judge's documented fallback is the answer. Substituting a hard `0.0` made
+    `on_error=0.7` mean one thing on a direct call and another through a
+    harness.
+    """
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def broken(prompt, **kwargs):
+        raise ValueError("the judge template is malformed")
+
+    judge = LLMJudge(broken, retry=RetryPolicy(attempts=1), on_error=0.7)
+    assert judge.score("i", "o").score == 0.7
+
+    report = EvaluationHarness([judge.as_metric()], retry=RetryPolicy(attempts=1)).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    assert report.score == 0.7
+    assert report.n_transient_errors == 0, "a malformed template is not throttling"
+
+
+def test_a_metric_with_no_fallback_still_scores_zero() -> None:
+    from adapt_agent.optimization.metrics import Metric
+
+    def broken(output, expected):
+        raise ValueError("not a provider fault")
+
+    report = EvaluationHarness([Metric("custom", broken)], retry=RetryPolicy(attempts=1)).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    assert report.score == 0.0
+
+
+def test_a_transient_failure_ignores_the_fallback() -> None:
+    """That row is excluded, so no score it carries would be read anyway."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def throttled(prompt, **kwargs):
+        raise RuntimeError("429 Too Many Requests")
+
+    judge = LLMJudge(throttled, retry=RetryPolicy(attempts=1), on_error=0.7)
+    report = EvaluationHarness([judge.as_metric()], retry=RetryPolicy(attempts=1)).evaluate(
+        lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")])
+    )
+    assert report.n_transient_errors == 1
+    assert report.is_complete is False
+
+
+def test_a_declared_fallback_is_clamped() -> None:
+    from adapt_agent.optimization.metrics import Metric
+
+    assert Metric("m", lambda o, e: 1.0, on_error=5.0).on_error == 1.0
+    assert Metric("m", lambda o, e: 1.0, on_error=-2.0).on_error == 0.0
+    assert Metric("m", lambda o, e: 1.0).on_error is None
+
+
+# -- a declared fallback belongs to one propagation ----------------------------
+#
+# An exception instance is routinely reused: `Mock(side_effect=exc)` raises the
+# same object every call, and a module-level sentinel is ordinary. A note left
+# on it answered for the *next* metric's failure too.
+
+_SHARED_ERROR = ValueError("one singleton error, reused by every metric")
+
+
+def _raises_shared(output, expected):
+    raise _SHARED_ERROR
+
+
+def test_two_metrics_sharing_an_exception_keep_their_own_fallbacks() -> None:
+    from adapt_agent.optimization.dataset import Example, GoldenDataset
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import Metric
+
+    report = EvaluationHarness(
+        [
+            Metric("first", _raises_shared, on_error=0.7),
+            Metric("second", _raises_shared, on_error=0.2),
+            Metric("third", _raises_shared),
+        ],
+        retry=RetryPolicy(attempts=1),
+    ).evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+
+    assert report.aggregate["first"] == pytest.approx(0.7)
+    assert report.aggregate["second"] == pytest.approx(0.2)
+    assert report.aggregate["third"] == pytest.approx(0.0)
+
+
+def test_a_shared_exception_does_not_carry_a_fallback_between_rows() -> None:
+    """The leak crossed rows too, so one metric's own 0.4 came back as 0.7."""
+    from adapt_agent.optimization.dataset import Example, GoldenDataset
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import Metric
+
+    rows = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    poisoner = EvaluationHarness(
+        [Metric("poisoner", _raises_shared, on_error=0.7)], retry=RetryPolicy(attempts=1)
+    )
+    poisoner.evaluate(lambda x: "ok", rows)
+
+    report = EvaluationHarness(
+        [Metric("only", _raises_shared, on_error=0.4)], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", rows)
+    assert report.aggregate["only"] == pytest.approx(0.4)
+
+
+def test_the_note_does_not_outlive_the_propagation_that_set_it() -> None:
+    from adapt_agent.optimization.retry import (
+        consume_declared_fallback,
+        declared_fallback,
+        note_declared_fallback,
+    )
+
+    error = ValueError("boom")
+    with collecting_declared_fallbacks():
+        note_declared_fallback(error, 0.7)
+    assert declared_fallback(error) == pytest.approx(0.7)
+    assert consume_declared_fallback(error) == pytest.approx(0.7)
+    assert declared_fallback(error) is None
+    # ...and a second consume finds nothing rather than repeating itself
+    assert consume_declared_fallback(error) is None
+    # a later declaration on the same object is its own, not the old one
+    with collecting_declared_fallbacks():
+        note_declared_fallback(error, 0.2)
+    assert consume_declared_fallback(error) == pytest.approx(0.2)
+
+
+def test_the_note_is_cleared_for_an_exception_that_refuses_attributes() -> None:
+    """The weak-table half of the mechanism has to be cleared too."""
+    from adapt_agent.optimization.retry import (
+        consume_declared_fallback,
+        declared_fallback,
+        note_declared_fallback,
+    )
+
+    error = RefusesAttributesAndUnhashable("boom")
+    with collecting_declared_fallbacks():
+        note_declared_fallback(error, 0.7)
+    assert declared_fallback(error) == pytest.approx(0.7)
+    assert consume_declared_fallback(error) == pytest.approx(0.7)
+    assert declared_fallback(error) is None
+
+
+def test_the_exhausted_marker_belongs_to_one_propagation_too() -> None:
+    """Reversed from the round before, which argued it should persist.
+
+    That argument -- the mark records a property of the error, and whichever
+    layer sets it re-sets it on each raise -- only holds while the *same* layer
+    raises. Another callback reusing the object never sets it, and inherits it.
+    """
+    from adapt_agent.optimization.retry import (
+        consume_retries_exhausted,
+        mark_retries_exhausted,
+        retries_already_exhausted,
+    )
+
+    error = ValueError("429 Too Many Requests")
+    mark_retries_exhausted(error)
+    # A plain read still does not clear it, so the two accessors stay distinct.
+    assert retries_already_exhausted(error) is True
+    assert retries_already_exhausted(error) is True
+    assert consume_retries_exhausted(error) is True
+    assert retries_already_exhausted(error) is False
+    assert consume_retries_exhausted(error) is False
+
+
+def test_a_metric_reusing_a_judges_exception_still_gets_its_retries() -> None:
+    """The reported shape, end to end.
+
+    A judge spends its budget on an exception and re-raises it; a later metric
+    raises the same object and must be retried on its own account. Leaked, the
+    harness called it once and dropped a row that would have scored 1.0 --
+    turning a complete evaluation into an incomplete one.
+    """
+    from adapt_agent.optimization.dataset import Example, GoldenDataset
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import Metric
+    from adapt_agent.optimization.retry import mark_retries_exhausted, retries_already_exhausted
+
+    shared = TimeoutError("429 Too Many Requests")
+    calls = {"n": 0}
+
+    def exhausts_like_a_judge(output, expected):
+        raise mark_retries_exhausted(shared)
+
+    def flaky(output, expected):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise shared
+        return 1.0
+
+    report = EvaluationHarness(
+        [Metric("judgelike", exhausts_like_a_judge), Metric("flaky", flaky)],
+        retry=RetryPolicy(attempts=3, initial_backoff=0.0, jitter=0.0),
+    ).evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+
+    assert report.aggregate["flaky"] == pytest.approx(1.0)
+    assert calls["n"] == 2, "the second metric was denied its own retry"
+    assert retries_already_exhausted(shared) is False
+
+
+# -- every exit from the metric retry loop consumes the note -------------------
+#
+# Five paths leave that except block; only two used to read the fallback. The
+# other three left it on the exception -- including the retry `continue`, so a
+# *successful* retry still leaked one.
+
+_PERMANENT_POLICY = RetryPolicy(attempts=1, is_transient=lambda exc: False)
+
+
+def _leaks_through(first, policy):
+    """Run one evaluation that takes `first`'s exit, then read what it left.
+
+    The second harness classifies the failure as permanent, which is the only
+    way a fallback is ever read -- so it is the shape in which a leaked note
+    changes a score rather than merely lingering.
+    """
+    from adapt_agent.optimization.dataset import Example, GoldenDataset
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import Metric
+    from adapt_agent.optimization.retry import declared_fallback
+
+    shared = TimeoutError("429 Too Many Requests")
+    state = {"n": 0}
+    rows = GoldenDataset([Example(inputs="a", expected="ok")])
+
+    EvaluationHarness(
+        [Metric("first", lambda o, e: first(shared, state), on_error=0.7)], retry=policy
+    ).evaluate(lambda x: "ok", rows)
+
+    def raises_shared(output, expected):
+        raise shared
+
+    report = EvaluationHarness(
+        [Metric("second", raises_shared, on_error=0.2)], retry=_PERMANENT_POLICY
+    ).evaluate(lambda x: "ok", rows)
+    return report.aggregate["second"], declared_fallback(shared)
+
+
+def test_a_successful_retry_leaves_no_note_behind() -> None:
+    """The reported path: the attempt failed, the retry succeeded, the note stayed."""
+
+    def retry_then_succeed(shared, state):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise shared
+        return 1.0
+
+    score, left = _leaks_through(
+        retry_then_succeed, RetryPolicy(attempts=3, initial_backoff=0.0, jitter=0.0)
+    )
+    assert score == pytest.approx(0.2)
+    assert left is None
+
+
+def test_an_exhausted_mark_transient_exit_leaves_no_note_behind() -> None:
+    from adapt_agent.optimization.retry import mark_retries_exhausted
+
+    def marks_exhausted(shared, state):
+        raise mark_retries_exhausted(shared)
+
+    score, left = _leaks_through(marks_exhausted, RetryPolicy(attempts=1))
+    assert score == pytest.approx(0.2)
+    assert left is None
+
+
+def test_an_attempts_spent_transient_exit_leaves_no_note_behind() -> None:
+    def always_transient(shared, state):
+        raise shared
+
+    score, left = _leaks_through(always_transient, RetryPolicy(attempts=1))
+    assert score == pytest.approx(0.2)
+    assert left is None
+
+
+def test_a_permanent_exit_still_consumes_it_too() -> None:
+    """The two paths that always did, so the fix cannot regress them."""
+
+    def always(shared, state):
+        raise shared
+
+    score, left = _leaks_through(always, _PERMANENT_POLICY)
+    assert score == pytest.approx(0.2)
+    assert left is None
+
+
+# -- round 39: a note belongs to one propagation, and so to one thread ---------
+
+
+def _crosstalk(note, consume, values):
+    """Every propagation notes, *then* every one reads. What each gets back.
+
+    A barrier rather than a sleep, so the interleaving is the one being tested
+    rather than the one the scheduler happened to produce: without it the
+    window between noting and consuming is a handful of bytecodes and the race
+    reproduces about once in two hundred runs, which is a flaky test rather
+    than a guard.
+    """
+    import threading
+
+    shared = TimeoutError("429 Too Many Requests")
+    gate = threading.Barrier(len(values), timeout=10)
+    got: dict[str, object] = {}
+
+    def run(label: str, value: object) -> None:
+        with collecting_declared_fallbacks():
+            note(shared, value)
+        gate.wait()
+        got[label] = consume(shared)
+
+    threads = [threading.Thread(target=run, args=item) for item in values.items()]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    return got
+
+
+def test_two_propagations_of_one_instance_do_not_share_a_fallback_note() -> None:
+    """`Mock(side_effect=exc)` raises one object every call, and a sentinel is
+    an ordinary thing to raise -- so under concurrency two metrics really can
+    unwind the same instance at once.
+
+    Keyed by the exception alone, one propagation read the other's note and
+    consumed it first: measured `{'b': 0.7, 'a': None}` where `a` declared
+    `0.7` and `b` declared `0.2`. Both wrong, and the one that lost its note
+    falls back to the *wrapper's* `on_error`, which for a dispatcher is
+    nothing at all.
+    """
+    from adapt_agent.optimization.retry import (
+        consume_declared_fallback,
+        note_declared_fallback,
+    )
+
+    got = _crosstalk(note_declared_fallback, consume_declared_fallback, {"a": 0.7, "b": 0.2})
+    assert got == {"a": 0.7, "b": 0.2}
+
+
+def test_two_propagations_of_one_instance_do_not_share_the_exhausted_mark() -> None:
+    """The same store, so the same defect: one propagation consumed the other's
+    mark and the loser spent a retry budget a lower layer had already spent.
+
+    Reported for the fallback note only. They are one class because they are
+    one mechanism -- which is the whole reason that mechanism is written once.
+    """
+    from adapt_agent.optimization.retry import (
+        consume_retries_exhausted,
+        mark_retries_exhausted,
+    )
+
+    got = _crosstalk(
+        lambda exc, _value: mark_retries_exhausted(exc),
+        consume_retries_exhausted,
+        {"spent": True, "also-spent": True},
+    )
+    assert got == {"spent": True, "also-spent": True}
+
+
+def test_concurrent_rows_each_score_their_own_declared_fallback() -> None:
+    """End to end, and deterministic for the same reason as `_crosstalk`.
+
+    The barrier sits in the dispatcher's own `except`, which is where both
+    propagations have noted and neither has yet consumed. Catching and
+    re-raising in a dispatcher is ordinary, so this is the real path rather
+    than a probe of the primitives.
+    """
+    import threading
+
+    from adapt_agent.optimization.dataset import Example, GoldenDataset
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import Metric
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    shared = TimeoutError("429 Too Many Requests")
+    gate = threading.Barrier(2, timeout=10)
+
+    def raiser(output: object, expected: object) -> float:
+        raise shared
+
+    inner = {
+        "a": Metric("inner-a", raiser, on_error=0.7),
+        "b": Metric("inner-b", raiser, on_error=0.2),
+    }
+
+    def dispatch(output: object, expected: object) -> float:
+        # What `checks` does: route the row to the scorer it declares. The
+        # harness only ever holds this wrapper, whose own `on_error` is None.
+        try:
+            return inner[expected](output, expected)
+        except Exception:
+            gate.wait()  # both have noted; neither has consumed
+            raise
+
+    report = EvaluationHarness(
+        [Metric("dispatch", dispatch)],
+        retry=RetryPolicy(attempts=1, is_transient=lambda exc: False),
+        concurrency=2,
+    ).evaluate(
+        lambda x: "out",
+        GoldenDataset([Example(inputs="1", expected="a"), Example(inputs="2", expected="b")]),
+    )
+    assert {r.expected: round(r.scores["dispatch"], 3) for r in report.results} == {
+        "a": 0.7,
+        "b": 0.2,
+    }
+
+
+def test_a_note_is_invisible_to_a_thread_that_did_not_take_it() -> None:
+    """The rule stated on its own, without a race to arrange."""
+    import threading
+
+    from adapt_agent.optimization.retry import declared_fallback, note_declared_fallback
+
+    shared = TimeoutError("429 Too Many Requests")
+    with collecting_declared_fallbacks():
+        note_declared_fallback(shared, 0.7)
+    seen: list[float | None] = []
+    elsewhere = threading.Thread(target=lambda: seen.append(declared_fallback(shared)))
+    elsewhere.start()
+    elsewhere.join(timeout=10)
+    assert seen == [None]
+    assert declared_fallback(shared) == 0.7  # ...and still here, for this one
+
+
+def test_a_per_thread_table_still_dies_with_its_exception() -> None:
+    """Why the table hangs off the exception rather than off a thread-local.
+
+    A thread-local table keyed by `id` would outlive every note that is set and
+    never consumed, and the address could then be reused by an unrelated
+    exception -- the leak consuming was added to stop, moved somewhere harder
+    to see.
+    """
+    import gc
+    import weakref
+
+    from adapt_agent.optimization.retry import _DECLARED_FALLBACK, note_declared_fallback
+
+    class Carrier(Exception):  # takes the attribute, and can be watched
+        pass
+
+    exc = Carrier("429 Too Many Requests")
+    before = len(_DECLARED_FALLBACK._by_identity)
+    with collecting_declared_fallbacks():
+        note_declared_fallback(exc, 0.7)
+
+    # The table hangs off the exception...
+    assert exc.__adapt_declared_fallback__ == {threading.get_ident(): 0.7}
+    # ...and nothing global holds either of them, so noting cannot outlive or
+    # retain what it was noted against.
+    assert len(_DECLARED_FALLBACK._by_identity) == before
+    watch = weakref.ref(exc)
+    del exc
+    gc.collect()
+    assert watch() is None
+
+
+def test_only_one_thread_ever_attaches_a_table_to_one_exception() -> None:
+    """Attaching is this module's one compound step, and the lock is what makes
+    it atomic. Both halves matter: without the lock, two threads each attach a
+    fresh table and whichever lands second silently discards the first's note;
+    with the lock but without the re-check inside it, the same thing happens
+    one step later.
+
+    Deterministic rather than probabilistic. The exception's own `__setattr__`
+    holds the attaching thread until a short barrier times out, which is far
+    longer than the other thread needs to pass the fast check and block on the
+    lock -- so a *second* entry to `__setattr__` is the failure, rather than an
+    unlucky interleaving being the only way to see one.
+    """
+    from adapt_agent.optimization.retry import _DECLARED_FALLBACK, note_declared_fallback
+
+    attribute = _DECLARED_FALLBACK._attribute
+    attaching = threading.Barrier(2, timeout=0.25)
+    start = threading.Barrier(2, timeout=10)
+    entered: list[int] = []
+
+    class Watched(Exception):
+        def __setattr__(self, name: str, value: object) -> None:
+            if name == attribute:
+                entered.append(threading.get_ident())
+                try:
+                    attaching.wait()  # a second thread here means no exclusion
+                except threading.BrokenBarrierError:
+                    pass
+            object.__setattr__(self, name, value)
+
+    shared = Watched("429 Too Many Requests")
+
+    def run(value: float) -> None:
+        start.wait()
+        with collecting_declared_fallbacks():
+            note_declared_fallback(shared, value)
+
+    threads = [threading.Thread(target=run, args=(value,)) for value in (0.7, 0.2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(entered) == 1
+    # ...and both notes survived, which is what the exclusion is for
+    assert sorted(getattr(shared, attribute).values()) == [0.2, 0.7]
+
+
+# -- round 41: a note is only written where something will consume it ----------
+
+
+def test_a_direct_metric_call_leaves_no_note_behind() -> None:
+    """A note is a side channel between two frames — the metric that raises and
+    the harness that catches. Called directly, the second frame does not exist,
+    so writing one left it on the exception with nothing to take it off.
+
+    Three earlier rounds scoped this note's *lifetime* — consumed as read, once
+    at the block's entrance, per thread — and none of them asked whether it
+    should be written at all.
+    """
+    from unittest.mock import Mock
+
+    from adapt_agent.optimization.metrics import Metric
+    from adapt_agent.optimization.retry import declared_fallback
+
+    shared = TimeoutError("429 Too Many Requests")
+    raiser = Mock(side_effect=shared)
+    permanent = RetryPolicy(attempts=1, is_transient=lambda exc: False)
+    rows = GoldenDataset([Example(inputs="a", expected="ok")])
+
+    try:
+        Metric("direct", lambda o, e: raiser(), on_error=0.7)("out", "ok")
+    except Exception:
+        pass
+    assert declared_fallback(shared) is None
+
+    # ...so the next metric to raise that same object scores its own fallback
+    report = EvaluationHarness(
+        [Metric("later", lambda o, e: raiser(), on_error=0.2)], retry=permanent
+    ).evaluate(lambda x: "out", rows)
+    assert report.aggregate["later"] == pytest.approx(0.2)
+
+
+def test_the_collector_does_not_substitute_the_exception_it_wraps() -> None:
+    """Why this context manager is hand-written rather than a generator.
+
+    `contextlib.contextmanager`'s `__exit__` throws the exception into the
+    generator and then assigns `exc.__traceback__` — a *Python-level* attribute
+    set. An exception that refuses attributes raises `AttributeError` from its
+    own `__setattr__`, and that is what propagates instead. It is precisely the
+    class of error this module exists to handle, and the substituted exception
+    carries none of the marks the original did: the harness spent a second
+    retry budget and scored the row a hard zero rather than excluding it.
+
+    The half that matters is asserted everywhere; the counterexample is version
+    dependent and says so. Measured: 3.12 and 3.14 substitute, **3.10 does
+    not** -- the assignment is not in that release's `contextlib`. So the
+    generator form is a hazard on the interpreters most people run and a quiet
+    no-op on the oldest one this package supports, which is the worst shape for
+    a bug to have and the reason this is pinned rather than remembered.
+    """
+    import contextlib
+    import sys
+    from collections.abc import Iterator
+
+    from adapt_agent.optimization.retry import mark_retries_exhausted, retries_already_exhausted
+
+    def raise_marked() -> None:
+        raise mark_retries_exhausted(RefusesAttributes("429 Too Many Requests"))
+
+    # Ours, on every interpreter: the exception arrives as itself, marks intact.
+    with pytest.raises(RefusesAttributes) as caught:
+        with collecting_declared_fallbacks():
+            raise_marked()
+    assert retries_already_exhausted(caught.value) is True
+
+    if sys.version_info < (3, 12):  # pragma: no cover - measured, not assumed
+        return
+
+    @contextlib.contextmanager
+    def generator_based() -> Iterator[None]:
+        yield
+
+    with pytest.raises(AttributeError, match="__traceback__"):
+        with generator_based():
+            raise_marked()
+
+
+def test_collection_nests_so_a_dispatcher_does_not_switch_it_off() -> None:
+    """A metric may call another, and the inner `with` must not end collection
+    for the outer one on the way out."""
+    from adapt_agent.optimization.retry import (
+        collecting_a_declared_fallback,
+        declared_fallback,
+        note_declared_fallback,
+    )
+
+    # It must also not swallow. A truthy `__exit__` would suppress the metric's
+    # exception inside the harness's `while True`, which does not fail -- it
+    # loops forever, and a hanging guard is worse than none. Pinned here, where
+    # it fails in microseconds.
+    with pytest.raises(ValueError, match="boom"):
+        with collecting_declared_fallbacks():
+            raise ValueError("boom")
+
+    assert collecting_a_declared_fallback() is False
+    with collecting_declared_fallbacks():
+        with collecting_declared_fallbacks():
+            assert collecting_a_declared_fallback() is True
+        assert collecting_a_declared_fallback() is True
+        exc = TimeoutError("429 Too Many Requests")
+        note_declared_fallback(exc, 0.7)
+        assert declared_fallback(exc) == pytest.approx(0.7)
+    assert collecting_a_declared_fallback() is False
+
+
+# -- a wrapper carries none of the evidence its cause does -------------------
+
+
+class _Throttled(Exception):
+    """A provider error the way a provider raises it."""
+
+    status_code = 429
+
+
+def _raised_from(outer: BaseException, inner: BaseException) -> BaseException:
+    """``outer`` with ``inner`` as its explicit ``__cause__``."""
+    try:
+        raise inner
+    except BaseException as cause:  # noqa: BLE001 - a stop signal is one of the cases
+        try:
+            raise outer from cause
+        except BaseException as wrapper:  # noqa: BLE001 - same
+            return wrapper
+
+
+def _raised_during(outer: BaseException, inner: BaseException) -> BaseException:
+    """``outer`` raised while handling ``inner``, so only ``__context__`` is set."""
+    try:
+        raise inner
+    except BaseException:  # noqa: BLE001 - same
+        try:
+            raise outer
+        except BaseException as wrapper:  # noqa: BLE001 - same
+            return wrapper
+
+
+def _raised_from_none(outer: BaseException, inner: BaseException) -> BaseException:
+    """``outer`` raised while handling ``inner``, with the context suppressed."""
+    try:
+        raise inner
+    except BaseException:  # noqa: BLE001 - same
+        try:
+            raise outer from None
+        except BaseException as wrapper:  # noqa: BLE001 - same
+            return wrapper
+
+
+WRAPPED_TRANSIENT = [
+    ("explicit cause, timeout", _raised_from, TimeoutError("timed out")),
+    ("explicit cause, 429", _raised_from, _Throttled("slow down")),
+    ("implicit context, timeout", _raised_during, TimeoutError("timed out")),
+    ("implicit context, 429", _raised_during, _Throttled("slow down")),
+]
+
+
+@pytest.mark.parametrize(("label", "wrap", "inner"), WRAPPED_TRANSIENT)
+def test_a_wrapped_provider_error_is_still_transient(label, wrap, inner) -> None:
+    """An SDK almost never lets a provider error reach the harness bare.
+
+    `raise RuntimeError("agent invocation failed") from TimeoutError(...)` is
+    the ordinary shape, and every question this module asks was asked of the
+    wrapper alone: the outer type is a `RuntimeError`, it carries no status and
+    its message says nothing. So a throttled call scored an **earned zero**,
+    counted against the agent, in a report that still called itself complete --
+    the exact measurement bias this release exists to remove, arriving through
+    the shape most likely to occur in practice.
+    """
+    assert is_transient_error(inner) is True, label
+    assert is_transient_error(wrap(RuntimeError("agent invocation failed"), inner)) is True, label
+
+
+def test_the_chain_is_followed_to_any_depth() -> None:
+    """A framework wrapping an SDK wrapping a provider is two layers, not one."""
+    inner: BaseException = _Throttled("slow down")
+    for layer in range(4):
+        inner = _raised_from(RuntimeError(f"layer {layer}"), inner)
+    assert is_transient_error(inner) is True
+
+
+def test_raise_from_none_hides_what_it_says_it_hides() -> None:
+    """Which links count is Python's rule, not one invented here.
+
+    `raise X from None` sets no cause and suppresses the context, which is
+    exactly the chain a traceback prints. Reading the suppressed context anyway
+    would retry a failure whose author said the cause is irrelevant.
+    """
+    wrapped = _raised_from_none(RuntimeError("agent invocation failed"), _Throttled("slow down"))
+    assert wrapped.__cause__ is None
+    assert wrapped.__suppress_context__ is True
+    assert is_transient_error(wrapped) is False
+
+
+STOP_SIGNALS = [KeyboardInterrupt(), SystemExit(1), asyncio.CancelledError()]
+
+
+@pytest.mark.parametrize("signal", STOP_SIGNALS)
+@pytest.mark.parametrize("wrap", [_raised_from, _raised_during])
+def test_a_stop_signal_anywhere_in_the_chain_is_never_transient(wrap, signal) -> None:
+    """ "Stop" does not become "try again" by being wrapped, in either position."""
+    assert is_transient_error(wrap(RuntimeError("timed out"), signal)) is False
+    assert is_transient_error(wrap(signal, _Throttled("slow down"))) is False
+
+
+def test_a_wrapped_deterministic_defect_stays_permanent() -> None:
+    """The direction that matters most, and the one chaining could have broken.
+
+    Retrying a bug then *excluding* the row hides the defect the run exists to
+    surface. Each link is judged on its own, so the deterministic-type guard
+    still speaks for the link it was written for -- and the two messages are
+    never read as one, which would let either link's wording speak for the
+    other.
+    """
+    assert (
+        is_transient_error(
+            _raised_from(RuntimeError("agent invocation failed"), ValueError("bad config"))
+        )
+        is False
+    )
+    assert (
+        is_transient_error(
+            _raised_from(
+                RuntimeError("agent invocation failed"), ValueError("timeout must be positive")
+            )
+        )
+        is False
+    )
+    # ...and a genuinely transient cause under a deterministic wrapper still is
+    assert (
+        is_transient_error(_raised_from(ValueError("bad config"), _Throttled("slow down"))) is True
+    )
+
+
+def test_a_cyclic_chain_terminates() -> None:
+    """Cycle-safe by *identity*, for the reason the note table is.
+
+    An exception may define `__eq__` without `__hash__`, so a set of the
+    objects themselves is not available; and two distinct errors that compare
+    equal are still two links. The walk holds every exception it has seen, so
+    an `id` cannot be reused underneath it.
+    """
+    first = RuntimeError("a")
+    second = RuntimeError("b")
+    first.__cause__ = second
+    second.__cause__ = first
+    assert is_transient_error(first) is False  # terminates, rather than hanging
+    looped = RuntimeError("self")
+    looped.__context__ = looped
+    assert is_transient_error(looped) is False
+
+
+class _Unhashable(Exception):
+    """Equality without a hash -- the shape a `set` of the objects cannot hold.
+
+    The same shape that broke the exhausted-retries marker's `WeakSet` two
+    review rounds ago, which is why the chain walk was written to key by `id`
+    from the start. It measured *zero* until this existed: the cycle test above
+    uses a `RuntimeError`, which is hashable, so keying by the object worked
+    perfectly well for it. Each property covered alone, their product covered
+    by nobody -- again.
+    """
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Unhashable)
+
+
+def test_an_unhashable_link_does_not_break_the_walk() -> None:
+    """Keyed by `id`, so an exception that refuses to be hashed is still a link.
+
+    Identity is also the right key on its own terms: two distinct errors that
+    compare equal are still two separate links in one chain.
+    """
+    wrapped = _raised_from(_Unhashable("wrapper"), _Throttled("slow down"))
+    assert is_transient_error(wrapped) is True
+    # ...and an unhashable link deeper in, under a hashable wrapper
+    deeper = _raised_from(RuntimeError("outer"), _raised_from(_Unhashable("mid"), TimeoutError()))
+    assert is_transient_error(deeper) is True
+
+
+def test_the_servers_requested_wait_survives_being_wrapped() -> None:
+    """The same rule, and the quieter half of the same bug.
+
+    Losing the classification scores an earned zero; losing `Retry-After` only
+    makes the backoff guess, so it retries sooner than the server asked. Same
+    cause: the wrapper carries neither the attribute nor the response.
+    """
+    inner = _Throttled("slow down")
+    inner.retry_after = 7
+    assert retry_after_seconds(inner) == 7.0
+    assert retry_after_seconds(_raised_from(RuntimeError("wrapped"), inner)) == 7.0
+
+
+def test_a_wrapped_throttle_is_retried_and_left_out_of_the_score() -> None:
+    """End to end, which is where the bias was: before this, all three of these
+    agents were indistinguishable -- one call, an earned zero, `is_complete`
+    true, and a row in `failures()` handed to a proposer as a case the
+    instruction got wrong.
+    """
+    dataset = GoldenDataset([Example(inputs="a", expected="ok")])
+    calls = {"n": 0}
+
+    def wrapping_agent(_text: str) -> str:
+        calls["n"] += 1
+        try:
+            raise _Throttled("slow down")
+        except _Throttled as exc:
+            raise RuntimeError("agent invocation failed") from exc
+
+    harness = EvaluationHarness(metrics={"exact": exact_match()}, retry=FAST)
+    report = harness.evaluate(wrapping_agent, dataset)
+    assert calls["n"] == FAST.attempts
+    assert report.n_transient_errors == 1
+    assert report.is_complete is False
+    assert report.failures() == []
+
+    calls["n"] = 0
+
+    def defective_agent(_text: str) -> str:
+        calls["n"] += 1
+        try:
+            raise ValueError("bad config")
+        except ValueError as exc:
+            raise RuntimeError("agent invocation failed") from exc
+
+    report = harness.evaluate(defective_agent, dataset)
+    assert calls["n"] == 1  # not retried
+    assert report.n_transient_errors == 0
+    assert report.is_complete is True
+    assert len(report.failures()) == 1

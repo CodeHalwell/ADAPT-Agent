@@ -73,13 +73,43 @@ def _predicate(obj: Any) -> bool:
         return False
 
 
+#: Attributes to follow, in order, when digging a user's node object out of the
+#: wrappers LangGraph puts around it.
+_UNWRAP_ATTRS = ("runnable", "bound", "func", "afunc", "__self__")
+
+
+def _has_tunable_surface(obj: Any) -> bool:
+    """Whether ``obj`` exposes anything this introspector could bind."""
+    return any(hasattr(obj, attr) for attr in ("system_prompt", "prompt", "model", "llm", "tools"))
+
+
 def _runnable_of(node: Any) -> Any:
-    """Return the runnable carried by a node (``node`` / ``.runnable`` / ``.bound``)."""
-    for attr in ("runnable", "bound"):
-        candidate = getattr(node, attr, None)
-        if candidate is not None:
-            return candidate
-    return node
+    """Return the object on a node that actually carries the tunable knobs.
+
+    A compiled graph does not hand back the callable you registered: a
+    ``PregelNode`` holds a ``RunnableCallable`` wrapper at ``.bound``, and *your*
+    node object sits one further hop down at ``.func`` (or ``.func.__self__``
+    when you registered a bound method). Stopping at ``.bound`` -- as this did --
+    inspects the wrapper, which exposes no prompt and no model, so every
+    realistic graph introspected to zero parameters while still being detected
+    as LangGraph. That reads as "this graph has no knobs" rather than as a
+    broken walk.
+
+    Each hop is taken only when it leads somewhere with a bindable attribute, so
+    unwrapping never overshoots past the object holding the knobs.
+    """
+    current = node
+    for _ in range(len(_UNWRAP_ATTRS)):
+        if _has_tunable_surface(current) and current is not node:
+            return current
+        for attr in _UNWRAP_ATTRS:
+            candidate = getattr(current, attr, None)
+            if candidate is not None and candidate is not current:
+                current = candidate
+                break
+        else:
+            break
+    return current
 
 
 def _prompt_param(runnable: Any, component: str) -> Parameter | None:

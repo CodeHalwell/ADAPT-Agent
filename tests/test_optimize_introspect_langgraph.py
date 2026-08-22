@@ -6,6 +6,10 @@ attribute shape (``invoke`` + ``nodes`` mapping with node runnables carrying a
 imported.
 """
 
+import importlib.util
+
+import pytest
+
 from adapt_agent.optimization.introspection import detect, introspect
 from adapt_agent.optimization.introspection.langgraph import _predicate
 from adapt_agent.optimization.parameters import ParameterKind
@@ -188,3 +192,56 @@ def test_introspect_reads_nodes_via_get_graph() -> None:
     params = {p.name: p for p in introspect(graph)}
     assert "researcher.system_prompt" in params
     assert params["researcher.system_prompt"].kind is ParameterKind.PROMPT
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("langgraph") is None,
+    reason="langgraph is not installed",
+)
+def test_a_real_compiled_graph_yields_tunable_parameters() -> None:
+    """A compiled graph does not hand back the callable you registered.
+
+    `PregelNode.bound` is a `RunnableCallable` wrapper; the node object you
+    added sits one hop further down at `.func`. Walking only as far as `.bound`
+    inspected the wrapper -- which exposes no prompt and no model -- so every
+    realistic graph introspected to zero parameters while still being *detected*
+    as LangGraph. That reads as "this graph has nothing to tune" rather than as
+    a broken walk, which is why no fake in this module caught it.
+    """
+    from typing import Annotated, TypedDict
+
+    from langgraph.graph import END, START, StateGraph  # type: ignore[import-not-found]
+    from langgraph.graph.message import add_messages  # type: ignore[import-not-found]
+
+    class State(TypedDict):
+        messages: Annotated[list, add_messages]
+
+    class _Model:
+        model_name = "gpt-4o-mini"
+        temperature = 0.2
+
+    class ChatNode:
+        def __init__(self) -> None:
+            self.system_prompt = "You are a helpful agent."
+            self.model = _Model()
+
+        def __call__(self, state):  # pragma: no cover - never invoked
+            return {"messages": []}
+
+    builder = StateGraph(State)
+    builder.add_node("chat", ChatNode())
+    builder.add_edge(START, "chat")
+    builder.add_edge("chat", END)
+    graph = builder.compile()
+
+    assert detect(graph) == "langgraph"
+
+    params = {p.name: p for p in introspect(graph)}
+    assert params["chat.system_prompt"].kind is ParameterKind.PROMPT
+    assert params["chat.system_prompt"].value == "You are a helpful agent."
+    assert params["chat.model"].value == "gpt-4o-mini"
+    assert params["chat.temperature"].value == 0.2
+
+    # Writable, not merely discoverable: the write must reach the node object.
+    params["chat.system_prompt"].write("Be terse.")
+    assert graph.nodes["chat"].bound.func.system_prompt == "Be terse."

@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from adapt_agent.exceptions import IncompleteEvaluationError
 from adapt_agent.optimization.dataset import GoldenDataset
 from adapt_agent.optimization.evaluation import EvaluationHarness, EvaluationReport
 from adapt_agent.optimization.parameters import Parameter, ParameterKind
@@ -60,6 +61,11 @@ class Trial:
     strategy: str
     accepted: bool = False
     metrics: dict[str, float] = field(default_factory=dict)
+    #: False when transient provider failures cost this trial some rows, so its
+    #: ``score`` is a mean over a subset and is not comparable with any other.
+    complete: bool = True
+    #: How many rows were dropped for transient failures.
+    n_transient_errors: int = 0
 
 
 #: Reserved top-level name: the exported file's own metadata block. A tuned
@@ -81,6 +87,7 @@ class OptimizationResult:
         history: Every :class:`Trial` evaluated, in order.
         best_report: The :class:`EvaluationReport` for the winning configuration.
         validation_score: Score of ``best_config`` on a held-out set, if provided.
+        validation_complete: Whether that score covered every held-out row.
         recommendations: Advisory, human-readable suggestions gathered during the
             run (e.g. new tools/skills the judge proposes). These are never applied
             automatically -- the optimizer only *selects* among existing tools.
@@ -94,6 +101,20 @@ class OptimizationResult:
     best_report: EvaluationReport | None = None
     validation_score: float | None = None
     recommendations: list[str] = field(default_factory=list)
+
+    # -- fields added after 0.3.0 -----------------------------------------
+    #
+    # Appended, never inserted. This dataclass is public and positional
+    # construction is a supported call shape, so a field placed in the
+    # middle silently rebinds every argument after it: `recommendations`
+    # was the eighth positional, and putting this flag in front of it
+    # assigned the caller's list to a boolean and left the recommendations
+    # empty -- lost on serialisation, with no error raised.
+    #: False when transient provider failures cost the validation pass some
+    #: rows, so :attr:`validation_score` is a mean over a subset and is not
+    #: comparable with :attr:`best_score`. ``True`` when there was no
+    #: validation set at all -- there is nothing partial about not running.
+    validation_complete: bool = True
 
     @property
     def improved(self) -> bool:
@@ -248,7 +269,8 @@ class OptimizationResult:
                         f"# baseline={provenance['baseline_score']:.4f} "
                         f"best={provenance['best_score']:.4f} "
                         f"improvement={provenance['improvement']:+.4f} "
-                        f"validation={provenance['validation_score']} "
+                        f"validation={provenance['validation_score']}"
+                        f"{'' if provenance['validation_complete'] else ' (PARTIAL)'} "
                         f"over {provenance['n_evals']} evals.\n"
                         "# Review this diff before committing: prompts here were "
                         "machine-written.\n"
@@ -263,6 +285,10 @@ class OptimizationResult:
             "best_score": self.best_score,
             "improvement": self.improvement,
             "validation_score": self.validation_score,
+            # Travels with the score it qualifies. A partial validation is the
+            # same number as a whole one until something says otherwise, and a
+            # persisted result is read long after the run's logs are gone.
+            "validation_complete": self.validation_complete,
             "n_evals": self.n_evals,
         }
 
@@ -273,6 +299,7 @@ class OptimizationResult:
             "best_score": self.best_score,
             "improvement": self.improvement,
             "validation_score": self.validation_score,
+            "validation_complete": self.validation_complete,
             "n_evals": self.n_evals,
             "best_config": self.best_config,
             "recommendations": list(self.recommendations),
@@ -358,7 +385,7 @@ class Optimizer:
             raise ValueError("Cannot optimize against an empty dataset")
 
         baseline_snapshot = target.snapshot()
-        baseline_report = self.harness.evaluate(target, dataset)
+        baseline_report = self._evaluate_baseline(target, dataset)
         baseline_score = baseline_report.score
         if self.verbose:
             logger.info("[%s] baseline score=%.4f", self.strategy_name, baseline_score)
@@ -382,8 +409,11 @@ class Optimizer:
             target.apply(state.best_config)
 
         validation_score: float | None = None
+        validation_complete = True
         if val_dataset:
-            validation_score = self.harness.evaluate(target, val_dataset).score
+            validation_report = self._evaluate_validation(target, val_dataset)
+            validation_score = validation_report.score
+            validation_complete = validation_report.is_complete
 
         recommendations = list(self._recommendations)
         recommendations.extend(self._suggest_tools(target, state))
@@ -396,6 +426,7 @@ class Optimizer:
             history=state.history,
             best_report=state.best_report,
             validation_score=validation_score,
+            validation_complete=validation_complete,
             recommendations=recommendations,
         )
         if self.verbose:
@@ -426,21 +457,123 @@ class Optimizer:
         report = self.harness.evaluate(target, dataset)
         return report
 
+    def _evaluate_baseline(
+        self, target: OptimizableAgent, dataset: GoldenDataset
+    ) -> EvaluationReport:
+        """Evaluate the starting configuration, re-running an incomplete result.
+
+        The baseline never passes through :meth:`_record`, so the completeness
+        invariant enforced there does not reach it -- and the baseline is the
+        one score every candidate is measured against. A baseline throttled on a
+        hard row scores over its survivors, sets ``best_score`` too high, and no
+        fully-evaluated candidate can beat it: the search then returns the
+        starting config as the winner, which looks like "nothing improved on
+        your prompt" rather than like a broken run.
+
+        A baseline is re-run once rather than rejected outright, because there is
+        nothing to fall back to. If it is *still* incomplete this raises: a
+        logged warning is too easy to lose in a long run's output, and the
+        failure mode it precedes is a wrong answer wearing the costume of a
+        valid one.
+        """
+        report = self.harness.evaluate(target, dataset)
+        if report.is_complete:
+            return report
+        logger.warning(
+            "[%s] baseline scored %.4f over %d of %d rows (%d transient failures); re-running",
+            self.strategy_name,
+            report.score,
+            report.n_scored,
+            report.n_evaluated,
+            report.n_transient_errors,
+        )
+        retried = self.harness.evaluate(target, dataset)
+        if not retried.is_complete:
+            raise IncompleteEvaluationError(
+                f"{self.strategy_name}: the baseline evaluation still could not score "
+                f"{retried.n_transient_errors} of {retried.n_evaluated} rows after a re-run "
+                f"(transient provider failures). Every candidate is compared against the "
+                f"baseline, so continuing would silently return the starting configuration "
+                f"as the winner. Lower the concurrency, widen the retry policy, or wait for "
+                f"the provider to recover."
+            )
+        return retried
+
+    def _evaluate_validation(
+        self, target: OptimizableAgent, dataset: GoldenDataset
+    ) -> EvaluationReport:
+        """Evaluate the held-out set, re-running once if throttling cost it rows.
+
+        Validation does not steer the search, so unlike the baseline this never
+        aborts -- a partial held-out score is still worth reporting. It must not
+        be reported *as if* it were whole, though: it is the number a user reads
+        to decide whether the tuned config generalises, and a mean over the rows
+        that happened to survive throttling silently answers a different
+        question. The completeness travels with it on
+        :attr:`OptimizationResult.validation_complete`.
+        """
+        report = self.harness.evaluate(target, dataset)
+        if report.is_complete:
+            return report
+        logger.warning(
+            "[%s] validation scored %.4f over %d of %d rows (%d transient failures); re-running",
+            self.strategy_name,
+            report.score,
+            report.n_scored,
+            report.n_evaluated,
+            report.n_transient_errors,
+        )
+        retried = self.harness.evaluate(target, dataset)
+        if not retried.is_complete:
+            logger.error(
+                "[%s] validation is still incomplete after a re-run (%d of %d rows lost to "
+                "transient failures). validation_score covers only the rows that succeeded; "
+                "OptimizationResult.validation_complete is False.",
+                self.strategy_name,
+                retried.n_transient_errors,
+                retried.n_evaluated,
+            )
+        return retried
+
     def _record(
         self,
         state: _SearchState,
         config: dict[str, Any],
         report: EvaluationReport,
     ) -> bool:
-        """Record a trial and update the best-so-far. Returns True if accepted."""
-        accepted = report.score > state.best_score + self.min_improvement
+        """Record a trial and update the best-so-far. Returns True if accepted.
+
+        An *incomplete* trial can never be accepted, however well it scored.
+        Transient failures drop rows from the score, so an incomplete trial's
+        mean is taken over a different subset than its rivals' -- a candidate
+        that answers one easy row and gets throttled on a hard one scores 1.0
+        and would otherwise beat a fully-evaluated 0.9. Excluding throttled rows
+        stops throttling from *penalising* a candidate; refusing to crown a
+        partial trial stops it from *rewarding* one. Both are needed, or the
+        search still selects for luck, just in the opposite direction.
+        """
+        complete = report.is_complete
+        accepted = complete and report.score > state.best_score + self.min_improvement
         trial = Trial(
             config=dict(config),
             score=report.score,
             strategy=self.strategy_name,
             accepted=accepted,
             metrics=dict(report.aggregate),
+            complete=complete,
+            n_transient_errors=report.n_transient_errors,
         )
+        if not complete:
+            logger.warning(
+                "[%s] trial #%d scored %.4f over %d of %d rows (%d transient failures); "
+                "not eligible to win -- its score is not comparable with a complete trial's",
+                self.strategy_name,
+                len(state.history) + 1,
+                report.score,
+                report.n_scored,
+                report.n_evaluated,
+                report.n_transient_errors,
+            )
         state.history.append(trial)
         if accepted:
             state.best_config = dict(config)
@@ -809,6 +942,13 @@ class EvolutionaryOptimizer(Optimizer):
             seen.add(key)
             report = self._eval_config(target, config, dataset)
             self._record(state, config, report)
+            if not report.is_complete:
+                # `_record` only guards the global best. Survivors and parents
+                # are chosen from *this* list, so an incomplete candidate left
+                # in it would breed from a score measured over an easier subset
+                # -- throttling would steer the search even while being barred
+                # from winning it.
+                continue
             scored.append((config, report.score))
         scored.sort(key=lambda cs: cs[1], reverse=True)
         return scored
@@ -842,7 +982,7 @@ class PipelineOptimizer(Optimizer):
     ) -> OptimizationResult:
         target = wrap(agent, runner=runner, components=components, parameters=parameters)
         baseline_snapshot = target.snapshot()
-        baseline_score = self.harness.evaluate(target, dataset).score
+        baseline_score = self._evaluate_baseline(target, dataset).score
 
         combined_history: list[Trial] = []
         combined_recommendations: list[str] = []
@@ -876,7 +1016,9 @@ class PipelineOptimizer(Optimizer):
         if best_config:
             target.apply(best_config)
 
-        validation_score = self.harness.evaluate(target, val_dataset).score if val_dataset else None
+        validation_report = self._evaluate_validation(target, val_dataset) if val_dataset else None
+        validation_score = validation_report.score if validation_report else None
+        validation_complete = validation_report.is_complete if validation_report else True
 
         # Optionally run the pipeline-level tool suggestion on the cumulative best,
         # then dedupe so a repeated suggestion from several stages appears once.
@@ -896,6 +1038,7 @@ class PipelineOptimizer(Optimizer):
             history=combined_history,
             best_report=best_report,
             validation_score=validation_score,
+            validation_complete=validation_complete,
             recommendations=_dedup(combined_recommendations),
         )
 

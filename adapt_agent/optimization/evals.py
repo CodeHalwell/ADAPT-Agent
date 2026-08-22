@@ -277,19 +277,12 @@ def _resolve_metrics(
         raw_specs: list[Any] = list(metrics.values())
         resolved = []
         for name, spec in metrics.items():
-            metric = _resolve_one(spec)
-            resolved.append(
-                Metric(
-                    name,
-                    metric.fn,
-                    needs_example=metric.needs_example,
-                    # Renaming must not strip the flag: dropping it here made
-                    # automatic extractor selection fall back to text, so a
-                    # model-returning agent scored 0.0 under a renamed
-                    # field_match.
-                    structural=metric.structural,
-                )
-            )
+            # Renaming must not strip anything the metric carries. Listing the
+            # fields here dropped `structural` once -- automatic extractor
+            # selection fell back to text, so a model-returning agent scored
+            # 0.0 under a renamed field_match -- and dropped `on_error` the
+            # round it was added. `renamed` copies whole, so there is no list.
+            resolved.append(_resolve_one(spec).renamed(name))
     else:
         raw_specs = list(metrics) if isinstance(metrics, (list, tuple)) else [metrics]
         resolved = [_resolve_one(spec) for spec in raw_specs]

@@ -31,9 +31,16 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from adapt_agent.optimization.retry import (
+    DEFAULT_RETRY_POLICY,
+    RetryPolicy,
+    mark_retries_exhausted,
+)
 
 if TYPE_CHECKING:
     from adapt_agent.optimization.providers import ModelProvider
@@ -211,6 +218,7 @@ class LLMJudge:
         on_error: float = 0.0,
         adversarial: bool = False,
         score_is_normalized: bool = False,
+        retry: RetryPolicy | None = None,
     ):
         # Coerce providers / names / callables to a single completion callable.
         from adapt_agent.optimization.providers import as_provider
@@ -220,6 +228,7 @@ class LLMJudge:
         else:
             self.complete = complete
         self.rubric = rubric
+        self.retry = DEFAULT_RETRY_POLICY if retry is None else retry
         self.pass_threshold = pass_threshold
         self.scale = max(1, int(scale))
         self.max_failures = max(1, int(max_failures))
@@ -237,8 +246,18 @@ class LLMJudge:
         *,
         criteria: str | None = None,
         rubric: str | None = None,
+        propagate_transient: bool = False,
     ) -> JudgeVerdict:
-        """Grade a single ``output`` and return a :class:`JudgeVerdict`."""
+        """Grade a single ``output`` and return a :class:`JudgeVerdict`.
+
+        Args:
+            propagate_transient: Let a transient provider failure that outlived
+                its retries escape as an exception instead of collapsing to the
+                ``on_error`` verdict. :meth:`as_metric` sets this so the harness
+                can drop the row rather than score the candidate zero for the
+                provider's congestion. Direct callers keep the fallback --
+                there is no harness behind them to catch anything.
+        """
         rubric_text = rubric or self.rubric
         system = _SCORE_SYSTEM.format(
             stance=self._stance_block(),
@@ -252,7 +271,7 @@ class LLMJudge:
             reference_block=_reference_block(expected),
             criteria_block=_criteria_block(criteria),
         )
-        raw = self._complete(user, system=system)
+        raw = self._complete(user, system=system, propagate_transient=propagate_transient)
         if raw is None:
             return JudgeVerdict(
                 self.on_error,
@@ -471,6 +490,13 @@ class LLMJudge:
         The returned metric needs the full :class:`~adapt_agent.optimization.dataset.Example`
         (for the input and any per-example ``criteria`` in metadata) and is
         therefore evaluated by the harness with example context.
+
+        It also carries this judge's ``on_error`` forward. The adapter
+        re-raises a grading failure so the harness can classify it, and once
+        the harness has ruled the error *permanent* the question the fallback
+        answers is settled -- so it applies, and ``on_error=0.7`` means the
+        same thing through a harness as it does on a direct call. Only the
+        classification was ever the harness's to make.
         """
         # Imported lazily to avoid a circular import at module load time.
         from adapt_agent.optimization.metrics import Metric
@@ -483,10 +509,15 @@ class LLMJudge:
                 meta = getattr(example, "metadata", {}) or {}
                 ex_criteria = meta.get("criteria", criteria)
             return self.score(
-                input_data, output, expected, criteria=ex_criteria, rubric=rubric
+                input_data,
+                output,
+                expected,
+                criteria=ex_criteria,
+                rubric=rubric,
+                propagate_transient=True,
             ).score
 
-        return Metric(name, _fn, needs_example=True)
+        return Metric(name, _fn, needs_example=True, on_error=self.on_error)
 
     # -- internals -------------------------------------------------------------
 
@@ -494,22 +525,92 @@ class LLMJudge:
         """Return the adversarial stance directive (or empty) for system prompts."""
         return f"\n{_ADVERSARIAL_STANCE}\n" if self.adversarial else ""
 
-    def _complete(self, prompt: str, *, system: str | None = None) -> str | None:
+    def _complete(
+        self, prompt: str, *, system: str | None = None, propagate_transient: bool = False
+    ) -> str | None:
         """Call the completion function.
 
         Passes ``system`` (rubric/instructions) to the provider when supported.
-        Logs exceptions; re-raises auth/permission errors so a misconfigured key
-        fails loudly; returns ``None`` for other (transient) errors.
+
+        Three outcomes, deliberately different:
+
+        * **Auth/permission errors re-raise immediately.** A misconfigured key
+          should fail loudly, not score every example zero.
+        * **Transient errors are retried, then re-raised -- but only for
+          ``propagate_transient=True`` callers.** A judge's provider call is a
+          network round trip, and under concurrency a 429 there is as likely as
+          one on the agent call. Swallowing it into ``on_error`` scored the
+          *candidate* zero for the *provider's* congestion, so the metric
+          adapter (:meth:`as_metric`) lets it out and the harness drops the row.
+          Every other entry point -- :meth:`score`, :meth:`critique`,
+          :meth:`improve_prompt` -- keeps its documented graceful fallback:
+          those are standalone calls with no harness to catch anything, and
+          turning them into raisers would be an unannounced breaking change.
+        * **Anything else returns ``None``**, which the caller turns into
+          ``on_error`` -- a judge that reliably returns garbage is a real
+          failure of this configuration.
         """
-        try:
-            result = self._invoke(prompt, system)
-        except Exception as exc:  # noqa: BLE001 -- classify then re-raise or swallow
-            name = type(exc).__name__
-            if any(tag in name for tag in ("Authentication", "Permission", "InvalidAPIKey")):
-                logger.error("Judge completion failed with auth/permission error: %s", exc)
-                raise
-            logger.warning("Judge completion failed (transient), returning None: %s", exc)
-            return None
+        policy = self.retry
+        attempt = 1
+        while True:
+            try:
+                result = self._invoke(prompt, system)
+                break
+            except Exception as exc:  # noqa: BLE001 -- classify, then act
+                name = type(exc).__name__
+                if any(tag in name for tag in ("Authentication", "Permission", "InvalidAPIKey")):
+                    logger.error("Judge completion failed with auth/permission error: %s", exc)
+                    raise
+                # Classify through the *policy*, not the module-level default:
+                # a caller who supplied `RetryPolicy(is_transient=...)` for a
+                # provider-specific exception must be honoured here too, or
+                # the judge swallows into `on_error` what the harness would
+                # have retried and excluded.
+                if policy.should_retry(exc, 0):
+                    if policy.should_retry(exc, attempt):
+                        delay = policy.delay_for(exc, attempt)
+                        logger.info(
+                            "Judge completion hit a transient error (attempt %d/%d), "
+                            "retrying in %.2fs: %s",
+                            attempt,
+                            policy.attempts,
+                            delay,
+                            exc,
+                        )
+                        time.sleep(delay)
+                        attempt += 1
+                        continue
+                    logger.warning(
+                        "Judge completion still failing transiently after %d attempt(s); "
+                        "re-raising so the row is excluded from the score: %s",
+                        attempt,
+                        exc,
+                    )
+                    if not propagate_transient:
+                        return None
+                    # Stamped so the harness excludes the row without spending a
+                    # second retry budget on an already-exhausted call.
+                    mark_retries_exhausted(exc)
+                    raise
+                if propagate_transient:
+                    # The metric-adapter path, where the harness is the
+                    # authority on what counts as transient. This policy did
+                    # not recognise the exception, but the harness may have its
+                    # own classifier configured -- consuming it into `on_error`
+                    # here decides the question before the harness is asked,
+                    # and a provider fault then scores as an earned zero.
+                    #
+                    # Deliberately *not* stamped with `mark_retries_exhausted`:
+                    # this policy did not retry it, so the harness should get
+                    # its full budget under its own classifier.
+                    logger.warning(
+                        "Judge completion failed and this policy does not classify it as "
+                        "transient; re-raising so the harness can apply its own: %s",
+                        exc,
+                    )
+                    raise
+                logger.warning("Judge completion failed, returning None: %s", exc)
+                return None
         return result if isinstance(result, str) else (str(result) if result is not None else None)
 
     def _invoke(self, prompt: str, system: str | None) -> Any:

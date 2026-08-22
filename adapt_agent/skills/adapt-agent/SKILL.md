@@ -293,7 +293,15 @@ strategies, and the declarative `adapt-agent train config.yaml` flow.
   is `max_evals x len(dataset)` LLM round-trips. Pass `concurrency=` to
   `evaluate_agent`/`evaluate` (threads, for sync agents) or use `aevaluate`
   (no threads, for async ones); ordering and per-example error handling are
-  unchanged.
+  unchanged. On the optimizer path pass it to `EvaluationHarness(...,
+  concurrency=8)` instead — an `Optimizer` calls `harness.evaluate(target,
+  dataset)` with no kwargs, so a per-call argument never reaches it.
+- **A throttled example is not a bad answer.** Transient failures (429, 5xx,
+  timeouts) are retried with backoff, and one that outlives its retries is
+  counted in `report.n_transient_errors` and excluded from the score. Scoring it
+  zero would bias systematically, not randomly: the candidate evaluated while
+  the provider was busiest would score lowest, and the optimizer would select
+  for luck. Genuine agent errors are never retried and still score zero.
 - **A structured (non-text) output survives extraction unchanged**, so score it
   with `json_subset` or a custom callable rather than `exact_match`.
 - **Unlabeled rows are fine** for judge-graded evals; `expected` is optional.

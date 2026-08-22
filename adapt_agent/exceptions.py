@@ -49,4 +49,17 @@ __all__ = [
     "SkillError",
     "AdapterError",
     "MissingDependencyError",
+    "IncompleteEvaluationError",
 ]
+
+
+class IncompleteEvaluationError(AdaptError):
+    """An evaluation could not score every row, and the caller needs all of them.
+
+    Raised when an optimizer's *baseline* stays incomplete after a re-run.
+    Every candidate is compared against the baseline, so a score computed over
+    a subset of the dataset makes the whole search meaningless -- and it fails
+    quietly: the inflated baseline is unbeatable, so the run ends reporting the
+    starting configuration, which is indistinguishable from "nothing improved".
+    Better to stop and say so.
+    """

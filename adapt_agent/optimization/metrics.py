@@ -14,12 +14,14 @@ All built-ins are pure-Python and dependency-free.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import re
 from collections.abc import Callable, Sequence
 from typing import Any
 
 from .extractors import extract_output_text
+from .retry import note_declared_fallback
 
 #: A bare metric function. Either ``(output, expected)`` or, for example-aware
 #: metrics wrapped in :class:`Metric`, ``(output, expected, example)``.
@@ -40,22 +42,73 @@ class Metric:
             :func:`~adapt_agent.optimization.extractors.extract_output_payload`
             over ``extract_output_text``, so the structure a structural metric
             needs is not flattened away before it runs.
+        on_error: Score to record when this metric fails *permanently* -- it
+            raised, and the harness classified the error as a real failure
+            rather than throttling. ``None`` means no opinion, and the harness
+            records ``0.0``.
+
+            This exists because a metric can have a documented fallback of its
+            own: :meth:`~adapt_agent.optimization.judge.LLMJudge.as_metric`
+            sets it from the judge's ``on_error``, so a judge configured with
+            ``on_error=0.7`` scores a grading failure the same whether it is
+            called directly or through a harness. A transient failure ignores
+            this: that row is excluded from the aggregate, so no score it could
+            carry would be read.
     """
 
     def __init__(
-        self, name: str, fn: MetricFn, *, needs_example: bool = False, structural: bool = False
+        self,
+        name: str,
+        fn: MetricFn,
+        *,
+        needs_example: bool = False,
+        structural: bool = False,
+        on_error: float | None = None,
     ):
         self.name = name
         self.fn = fn
         self.needs_example = needs_example
         self.structural = structural
+        self.on_error = None if on_error is None else _clamp(on_error)
 
     def __call__(self, output: Any, expected: Any, example: Any = None) -> float:
-        if self.needs_example:
-            raw = self.fn(output, expected, example)
-        else:
-            raw = self.fn(output, expected)
+        try:
+            if self.needs_example:
+                raw = self.fn(output, expected, example)
+            else:
+                raw = self.fn(output, expected)
+        except Exception as exc:
+            # The fallback belongs to the failure, so it travels with it. A
+            # metric can dispatch to another -- `checks` routes each row to the
+            # scorer that row declares -- and the harness only ever sees the
+            # outermost one, whose `on_error` says nothing about the metric
+            # that actually raised. Noting it here covers any depth of
+            # wrapping, and `note_declared_fallback` keeps the innermost:
+            # the metric nearest the failure is the one that answers for it.
+            if self.on_error is not None:
+                note_declared_fallback(exc, self.on_error)
+            raise
         return _clamp(raw)
+
+    def renamed(self, name: str) -> Metric:
+        """This metric under a different reporting name, everything else intact.
+
+        The mapping form of ``metrics`` renames each entry after its key, and
+        both places that do it used to rebuild the metric by hand, listing the
+        fields to carry. A list of fields beside a constructor that owns them
+        goes stale the first time the constructor grows: ``structural`` was
+        dropped that way once -- a renamed ``field_match`` scored a
+        model-returning agent ``0.0`` -- and ``on_error`` was dropped the same
+        way the round it was added, turning a judge's declared ``0.7`` fallback
+        back into a hard zero.
+
+        So the copy is whole rather than enumerated, and a field added later is
+        carried without anyone remembering to. Copying also keeps a subclass a
+        subclass, which rebuilding through ``Metric(...)`` did not.
+        """
+        clone = copy.copy(self)
+        clone.name = name
+        return clone
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return f"Metric(name={self.name!r}, needs_example={self.needs_example})"
