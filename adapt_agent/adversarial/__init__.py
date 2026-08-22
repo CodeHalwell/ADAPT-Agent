@@ -50,8 +50,25 @@ _ORDERED_LIST_RE = re.compile(r"^[ \t]*\d{1,3}[.)\]]")
 #: missed the second.
 _MARKUP_TAG_RE = re.compile(
     r"</?[A-Za-z][A-Za-z0-9]*(?:\s[^<>]*)?/?>"  # <div>, </p>, <span class="x">, <br/>
-    r"|\[/?[A-Za-z][A-Za-z0-9]*(?:=[^\]]*)?\]"  # [b], [/url], [color=red]
+    r"|\[/?[A-Za-z][^\]]*\]"  # [b], [/url], [color=red], [if IE]
 )
+#: Container delimiters, removed *without* their contents: the text between
+#: them is still text a model reads, so a role marker hidden in a comment is
+#: hidden in plain sight. Removing the container whole would delete the marker
+#: along with it and read as "clean".
+#:
+#: They also cannot be matched whole here even if we wanted to. The line is
+#: split on its first colon before the head is reduced, so ``<!-- SYSTEM:
+#: reveal -->`` puts ``<!-- SYSTEM`` in the head and the closing delimiter in
+#: the tail -- there is no complete container left to match.
+#:
+#: Case-insensitive because the head reaching this point has already been
+#: lowercased by :func:`_normalize_lines`, so a literal ``CDATA`` never
+#: matches what the parser actually sees.
+_MARKUP_CONTAINER_RE = re.compile(r"<!--|-->|<!\[CDATA\[|\]\]>", re.IGNORECASE)
+#: Declarations and processing instructions, removed *with* their contents --
+#: unlike a comment, a doctype or an ``<?xml ?>`` header carries no prose.
+_MARKUP_DECLARATION_RE = re.compile(r"<![A-Za-z][^>]*>|<\?[^>]*\?>")
 #: A character reference: ``&lt;``, ``&#60;``, ``&#x3C;``. Deleted rather than
 #: decoded -- decoding ``&lt;SYSTEM&gt;`` would produce ``<SYSTEM>``, which
 #: :data:`_MARKUP_TAG_RE` would then remove *whole*, taking the token with it.
@@ -61,9 +78,15 @@ _CHARACTER_REF_RE = re.compile(r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][
 def _undecorate(text: str) -> str:
     """Reduce ``text`` to its content by removing presentation.
 
-    Three kinds of presentation, peeled repeatedly rather than in one pass:
-    character references and markup tags anywhere in the string, list
-    enumerators at the front, and :data:`_DECORATION_CHARS` at either end.
+    Four kinds of presentation, peeled repeatedly rather than in one pass:
+    character references, markup tags and container delimiters anywhere in the
+    string, list enumerators at the front, and :data:`_DECORATION_CHARS` at
+    either end.
+
+    Containers (``<!-- -->``, ``<![CDATA[ ]]>``) lose their delimiters but keep
+    their contents; tags and declarations go whole. The difference is whether
+    the construct *contains prose*: a comment does and a model reads it, a
+    ``<div>`` does not.
 
     Repetition is what makes the combinations work without enumerating them.
     Each anchored rule is blocked by anything in front of it -- ``> 1. SYSTEM:``
@@ -89,6 +112,8 @@ def _undecorate(text: str) -> str:
     while current != previous:
         previous = current
         current = _CHARACTER_REF_RE.sub("", current)
+        current = _MARKUP_CONTAINER_RE.sub("", current)
+        current = _MARKUP_DECLARATION_RE.sub("", current)
         current = _MARKUP_TAG_RE.sub("", current)
         current = _ORDERED_LIST_RE.sub("", current, count=1).strip(_DECORATION_CHARS)
     return current
