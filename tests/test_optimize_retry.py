@@ -986,3 +986,105 @@ def test_a_validation_pass_that_recovers_on_the_re_run_is_complete() -> None:
 
     assert evaluations["n"] == 2
     assert report.is_complete is True
+
+
+def _tunable_agent(throttle_on: set[str], *, throttle_times: int | None = None):
+    """A minimal optimizable agent that throttles on the named inputs.
+
+    One prompt knob with two candidates, so the search has something to do and
+    `optimize()` runs end to end. `throttle_times` bounds how many times each
+    named input throttles before it starts succeeding -- that is what separates
+    a re-running validation path from a single-shot one.
+    """
+    from adapt_agent.optimization.parameters import Parameter, ParameterKind
+    from adapt_agent.optimization.target import wrap
+
+    state = {"prompt": "BAD"}
+    thrown: dict[str, int] = {}
+
+    def runner(question: str) -> str:
+        if question in throttle_on:
+            seen = thrown.get(question, 0)
+            if throttle_times is None or seen < throttle_times:
+                thrown[question] = seen + 1
+                raise RuntimeError("429 Too Many Requests")
+        return "ok" if state["prompt"] == "GOOD" else "wrong"
+
+    parameter = Parameter(
+        name="prompt",
+        kind=ParameterKind.PROMPT,
+        candidates=["BAD", "GOOD"],
+        getter=lambda: state["prompt"],
+        setter=lambda v: state.__setitem__("prompt", v),
+    )
+    return wrap(runner, runner=runner, parameters=[parameter])
+
+
+def _build_optimizer(name: str, harness):
+    """`GridSearchOptimizer` directly, and the same wrapped in a pipeline.
+
+    Both override `optimize()`, so both need their own validation wiring.
+    """
+    import adapt_agent.optimization.optimizers as optimizers
+
+    grid = optimizers.GridSearchOptimizer(harness, seed=0)
+    if name == "GridSearchOptimizer":
+        return grid
+    return optimizers.PipelineOptimizer(harness, [grid])
+
+
+@pytest.mark.parametrize("optimizer_name", ["GridSearchOptimizer", "PipelineOptimizer"])
+def test_optimize_surfaces_an_incomplete_validation_end_to_end(optimizer_name: str) -> None:
+    """The wiring, not just the helper.
+
+    `_evaluate_validation` had its own tests while both `optimize()` methods
+    still called `harness.evaluate` directly -- so the helper was correct and
+    unreachable, which is the shape of the original finding. This drives the
+    public entry point and reads the flag off the result.
+    """
+    train = GoldenDataset([Example(inputs="q0", expected="ok")])
+    val = GoldenDataset(
+        [Example(inputs="v_ok", expected="ok"), Example(inputs="v_throttled", expected="ok")]
+    )
+    agent = _tunable_agent({"v_throttled"})
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+
+    result = _build_optimizer(optimizer_name, harness).optimize(agent, train, val_dataset=val)
+
+    assert result.validation_complete is False, "a partial validation reported as whole"
+    assert result.validation_score is not None, "the partial score is still returned"
+
+
+@pytest.mark.parametrize("optimizer_name", ["GridSearchOptimizer", "PipelineOptimizer"])
+def test_optimize_reports_a_clean_validation_as_complete(optimizer_name: str) -> None:
+    train = GoldenDataset([Example(inputs="v_ok", expected="ok")])
+    val = GoldenDataset([Example(inputs="v_ok", expected="ok")])
+    agent = _tunable_agent(set())
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+
+    result = _build_optimizer(optimizer_name, harness).optimize(agent, train, val_dataset=val)
+
+    assert result.validation_complete is True
+
+
+@pytest.mark.parametrize("optimizer_name", ["GridSearchOptimizer", "PipelineOptimizer"])
+def test_optimize_re_runs_a_throttled_validation_pass(optimizer_name: str) -> None:
+    """The assertion that separates the two paths.
+
+    A permanently throttled hold-out reports `validation_complete=False` whether
+    `optimize()` calls `_evaluate_validation` or `harness.evaluate` directly, so
+    that alone does not pin the wiring. Only the re-run does: this row fails once
+    and then succeeds, so a single-shot call reports it partial forever.
+    """
+    train = GoldenDataset([Example(inputs="v_ok", expected="ok")])
+    val = GoldenDataset(
+        [Example(inputs="v_ok", expected="ok"), Example(inputs="v_flaky", expected="ok")]
+    )
+    # `attempts=1` means no in-harness retry, so recovery can only come from the
+    # optimizer re-running the whole pass.
+    agent = _tunable_agent({"v_flaky"}, throttle_times=1)
+    harness = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1))
+
+    result = _build_optimizer(optimizer_name, harness).optimize(agent, train, val_dataset=val)
+
+    assert result.validation_complete is True, "validation did not go through _evaluate_validation"

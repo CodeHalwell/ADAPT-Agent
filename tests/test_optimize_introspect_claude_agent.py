@@ -55,9 +55,17 @@ def test_an_unset_foreign_attribute_does_not_block_detection() -> None:
     returned None, `introspect` returned [], and the whole framework looked like
     it had no tunable knobs. An attribute that exists but holds nothing is not
     evidence of another framework.
+
+    The falsy markers here are ones still listed in `_FOREIGN_ATTRS`. `agents`
+    was dropped from that list entirely, so asserting on it alone would pass
+    against a `hasattr` veto and leave the populated-value rule unguarded.
     """
     options = types.SimpleNamespace(
-        system_prompt="You are helpful.", allowed_tools=["Read"], agents=None
+        system_prompt="You are helpful.",
+        allowed_tools=["Read"],
+        agents=None,
+        handoffs=[],
+        sub_agents=None,
     )
     assert _predicate(options) is True
     assert detect(options) == "claude_agent"
