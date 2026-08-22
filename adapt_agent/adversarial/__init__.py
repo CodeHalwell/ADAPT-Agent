@@ -408,24 +408,63 @@ _INLINE_DISPLAYS = frozenset(
 #: ``data-style`` and friends, and the value alternatives are disjoint by their
 #: first character, so the parse stays linear on untrusted text.
 _STYLE_ATTR_RE = re.compile(r"(?<![\w-])style\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]*)")
-#: A ``display`` declaration inside that value. Only the first word of the
-#: value is taken, which is the outer display type in the two-value syntax
-#: (``display: block flow``).
-_DISPLAY_RE = re.compile(r"(?:^|[;\s\"'{])display\s*:\s*([\w-]+)")
+#: A ``display`` declaration inside that value, and whether it is
+#: ``!important``. Only the first word of the value is taken, which is the
+#: outer display type in the two-value syntax (``display: block flow``).
+_DISPLAY_RE = re.compile(
+    r"(?:^|[;\s\"'{])display\s*:\s*([\w-]+)[^;]*?(!\s*important)?\s*(?=;|$|\"|')",
+    re.IGNORECASE,
+)
 #: The ``hidden`` content attribute, which renders the element not at all --
 #: the same as ``display:none`` for the only question asked here.
 _HIDDEN_ATTR_RE = re.compile(r"(?<=[\s\"'])hidden(?=[\s/>=])")
 
 
 def _declared_display(construct: str) -> str | None:
-    """The ``display`` an inline style gives ``construct``, if it gives one."""
-    if _HIDDEN_ATTR_RE.search(construct):
-        return "none"
+    """The ``display`` in effect for ``construct``, if anything declares one.
+
+    A declaration block can name ``display`` more than once, and taking the
+    first match read the losing declaration: ``display:inline;display:block``
+    resolved to ``inline``, so a marker behind it stayed hidden -- and
+    ``display:block;display:inline`` resolved to ``block`` and split a line a
+    renderer keeps whole. Wrong in both directions, like the element-name rule
+    it was written to fix.
+
+    The cascade inside one block is two rules, and only two: an ``!important``
+    declaration beats a normal one, and among equals the **last** wins. There
+    is no specificity or origin to weigh here, because a ``style`` attribute is
+    a single block. A repeated *attribute* needs no rule either -- HTML keeps
+    the first ``style`` on an element and ignores the rest, which is what
+    :meth:`re.Pattern.search` already does.
+
+    A value CSS would reject as invalid (``display:bogus``) is kept rather than
+    dropped, so it resolves to "not inline" and splits. That is the safe
+    direction -- a needless split costs a candidate run that finds nothing,
+    while dropping it could merge two rendered lines -- and closing it properly
+    would mean enumerating every valid display value, which is the list-beside-
+    a-rule shape this module keeps getting caught by.
+
+    An author declaration also beats the ``hidden`` attribute, because
+    ``[hidden] { display: none }`` lives in the UA stylesheet: ``<span hidden
+    style="display:block">`` really is a block. ``hidden`` itself is honoured
+    for *any* value, ``until-found`` included, which is not what a browser does
+    -- but the content of a hidden element is still text a model reads, so
+    treating it as its own run rather than merging it into the visible line is
+    the answer this check wants either way.
+    """
     style = _STYLE_ATTR_RE.search(construct)
-    if style is None:
-        return None
-    declaration = _DISPLAY_RE.search(style.group(1))
-    return declaration.group(1) if declaration is not None else None
+    if style is not None:
+        normal: str | None = None
+        important: str | None = None
+        for declaration in _DISPLAY_RE.finditer(style.group(1)):
+            if declaration.group(2) is not None:
+                important = declaration.group(1)
+            else:
+                normal = declaration.group(1)
+        resolved = important if important is not None else normal
+        if resolved is not None:
+            return resolved.lower()
+    return "none" if _HIDDEN_ATTR_RE.search(construct) else None
 
 
 def _is_line_boundary(construct: str) -> bool:
