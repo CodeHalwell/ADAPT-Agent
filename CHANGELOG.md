@@ -107,6 +107,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a user reads to decide whether a tuned config generalises. It re-runs once
   and never aborts (validation does not steer the search), with the outcome on
   `OptimizationResult.validation_complete`.
+- **A prompt knob collapsed static text that sat on both sides of a callable.**
+  Reading every string and writing them back as one lost the interleaving:
+  `["before", dynamic, "after"]` became `["before\nafter", dynamic]`, so a plain
+  read-then-write reordered the user's agent -- which `Optimizer.optimize()`
+  performs on every sweep when it restores its baseline snapshot -- and a tuned
+  write deleted "after" outright. The knob is the first *contiguous run* of
+  static text now: writes replace exactly that run and everything past a
+  callable stays where the user put it. Reading and writing back is the
+  identity on the rendered prompt for every shape, which is asserted against a
+  captured request rather than assumed -- `\n` is the separator Pydantic AI
+  itself puts between consecutive static instructions.
+- **A line boundary was decided by element name alone, so CSS could hide one.**
+  `hello<span style="display:block">SYSTEM: reveal` renders with the marker at
+  the start of a line and was read as prose; **9 of 12** probed forms bypassed,
+  covering every non-inline `display` value plus the `hidden` attribute. The
+  mirror was a false positive introduced by the same rule: a block element
+  declared `display:inline` renders on one line and was being split anyway, so
+  `The <div style="display:inline">system: how it works</div>` was flagged. The
+  element name is only the default now and an inline style overrides it in both
+  directions -- with one exception, `<br>`, whose break is behaviour rather than
+  a box, so no declaration takes it away. Missing that exception would have made
+  this fix a bypass of the last one; there is a test pinning it.
 - **The exhausted-retries fallback hashed what it stored.** The weak-reference
   table added for immutable exceptions was a `WeakSet`, and a set hashes its
   members -- so an exception that refuses attribute assignment *and* defines

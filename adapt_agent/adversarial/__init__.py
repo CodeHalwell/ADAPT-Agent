@@ -372,10 +372,79 @@ _INLINE_ELEMENTS = frozenset(
 _ELEMENT_NAME_RE = re.compile(r"[<\[]\s*/?\s*([A-Za-z][A-Za-z0-9._:-]*)")
 
 
+#: Elements whose break is not a box, so no ``display`` can take it away.
+#: ``<br>`` forces a line break as its *behaviour*; ``display:inline`` on one
+#: changes nothing, and honouring the declaration there would have turned this
+#: fix into a bypass of the previous one.
+_FORCED_BREAK_ELEMENTS = frozenset({"br"})
+
+#: ``display`` values that keep a box inside the line it sits in.
+#:
+#: Enumerated in the same direction, and for the same reason, as
+#: :data:`_INLINE_ELEMENTS`: an omission here splits a line a renderer keeps
+#: whole, which the unsplit line still covers, while the reverse hides a
+#: marker. Everything else -- ``block``, ``flex``, ``grid``, ``table``,
+#: ``list-item``, ``flow-root``, and ``none``, whose box is not rendered at all
+#: and so cannot continue the line -- is a boundary.
+_INLINE_DISPLAYS = frozenset(
+    {
+        "contents",
+        "inline",
+        "inline-block",
+        "inline-flex",
+        "inline-grid",
+        "inline-list-item",
+        "inline-table",
+        "math",
+        "ruby",
+        "ruby-base",
+        "ruby-base-container",
+        "ruby-text",
+        "ruby-text-container",
+    }
+)
+
+#: A ``style`` attribute and its value. The name is guarded against
+#: ``data-style`` and friends, and the value alternatives are disjoint by their
+#: first character, so the parse stays linear on untrusted text.
+_STYLE_ATTR_RE = re.compile(r"(?<![\w-])style\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]*)")
+#: A ``display`` declaration inside that value. Only the first word of the
+#: value is taken, which is the outer display type in the two-value syntax
+#: (``display: block flow``).
+_DISPLAY_RE = re.compile(r"(?:^|[;\s\"'{])display\s*:\s*([\w-]+)")
+#: The ``hidden`` content attribute, which renders the element not at all --
+#: the same as ``display:none`` for the only question asked here.
+_HIDDEN_ATTR_RE = re.compile(r"(?<=[\s\"'])hidden(?=[\s/>=])")
+
+
+def _declared_display(construct: str) -> str | None:
+    """The ``display`` an inline style gives ``construct``, if it gives one."""
+    if _HIDDEN_ATTR_RE.search(construct):
+        return "none"
+    style = _STYLE_ATTR_RE.search(construct)
+    if style is None:
+        return None
+    declaration = _DISPLAY_RE.search(style.group(1))
+    return declaration.group(1) if declaration is not None else None
+
+
 def _is_line_boundary(construct: str) -> bool:
-    """Return ``True`` when ``construct`` ends the rendered line it sits in."""
+    """Return ``True`` when ``construct`` ends the rendered line it sits in.
+
+    The element name is only the *default* answer. A ``style`` attribute
+    overrides it in both directions -- ``<span style="display:block">`` starts
+    a line and ``<div style="display:inline">`` does not -- and reading the
+    name alone left the first as a bypass and the second as a false positive
+    on ordinary prose.
+    """
     name = _ELEMENT_NAME_RE.match(construct)
-    return name is None or name.group(1).lower() not in _INLINE_ELEMENTS
+    element = name.group(1).lower() if name is not None else None
+    if element in _FORCED_BREAK_ELEMENTS:
+        return True
+    display = _declared_display(construct)
+    if display is not None:
+        return display not in _INLINE_DISPLAYS
+    return element is None or element not in _INLINE_ELEMENTS
 
 
 def _content_segments(normalized: str) -> list[str]:

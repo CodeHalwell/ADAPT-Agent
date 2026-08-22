@@ -83,33 +83,65 @@ def _is_populated(value: Any) -> bool:
     return isinstance(value, (list, tuple)) and bool(value)
 
 
+def _first_static_run(value: Any) -> tuple[int, int]:
+    """The half-open index range of the first unbroken run of strings.
+
+    A prompt sequence can hold static text on *both* sides of a callable, and
+    a single string cannot represent that without choosing an order. Reading
+    all the strings and writing them back as one collapsed the interleaving --
+    ``["before", dynamic, "after"]`` became ``["before\nafter", dynamic]``, so
+    a plain read-then-write reordered the agent, and a tuned write deleted
+    "after" outright.
+
+    So the knob is one *run*: contiguous static text, with everything on the
+    far side of a callable left exactly where the user put it. For the common
+    shapes -- all strings, strings then callables, callables then strings --
+    the run is the whole of the static text and nothing is left out.
+    """
+    if not isinstance(value, (list, tuple)):
+        return (0, 0)
+    start = next((i for i, item in enumerate(value) if isinstance(item, str)), None)
+    if start is None:
+        return (0, 0)
+    end = start
+    while end < len(value) and isinstance(value[end], str):
+        end += 1
+    return (start, end)
+
+
 def _sequence_prompt_param(obj: Any, attr: str, wrap: Any, component: str) -> Parameter:
     """Bind the static prompt text held in the sequence at ``obj.<attr>``.
 
-    Reads join the string elements; writes replace them with the new text *in
-    place*, leaving any callables where they were. Replacing the sequence
-    wholesale would delete the agent's dynamic instructions, and joining it
-    wholesale would raise on the first callable.
+    Reads join the first run of static text; writes replace exactly that run,
+    leaving callables -- and any static text beyond them -- where they were.
+    Replacing the sequence wholesale would delete the agent's dynamic
+    instructions, joining it wholesale would raise on the first callable, and
+    collapsing every string into one would reorder the sequence and drop
+    whatever sat past the callable. See :func:`_first_static_run`.
+
+    ``"\n"`` is the separator Pydantic AI itself puts between consecutive
+    static instructions, so reading a run and writing it back unchanged leaves
+    the rendered prompt byte-identical.
     """
 
     def _getter() -> Any:
         prompts = getattr(obj, attr, None)
         if prompts is None:
             return None
-        return "\n".join(_string_elements(prompts))
+        start, end = _first_static_run(prompts)
+        return "\n".join(prompts[start:end])
 
     def _setter(value: Any) -> None:
-        replaced: list[Any] = []
-        placed = False
-        for item in getattr(obj, attr, None) or ():
-            if isinstance(item, str):
-                if not placed:
-                    replaced.append(value)
-                    placed = True
-            else:
-                replaced.append(item)
-        if not placed:
-            replaced.insert(0, value)
+        current = list(getattr(obj, attr, None) or ())
+        start, end = _first_static_run(current)
+        if start == end:  # no static text yet: the new prompt goes in front
+            # ...unless there is no prompt either. Writing back the empty value
+            # a callable-only field reads must leave that field untouched, or
+            # the round trip an optimizer performs on every sweep grows an
+            # empty instruction each time.
+            replaced = [value, *current] if value else list(current)
+        else:
+            replaced = [*current[:start], value, *current[end:]]
         setattr(obj, attr, wrap(replaced))
 
     return Parameter(

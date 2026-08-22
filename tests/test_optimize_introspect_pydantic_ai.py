@@ -259,3 +259,119 @@ def test_a_real_agent_with_a_dynamic_instruction_binds_its_static_text(kwarg: st
     prompts[0].write("Be brief.")
     populated = "_instructions" if kwarg == "instructions" else "_system_prompts"
     assert list(getattr(agent, populated)) == ["Be brief.", _dynamic]
+
+
+# -- static text can sit on both sides of a callable ---------------------------
+#
+# Reading every string and writing them back as one collapsed the interleaving:
+# `["before", dynamic, "after"]` became `["before\nafter", dynamic]`, so a plain
+# read-then-write reordered the user's agent and a tuned write deleted "after".
+# The knob is one contiguous run now, and everything past a callable stays put.
+
+
+class InterleavedAgent:
+    """A Pydantic AI agent with static text on both sides of a callable."""
+
+    def __init__(self, instructions: list[object]) -> None:
+        self.model = "openai:gpt-4o"
+        self._system_prompts: tuple[object, ...] = ()
+        self._instructions: list[object] = instructions
+
+    def run_sync(self, prompt: str) -> str:  # pragma: no cover - never called
+        return prompt
+
+
+@pytest.mark.parametrize(
+    ("instructions", "expected_value"),
+    [
+        (["before", _dynamic, "after"], "before"),
+        ([_dynamic, "mid", _dynamic], "mid"),
+        (["a", "b", _dynamic], "a\nb"),
+        (["only"], "only"),
+    ],
+    ids=["between", "surrounded", "adjacent-pair", "single"],
+)
+def test_the_prompt_is_the_first_run_of_static_text(
+    instructions: list[object], expected_value: str
+) -> None:
+    agent = InterleavedAgent(list(instructions))
+    prompt = next(p for p in introspect(agent) if p.kind is ParameterKind.PROMPT)
+    assert prompt.value == expected_value
+
+
+@pytest.mark.parametrize(
+    ("instructions", "after_write"),
+    [
+        (["before", _dynamic, "after"], ["TUNED", _dynamic, "after"]),
+        ([_dynamic, "mid", _dynamic], [_dynamic, "TUNED", _dynamic]),
+        (["a", "b", _dynamic], ["TUNED", _dynamic]),
+        ([_dynamic], ["TUNED", _dynamic]),
+    ],
+    ids=["between", "surrounded", "adjacent-pair", "callable-only"],
+)
+def test_a_write_replaces_the_run_and_moves_nothing_else(
+    instructions: list[object], after_write: list[object]
+) -> None:
+    agent = InterleavedAgent(list(instructions))
+    prompt = next(p for p in introspect(agent) if p.kind is ParameterKind.PROMPT)
+    prompt.write("TUNED")
+    assert agent._instructions == after_write
+
+
+def test_reading_and_writing_back_changes_nothing() -> None:
+    """`Optimizer.optimize` restores its snapshot, so this runs on every sweep.
+
+    A knob whose round-trip is not the identity mutates the user's agent just
+    by being optimized over, whether or not any candidate wins.
+    """
+    for instructions in (
+        ["before", _dynamic, "after"],
+        [_dynamic, "mid", _dynamic],
+        ["only"],
+        [_dynamic],
+    ):
+        agent = InterleavedAgent(list(instructions))
+        prompt = next(p for p in introspect(agent) if p.kind is ParameterKind.PROMPT)
+        prompt.write(prompt.value)
+        assert agent._instructions == instructions
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("pydantic_ai") is None,
+    reason="pydantic-ai is not installed",
+)
+@pytest.mark.parametrize(
+    "instructions",
+    [["before", _dynamic, "after"], [_dynamic, "mid", _dynamic], ["a", "b", _dynamic], ["only"]],
+    ids=["between", "surrounded", "adjacent-pair", "single"],
+)
+def test_a_real_round_trip_leaves_the_rendered_prompt_identical(
+    instructions: list[object],
+) -> None:
+    """The property that matters is the text the model receives, not the list.
+
+    An adjacent pair does collapse into one element -- two strings cannot be
+    recovered from their join -- and that is safe only because `\n` is the
+    separator Pydantic AI puts between them, which this asserts rather than
+    assumes.
+    """
+    import pydantic_ai  # type: ignore[import-not-found]
+    from pydantic_ai.models.test import TestModel  # type: ignore[import-not-found]
+
+    def rendered(agent: object) -> list[str]:
+        captured: list[object] = []
+
+        class _Capture(TestModel):  # type: ignore[misc]
+            async def request(self, messages, *args, **kwargs):  # type: ignore[no-untyped-def]
+                captured.append(messages)
+                return await super().request(messages, *args, **kwargs)
+
+        agent.model = _Capture()  # type: ignore[attr-defined]
+        agent.run_sync("hi")  # type: ignore[attr-defined]
+        return [m.instructions for m in captured[0] if getattr(m, "instructions", None)]
+
+    before = rendered(pydantic_ai.Agent("test", instructions=list(instructions)))
+    agent = pydantic_ai.Agent("test", instructions=list(instructions))
+    prompt = next(p for p in introspect(agent) if p.kind is ParameterKind.PROMPT)
+    prompt.write(prompt.value)
+    assert rendered(agent) == before
