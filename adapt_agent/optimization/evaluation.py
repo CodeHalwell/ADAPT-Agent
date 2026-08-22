@@ -286,19 +286,27 @@ class EvaluationReport:
         instruction still gets wrong", and "the provider throttled you" is not
         evidence about the instruction.
 
-        That holds per metric, not just per row. ``r.transient`` speaks for the
-        *primary*, so selecting on a throttled secondary would otherwise return
-        every row it never measured -- their scores are placeholder zeros, and
-        handing them to a proposer as failures blames the agent for the
-        provider's congestion.
+        That holds per metric, not just per row, and in both directions.
+        ``r.transient`` and ``r.error`` speak for the *primary*, so keying off
+        them excluded rows where the *selected* metric measured perfectly well
+        and scored badly -- hiding genuine failures, and disagreeing with
+        :meth:`below` on the same data. :attr:`ExampleResult.transient_metrics`
+        is the only per-metric signal, and a transient failure of the agent call
+        names every metric there, so it is sufficient on its own.
+
+        ``r.error`` still force-includes, but only when it is a real agent
+        failure: on a row whose primary metric was throttled it holds the
+        marker ``"transient metric failure"``, which says nothing about a
+        secondary that scored fine.
         """
         name = metric or self.primary_metric
         cutoff = self.failure_threshold if threshold is None else threshold
         out: list[ExampleResult] = []
         for r in self.results:
-            if r.transient or name in r.transient_metrics:
+            if name in r.transient_metrics:
                 continue
-            if r.error is not None or r.scores.get(name, 0.0) < cutoff:
+            agent_failed = r.error is not None and not r.transient
+            if agent_failed or r.scores.get(name, 0.0) < cutoff:
                 out.append(r)
         return out
 

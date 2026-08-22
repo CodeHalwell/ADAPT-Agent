@@ -1372,3 +1372,67 @@ def test_the_judge_kwarg_list_is_derived_not_hand_written() -> None:
 
     expected = set(inspect.signature(LLMJudge.__init__).parameters) - {"self", "complete"}
     assert set(judges._JUDGE_KW) == expected
+
+
+def test_a_throttled_primary_does_not_hide_a_real_secondary_failure() -> None:
+    """The complement of the previous fix, and the same asymmetry again.
+
+    Scoping the *exclusion* to `transient_metrics` stopped throttling being
+    reported as an agent failure. But `failures()` still keyed its skip off
+    `r.transient` and `r.error`, which speak for the primary -- so a secondary
+    that measured every row and genuinely scored 0.3 was dropped, while
+    `below()` returned those same rows. Two selectors disagreeing on the same
+    data, with the one used by proposers hiding real failures.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [Metric("primary", throttled), Metric("secondary", lambda o, e: 0.3)],
+        retry=RetryPolicy(attempts=1),
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert len(report.failures(metric="secondary")) == 4, "a real failure was hidden"
+    assert len(report.below("secondary", 1.0)) == 4
+    assert report.failures(metric="primary") == [], "the throttled metric has no failures to report"
+
+
+def test_a_transient_primary_does_not_force_include_a_healthy_secondary() -> None:
+    """`r.error` holds a marker, not an agent failure, on a throttled row.
+
+    Dropping the `r.transient` skip without also scoping the error
+    force-include would swing the bug the other way: every row listed as a
+    failure of a secondary that scored perfectly.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [Metric("primary", throttled), exact_match()], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.results[0].error == "transient metric failure", "the marker is still set"
+    assert report.failures(metric="exact_match") == []
+
+
+def test_a_permanent_agent_error_still_force_includes_every_metric() -> None:
+    """Scoping the error check must not lose the genuine-failure case."""
+    from adapt_agent.optimization.metrics import Metric
+
+    def broken(payload):
+        raise ValueError("bad prompt")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [exact_match(), Metric("secondary", lambda o, e: 1.0)], retry=RetryPolicy(attempts=1)
+    ).evaluate(broken, dataset)
+
+    # Force-included on the error even though `secondary` would have scored 1.0.
+    assert len(report.failures()) == 4
+    assert len(report.failures(metric="secondary")) == 4

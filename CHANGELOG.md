@@ -123,6 +123,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as a unit -- so `**SYSTEM**:`, `` `SYSTEM`: ``, `__SYSTEM__:` and
   `1. SYSTEM:` are caught, while `2024: a year in review` and `1. system
   design: how it works` stay clean.
+- **…and then hid genuine secondary failures.** Scoping the *exclusion* to
+  `transient_metrics` stopped throttling being reported as an agent failure,
+  but `failures()` still keyed its skip off `r.transient` and `r.error`, which
+  speak for the primary. A secondary that measured every row and genuinely
+  scored `0.3` was dropped, while `below()` returned those same rows — two
+  selectors disagreeing on the same data, with the one proposers read hiding
+  the real failures. `transient_metrics` is the only per-metric signal and is
+  sufficient alone, since a transient *agent* failure names every metric there.
+  `r.error` still force-includes, but only when it is a real agent failure: on
+  a throttled row it holds the marker `"transient metric failure"`, which says
+  nothing about a secondary that scored fine.
 - **The retry policy could not reach any provider-specific judge.** `judges.py`
   listed the judge-side keyword arguments by hand, and its own comment claimed
   "everything except `complete`" while omitting `retry` — so
