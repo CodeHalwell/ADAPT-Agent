@@ -1193,3 +1193,101 @@ def test_validation_completeness_survives_serialisation() -> None:
     )
     assert whole.to_dict()["validation_complete"] is True
     assert whole._provenance()["validation_complete"] is True
+
+
+# -- the message is the weakest signal, so it speaks for the least -------------
+
+#: Deterministic defects whose text happens to mention a transient-sounding
+#: word. Retrying these wastes the budget and then drops the row from the
+#: score, hiding the very bug the run exists to surface.
+DETERMINISTIC_DEFECTS = [
+    ValueError("timeout must be positive"),
+    ValueError("invalid timeout value"),
+    ValueError("request timed out is not a valid state name"),
+    ValueError("connection reset is not a supported enum member"),
+    ValueError("order 500 not found"),
+    ValueError("customer overloaded the cart with 200 items"),
+    TypeError("expected int for timeout, got str"),
+    KeyError("timeout"),
+    AssertionError("expected 429 items, got 3"),
+    IndexError("429"),
+]
+
+#: Status numbers need status *context*. A bare number in a message is data.
+BARE_NUMBERS = [
+    "order 429 not found",
+    "expected 500 tokens, got 3",
+    "batch 503 complete",
+    "user 408 deleted",
+]
+
+STATUS_PHRASINGS = [
+    "429 Too Many Requests",
+    "Error code: 429",
+    "HTTP 503",
+    "status 500",
+    "(status code: 429)",
+    "503 Service Unavailable",
+    "504",
+]
+
+
+@pytest.mark.parametrize("exc", DETERMINISTIC_DEFECTS, ids=lambda e: type(e).__name__ + str(e)[:24])
+def test_a_deterministic_defect_is_not_transient(exc: Exception) -> None:
+    assert is_transient_error(exc) is False
+
+
+@pytest.mark.parametrize("message", BARE_NUMBERS)
+def test_a_bare_status_number_is_not_status_context(message: str) -> None:
+    assert is_transient_error(RuntimeError(message)) is False
+
+
+@pytest.mark.parametrize("message", STATUS_PHRASINGS)
+def test_a_status_number_in_context_is_still_transient(message: str) -> None:
+    assert is_transient_error(RuntimeError(message)) is True
+
+
+def test_a_provider_subclass_of_a_builtin_keeps_message_matching() -> None:
+    """The gate is on the *exact* type, not `isinstance`.
+
+    A provider that subclasses `ValueError` for its own errors is not the
+    deterministic builtin the gate excludes, and its message is still the best
+    evidence available.
+    """
+
+    class ProviderError(ValueError):
+        pass
+
+    assert is_transient_error(ProviderError("Error code: 429")) is True
+    assert is_transient_error(ValueError("Error code: 429")) is False
+
+
+def test_the_escape_hatch_still_reaches_what_the_default_declines() -> None:
+    """A provider signalling throttling with a bare ValueError is documented as
+    out of scope for the default, so the custom predicate has to cover it."""
+    policy = RetryPolicy(attempts=2, is_transient=lambda exc: "throttled" in str(exc))
+    assert policy.should_retry(ValueError("throttled by quota"), 1) is True
+
+
+def test_a_throttled_metric_is_not_reported_as_a_failing_case() -> None:
+    """`failures()` feeds an LLM proposer "cases your instruction gets wrong".
+
+    Row-level transient status speaks for the primary, so selecting on a
+    throttled *secondary* returned every row it never measured -- placeholder
+    zeros presented as evidence against the agent.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [exact_match(), Metric("secondary", throttled)], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.failures() == []
+    assert report.failures(metric="secondary") == [], "throttling reported as agent failure"
+    assert report.below("secondary", 1.0) == []
+    # A metric that really did score badly is still reported.
+    assert len(report.below("exact_match", 2.0)) == 4

@@ -130,6 +130,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exclusion is driven by `transient_metrics` alone; the row flag now speaks
   only for completeness. A transient failure of the *agent call* names every
   metric, since there is no output for any of them to measure.
+- **A deterministic defect could be retried as if it were throttling.** The
+  message heuristic — the weakest of the three signals, after HTTP status and
+  exception type — ran for every exception, so `ValueError("timeout must be
+  positive")` classified as transient. That is the worst possible direction for
+  the error to go: the harness retries a bug, then *excludes* the row from the
+  score, hiding the defect the run exists to surface. Message matching is now
+  limited to types that could plausibly be provider-shaped (matched on the
+  exact type, so a provider subclassing `ValueError` keeps it), and a bare
+  status number needs status context — `429 Too Many Requests` and
+  `Error code: 429` still match, `order 429 not found` no longer does. 10 of 11
+  deterministic defects reclassified with no loss on genuine transients; use
+  `RetryPolicy(is_transient=...)` for a provider the default declines.
+- **Throttling was reported as an agent failure per metric.** `failures()` and
+  `below()` skipped rows whose *row* was transient, which speaks only for the
+  primary — so `failures(metric="secondary")` returned every row a throttled
+  secondary never measured, presenting placeholder zeros to an LLM proposer as
+  cases the instruction gets wrong. Both now skip rows where the selected
+  metric itself failed transiently.
 - **`validation_complete` was not serialised.** It existed only on the live
   object -- `to_dict()` and the provenance header both wrote
   `validation_score` with nothing to qualify it, so a persisted result or a

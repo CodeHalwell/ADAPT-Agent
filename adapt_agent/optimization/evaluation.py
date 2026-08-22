@@ -282,12 +282,18 @@ class EvaluationReport:
         omitted: this list is what gets handed to an LLM proposer as "cases your
         instruction still gets wrong", and "the provider throttled you" is not
         evidence about the instruction.
+
+        That holds per metric, not just per row. ``r.transient`` speaks for the
+        *primary*, so selecting on a throttled secondary would otherwise return
+        every row it never measured -- their scores are placeholder zeros, and
+        handing them to a proposer as failures blames the agent for the
+        provider's congestion.
         """
         name = metric or self.primary_metric
         cutoff = self.failure_threshold if threshold is None else threshold
         out: list[ExampleResult] = []
         for r in self.results:
-            if r.transient:
+            if r.transient or name in r.transient_metrics:
                 continue
             if r.error is not None or r.scores.get(name, 0.0) < cutoff:
                 out.append(r)
@@ -299,8 +305,15 @@ class EvaluationReport:
         Unlike :meth:`failures`, this looks only at the named metric's score and
         does **not** force-include errored examples (an errored example simply
         scores ``0.0`` and is included if that is below ``threshold``).
+
+        Rows where ``metric`` itself failed transiently are still skipped: it
+        has no score on them to be below anything, only a placeholder zero.
         """
-        return [r for r in self.results if r.scores.get(metric, 0.0) < threshold]
+        return [
+            r
+            for r in self.results
+            if metric not in r.transient_metrics and r.scores.get(metric, 0.0) < threshold
+        ]
 
     def to_dict(self) -> dict[str, Any]:
         return {

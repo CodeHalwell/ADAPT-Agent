@@ -77,7 +77,53 @@ _TRANSIENT_MESSAGE_FRAGMENTS = (
     "timeout",
 )
 
-_STATUS_WORD = re.compile(r"\b(408|409|425|429|500|502|503|504)\b")
+#: A status number in *status context* -- "Error code: 429", "HTTP 503",
+#: "429 Too Many Requests". A bare number is not enough: "order 500 not found"
+#: and "expected 429 items, got 3" are application errors, not throttling.
+_STATUS_CODES = "408|409|425|429|500|502|503|504"
+_STATUS_REASONS = (
+    "too many requests|request timeout|conflict|too early|internal server error|"
+    "bad gateway|service unavailable|gateway timeout"
+)
+_STATUS_WORD = re.compile(
+    rf"\b(?:error|status|statuscode|status_code|code|http|https?error)\b\W{{0,12}}"
+    rf"(?:{_STATUS_CODES})\b"
+    rf"|\b(?:{_STATUS_CODES})\b\W{{0,3}}(?:{_STATUS_REASONS})"
+    rf"|^\s*(?:{_STATUS_CODES})\s*$"
+)
+
+#: Exception types whose message says nothing about a provider. These are
+#: raised by deterministic logic -- argument validation, a missing key, a failed
+#: assertion -- so a message that happens to contain "timeout" or "429" is
+#: describing the *subject* of the error, not a fault to retry.
+#: ``ValueError("timeout must be positive")`` is the canonical case.
+#:
+#: Matched on the *exact* type, never ``isinstance``: a provider that subclasses
+#: ``ValueError`` for its own errors keeps message matching, and only the bare
+#: builtin is excluded. Type-name and HTTP-status checks still run for these --
+#: this gate is on the message heuristic alone, which is the weakest signal.
+_DETERMINISTIC_TYPES = frozenset(
+    {
+        ArithmeticError,
+        AssertionError,
+        AttributeError,
+        ImportError,
+        IndexError,
+        KeyError,
+        LookupError,
+        ModuleNotFoundError,
+        NameError,
+        NotImplementedError,
+        RecursionError,
+        StopAsyncIteration,
+        StopIteration,
+        SyntaxError,
+        TypeError,
+        UnboundLocalError,
+        ValueError,
+        ZeroDivisionError,
+    }
+)
 
 
 def _status_of(exc: BaseException) -> int | None:
@@ -107,6 +153,11 @@ def is_transient_error(exc: BaseException) -> bool:
     Checked in order of decreasing reliability: an explicit HTTP status, then
     the exception's type name, then its message. Never imports a provider SDK.
 
+    The message is only consulted for exceptions that could plausibly be
+    provider-shaped -- see :data:`_DETERMINISTIC_TYPES`. A provider that signals
+    throttling with a bare :class:`ValueError` and nothing else to go on would
+    be missed; pass ``RetryPolicy(is_transient=...)`` for that.
+
     A :class:`KeyboardInterrupt` / :class:`SystemExit` / ``CancelledError`` is
     never transient -- those mean *stop*, not *try again*.
     """
@@ -122,6 +173,14 @@ def is_transient_error(exc: BaseException) -> bool:
     names = _type_names(exc)
     if any(fragment in name for name in names for fragment in _TRANSIENT_TYPE_FRAGMENTS):
         return True
+
+    # The message is the weakest signal, so it only speaks for exceptions that
+    # could plausibly have come from a provider. A deterministic builtin that
+    # merely mentions a timeout is a defect to score, not a fault to retry --
+    # and retrying it wastes the budget, then drops the row from the score,
+    # hiding the very bug the run should surface.
+    if type(exc) in _DETERMINISTIC_TYPES:
+        return False
 
     message = str(exc).lower()
     if any(fragment in message for fragment in _TRANSIENT_MESSAGE_FRAGMENTS):
