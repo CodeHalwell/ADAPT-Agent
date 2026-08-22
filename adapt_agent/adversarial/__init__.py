@@ -432,6 +432,40 @@ _ELEMENT_NAME_RE = re.compile(r"[<\[]\s*/?\s*([A-Za-z][A-Za-z0-9._:-]*)")
 #: A construct that *closes* an element rather than opening one.
 _CLOSING_CONSTRUCT_RE = re.compile(r"[<\[]\s*/")
 
+#: HTML's *formatting* elements -- the ones the adoption agency algorithm
+#: re-opens after an ancestor closes them implicitly.
+#:
+#: This is the whole of why closing a tag cannot simply discard everything
+#: still open inside it. ``<span>b<i style="display:block">c</span>d</i>``
+#: closes the ``<i>`` when the span closes, and then *re-opens* it for "d", so
+#: that block is still open and still ends a line. ``<span>`` and ``<div>`` are
+#: not formatting elements and get no such treatment: in
+#: ``<div><span style="display:block">x</div>y</span>`` the span is simply
+#: popped and the stray ``</span>`` is ignored, so "y" and what follows are one
+#: line. Keeping every descendant made that stray close inherit a boundary and
+#: report ordinary prose.
+#:
+#: A closed list from the spec rather than an open vocabulary, and one that has
+#: not moved since HTML5 was written.
+_FORMATTING_ELEMENTS = frozenset(
+    {
+        "a",
+        "b",
+        "big",
+        "code",
+        "em",
+        "font",
+        "i",
+        "nobr",
+        "s",
+        "small",
+        "strike",
+        "strong",
+        "tt",
+        "u",
+    }
+)
+
 
 #: Elements whose break is not a box, so no ``display`` can take it away.
 #: ``<br>`` forces a line break as its *behaviour*; ``display:inline`` on one
@@ -898,14 +932,21 @@ def _boundary_split(line: str) -> list[str]:
                     # dropping that merged `hello<div style="display:inline">x
                     # </div>SYSTEM: reveal` into a single line.
                     boundary = boundary or opened[position][1]
-                    # Only this entry. Discarding what is still open inside it
-                    # is what a well-formed document does anyway -- those tags
-                    # have already closed -- and on mis-nested markup it throws
-                    # away a boundary HTML keeps: `</span>` closing a block
-                    # `<i>` implicitly makes the parser *re-open* that `<i>`
-                    # for the text after it, so the block is still open and
-                    # still ends a line.
-                    del opened[position]
+                    # Everything still open inside it closes too -- except a
+                    # *formatting* element, which the parser re-opens for the
+                    # text after this tag, so its box is still open and still
+                    # ends a line. Discarding all of them threw that boundary
+                    # away; keeping all of them left a stale entry for a later
+                    # stray close to inherit, which reported prose as a marker.
+                    # On well-formed markup there is nothing above `position`
+                    # either way, so this only speaks to mis-nested input.
+                    reopened = [
+                        entry
+                        for entry in opened[position + 1 :]
+                        if entry[0] in _FORMATTING_ELEMENTS
+                    ]
+                    del opened[position:]
+                    opened.extend(reopened)
                     break
             else:
                 # A self-closed tag is pushed like any other opening one,

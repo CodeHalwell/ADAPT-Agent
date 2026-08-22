@@ -378,6 +378,19 @@ class _ExceptionNote:
             return entry[1]
         return default
 
+    def clear(self, exc: BaseException) -> None:
+        try:
+            delattr(exc, self._attribute)
+        except Exception:  # never set, or an exception that refuses attributes
+            pass
+        self._by_identity.pop(id(exc), None)
+
+    def consume(self, exc: BaseException, default: Any = None) -> Any:
+        """Read the note and remove it, so it cannot answer for a later raise."""
+        value = self.get(exc, default)
+        self.clear(exc)
+        return value
+
 
 _EXHAUSTED = _ExceptionNote(_EXHAUSTED_MARKER)
 
@@ -423,6 +436,27 @@ def declared_fallback(exc: BaseException) -> float | None:
     return None if carried is None else float(carried)
 
 
+def consume_declared_fallback(exc: BaseException) -> float | None:
+    """The fallback carried by ``exc``, removed as it is read.
+
+    A note belongs to **one propagation**, not to the exception object for the
+    rest of its life. An exception instance is routinely reused --
+    ``Mock(side_effect=exc)`` raises the same object every call, and a module
+    level sentinel is an ordinary thing to raise -- so a note left behind
+    answered for the *next* metric's failure as well: two metrics declaring
+    ``0.7`` and ``0.2`` both scored ``0.7``, and the leak crossed rows too, so
+    one metric's own ``0.4`` came back as ``0.7``. That corrupts the report
+    rather than merely mis-scoring one cell.
+
+    :data:`_EXHAUSTED_MARKER` is deliberately *not* consumed alongside it: that
+    one records a property of the error itself -- "a lower layer already spent
+    a budget on this" -- which stays true however often the object is raised,
+    and the layer that sets it re-sets it each time anyway.
+    """
+    carried = _DECLARED_FALLBACK.consume(exc, None)
+    return None if carried is None else float(carried)
+
+
 #: Used when a harness is constructed without an explicit policy.
 DEFAULT_RETRY_POLICY = RetryPolicy()
 
@@ -433,6 +467,7 @@ __all__ = [
     "retries_already_exhausted",
     "note_declared_fallback",
     "declared_fallback",
+    "consume_declared_fallback",
     "DEFAULT_RETRY_POLICY",
     "is_transient_error",
     "retry_after_seconds",

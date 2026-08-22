@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A declared fallback outlived the failure it belonged to.** The note a
+  metric leaves on the exception it raises was set once and never removed, so a
+  *reused* exception object carried the first metric's fallback for the rest of
+  its life. An exception instance is routinely reused -- `Mock(side_effect=exc)`
+  raises the same object every call, and a module-level sentinel is ordinary --
+  so two metrics declaring `0.7` and `0.2` both scored `0.7`, and the leak
+  crossed rows as well: a metric whose own fallback was `0.4` came back as
+  `0.7`. That corrupts the report rather than mis-scoring one cell.
+
+  The note is consumed as it is read now, so it answers for one propagation and
+  no more. The exhausted-retries marker is deliberately *not* consumed
+  alongside it: that one records a property of the error itself -- a lower
+  layer already spent a budget on it -- which stays true however often the
+  object is raised, and the layer that sets it re-sets it each time anyway.
+
+  Worth recording that this was a risk taken knowingly and judged wrong. It was
+  weighed when the note was added, called rare, and accepted on the grounds
+  that the retry marker has the same shape. The retry marker's leak costs a
+  skipped retry; this one silently changes a score.
+- **A closing tag kept descendants the parser had already popped.** Closing an
+  ancestor implicitly closes what is open inside it, but only a *formatting*
+  element is then re-opened for the following text. Keeping all of them left a
+  stale entry for a later stray close to inherit, so
+  `<div><span style="display:block">x</div>y</span>` reported ordinary prose as
+  a marker; discarding all of them -- which is what the previous round replaced
+  -- threw away the boundary a re-opened `<i>` genuinely still ends its line
+  with. Both directions of the same choice, and both wrong.
+
+  Descendants are discarded except HTML's formatting elements now, which is a
+  closed list from the spec. The previous round's argument was right about the
+  adoption agency and wrong about its scope: it re-opens `<i>`, `<b>`, `<em>`
+  and their kin, and `<span>` and `<div>` are not among them.
+
 - **The multi-keyword `display` value was read as a vocabulary, not a
   grammar.** Checking each token against a set of recognised inner types
   accepted any sequence drawn from it, so `display:inline flex grid` -- two
@@ -194,8 +227,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsplit line is checked too, which is what makes that direction harmless.
 
   Both of these came out of re-running the accumulated corpus rather than out of
-  the reported findings. That corpus now stands at **126 attack phrasings caught,
-  49 benign unaffected**, re-run whole each round rather than trusted from the last.
+  the reported findings. That corpus now stands at **130 attack phrasings caught,
+  51 benign unaffected**, re-run whole each round rather than trusted from the last.
 
 - **Microsoft Agent Framework agents yielded nothing tunable.** The
   introspector required `.instructions` and `.chat_client` as *attributes*.

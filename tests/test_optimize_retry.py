@@ -1871,3 +1871,97 @@ def test_a_declared_fallback_is_clamped() -> None:
     assert Metric("m", lambda o, e: 1.0, on_error=5.0).on_error == 1.0
     assert Metric("m", lambda o, e: 1.0, on_error=-2.0).on_error == 0.0
     assert Metric("m", lambda o, e: 1.0).on_error is None
+
+
+# -- a declared fallback belongs to one propagation ----------------------------
+#
+# An exception instance is routinely reused: `Mock(side_effect=exc)` raises the
+# same object every call, and a module-level sentinel is ordinary. A note left
+# on it answered for the *next* metric's failure too.
+
+_SHARED_ERROR = ValueError("one singleton error, reused by every metric")
+
+
+def _raises_shared(output, expected):
+    raise _SHARED_ERROR
+
+
+def test_two_metrics_sharing_an_exception_keep_their_own_fallbacks() -> None:
+    from adapt_agent.optimization.dataset import Example, GoldenDataset
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import Metric
+
+    report = EvaluationHarness(
+        [
+            Metric("first", _raises_shared, on_error=0.7),
+            Metric("second", _raises_shared, on_error=0.2),
+            Metric("third", _raises_shared),
+        ],
+        retry=RetryPolicy(attempts=1),
+    ).evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+
+    assert report.aggregate["first"] == pytest.approx(0.7)
+    assert report.aggregate["second"] == pytest.approx(0.2)
+    assert report.aggregate["third"] == pytest.approx(0.0)
+
+
+def test_a_shared_exception_does_not_carry_a_fallback_between_rows() -> None:
+    """The leak crossed rows too, so one metric's own 0.4 came back as 0.7."""
+    from adapt_agent.optimization.dataset import Example, GoldenDataset
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import Metric
+
+    rows = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    poisoner = EvaluationHarness(
+        [Metric("poisoner", _raises_shared, on_error=0.7)], retry=RetryPolicy(attempts=1)
+    )
+    poisoner.evaluate(lambda x: "ok", rows)
+
+    report = EvaluationHarness(
+        [Metric("only", _raises_shared, on_error=0.4)], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", rows)
+    assert report.aggregate["only"] == pytest.approx(0.4)
+
+
+def test_the_note_does_not_outlive_the_propagation_that_set_it() -> None:
+    from adapt_agent.optimization.retry import (
+        consume_declared_fallback,
+        declared_fallback,
+        note_declared_fallback,
+    )
+
+    error = ValueError("boom")
+    note_declared_fallback(error, 0.7)
+    assert declared_fallback(error) == pytest.approx(0.7)
+    assert consume_declared_fallback(error) == pytest.approx(0.7)
+    assert declared_fallback(error) is None
+    # ...and a second consume finds nothing rather than repeating itself
+    assert consume_declared_fallback(error) is None
+    # a later declaration on the same object is its own, not the old one
+    note_declared_fallback(error, 0.2)
+    assert consume_declared_fallback(error) == pytest.approx(0.2)
+
+
+def test_the_note_is_cleared_for_an_exception_that_refuses_attributes() -> None:
+    """The weak-table half of the mechanism has to be cleared too."""
+    from adapt_agent.optimization.retry import (
+        consume_declared_fallback,
+        declared_fallback,
+        note_declared_fallback,
+    )
+
+    error = RefusesAttributesAndUnhashable("boom")
+    note_declared_fallback(error, 0.7)
+    assert declared_fallback(error) == pytest.approx(0.7)
+    assert consume_declared_fallback(error) == pytest.approx(0.7)
+    assert declared_fallback(error) is None
+
+
+def test_the_exhausted_marker_is_deliberately_not_consumed() -> None:
+    """It records a property of the error, true however often it is raised."""
+    from adapt_agent.optimization.retry import mark_retries_exhausted, retries_already_exhausted
+
+    error = ValueError("429 Too Many Requests")
+    mark_retries_exhausted(error)
+    assert retries_already_exhausted(error) is True
+    assert retries_already_exhausted(error) is True

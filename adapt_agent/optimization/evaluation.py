@@ -28,7 +28,7 @@ from adapt_agent.optimization.metrics import Metric, MetricFn, coerce_metric
 from adapt_agent.optimization.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
-    declared_fallback,
+    consume_declared_fallback,
     retries_already_exhausted,
 )
 
@@ -730,7 +730,7 @@ class EvaluationHarness:
             # reading the wrapper scored that judge 0.0 here and 0.7 on a
             # direct call -- the same contract split the previous round closed,
             # reopened one layer down.
-            carried = declared_fallback(exc)
+            carried = consume_declared_fallback(exc)
             fallback = declared if carried is None else carried
             return 0.0 if fallback is None else max(0.0, min(1.0, float(fallback)))
 
