@@ -479,15 +479,53 @@ _CSS_IMPORTANT_RE = re.compile(r"!\s*important", re.IGNORECASE)
 #: and the value keeps a character no identifier can hold -- which is the safe
 #: reading, since CSS drops that declaration too.
 _CSS_ESCAPE_RE = re.compile(r"\\(?:([0-9A-Fa-f]{1,6})[ \t\r\n\f]?|([^\n\r\f]))")
-#: The leading identifier of a value, matched from position zero. Only the
-#: first word is taken, which is the outer display type in the two-value
-#: syntax (``display: block flow``).
+#: A value must *begin* with an identifier, matched from position zero.
 #:
-#: No ``\s*``: whitespace is stripped from the *raw* value before decoding, so
-#: a space a decode produced is part of the identifier and disqualifies it --
+#: No ``\s*``: whitespace is stripped from the raw value before decoding, so a
+#: space a decode produced is part of the identifier and disqualifies it --
 #: ``\20 block`` is the identifier " block", which is not the keyword
-#: ``block``.
+#: ``block``. This checks the start only; what follows is read as tokens by
+#: :func:`_is_inline_display`, because the rest of the value is not optional.
 _CSS_VALUE_RE = re.compile(r"[\w-]+")
+
+#: The *inner* display types, which the two-value syntax pairs with an outer
+#: one: ``display: inline flow-root`` is a real inline box.
+#:
+#: A closed grammar rather than an open vocabulary, which is what makes this a
+#: different thing from the list-beside-a-rule shape elsewhere in this module.
+#: It also fails in the harmless direction if the spec ever grows one: an inner
+#: keyword missing from here makes the value not-inline, which splits a line a
+#: renderer keeps whole -- the same direction :data:`_INLINE_DISPLAYS` is
+#: enumerated in, and covered by checking the unsplit line too.
+_INNER_DISPLAYS = frozenset({"flow", "flow-root", "list-item", "table", "flex", "grid", "ruby"})
+
+
+def _is_inline_display(value: str) -> bool:
+    """Whether a declared ``display`` keeps its box inside the line.
+
+    The **whole** value decides, not its first word. Reading only the first
+    identifier made every trailing token invisible, so ``display:inline bogus``
+    resolved to ``inline`` -- and CSS drops an invalid declaration outright, so
+    that value is not the inline one it resembles: the *earlier* declaration
+    applies instead. ``display:block; display:inline bogus`` renders as a
+    block, and reading the prefix hid a marker behind it. **8 of 23** probed
+    values were wrong, every one of them that way round.
+
+    The two-value syntax is real and stays supported -- ``inline flow``,
+    ``inline flow-root``, ``inline list-item`` are all genuinely inline -- but
+    only the outer keyword ``inline`` takes a second value. The legacy
+    shorthands do not, so ``inline-flex flow`` and ``contents flow`` are
+    invalid and cannot be inline either.
+
+    Anything unrecognised is *not* inline, which is the direction that splits a
+    line rather than merging two.
+    """
+    tokens = value.split()
+    if not tokens or tokens[0] not in _INLINE_DISPLAYS:
+        return False
+    if len(tokens) == 1:
+        return True
+    return tokens[0] == "inline" and all(token in _INNER_DISPLAYS for token in tokens[1:])
 
 
 def _decode_css_escapes(text: str) -> str:
@@ -557,10 +595,15 @@ def _declared_value(declaration: str, prop: str) -> tuple[str, bool] | None:
     if _decode_css_escapes(split[0].strip()).lower() != prop:
         return None
     value = _decode_css_escapes(split[1].strip())
-    found = _CSS_VALUE_RE.match(value)
-    if found is None:
+    if _CSS_VALUE_RE.match(value) is None:
         return None
-    return found.group(), _CSS_IMPORTANT_RE.search(value) is not None
+    # `!important` is the declaration's flag, not part of its value, so it
+    # comes off before the value is read as tokens -- otherwise every
+    # `display:inline !important` would look like a value with junk after it.
+    important = _CSS_IMPORTANT_RE.search(value) is not None
+    if important:
+        value = _CSS_IMPORTANT_RE.sub(" ", value)
+    return " ".join(value.split()).lower(), important
 
 
 def _css_declarations(block: str) -> list[str]:
@@ -699,7 +742,7 @@ def _declared_display(construct: str) -> str | None:
                 normal = found[0]
         resolved = important if important is not None else normal
         if resolved is not None:
-            return resolved.lower()
+            return resolved  # already folded to lowercase, single-spaced
     return "none" if _HIDDEN_ATTR_RE.search(construct) else None
 
 
@@ -718,7 +761,7 @@ def _is_line_boundary(construct: str) -> bool:
         return True
     display = _declared_display(construct)
     if display is not None:
-        return display not in _INLINE_DISPLAYS
+        return not _is_inline_display(display)
     return element is None or element not in _INLINE_ELEMENTS
 
 

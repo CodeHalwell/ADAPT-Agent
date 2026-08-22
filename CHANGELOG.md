@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An inline keyword with junk after it won the cascade.** Only the first
+  identifier of a `display` value was read, so every trailing token was
+  invisible and `display:inline bogus` resolved to `inline`. CSS drops an
+  invalid declaration outright, which means that value is not the inline one it
+  resembles -- the *earlier* declaration applies instead. So
+  `style="display:block; display:inline bogus"` renders as a block and the
+  marker behind it went unreported. **8 of 23** probed values were wrong, every
+  one of them that way round.
+
+  The whole value decides now. That does not mean enumerating valid display
+  values -- the list-beside-a-rule shape this module keeps getting caught by --
+  because the question is only whether the box stays inside its line: a single
+  recognised inline keyword does, and so does the outer keyword `inline`
+  followed by inner display types from a closed grammar (`inline flow`,
+  `inline flow-root`, `inline list-item`). Only `inline` takes a second value,
+  so `inline-flex flow` and `contents flow` are invalid and not inline either.
+  Anything unrecognised is not inline, which splits a line rather than merging
+  two -- the same direction the inline set itself is enumerated in.
+
+  `!important` comes off before the value is read, since it is the
+  declaration's flag rather than part of its value; otherwise every
+  `display:inline !important` would have looked like junk after a keyword.
+
 - **A closing tag paired with the wrong opening element.** The stack that lets
   a closing tag inherit its opening tag's boundary held only the openings that
   *were* boundaries, which is not a nesting stack: an inline element of the
@@ -148,8 +171,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsplit line is checked too, which is what makes that direction harmless.
 
   Both of these came out of re-running the accumulated corpus rather than out of
-  the reported findings. That corpus now stands at **115 attack phrasings caught,
-  42 benign unaffected**, re-run whole each round rather than trusted from the last.
+  the reported findings. That corpus now stands at **120 attack phrasings caught,
+  46 benign unaffected**, re-run whole each round rather than trusted from the last.
 
 - **Microsoft Agent Framework agents yielded nothing tunable.** The
   introspector required `.instructions` and `.chat_client` as *attributes*.
