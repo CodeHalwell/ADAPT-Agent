@@ -451,12 +451,25 @@ def _declared_display(construct: str) -> str | None:
     -- but the content of a hidden element is still text a model reads, so
     treating it as its own run rather than merging it into the visible line is
     the answer this check wants either way.
+
+    The value is **decoded before it is parsed**, because that is the order the
+    two parsers run in: HTML resolves character references in an attribute
+    value and hands the result to CSS, so ``style="display&#58;block"`` is a
+    real ``display:block`` and reading the raw text found no declaration at
+    all. Decoding here is :func:`html.unescape` rather than
+    :func:`_referenced_character`, and deliberately: the question is what the
+    *HTML parser* handed over, so HTML's own answer is the right one.
+
+    Only the value. HTML does not resolve references in an attribute *name* or
+    an element name, so ``&#115;tyle=`` is not a ``style`` attribute and must
+    not be read as one -- which is why the decode happens after the attribute
+    has been located rather than over the whole construct.
     """
     style = _STYLE_ATTR_RE.search(construct)
     if style is not None:
         normal: str | None = None
         important: str | None = None
-        for declaration in _DISPLAY_RE.finditer(style.group(1)):
+        for declaration in _DISPLAY_RE.finditer(html.unescape(style.group(1))):
             if declaration.group(2) is not None:
                 important = declaration.group(1)
             else:

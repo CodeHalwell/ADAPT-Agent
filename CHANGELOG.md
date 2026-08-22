@@ -118,6 +118,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity on the rendered prompt for every shape, which is asserted against a
   captured request rather than assumed -- `\n` is the separator Pydantic AI
   itself puts between consecutive static instructions.
+- **...and the style value was parsed before it was decoded.** Two parsers run
+  in sequence: HTML resolves character references in an attribute value and
+  hands the result to CSS, so `style="display&#58;block"` is a real
+  `display:block` while the raw text shows no declaration at all. **6 of 11**
+  probed forms were wrong, again in both directions -- an encoded `block` hid a
+  marker, and an encoded `inline` failed to keep a line whole. The value is
+  decoded before it is parsed now, with `html.unescape` rather than the
+  code-point reader used for line breaks: the question here is what the *HTML
+  parser* handed over, so HTML's own answer is the right one. Only the value --
+  HTML resolves no references in an attribute name, so the decode happens after
+  the attribute is located and `&#115;tyle=` is still not a style.
 - **...and a declaration block can name `display` more than once.** Taking the
   first match read the *losing* declaration, so `display:inline;display:block`
   resolved to `inline` and a marker behind it stayed hidden, while
