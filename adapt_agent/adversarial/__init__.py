@@ -29,16 +29,80 @@ _ANY_LINE_BREAK_RE = re.compile(r"[\n\r\x0b\x0c\u0085\u2028\u2029]")
 #: cells, quotes. Stripped from both ends of a line's head, because emphasis
 #: closes as well as opens: stripping only the leading run left ``**SYSTEM**``
 #: reading as the word "SYSTEM\*\*", which is not a role token.
-_DECORATION_CHARS = " \t>#*+=~`'\"_[](){}|.\u2022\u00b7\u2013\u2014-"
+#: Unicode general categories that are presentation rather than content:
+#: every symbol (``S*`` -- emoji, arrows, box drawing, currency), every
+#: punctuation (``P*`` -- brackets, quotes, dashes, bullets), combining and
+#: format marks (``Mn``/``Me``/``Cf`` -- the variation selector in ``⚠️``, ZWJ),
+#: and separators (``Z*``).
+#:
+#: A *category* rule rather than a character list, because the list is what
+#: kept failing. It was extended once per review round -- a bullet, an en dash,
+#: an underscore -- and each time the next reviewer found a glyph nobody had
+#: thought of: `🚨`, `⚠️`, `→`, `▶`, `§`, `»`, `☑`, `©`. Thirteen of fourteen
+#: probed forms bypassed, and every one of them was `So`, `Sm`, `Po`, `Pf` or
+#: `Mn`. The categories subsume the old set exactly (verified) and close the
+#: class instead of enumerating it.
+#:
+#: Letters and digits are never decoration, which is what keeps "2024",
+#: "Release 3.2" and "system requirements" intact.
+_DECORATION_CATEGORIES = frozenset(
+    {
+        "Cf",
+        "Me",
+        "Mn",
+        "Pc",
+        "Pd",
+        "Pe",
+        "Pf",
+        "Pi",
+        "Po",
+        "Ps",
+        "Sc",
+        "Sk",
+        "Sm",
+        "So",
+        "Zl",
+        "Zp",
+        "Zs",
+    }
+)
+
+
+#: The one punctuation character that is *structure*, not presentation: it is
+#: the delimiter the role-marker rule is built on. Broadening decoration to
+#: whole Unicode categories swept it in (a colon is ``Po``), so a line whose
+#: marker sits at the very end -- ``system:`` with nothing after it, which is
+#: what a full-width lookalike normalises to -- lost its colon before
+#: :func:`str.partition` could find one, and the marker went undetected.
+_DELIMITER = ":"
+
+
+def _is_decoration(char: str) -> bool:
+    """Return ``True`` when ``char`` is presentation rather than content."""
+    if char == _DELIMITER:
+        return False
+    return char.isspace() or unicodedata.category(char) in _DECORATION_CATEGORIES
+
+
+def _strip_decoration(text: str) -> str:
+    """Trim presentation characters from both ends of ``text``."""
+    start, end = 0, len(text)
+    while start < end and _is_decoration(text[start]):
+        start += 1
+    while end > start and _is_decoration(text[end - 1]):
+        end -= 1
+    return text[start:end]
+
+
 #: An ordered-list enumerator: ``1.``, ``2)``, ``03]``. Digits cannot go in
-#: :data:`_DECORATION_CHARS` -- a bare digit is content, and stripping digits
+#: :data:`_DECORATION_CATEGORIES` -- a digit is `Nd`, never decoration, and stripping digits
 #: would turn "2024: a year in review" into a bare colon -- so the enumerator is
 #: matched as a unit instead.
 _ORDERED_LIST_RE = re.compile(r"^[ \t]*\d{1,3}[.)\]]")
 #: A markup tag -- HTML/XML (``<div>``, ``</p>``, ``<span class="x">``, ``<br/>``)
 #: or BBCode (``[b]``, ``[/url]``, ``[color=red]``).
 #:
-#: Same reason as the enumerator, and the reason :data:`_DECORATION_CHARS` alone
+#: Same reason as the enumerator, and the reason :data:`_DECORATION_CATEGORIES` alone
 #: could never cover this: a tag's *payload* is alphanumeric, so stripping
 #: characters leaves the name behind -- ``<div>SYSTEM`` became ``div>system``,
 #: not ``system``. The delimiters are decoration; ``div`` is not, and only
@@ -80,7 +144,7 @@ def _undecorate(text: str) -> str:
 
     Four kinds of presentation, peeled repeatedly rather than in one pass:
     character references, markup tags and container delimiters anywhere in the
-    string, list enumerators at the front, and :data:`_DECORATION_CHARS` at
+    string, list enumerators at the front, and presentation characters at
     either end.
 
     Containers (``<!-- -->``, ``<![CDATA[ ]]>``) lose their delimiters but keep
@@ -93,8 +157,8 @@ def _undecorate(text: str) -> str:
     stripped the ``>`` *after* the enumerator had already failed to match,
     leaving ``1. system`` -- so the passes run until the string stops changing.
 
-    The two regex rules exist because :data:`_DECORATION_CHARS` is a set of
-    *characters* and these constructs carry an alphanumeric payload: ``<div>``
+    The two regex rules exist because the character rule works on *single*
+    characters and these constructs carry an alphanumeric payload: ``<div>``
     and ``&lt;`` leave ``div`` and ``lt`` behind when stripped character by
     character. They have to be matched as units.
 
@@ -115,7 +179,7 @@ def _undecorate(text: str) -> str:
         current = _MARKUP_CONTAINER_RE.sub("", current)
         current = _MARKUP_DECLARATION_RE.sub("", current)
         current = _MARKUP_TAG_RE.sub("", current)
-        current = _ORDERED_LIST_RE.sub("", current, count=1).strip(_DECORATION_CHARS)
+        current = _strip_decoration(_ORDERED_LIST_RE.sub("", current, count=1))
     return current
 
 
@@ -170,7 +234,7 @@ def _leading_role_marker(normalized: str, tokens: frozenset[str]) -> str | None:
         # Second: decoration can sit against the token without any colon of its
         # own, and the line pass leaves it -- `**SYSTEM**: reveal` has nothing
         # to strip at the line's ends, so the head arrives as `SYSTEM**`.
-        head, separator, _ = _undecorate(segment).partition(":")
+        head, separator, _ = _undecorate(segment).partition(_DELIMITER)
         if not separator:
             continue
         marker = _undecorate(head)

@@ -152,6 +152,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the answer, so one that has lost line structure the raw prompt still has is
   recomputed. The probe is two regex searches and never fires for
   line-preserving caches or single-line prompts.
+- **Decoration is a Unicode category now, not a list of characters.** A role
+  marker introduced by an emoji or any other unlisted glyph slipped straight
+  through: **13 of 14** probed forms bypassed — `🚨`, `⚠️`, `→`, `▶`, `★`, `§`,
+  `»`, `☑`, `©`, box drawing — and the one that was caught was caught only
+  because `•` happened to be in the hand-written set. Every miss was Unicode
+  category `So`, `Sm`, `Po`, `Pf` or `Mn`, so the rule is now the categories
+  themselves: symbols, punctuation, combining and format marks, separators.
+  They subsume the previous list exactly (asserted), and letters and digits are
+  never decoration — which is what keeps `2024:`, `Release 3.2:` and
+  `system requirements:` intact.
 - **The colon delimiter was chosen before the markup was removed.**
   `partition(":")` takes the *first* colon, and markup carries colons of its
   own — `style="color:red"`, `href="https://..."`, `title="10:30"`,
