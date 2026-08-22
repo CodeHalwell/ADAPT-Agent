@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A CSS identifier escape hid a `display` declaration.** `\62 ` is the
+  identifier character `b`, so `style="display:\62 lock"` is a real
+  `display:block` and the raw text spells no `block` at all -- an inline
+  element a renderer draws as a block, with the marker behind it unreported.
+  **12 of 18** resolver cases were wrong, in both directions: an escaped
+  `inline` read as no declaration and split a line a renderer keeps whole, and
+  an escaped `;` inside a value split the block and handed the cascade to a
+  decoy.
+
+  The rule is one sentence -- *a backslash escape is part of a token, never
+  structure* -- and it had to be applied at all three cuts, not just the one
+  reported. Declarations are separated on unescaped semicolons, a declaration
+  is cut from its value at an unescaped colon, and each half is decoded only
+  once its cut is made. Decoding earlier would let an escape produce structure
+  CSS never gives it: `--x:\;display:inline` is one declaration whose value
+  happens to hold a semicolon, and `display\3A inline` declares nothing at all
+  because that colon is inside the property's name.
+
+  Each half is also stripped *before* it is decoded and never after, because
+  whitespace a decode produced belongs to the identifier: CSS reads
+  `\20 display` as the property " display" and `display:\20 block` as the
+  value " block", and neither is the keyword it resembles. Stripping after
+  would have invented declarations -- including `inline` ones, which is the
+  bypass direction.
+- **Renaming a metric dropped the field added to it.** The mapping form of
+  `metrics` renames each entry after its key, and both places that did it
+  rebuilt the metric from a hand-written list of fields to carry.
+  `EvaluationHarness({"renamed": judge.as_metric()})` therefore reset an
+  `LLMJudge(on_error=0.7)` fallback to `None`, so a permanent grading failure
+  scored `0.0` under a mapping and `0.7` under a list.
+
+  That list had already gone stale once -- `structural` was dropped the same
+  way, and a renamed `field_match` scored a model-returning agent `0.0` -- so
+  the fix is the rule rather than a third field: `Metric.renamed()` copies the
+  metric whole, and both sites call it. A field added later is carried without
+  anyone remembering to, and a subclass stays its own class, which rebuilding
+  through `Metric(...)` did not. The tests compare the whole instance rather
+  than naming fields, for the same reason.
+
 - **A character reference without its semicolon was read as text.** HTML makes
   the terminator optional -- a browser decodes `&#10SYSTEM:` to a newline before
   `SYSTEM:` -- and the pattern required it, so every separator this module had
@@ -65,7 +104,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsplit line is checked too, which is what makes that direction harmless.
 
   Both of these came out of re-running the accumulated corpus rather than out of
-  the reported findings: **107 attack phrasings caught, 39 benign unaffected**.
+  the reported findings. That corpus now stands at **115 attack phrasings caught,
+  42 benign unaffected**, re-run whole each round rather than trusted from the last.
 
 - **Microsoft Agent Framework agents yielded nothing tunable.** The
   introspector required `.instructions` and `.chat_client` as *attributes*.

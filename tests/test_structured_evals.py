@@ -341,6 +341,30 @@ def test_renaming_a_structural_metric_keeps_it_structural():
     assert plain.aggregate["lane"] == 1.0
 
 
+def test_evaluate_agent_renames_without_dropping_a_field():
+    """The same list-of-fields bug lived at this second rename site too.
+
+    Exhaustive by construction rather than naming the fields, because the list
+    in the code went stale twice and a list in the test would go the same way.
+    """
+    from adapt_agent.optimization.evals import _resolve_metrics
+    from adapt_agent.optimization.metrics import Metric
+
+    source = Metric(
+        "original",
+        lambda output, expected, example: 1.0,
+        needs_example=True,
+        structural=True,
+        on_error=0.7,
+    )
+    (clone,) = _resolve_metrics({"renamed": source}, None, criteria=None, rubric=None)
+
+    assert clone.name == "renamed"
+    assert {k: v for k, v in vars(clone).items() if k != "name"} == {
+        k: v for k, v in vars(source).items() if k != "name"
+    }
+
+
 def test_evaluate_agent_accepts_concurrency():
     report = evaluate_agent(JsonAgent(), ROWS * 6, metrics=field_metrics(["lane"]), concurrency=3)
     assert report.n == 6

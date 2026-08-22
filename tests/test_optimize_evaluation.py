@@ -530,3 +530,77 @@ def test_harness_output_extractor_applies_per_example_checks():
 
     report = harness.evaluate(agent, data)
     assert report.aggregate["checks"] == 1.0
+
+
+# -- renaming a metric carries everything it holds -----------------------------
+#
+# The mapping form renames each entry after its key. Both places that do it
+# used to rebuild the metric from a hand-written list of fields, and that list
+# went stale twice: `structural` once, then `on_error` the round it was added.
+
+
+def test_renaming_carries_every_field_a_metric_has() -> None:
+    """Exhaustive by construction, so a field added later is covered too.
+
+    Comparing the whole instance dict rather than naming the fields is the
+    point: a list of fields in the test would go stale exactly as the list in
+    the code did.
+    """
+    source = Metric(
+        "original",
+        lambda output, expected, example: 1.0,
+        needs_example=True,
+        structural=True,
+        on_error=0.7,
+    )
+    clone = source.renamed("renamed")
+
+    assert clone.name == "renamed"
+    assert {k: v for k, v in vars(clone).items() if k != "name"} == {
+        k: v for k, v in vars(source).items() if k != "name"
+    }
+    # ...and it is a copy, not the same object wearing a new name.
+    assert clone is not source
+    assert source.name == "original"
+
+
+def test_a_renamed_metric_keeps_its_subclass() -> None:
+    """Rebuilding through `Metric(...)` flattened one; copying does not."""
+
+    class CountingMetric(Metric):
+        pass
+
+    clone = CountingMetric("original", lambda o, e: 1.0).renamed("renamed")
+    assert isinstance(clone, CountingMetric)
+
+
+def test_the_harness_renames_without_dropping_a_fallback() -> None:
+    """The reported path: a mapping key must not silently reset `on_error`."""
+    source = Metric("original", lambda o, e: 1.0, structural=True, on_error=0.7)
+    (clone,) = EvaluationHarness._normalize_metrics({"renamed": source})
+
+    assert clone.name == "renamed"
+    assert clone.on_error == 0.7
+    assert clone.structural is True
+
+
+def test_a_renamed_judge_metric_scores_its_own_fallback() -> None:
+    """End to end, because the two halves of this were fixed a round apart."""
+    from adapt_agent.optimization.judge import LLMJudge
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    def broken(prompt, **kwargs):
+        raise ValueError("the judge template is malformed")
+
+    judge = LLMJudge(broken, retry=RetryPolicy(attempts=1), on_error=0.7)
+    data = GoldenDataset([Example(inputs="a", expected="ok")])
+
+    listed = EvaluationHarness([judge.as_metric()], retry=RetryPolicy(attempts=1)).evaluate(
+        lambda x: "ok", data
+    )
+    mapped = EvaluationHarness(
+        {"renamed": judge.as_metric()}, retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", data)
+
+    assert listed.score == 0.7
+    assert mapped.score == 0.7, "a mapping key must not reset the declared fallback"

@@ -432,14 +432,9 @@ class EvaluationHarness:
             for name, m in metrics.items():
                 if isinstance(m, Metric):
                     # Honour the mapping key as the metric's reporting name.
-                    normalized.append(
-                        Metric(
-                            name,
-                            m.fn,
-                            needs_example=m.needs_example,
-                            structural=m.structural,
-                        )
-                    )
+                    # `renamed` copies the metric whole rather than listing the
+                    # fields to carry, because that list went stale twice.
+                    normalized.append(m.renamed(name))
                 else:
                     normalized.append(Metric(name, m))
                 # Note: a bare callable mapped under ``name`` becomes an

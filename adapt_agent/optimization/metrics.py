@@ -14,6 +14,7 @@ All built-ins are pure-Python and dependency-free.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import re
 from collections.abc import Callable, Sequence
@@ -75,6 +76,26 @@ class Metric:
         else:
             raw = self.fn(output, expected)
         return _clamp(raw)
+
+    def renamed(self, name: str) -> Metric:
+        """This metric under a different reporting name, everything else intact.
+
+        The mapping form of ``metrics`` renames each entry after its key, and
+        both places that do it used to rebuild the metric by hand, listing the
+        fields to carry. A list of fields beside a constructor that owns them
+        goes stale the first time the constructor grows: ``structural`` was
+        dropped that way once -- a renamed ``field_match`` scored a
+        model-returning agent ``0.0`` -- and ``on_error`` was dropped the same
+        way the round it was added, turning a judge's declared ``0.7`` fallback
+        back into a hard zero.
+
+        So the copy is whole rather than enumerated, and a field added later is
+        carried without anyone remembering to. Copying also keeps a subclass a
+        subclass, which rebuilding through ``Metric(...)`` did not.
+        """
+        clone = copy.copy(self)
+        clone.name = name
+        return clone
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return f"Metric(name={self.name!r}, needs_example={self.needs_example})"
