@@ -1436,3 +1436,114 @@ def test_a_permanent_agent_error_still_force_includes_every_metric() -> None:
     # Force-included on the error even though `secondary` would have scored 1.0.
     assert len(report.failures()) == 4
     assert len(report.failures(metric="secondary")) == 4
+
+
+# -- the harness owns classification on the metric path ------------------------
+
+
+class _QuotaFault(Exception):
+    """A provider-specific fault only a custom classifier would recognise."""
+
+
+def test_the_harness_classifier_reaches_a_judge_used_as_a_metric() -> None:
+    """A classifier on the harness alone never got a say.
+
+    `LLMJudge._complete` consumed anything *its own* policy did not recognise
+    into `on_error`, so a caller who configured `RetryPolicy(is_transient=...)`
+    on the harness -- the documented place to configure metric retry -- had a
+    provider fault scored as an earned zero, `is_complete=True`, and the rows
+    handed to a proposer as failures.
+    """
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def quota_exhausted(prompt, **kwargs):
+        raise _QuotaFault("monthly quota exhausted")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    report = EvaluationHarness(
+        [LLMJudge(quota_exhausted).as_metric()],
+        retry=RetryPolicy(attempts=1, is_transient=lambda exc: isinstance(exc, _QuotaFault)),
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.n_transient_errors == 3, "the harness classifier still never ran"
+    assert report.is_complete is False
+    assert report.failures() == [], "a provider fault reported as the agent's failure"
+
+
+def test_neither_classifier_recognising_it_is_still_an_earned_zero() -> None:
+    """Propagating must not turn every judge exception into a transient one."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def broken(prompt, **kwargs):
+        raise _QuotaFault("the judge is misconfigured")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(3)])
+    report = EvaluationHarness(
+        [LLMJudge(broken).as_metric()], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.n_transient_errors == 0
+    assert report.is_complete is True
+    assert len(report.failures()) == 3
+
+
+def test_a_standalone_judge_is_unaffected_by_the_propagating_path() -> None:
+    from adapt_agent.optimization.judge import LLMJudge
+
+    def broken(prompt, **kwargs):
+        raise _QuotaFault("the judge is misconfigured")
+
+    judge = LLMJudge(broken, on_error=0.25)
+    assert judge.score("i", "o").score == 0.25
+    assert judge.critique("i", "o") == ""
+
+
+# -- the 5xx family, as a range ------------------------------------------------
+
+
+class _StatusResponse:
+    def __init__(self, status: int) -> None:
+        self.status_code = status
+
+
+class _StatusError(Exception):
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HTTP {status}")
+        self.response = _StatusResponse(status)
+
+
+#: 529 is how Anthropic reports an overloaded model, 52x is the Cloudflare
+#: gateway block, and 507/508/509 are ordinary server faults. All were scored as
+#: earned zeros while the constant's own docstring claimed "the 5xx family".
+RETRYABLE_STATUSES = [408, 409, 425, 429, 500, 502, 503, 504, 507, 508, 509, 520, 522, 524, 529]
+
+#: Deterministic properties of the request: a retry sends the same thing to the
+#: same server and gets the same answer.
+PERMANENT_STATUSES = [400, 401, 403, 404, 422, 501, 505]
+
+
+@pytest.mark.parametrize("status", RETRYABLE_STATUSES)
+def test_a_server_side_status_is_transient(status: int) -> None:
+    assert is_transient_error(_StatusError(status)) is True
+
+
+@pytest.mark.parametrize("status", PERMANENT_STATUSES)
+def test_a_client_side_or_deterministic_status_is_not(status: int) -> None:
+    assert is_transient_error(_StatusError(status)) is False
+
+
+@pytest.mark.parametrize("status", RETRYABLE_STATUSES + PERMANENT_STATUSES)
+def test_the_message_path_classifies_a_status_the_same_way(status: int) -> None:
+    """A message saying "Error code: 529" must agree with a response carrying 529.
+
+    The two are separate spellings of one rule -- a set and a regex alternation
+    -- and they drifted apart once already.
+    """
+    from adapt_agent.optimization.retry import _status_is_transient
+
+    assert is_transient_error(RuntimeError(f"Error code: {status}")) is _status_is_transient(status)
+
+
+@pytest.mark.parametrize("message", ["order 429 not found", "shard 529 rebalanced"])
+def test_a_bare_5xx_number_still_needs_status_context(message: str) -> None:
+    assert is_transient_error(RuntimeError(message)) is False

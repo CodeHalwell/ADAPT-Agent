@@ -28,9 +28,31 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-#: HTTP status codes worth retrying: throttling, request timeouts, and the
-#: 5xx family that means "the server, not your request, is having a problem".
-_TRANSIENT_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+#: Non-5xx status codes worth retrying: throttling, request timeouts, a
+#: conflict worth a second attempt, and Early Hints replay.
+_TRANSIENT_STATUS = frozenset({408, 409, 425, 429})
+
+#: The 5xx codes that are *not* worth retrying. Everything else in the range is,
+#: because 5xx means "the server, not your request, is having a problem" -- but
+#: these two are deterministic properties of the request, so a retry sends the
+#: same thing to the same server and gets the same answer.
+_PERMANENT_5XX = frozenset({501, 505})  # Not Implemented, HTTP Version Not Supported
+
+
+def _status_is_transient(status: int) -> bool:
+    """Return ``True`` when ``status`` is worth another attempt.
+
+    The 5xx family is matched as a *range*, not a hand-listed subset. The list
+    it replaces held ``500/502/503/504`` while the docstring above it claimed
+    "the 5xx family" -- so 507, 508, 509 and the whole 52x gateway block were
+    scored as earned zeros, and so was **529**, which is how Anthropic reports
+    an overloaded model. A list that must be extended for every provider's
+    chosen code drifts from the rule written beside it; a range cannot.
+    """
+    if status in _TRANSIENT_STATUS:
+        return True
+    return 500 <= status <= 599 and status not in _PERMANENT_5XX
+
 
 #: Attributes that may carry an HTTP status, in the order providers use them.
 _STATUS_ATTRS = ("status_code", "status", "http_status", "code")
@@ -80,7 +102,11 @@ _TRANSIENT_MESSAGE_FRAGMENTS = (
 #: A status number in *status context* -- "Error code: 429", "HTTP 503",
 #: "429 Too Many Requests". A bare number is not enough: "order 500 not found"
 #: and "expected 429 items, got 3" are application errors, not throttling.
-_STATUS_CODES = "408|409|425|429|500|502|503|504"
+#: The same rule as :func:`_status_is_transient`, spelled for a regex: the
+#: non-5xx codes, plus 5xx except the two deterministic ones. Kept in step
+#: with it by a test, because a message saying "Error code: 529" has to
+#: classify the same way as a response object carrying ``status_code=529``.
+_STATUS_CODES = r"408|409|425|429|5(?!01\b|05\b)\d{2}"
 _STATUS_REASONS = (
     "too many requests|request timeout|conflict|too early|internal server error|"
     "bad gateway|service unavailable|gateway timeout"
@@ -168,7 +194,7 @@ def is_transient_error(exc: BaseException) -> bool:
 
     status = _status_of(exc)
     if status is not None:
-        return status in _TRANSIENT_STATUS
+        return _status_is_transient(status)
 
     names = _type_names(exc)
     if any(fragment in name for name in names for fragment in _TRANSIENT_TYPE_FRAGMENTS):

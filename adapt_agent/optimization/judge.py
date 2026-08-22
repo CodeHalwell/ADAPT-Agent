@@ -585,6 +585,23 @@ class LLMJudge:
                     # second retry budget on an already-exhausted call.
                     mark_retries_exhausted(exc)
                     raise
+                if propagate_transient:
+                    # The metric-adapter path, where the harness is the
+                    # authority on what counts as transient. This policy did
+                    # not recognise the exception, but the harness may have its
+                    # own classifier configured -- consuming it into `on_error`
+                    # here decides the question before the harness is asked,
+                    # and a provider fault then scores as an earned zero.
+                    #
+                    # Deliberately *not* stamped with `mark_retries_exhausted`:
+                    # this policy did not retry it, so the harness should get
+                    # its full budget under its own classifier.
+                    logger.warning(
+                        "Judge completion failed and this policy does not classify it as "
+                        "transient; re-raising so the harness can apply its own: %s",
+                        exc,
+                    )
+                    raise
                 logger.warning("Judge completion failed, returning None: %s", exc)
                 return None
         return result if isinstance(result, str) else (str(result) if result is not None else None)

@@ -195,6 +195,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exclusion is driven by `transient_metrics` alone; the row flag now speaks
   only for completeness. A transient failure of the *agent call* names every
   metric, since there is no output for any of them to measure.
+- **A harness-level retry classifier never reached a judge used as a metric.**
+  `LLMJudge._complete` consumed anything *its own* policy did not recognise into
+  `on_error`, so a caller who configured `RetryPolicy(is_transient=...)` on the
+  harness — the documented place to configure metric retry — had a provider
+  fault scored as an earned zero: `score=0.0`, `is_complete=True`, zero
+  transient errors, and the rows handed to a proposer as the agent's failures.
+  On the metric-adapter path the harness is the authority, so an unrecognised
+  exception is re-raised for it to classify, deliberately *without* the
+  exhausted-retries marker since this policy never retried it. Standalone
+  `score()`/`critique()` keep their `on_error` fallback, and an exception
+  neither classifier recognises is still an earned zero.
+- **Only four 5xx codes were retried, beside a docstring claiming "the 5xx
+  family".** `_status_of()` finds the status and returns immediately, so 507,
+  508, 509 and the whole 52x gateway block were scored as earned zeros — and so
+  was **529**, which is how Anthropic reports an overloaded model. The range is
+  classified now, minus 501 and 505 (deterministic properties of the request: a
+  retry sends the same thing to the same server). The message path carried the
+  same hand-listed subset and drifted the same way; both spellings are now kept
+  in step by a test, since `Error code: 529` must classify like a response
+  object carrying `status_code=529`.
 - **A deterministic defect could be retried as if it were throttling.** The
   message heuristic — the weakest of the three signals, after HTTP status and
   exception type — ran for every exception, so `ValueError("timeout must be
