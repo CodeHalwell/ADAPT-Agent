@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A brace inside a CSS comment closed a stylesheet rule.** `_style_rules`
+  honoured escapes and quotes and knew nothing about comments, so
+  `<style>.x{/* } */display:block}</style>` resolved to nothing at all and the
+  marker behind the block went unreported. Wrong in the mirror direction too,
+  and there it passed only by accident: a quote inside a comment opened a
+  string that swallowed the rest of the sheet, leaving an invalid value that
+  this module happens to read as not-inline.
+
+  The tokenizer reads strings, comments and escapes in a *single* pass, so
+  none of them can be settled before the others — the same ordering that
+  already governs `_strip_css_comments` and `_css_declarations` one step down,
+  arriving at a third layer. All three share `_css_skip` now, which consumes
+  whichever of the three begins at a position and consumes it whole; each
+  hides the other two while it lasts, and an unterminated string or comment
+  runs to the end of the text, as CSS says. Both scans in `_style_rules` use
+  it, so they can no longer disagree about what is structure.
+
 - **Reading an embedded stylesheet was quadratic, twice.** Both were copies
   where a scan belonged, and both are reachable from an ordinary prompt on a
   detector with no default length limit. `_stylesheet_text` searched a fresh

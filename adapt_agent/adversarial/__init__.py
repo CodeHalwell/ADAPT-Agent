@@ -1206,6 +1206,45 @@ def _stylesheet_text(text: str) -> str:
     return "\n".join(sheets)
 
 
+def _css_skip(text: str, index: int) -> int:
+    """Past whatever begins at ``index`` and is not structure, or ``index``.
+
+    An escape, a string and a comment are each consumed whole, and each hides
+    the other two while it lasts: `/*` inside a string is not a comment, a
+    quote inside a comment is not a string, and neither is anything after a
+    backslash. That is the tokenizer's own single pass, and settling any one of
+    them first is the ordering mistake this module has now made at three
+    different layers.
+
+    Written once and shared by both scans in :func:`_style_rules`, which is
+    the other lesson from the round before: the two used to carry their own
+    copies of the quote-and-escape rule and neither knew about comments, so a
+    brace inside one closed a rule that CSS keeps open --
+    ``.x{/* } */display:block}`` resolved to nothing at all. A quote inside a
+    comment was wrong in the mirror direction and passed only by accident: it
+    opened a string that swallowed the rest of the sheet, and the value that
+    left behind was invalid, which this module reads as not-inline.
+    """
+    char = text[index]
+    if char == "\\":
+        return index + 2
+    if char in "\"'":
+        end = index + 1
+        limit = len(text)
+        while end < limit:
+            if text[end] == "\\":
+                end += 2
+                continue
+            if text[end] == char:
+                return end + 1
+            end += 1
+        return limit  # an unterminated string runs to the end, as CSS says
+    if text.startswith("/*", index):
+        close = text.find("*/", index + 2)
+        return len(text) if close < 0 else close + 2
+    return index
+
+
 def _style_rules(sheet: str) -> list[tuple[str, str]]:
     """Every ``selector { declarations }`` rule in ``sheet``, nesting included.
 
@@ -1229,22 +1268,13 @@ def _style_rules(sheet: str) -> list[tuple[str, str]]:
     rules: list[tuple[str, str]] = []
     stack: list[tuple[str, int]] = []
     index = start = 0
-    quote = ""
     end = len(sheet)
     while index < end:
+        skipped = _css_skip(sheet, index)
+        if skipped != index:
+            index = skipped
+            continue
         char = sheet[index]
-        if char == "\\":
-            index += 2
-            continue
-        if quote:
-            if char == quote:
-                quote = ""
-            index += 1
-            continue
-        if char in "\"'":
-            quote = char
-            index += 1
-            continue
         if char == ";":
             # A declaration ends here, so a selector after it starts clean. The
             # prelude of a *nested* rule would otherwise carry the enclosing
@@ -1287,20 +1317,12 @@ def _style_rules(sheet: str) -> list[tuple[str, str]]:
         # compromise.
         pieces: list[str] = []
         start = index = stack[0][1]
-        quote = ""
         while index < end:
-            char = sheet[index]
-            if char == "\\":
-                index += 2
+            skipped = _css_skip(sheet, index)
+            if skipped != index:
+                index = skipped
                 continue
-            if quote:
-                if char == quote:
-                    quote = ""
-                index += 1
-                continue
-            if char in "\"'":
-                quote = char
-            elif char == "{":
+            if sheet[index] == "{":
                 pieces.append(sheet[start:index])
                 start = index + 1
             index += 1
