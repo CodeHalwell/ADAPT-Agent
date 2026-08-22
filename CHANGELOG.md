@@ -107,6 +107,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a user reads to decide whether a tuned config generalises. It re-runs once
   and never aborts (validation does not steer the search), with the outcome on
   `OptimizationResult.validation_complete`.
+- **The exhausted-retries fallback hashed what it stored.** The weak-reference
+  table added for immutable exceptions was a `WeakSet`, and a set hashes its
+  members -- so an exception that refuses attribute assignment *and* defines
+  `__eq__` without `__hash__` fell through both mechanisms at once. Each
+  property alone was covered; their intersection was not, and the earlier test
+  matrix had them one at a time. Nothing here needs equality, since two
+  distinct exceptions that compare equal are still two separate retry budgets,
+  so the table is keyed by `id` with the stored weak reference re-checked by
+  identity -- which also makes an address reused after collection harmless.
+  Measured: nine provider calls for one row, back to three.
+- **The cache-staleness probe read the raw prompt undecoded.** It compared a
+  caller's cache against the line breaks *literally* present, and a break
+  written as `&#10;` only exists once the references are decoded -- so a
+  collapsed cache looked faithful and every encoded break was a bypass, for
+  exactly the legacy callers the probe exists to protect. The raw side is
+  decoded before the comparison; the cache side deliberately is not, since
+  decoding it would let a cache that kept its references *look* like it had
+  line structure and suppress the recompute. Decoding is the only transform
+  the probe has to anticipate: NFKC introduces no line boundary for any code
+  point in Unicode, which is now asserted rather than assumed.
 - **Three Unicode line separators were missing from the separator list.** The
   docstring promised "every recognised line separator" and the pattern held
   seven of the ten `str.splitlines` honours, so U+001C, U+001D and U+001E --

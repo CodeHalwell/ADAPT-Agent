@@ -702,13 +702,27 @@ class AdversarialDefense:
         never change the answer.
 
         So a cache that has lost line structure the raw prompt still has is
-        recomputed. The probe is two regex searches, and it never fires for the
-        internal callers (which pass :func:`_normalize_lines` output) or for
-        single-line prompts.
+        recomputed. The probe never fires for the internal callers (which pass
+        :func:`_normalize_lines` output) or for single-line prompts.
+
+        The raw side is probed for the line structure normalisation *would*
+        find, not for the breaks literally present. A break written as
+        ``&#10;`` is one that only appears once the references are decoded, so
+        probing the raw text left the collapsed cache looking faithful and
+        every encoded break was a bypass for exactly the callers this method
+        exists to protect. Decoding is the only such transform:
+        :func:`unicodedata.normalize` introduces no line boundary for any code
+        point in Unicode, which is asserted rather than assumed.
+
+        Only the raw side is decoded. Doing it to the cache too would let a
+        cache that kept its references *look* like it had line structure and
+        suppress the recompute, which is the unsafe direction.
         """
         if prompt_normalized is None:
             return _normalize_lines(prompt)
-        if not _ANY_LINE_BREAK_RE.search(prompt_normalized) and _ANY_LINE_BREAK_RE.search(prompt):
+        if not _ANY_LINE_BREAK_RE.search(prompt_normalized) and _ANY_LINE_BREAK_RE.search(
+            _decode_line_breaks(prompt)
+        ):
             return _normalize_lines(prompt)
         return prompt_normalized
 

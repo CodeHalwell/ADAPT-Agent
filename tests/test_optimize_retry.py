@@ -1655,6 +1655,24 @@ class UnhashableError(RuntimeError):
     __hash__ = None  # type: ignore[assignment]
 
 
+class RefusesAttributesAndUnhashable(RuntimeError):
+    """Both awkward properties at once, which is where the first fix fell through.
+
+    Each one alone was covered -- the attribute path handles an unhashable
+    exception, the fallback handles one that refuses attributes -- and their
+    intersection was covered by neither, because the fallback was a `WeakSet`
+    and a set hashes what it stores.
+    """
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(name)
+
+    def __eq__(self, other: object) -> bool:
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]
+
+
 @pytest.mark.parametrize(
     "exc",
     [
@@ -1662,8 +1680,15 @@ class UnhashableError(RuntimeError):
         RefusesAttributes("429 Too Many Requests"),
         FrozenError("429 Too Many Requests"),
         UnhashableError("429 Too Many Requests"),
+        RefusesAttributesAndUnhashable("429 Too Many Requests"),
     ],
-    ids=["builtin", "refuses-setattr", "frozen-dataclass", "unhashable"],
+    ids=[
+        "builtin",
+        "refuses-setattr",
+        "frozen-dataclass",
+        "unhashable",
+        "refuses-setattr-and-unhashable",
+    ],
 )
 def test_the_exhausted_marker_survives_every_exception_shape(exc: BaseException) -> None:
     from adapt_agent.optimization.retry import (
@@ -1706,3 +1731,80 @@ def test_budgets_do_not_multiply_on_an_exception_that_refuses_the_marker() -> No
 
     assert calls["n"] == 3, f"retried at both layers: {calls['n']} provider calls for one row"
     assert report.n_transient_errors == 1
+
+
+def test_budgets_do_not_multiply_on_an_unhashable_immutable_error() -> None:
+    """The measurable consequence of the intersection shape falling through."""
+    from adapt_agent.optimization.judge import LLMJudge
+
+    calls = {"n": 0}
+
+    def always_throttled(prompt, **kwargs):
+        calls["n"] += 1
+        raise RefusesAttributesAndUnhashable("429 Too Many Requests")
+
+    policy = RetryPolicy(attempts=3, initial_backoff=0.001, jitter=0.0)
+    harness = EvaluationHarness(
+        [LLMJudge(always_throttled, retry=policy).as_metric()], retry=policy
+    )
+    report = harness.evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+
+    assert calls["n"] == 3, f"retried at both layers: {calls['n']} provider calls for one row"
+    assert report.n_transient_errors == 1
+
+
+def test_marking_is_by_identity_not_equality() -> None:
+    """Two exceptions that compare equal are still two separate retry budgets."""
+    from adapt_agent.optimization.retry import (
+        mark_retries_exhausted,
+        retries_already_exhausted,
+    )
+
+    @dataclasses.dataclass(frozen=True)
+    class Equal(Exception):
+        detail: str
+
+    marked = Equal("429 Too Many Requests")
+    twin = Equal("429 Too Many Requests")
+    assert marked == twin
+    mark_retries_exhausted(marked)
+    assert retries_already_exhausted(marked) is True
+    assert retries_already_exhausted(twin) is False
+
+
+def test_an_id_reused_after_collection_is_not_mistaken_for_a_marked_error() -> None:
+    """`id` is only unique among *live* objects, so the entry is re-checked.
+
+    Racing a real collection against a real allocation is not something a test
+    can do deterministically, so the invariant is asserted directly: a stale
+    entry -- one whose referent is already gone -- must never answer for
+    whatever now occupies that address.
+    """
+    import weakref
+
+    from adapt_agent.optimization.retry import _EXHAUSTED_FALLBACK, retries_already_exhausted
+
+    dead = RefusesAttributesAndUnhashable("429 Too Many Requests")
+    reference = weakref.ref(dead)
+    successor = RefusesAttributesAndUnhashable("a completely unrelated error")
+    del dead
+    assert reference() is None, "the referent should be gone"
+
+    _EXHAUSTED_FALLBACK[id(successor)] = reference
+    try:
+        assert retries_already_exhausted(successor) is False
+    finally:
+        _EXHAUSTED_FALLBACK.pop(id(successor), None)
+
+
+def test_the_marker_table_does_not_retain_the_exceptions_it_marks() -> None:
+    """It is a process-lifetime table, so a strong reference would be a leak."""
+    import gc
+
+    from adapt_agent.optimization.retry import _EXHAUSTED_FALLBACK, mark_retries_exhausted
+
+    before = len(_EXHAUSTED_FALLBACK)
+    for _ in range(200):
+        mark_retries_exhausted(RefusesAttributesAndUnhashable("429 Too Many Requests"))
+    gc.collect()
+    assert len(_EXHAUSTED_FALLBACK) == before

@@ -310,8 +310,8 @@ class RetryPolicy:
 _EXHAUSTED_MARKER = "__adapt_retries_exhausted__"
 
 
-#: Exceptions that refused the marker attribute, held weakly so marking one
-#: cannot keep it alive.
+#: Exceptions that refused the marker attribute, keyed by identity and held
+#: weakly so marking one cannot keep it alive.
 #:
 #: Two mechanisms because neither alone covers every exception, and between
 #: them they cover all of it. A *builtin* exception takes the attribute but has
@@ -321,11 +321,20 @@ _EXHAUSTED_MARKER = "__adapt_retries_exhausted__"
 #: reaches -- a frozen-dataclass or otherwise immutable provider exception is
 #: the realistic case, and it is weak-referenceable by construction.
 #:
+#: **Identity, not equality.** This was a :class:`weakref.WeakSet`, which hashes
+#: what it stores -- so an exception that refuses attributes *and* defines
+#: ``__eq__`` without ``__hash__`` fell through both mechanisms at once. Each
+#: property alone was covered and their intersection was not. Nothing here
+#: needs equality: two distinct exceptions that compare equal are still two
+#: separate retry budgets, so the key is ``id`` and the stored reference is
+#: re-checked with ``is`` -- which also makes an id reused after collection
+#: harmless.
+#:
 #: Silently dropping the marker is not a cosmetic loss: the enclosing harness
 #: then spends its own budget on an error a judge already retried, so one row
 #: makes nine provider calls instead of three, piling on load precisely while
 #: the provider is throttling.
-_EXHAUSTED_FALLBACK: weakref.WeakSet[BaseException] = weakref.WeakSet()
+_EXHAUSTED_FALLBACK: dict[int, weakref.ref[BaseException]] = {}
 
 
 def mark_retries_exhausted(exc: BaseException) -> BaseException:
@@ -335,9 +344,14 @@ def mark_retries_exhausted(exc: BaseException) -> BaseException:
         return exc
     except Exception:  # an exception type that refuses attributes
         pass
+    key = id(exc)
+
+    def _forget(_dead: object, key: int = key) -> None:
+        _EXHAUSTED_FALLBACK.pop(key, None)
+
     try:
-        _EXHAUSTED_FALLBACK.add(exc)
-    except Exception:  # unhashable, or no weak reference support either
+        _EXHAUSTED_FALLBACK[key] = weakref.ref(exc, _forget)
+    except TypeError:  # no `__weakref__` slot *and* no settable attribute
         pass
     return exc
 
@@ -346,10 +360,8 @@ def retries_already_exhausted(exc: BaseException) -> bool:
     """Whether a lower layer already spent this error's retries."""
     if getattr(exc, _EXHAUSTED_MARKER, False):
         return True
-    try:
-        return exc in _EXHAUSTED_FALLBACK
-    except Exception:  # unhashable: it was never added either
-        return False
+    reference = _EXHAUSTED_FALLBACK.get(id(exc))
+    return reference is not None and reference() is exc
 
 
 #: Used when a harness is constructed without an explicit policy.
