@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A comment delimiter inside a CSS string was treated as a delimiter.** The
+  comment sweep was a pattern run before the block was tokenized, so it deleted
+  everything between two strings that each held one:
+  `display:inline;--x:"/*";display:block;--y:"*/"` lost its real
+  `display:block` and resolved to `inline`. The mirror reported prose, and an
+  escaped solidus opened a comment it cannot open. Three of sixteen resolver
+  cases wrong, in both directions.
+
+  The tokenizer reads strings, comments and escapes in **one pass**, so none of
+  them can be handled before the others. Comments are removed by the same
+  left-to-right scan the declaration splitter uses, with the same rule one
+  stage earlier: structure inside a string is not structure. Each comment still
+  becomes a space rather than nothing, still ends at its own first `*/`, and an
+  unterminated one still runs to the end of the block.
+- **The exhausted-retries mark outlived its propagation.** An exception that
+  escaped an `LLMJudge` carried the mark for the rest of its life, so a
+  *different* metric raising the same object was treated as having already
+  spent retries it never spent. Measured: a metric that succeeds on its second
+  attempt went from `score=1.0, calls=2, transient=0` to
+  `score=0.0, calls=1, transient=1`, turning a complete evaluation into an
+  incomplete one.
+
+  The mark is consumed when the harness handles the propagation, exactly as the
+  declared fallback is. The previous release notes argued the opposite -- that
+  the mark records a property of the error rather than of a propagation, and
+  that whichever layer sets it re-sets it on each raise. That argument only
+  holds while the *same* layer raises; another callback reusing the object
+  never sets it, and inherits it. `retries_already_exhausted` remains a
+  non-consuming read for callers that want to ask without clearing.
+
 - **A declared fallback outlived the failure it belonged to.** The note a
   metric leaves on the exception it raises was set once and never removed, so a
   *reused* exception object carried the first metric's fallback for the rest of
@@ -227,8 +257,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsplit line is checked too, which is what makes that direction harmless.
 
   Both of these came out of re-running the accumulated corpus rather than out of
-  the reported findings. That corpus now stands at **130 attack phrasings caught,
-  51 benign unaffected**, re-run whole each round rather than trusted from the last.
+  the reported findings. That corpus now stands at **133 attack phrasings caught,
+  53 benign unaffected**, re-run whole each round rather than trusted from the last.
 
 - **Microsoft Agent Framework agents yielded nothing tunable.** The
   introspector required `.instructions` and `.chat_client` as *attributes*.

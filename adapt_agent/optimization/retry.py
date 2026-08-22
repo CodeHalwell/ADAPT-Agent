@@ -417,6 +417,27 @@ def retries_already_exhausted(exc: BaseException) -> bool:
     return bool(_EXHAUSTED.get(exc, False))
 
 
+def consume_retries_exhausted(exc: BaseException) -> bool:
+    """Whether a lower layer spent this error's retries, clearing the mark.
+
+    Like the declared fallback, this belongs to **one propagation**. An earlier
+    round argued the opposite -- that the mark records a property of the error
+    itself, and that whichever layer sets it re-sets it on each raise anyway --
+    and that reasoning had a hole: it only holds while the *same* layer raises.
+    An exception object that escaped an :class:`~adapt_agent.optimization.judge.LLMJudge`
+    and is then reused by some other callback carries the mark with it, and
+    that callback never sets it, so the mark applies to a failure that never
+    spent anything.
+
+    The cost is not a skipped retry, which is what the old argument weighed.
+    A metric that would have succeeded on its second attempt is called once,
+    its row is dropped as transient, and a complete run becomes an incomplete
+    one: measured, ``score=1.0, calls=2, transient=0`` became
+    ``score=0.0, calls=1, transient=1, is_complete=False``.
+    """
+    return bool(_EXHAUSTED.consume(exc, False))
+
+
 def note_declared_fallback(exc: BaseException, score: float) -> BaseException:
     """Record the fallback declared by the metric raising ``exc``.
 
@@ -448,10 +469,10 @@ def consume_declared_fallback(exc: BaseException) -> float | None:
     one metric's own ``0.4`` came back as ``0.7``. That corrupts the report
     rather than merely mis-scoring one cell.
 
-    :data:`_EXHAUSTED_MARKER` is deliberately *not* consumed alongside it: that
-    one records a property of the error itself -- "a lower layer already spent
-    a budget on this" -- which stays true however often the object is raised,
-    and the layer that sets it re-sets it each time anyway.
+    The exhausted-retries mark is consumed the same way, by
+    :func:`consume_retries_exhausted`. It was not, for one round, on the
+    argument that it records a property of the error rather than of a
+    propagation -- see that function for why the argument was wrong.
     """
     carried = _DECLARED_FALLBACK.consume(exc, None)
     return None if carried is None else float(carried)
@@ -465,6 +486,7 @@ __all__ = [
     "RetryPolicy",
     "mark_retries_exhausted",
     "retries_already_exhausted",
+    "consume_retries_exhausted",
     "note_declared_fallback",
     "declared_fallback",
     "consume_declared_fallback",

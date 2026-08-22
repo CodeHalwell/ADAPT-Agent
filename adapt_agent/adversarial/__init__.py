@@ -711,12 +711,59 @@ def _css_declarations(block: str) -> list[str]:
     return declarations
 
 
-#: A CSS comment, including one left unterminated -- the tokenizer closes it
-#: at the end of the block. Replaced by a *space* rather than deleted, because
-#: a comment separates tokens: ``disp/**/lay`` is two identifiers and not the
-#: ``display`` property, while ``display/**/:block`` is that property with its
-#: colon. Deleting would have merged the first pair and invented a declaration.
-_CSS_COMMENT_RE = re.compile(r"/\*.*?(?:\*/|$)", re.DOTALL)
+def _strip_css_comments(block: str) -> str:
+    """Remove the CSS comments in ``block``, and only the real ones.
+
+    Each is replaced by a *space* rather than deleted, because a comment
+    separates tokens: ``disp/**/lay`` is two identifiers and not the ``display``
+    property, while ``display/**/:block`` is that property with its colon.
+    Deleting would have merged the first pair and invented a declaration.
+    An unterminated comment runs to the end of the block, as the tokenizer
+    closes it there.
+
+    A left-to-right scan rather than a pattern, because a comment delimiter is
+    only a delimiter *outside* a string, and the same is true in reverse -- the
+    tokenizer reads strings, comments and escapes in one pass, so none of them
+    can be handled before the others. A pattern that swept every ``/*`` to
+    every ``*/`` deleted whatever lay between two strings that each held one:
+    ``display:inline;--x:"/*";display:block;--y:"*/"`` lost its real
+    ``display:block`` and resolved to ``inline``, which is the bypass
+    direction, while the same trick the other way round reported prose. An
+    escaped solidus cannot open one either.
+
+    The same rule as :func:`_css_declarations` and :func:`_split_declaration`,
+    one stage earlier: structure inside a string is not structure.
+    """
+    out: list[str] = []
+    index = 0
+    quote = ""
+    while index < len(block):
+        char = block[index]
+        if char == "\\":
+            out.append(block[index : index + 2])
+            index += 2
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+            out.append(char)
+            index += 1
+            continue
+        if char in "\"'":
+            quote = char
+            out.append(char)
+            index += 1
+            continue
+        if char == "/" and block.startswith("/*", index):
+            end = block.find("*/", index + 2)
+            out.append(" ")
+            index = len(block) if end < 0 else end + 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 #: The ``hidden`` content attribute, which renders the element not at all --
 #: the same as ``display:none`` for the only question asked here.
 _HIDDEN_ATTR_RE = re.compile(r"(?<=[\s\"'])hidden(?=[\s/>=])")
@@ -794,7 +841,7 @@ def _declared_display(construct: str) -> str | None:
             value = value[1:-1]  # the attribute's own delimiters, not CSS's
         normal: str | None = None
         important: str | None = None
-        block = _CSS_COMMENT_RE.sub(" ", html.unescape(value))
+        block = _strip_css_comments(html.unescape(value))
         for declaration in _css_declarations(block):
             found = _declared_value(declaration, "display")
             if found is None:

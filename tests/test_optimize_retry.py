@@ -1957,11 +1957,59 @@ def test_the_note_is_cleared_for_an_exception_that_refuses_attributes() -> None:
     assert declared_fallback(error) is None
 
 
-def test_the_exhausted_marker_is_deliberately_not_consumed() -> None:
-    """It records a property of the error, true however often it is raised."""
-    from adapt_agent.optimization.retry import mark_retries_exhausted, retries_already_exhausted
+def test_the_exhausted_marker_belongs_to_one_propagation_too() -> None:
+    """Reversed from the round before, which argued it should persist.
+
+    That argument -- the mark records a property of the error, and whichever
+    layer sets it re-sets it on each raise -- only holds while the *same* layer
+    raises. Another callback reusing the object never sets it, and inherits it.
+    """
+    from adapt_agent.optimization.retry import (
+        consume_retries_exhausted,
+        mark_retries_exhausted,
+        retries_already_exhausted,
+    )
 
     error = ValueError("429 Too Many Requests")
     mark_retries_exhausted(error)
+    # A plain read still does not clear it, so the two accessors stay distinct.
     assert retries_already_exhausted(error) is True
     assert retries_already_exhausted(error) is True
+    assert consume_retries_exhausted(error) is True
+    assert retries_already_exhausted(error) is False
+    assert consume_retries_exhausted(error) is False
+
+
+def test_a_metric_reusing_a_judges_exception_still_gets_its_retries() -> None:
+    """The reported shape, end to end.
+
+    A judge spends its budget on an exception and re-raises it; a later metric
+    raises the same object and must be retried on its own account. Leaked, the
+    harness called it once and dropped a row that would have scored 1.0 --
+    turning a complete evaluation into an incomplete one.
+    """
+    from adapt_agent.optimization.dataset import Example, GoldenDataset
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import Metric
+    from adapt_agent.optimization.retry import mark_retries_exhausted, retries_already_exhausted
+
+    shared = TimeoutError("429 Too Many Requests")
+    calls = {"n": 0}
+
+    def exhausts_like_a_judge(output, expected):
+        raise mark_retries_exhausted(shared)
+
+    def flaky(output, expected):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise shared
+        return 1.0
+
+    report = EvaluationHarness(
+        [Metric("judgelike", exhausts_like_a_judge), Metric("flaky", flaky)],
+        retry=RetryPolicy(attempts=3, initial_backoff=0.0, jitter=0.0),
+    ).evaluate(lambda x: "ok", GoldenDataset([Example(inputs="a", expected="ok")]))
+
+    assert report.aggregate["flaky"] == pytest.approx(1.0)
+    assert calls["n"] == 2, "the second metric was denied its own retry"
+    assert retries_already_exhausted(shared) is False

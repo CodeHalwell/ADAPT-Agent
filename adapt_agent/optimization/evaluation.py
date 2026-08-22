@@ -29,7 +29,7 @@ from adapt_agent.optimization.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
     consume_declared_fallback,
-    retries_already_exhausted,
+    consume_retries_exhausted,
 )
 
 logger = logging.getLogger(__name__)
@@ -743,7 +743,7 @@ class EvaluationHarness:
                 # the error when its budget is spent. Retrying here as well
                 # would multiply the budgets and reset the backoff, adding
                 # load exactly while the provider is throttling.
-                if retries_already_exhausted(exc):
+                if consume_retries_exhausted(exc):
                     # The marker means "do not spend another budget", not
                     # "exclude this row". Exclusion is still *this* policy's
                     # call: a caller who narrowed `is_transient` to treat this
