@@ -1088,3 +1088,108 @@ def test_optimize_re_runs_a_throttled_validation_pass(optimizer_name: str) -> No
     result = _build_optimizer(optimizer_name, harness).optimize(agent, train, val_dataset=val)
 
     assert result.validation_complete is True, "validation did not go through _evaluate_validation"
+
+
+# -- exclusion is per metric in *both* directions ------------------------------
+
+
+def test_a_throttled_primary_does_not_discard_a_good_secondary() -> None:
+    """The mirror of the round-five fix, and the same mistake in reverse.
+
+    Scoping transient failures to the failing metric stopped a throttled
+    *secondary* erasing the primary. The whole-row branch still discarded every
+    metric when the *primary* was the one throttled -- so a secondary that
+    measured all four rows perfectly reported a mean of 0.0 over no samples.
+    An unearned zero is not a measurement; neither is discarding an earned one.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled(output, expected):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [Metric("primary", throttled), exact_match()], retry=RetryPolicy(attempts=1)
+    ).evaluate(lambda x: "ok", dataset)
+
+    assert report.aggregate["exact_match"] == 1.0, "a valid measurement was thrown away"
+    assert report.metric_samples == {"exact_match": 4}
+    assert report.transient_by_metric == {"primary": 4}
+    assert report.partial_metrics == ["primary"]
+    # The primary is still unmeasurable, so the run is still not comparable.
+    assert report.is_complete is False
+    assert report.n_transient_errors == 4
+
+
+def test_a_throttled_agent_call_loses_every_metric() -> None:
+    """No output means nothing for any metric to measure.
+
+    `transient_metrics` is the single source of truth for per-metric exclusion,
+    so a whole-row failure has to name them all rather than leave the
+    accumulator inferring it from the row flag.
+    """
+    from adapt_agent.optimization.metrics import Metric
+
+    def throttled_agent(payload):
+        raise RuntimeError("429 Too Many Requests")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness(
+        [exact_match(), Metric("secondary", lambda o, e: 1.0)], retry=RetryPolicy(attempts=1)
+    ).evaluate(throttled_agent, dataset)
+
+    assert report.metric_samples == {}, "a metric was credited for a row that never ran"
+    assert report.transient_by_metric == {"exact_match": 4, "secondary": 4}
+    assert report.is_complete is False
+
+
+def test_a_permanent_agent_failure_still_earns_its_zeros() -> None:
+    """The exclusion is for *transient* failures only -- a broken agent scores 0."""
+
+    def broken(payload):
+        raise ValueError("bad prompt")
+
+    dataset = GoldenDataset([Example(inputs=str(i), expected="ok") for i in range(4)])
+    report = EvaluationHarness([exact_match()], retry=RetryPolicy(attempts=1)).evaluate(
+        broken, dataset
+    )
+
+    assert report.aggregate["exact_match"] == 0.0
+    assert report.metric_samples == {"exact_match": 4}
+    assert report.n_errors == 4
+    assert report.n_transient_errors == 0
+    assert report.is_complete is True
+    assert len(report.failures()) == 4
+
+
+def test_validation_completeness_survives_serialisation() -> None:
+    """`validation_complete` exists to be read later, so it has to be written down.
+
+    A persisted result or a provenance header outlives the run's logs; a partial
+    validation score that serialises identically to a whole one is back to being
+    invisible.
+    """
+    from adapt_agent.optimization.optimizers import OptimizationResult
+
+    partial = OptimizationResult(
+        best_config={"p": "x"},
+        best_score=1.0,
+        baseline_score=0.0,
+        baseline_config={},
+        history=[],
+        validation_score=0.5,
+        validation_complete=False,
+    )
+    assert partial.to_dict()["validation_complete"] is False
+    assert partial._provenance()["validation_complete"] is False
+
+    whole = OptimizationResult(
+        best_config={},
+        best_score=1.0,
+        baseline_score=0.0,
+        baseline_config={},
+        history=[],
+        validation_score=0.5,
+    )
+    assert whole.to_dict()["validation_complete"] is True
+    assert whole._provenance()["validation_complete"] is True

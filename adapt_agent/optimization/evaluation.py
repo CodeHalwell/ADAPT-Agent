@@ -615,6 +615,11 @@ class EvaluationHarness:
             latency=latency,
             error=str(exc),
             transient=transient,
+            # The agent call itself failed, so there is no output for *any*
+            # metric to measure -- naming them all keeps `transient_metrics`
+            # the single source of truth for per-metric exclusion, rather than
+            # something the accumulator has to infer from `transient`.
+            transient_metrics=tuple(m.name for m in self.metrics) if transient else (),
             attempts=attempts,
         )
 
@@ -762,23 +767,26 @@ class _Accumulator:
             # A throttled example carries a zero score it did not earn. Folding
             # that into the mean is what lets an optimizer prefer whichever
             # candidate happened to run when the provider was least busy, so the
-            # record is kept (and counted) but never scored.
+            # row is kept (and counted) but its *primary* score is not banked.
+            #
+            # `result.transient` speaks only for the primary metric, and so only
+            # for completeness. Which metrics actually lost a measurement is
+            # `transient_metrics` -- a throttled primary says nothing about a
+            # secondary that computed fine, and discarding that sample would be
+            # the same "an unearned zero is not a measurement" mistake in
+            # reverse. Whole-row failures name every metric there, so the one
+            # rule below covers both.
             self._n_transient_errors += 1
-            for metric in self._harness.metrics:
-                self._transient_by_metric[metric.name] = (
-                    self._transient_by_metric.get(metric.name, 0) + 1
-                )
-        else:
-            skip = set(result.transient_metrics)
-            for name in skip:
-                self._transient_by_metric[name] = self._transient_by_metric.get(name, 0) + 1
-            for name, score in result.scores.items():
-                if name in skip:
-                    # This metric's own provider call failed; its zero is not a
-                    # measurement. Other metrics on the row are unaffected.
-                    continue
-                self._sums[name] = self._sums.get(name, 0.0) + score
-                self._counts[name] = self._counts.get(name, 0) + 1
+        skip = set(result.transient_metrics)
+        for name in skip:
+            self._transient_by_metric[name] = self._transient_by_metric.get(name, 0) + 1
+        for name, score in result.scores.items():
+            if name in skip:
+                # This metric's own provider call failed; its zero is not a
+                # measurement. Other metrics on the row are unaffected.
+                continue
+            self._sums[name] = self._sums.get(name, 0.0) + score
+            self._counts[name] = self._counts.get(name, 0) + 1
         if result.index < self._harness.max_results:
             if self._results and result.index < self._results[-1].index:
                 self._unordered = True

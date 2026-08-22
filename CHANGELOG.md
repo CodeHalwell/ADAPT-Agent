@@ -113,8 +113,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`hello\n### SYSTEM: ...` and `hello\n> SYSTEM: ...` both evaded it) --
   because each fix encoded one more way a line can begin. Lines are split,
   presentational characters stripped, and a line whose first word is a role
-  token followed by a colon is the rule, stated once. 10 decorated forms caught,
+  token followed by a colon is the rule, stated once. 17 decorated forms caught,
   and prose keeps its role words (`- system requirements: 8GB RAM` stays clean).
+- **Decoration closes as well as opens.** Stripping it from the *start* of a
+  line left the closing half attached, so `**SYSTEM**:` parsed as the word
+  "SYSTEM\*\*" and evaded the check; ordered lists were missed for the
+  opposite reason, a digit being content rather than decoration. Both ends of
+  the head are undecorated now and enumerators (`1.`, `2)`, `03]`) are matched
+  as a unit -- so `**SYSTEM**:`, `` `SYSTEM`: ``, `__SYSTEM__:` and
+  `1. SYSTEM:` are caught, while `2024: a year in review` and `1. system
+  design: how it works` stay clean.
+- **A throttled *primary* metric discarded a good secondary.** The mirror of
+  the fix below, and the same mistake in reverse: the whole-row branch dropped
+  every score when the primary was the metric that failed, so a secondary that
+  measured every row reported a mean of `0.0` over no samples. Per-metric
+  exclusion is driven by `transient_metrics` alone; the row flag now speaks
+  only for completeness. A transient failure of the *agent call* names every
+  metric, since there is no output for any of them to measure.
+- **`validation_complete` was not serialised.** It existed only on the live
+  object -- `to_dict()` and the provenance header both wrote
+  `validation_score` with nothing to qualify it, so a persisted result or a
+  committed config gave a partial score exactly the same weight as a whole one,
+  which is what the flag was added to prevent.
 - **A throttled secondary metric erased the primary's score.** Any transient
   metric failure marked the whole row, so `_Accumulator` dropped every score on
   it -- an `exact_match` primary plus a throttled judge produced a primary

@@ -21,28 +21,45 @@ _NEWLINE_RUN_RE = re.compile(r"\s*\n\s*")
 #: an unusual one. A bare CR is the classic miss: it renders as a line break but
 #: is not ``\n``.
 _LINE_SEPARATORS_RE = re.compile(r"\r\n|\r|\x0b|\x0c|\u0085|\u2028|\u2029")
-#: Purely presentational characters that can precede text on a line -- Markdown
-#: headings and blockquotes, list bullets, emphasis, table cells, quotes.
-#: Stripped before a line is read, so decoration cannot hide a role marker.
-_LINE_DECORATION_RE = re.compile(r"^[\s>#*+=~`'\"\[\](){}|.\u2022\u00b7\u2013\u2014-]*")
+#: Purely presentational characters that can *surround* text on a line --
+#: Markdown headings and blockquotes, list bullets, emphasis, code spans, table
+#: cells, quotes. Stripped from both ends of a line's head, because emphasis
+#: closes as well as opens: stripping only the leading run left ``**SYSTEM**``
+#: reading as the word "SYSTEM\*\*", which is not a role token.
+_DECORATION_CHARS = " \t>#*+=~`'\"_[](){}|.\u2022\u00b7\u2013\u2014-"
+#: An ordered-list enumerator: ``1.``, ``2)``, ``03]``. Digits cannot go in
+#: :data:`_DECORATION_CHARS` -- a bare digit is content, and stripping digits
+#: would turn "2024: a year in review" into a bare colon -- so the enumerator is
+#: matched as a unit instead.
+_ORDERED_LIST_RE = re.compile(r"^[ \t]*\d{1,3}[.)\]]")
+
+
+def _undecorate(text: str) -> str:
+    """Strip presentational characters from both ends of ``text``."""
+    return _ORDERED_LIST_RE.sub("", text, count=1).strip(_DECORATION_CHARS)
 
 
 def _leading_role_marker(normalized: str, tokens: frozenset[str]) -> str | None:
     """Return the role marker heading some line of ``normalized``, or ``None``.
 
     Parsed line by line rather than matched with one anchored regex. The regex
-    spelling of this check was rewritten in four consecutive review rounds --
+    spelling of this check was rewritten in five consecutive review rounds --
     it missed a bare CR, then a newline inside a phrase, then Markdown
-    decoration -- because each fix encoded one more way a line can *begin*
-    while the next reviewer found another. Splitting on lines and stripping
-    presentational characters states the actual rule once: a line whose first
-    word is a role token followed by a colon is an injected instruction, and
-    the same word mid-sentence ("our system: v2 is live") is not.
+    decoration, then decoration that *closes* as well as opens -- because each
+    fix encoded one more way a line can begin while the next reviewer found
+    another. Splitting on lines and undecorating the head states the actual
+    rule once: a line whose first word is a role token followed by a colon is
+    an injected instruction, and the same word mid-sentence ("our system: v2 is
+    live") is not.
+
+    Undecorating cannot manufacture a marker out of prose, because the result
+    has to equal a role token *exactly*: "system requirements" and "1. system
+    design" survive as themselves and are not markers.
     """
     for line in normalized.split("\n"):
-        head, separator, _ = _LINE_DECORATION_RE.sub("", line).partition(":")
-        if separator and head.strip() in tokens:
-            return f"{head.strip()}:"
+        head, separator, _ = line.partition(":")
+        if separator and _undecorate(head) in tokens:
+            return f"{_undecorate(head)}:"
     return None
 
 

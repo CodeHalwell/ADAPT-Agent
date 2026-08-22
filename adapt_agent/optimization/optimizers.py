@@ -260,7 +260,8 @@ class OptimizationResult:
                         f"# baseline={provenance['baseline_score']:.4f} "
                         f"best={provenance['best_score']:.4f} "
                         f"improvement={provenance['improvement']:+.4f} "
-                        f"validation={provenance['validation_score']} "
+                        f"validation={provenance['validation_score']}"
+                        f"{'' if provenance['validation_complete'] else ' (PARTIAL)'} "
                         f"over {provenance['n_evals']} evals.\n"
                         "# Review this diff before committing: prompts here were "
                         "machine-written.\n"
@@ -275,6 +276,10 @@ class OptimizationResult:
             "best_score": self.best_score,
             "improvement": self.improvement,
             "validation_score": self.validation_score,
+            # Travels with the score it qualifies. A partial validation is the
+            # same number as a whole one until something says otherwise, and a
+            # persisted result is read long after the run's logs are gone.
+            "validation_complete": self.validation_complete,
             "n_evals": self.n_evals,
         }
 
@@ -285,6 +290,7 @@ class OptimizationResult:
             "best_score": self.best_score,
             "improvement": self.improvement,
             "validation_score": self.validation_score,
+            "validation_complete": self.validation_complete,
             "n_evals": self.n_evals,
             "best_config": self.best_config,
             "recommendations": list(self.recommendations),
