@@ -107,6 +107,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a user reads to decide whether a tuned config generalises. It re-runs once
   and never aborts (validation does not steer the search), with the outcome on
   `OptimizationResult.validation_complete`.
+- **Three Unicode line separators were missing from the separator list.** The
+  docstring promised "every recognised line separator" and the pattern held
+  seven of the ten `str.splitlines` honours, so U+001C, U+001D and U+001E --
+  the file, group and record separators -- were read as horizontal whitespace
+  and a role marker behind one went undetected, in every spelling: literal,
+  `&#28;`, `&#x1C;`. This is the hand-maintained-list failure the rest of this
+  module has already been rewritten to avoid, so the fix is the rule rather
+  than three more characters: splitting calls `str.splitlines` directly, and
+  the boundary set used elsewhere is derived from it. A test re-derives that
+  set over the whole of Unicode, so a boundary added above the module's scan
+  limit fails loudly rather than quietly.
+
+  The reference spellings needed a second reader. `html.unescape` is
+  HTML5-faithful and the spec drops a reference to a disallowed control
+  outright, so `&#28;` decodes to nothing -- true of a browser, and not true of
+  an XML parser or anything reaching for `chr(int(...))`. "Is this a line
+  break?" now reads the code point the reference *names*; "what does a reader
+  see here?" stays with `html.unescape`, so `&#147;` remains a curly quote and
+  the marker it wraps is still found. 163 attack phrasings caught, 65 benign
+  unaffected.
 - **A character reference was deleted, joining the letters around it.** Every
   other construct the undecorator handles is invisible once rendered, so
   removing it is what a reader sees. A reference is not -- `&amp;` renders as
