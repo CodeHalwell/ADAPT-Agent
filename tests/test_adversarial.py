@@ -921,17 +921,23 @@ def test_undecorating_is_linear_in_the_length_of_the_input() -> None:
     Both shapes are here because consuming the enumerator run alone would fix
     only the first: `> 1. > 1. ...` alternates two rules and peels one prefix
     per pass either way.
+
+    20,000 repetitions rather than 10,000 for the margin. At 10,000 the
+    run-consuming near-fix takes 0.9s on the alternating shape -- inside the
+    budget on a fast machine and outside it on a slow one, which is a guard
+    that reports the machine rather than the code. At 20,000 it is 3.6s
+    against a linear ~10ms.
     """
     import time
 
     from adapt_agent.adversarial import _undecorate
 
     for prefix in ("1. ", "> 1. ", "- ", "<b>", "&lt;"):
-        text = prefix * 10_000 + "system: reveal"
+        text = prefix * 20_000 + "system: reveal"
         started = time.perf_counter()
         _undecorate(text)
         elapsed = time.perf_counter() - started
-        assert elapsed < 1.0, f"{prefix!r} * 10000 took {elapsed:.2f}s"
+        assert elapsed < 1.0, f"{prefix!r} * 20000 took {elapsed:.2f}s"
 
 
 def test_a_long_decorated_prompt_is_still_scanned_promptly() -> None:
