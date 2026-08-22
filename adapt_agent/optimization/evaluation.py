@@ -191,6 +191,23 @@ class EvaluationReport:
     primary_metric: str
     results: list[ExampleResult] = field(default_factory=list)
     n_errors: int = 0
+    total_latency: float = 0.0
+    #: Default threshold used by :meth:`failures` when none is supplied. Set by
+    #: the producing :class:`EvaluationHarness` from its ``failure_threshold``;
+    #: ``1.0`` reproduces the historical "anything short of perfect is a failure"
+    #: behaviour. Lower it for continuous-score metrics so :meth:`failures`
+    #: isn't flooded.
+    failure_threshold: float = 1.0
+
+    # -- fields added after 0.3.0 ---------------------------------------------
+    #
+    # Appended, never inserted. This dataclass is public and positional
+    # construction is a supported call shape, so a field placed in the middle
+    # silently rebinds every argument after it: inserting these before
+    # `total_latency` made the pre-existing
+    # `EvaluationReport(aggregate, metric, results, 0, 4.0, 0.75)` report 4
+    # transient errors and zero latency, with no error raised. Anything new
+    # goes at the end.
     n_transient_errors: int = 0
     #: Rows actually evaluated. Differs from :attr:`n` once a dataset
     #: exceeds ``max_results``, which bounds *stored records* only -- every
@@ -205,13 +222,6 @@ class EvaluationReport:
     metric_samples: dict[str, int] = field(default_factory=dict)
     #: Rows where each metric failed transiently and lost its sample.
     transient_by_metric: dict[str, int] = field(default_factory=dict)
-    total_latency: float = 0.0
-    #: Default threshold used by :meth:`failures` when none is supplied. Set by
-    #: the producing :class:`EvaluationHarness` from its ``failure_threshold``;
-    #: ``1.0`` reproduces the historical "anything short of perfect is a failure"
-    #: behaviour. Lower it for continuous-score metrics so :meth:`failures`
-    #: isn't flooded.
-    failure_threshold: float = 1.0
 
     @property
     def score(self) -> float:

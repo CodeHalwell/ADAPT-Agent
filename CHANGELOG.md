@@ -152,6 +152,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the answer, so one that has lost line structure the raw prompt still has is
   recomputed. The probe is two regex searches and never fires for
   line-preserving caches or single-line prompts.
+- **New dataclass fields are appended, not inserted.** `EvaluationReport` and
+  `OptimizationResult` are public and positional construction is a supported
+  call shape, so putting a field in the middle silently rebinds every argument
+  after it — no error, just wrong values:
+
+  ```
+  EvaluationReport(aggregate, metric, results, 0, 4.0, 0.75)
+    -> n_transient_errors=4.0, n_evaluated=0.75, total_latency=0.0, is_complete=False
+
+  OptimizationResult(..., validation_score, ["tune the prompt"])
+    -> validation_complete=["tune the prompt"], recommendations=[]
+  ```
+
+  Both are appended now, restoring the 0.3.0 positional meaning. Every public
+  dataclass this release touched was checked, not just the two reported —
+  `ExampleResult` and `Trial` were already correct — and the established prefix
+  of all four is asserted, so the next added field cannot repeat this.
 - **Custom elements and namespaced tags are ordinary markup.** The tag-name
   grammar was `[A-Za-z][A-Za-z0-9]*`, which stops at a hyphen — so `<my-tag>`
   (every custom element) and `<svg:g>` (every namespaced XML tag) went

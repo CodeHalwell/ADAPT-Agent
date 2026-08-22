@@ -100,12 +100,21 @@ class OptimizationResult:
     history: list[Trial] = field(default_factory=list)
     best_report: EvaluationReport | None = None
     validation_score: float | None = None
+    recommendations: list[str] = field(default_factory=list)
+
+    # -- fields added after 0.3.0 -----------------------------------------
+    #
+    # Appended, never inserted. This dataclass is public and positional
+    # construction is a supported call shape, so a field placed in the
+    # middle silently rebinds every argument after it: `recommendations`
+    # was the eighth positional, and putting this flag in front of it
+    # assigned the caller's list to a boolean and left the recommendations
+    # empty -- lost on serialisation, with no error raised.
     #: False when transient provider failures cost the validation pass some
     #: rows, so :attr:`validation_score` is a mean over a subset and is not
     #: comparable with :attr:`best_score`. ``True`` when there was no
     #: validation set at all -- there is nothing partial about not running.
     validation_complete: bool = True
-    recommendations: list[str] = field(default_factory=list)
 
     @property
     def improved(self) -> bool:
