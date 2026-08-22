@@ -2013,3 +2013,88 @@ def test_a_metric_reusing_a_judges_exception_still_gets_its_retries() -> None:
     assert report.aggregate["flaky"] == pytest.approx(1.0)
     assert calls["n"] == 2, "the second metric was denied its own retry"
     assert retries_already_exhausted(shared) is False
+
+
+# -- every exit from the metric retry loop consumes the note -------------------
+#
+# Five paths leave that except block; only two used to read the fallback. The
+# other three left it on the exception -- including the retry `continue`, so a
+# *successful* retry still leaked one.
+
+_PERMANENT_POLICY = RetryPolicy(attempts=1, is_transient=lambda exc: False)
+
+
+def _leaks_through(first, policy):
+    """Run one evaluation that takes `first`'s exit, then read what it left.
+
+    The second harness classifies the failure as permanent, which is the only
+    way a fallback is ever read -- so it is the shape in which a leaked note
+    changes a score rather than merely lingering.
+    """
+    from adapt_agent.optimization.dataset import Example, GoldenDataset
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+    from adapt_agent.optimization.metrics import Metric
+    from adapt_agent.optimization.retry import declared_fallback
+
+    shared = TimeoutError("429 Too Many Requests")
+    state = {"n": 0}
+    rows = GoldenDataset([Example(inputs="a", expected="ok")])
+
+    EvaluationHarness(
+        [Metric("first", lambda o, e: first(shared, state), on_error=0.7)], retry=policy
+    ).evaluate(lambda x: "ok", rows)
+
+    def raises_shared(output, expected):
+        raise shared
+
+    report = EvaluationHarness(
+        [Metric("second", raises_shared, on_error=0.2)], retry=_PERMANENT_POLICY
+    ).evaluate(lambda x: "ok", rows)
+    return report.aggregate["second"], declared_fallback(shared)
+
+
+def test_a_successful_retry_leaves_no_note_behind() -> None:
+    """The reported path: the attempt failed, the retry succeeded, the note stayed."""
+
+    def retry_then_succeed(shared, state):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise shared
+        return 1.0
+
+    score, left = _leaks_through(
+        retry_then_succeed, RetryPolicy(attempts=3, initial_backoff=0.0, jitter=0.0)
+    )
+    assert score == pytest.approx(0.2)
+    assert left is None
+
+
+def test_an_exhausted_mark_transient_exit_leaves_no_note_behind() -> None:
+    from adapt_agent.optimization.retry import mark_retries_exhausted
+
+    def marks_exhausted(shared, state):
+        raise mark_retries_exhausted(shared)
+
+    score, left = _leaks_through(marks_exhausted, RetryPolicy(attempts=1))
+    assert score == pytest.approx(0.2)
+    assert left is None
+
+
+def test_an_attempts_spent_transient_exit_leaves_no_note_behind() -> None:
+    def always_transient(shared, state):
+        raise shared
+
+    score, left = _leaks_through(always_transient, RetryPolicy(attempts=1))
+    assert score == pytest.approx(0.2)
+    assert left is None
+
+
+def test_a_permanent_exit_still_consumes_it_too() -> None:
+    """The two paths that always did, so the fix cannot regress them."""
+
+    def always(shared, state):
+        raise shared
+
+    score, left = _leaks_through(always, _PERMANENT_POLICY)
+    assert score == pytest.approx(0.2)
+    assert left is None

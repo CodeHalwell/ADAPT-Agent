@@ -722,7 +722,7 @@ class EvaluationHarness:
         # a name -- a caller's own object is not required to have the field.
         declared = getattr(metric, "on_error", None)
 
-        def _permanent(exc: BaseException) -> float:
+        def _permanent(carried: float | None) -> float:
             # What the failure itself carries wins over what the outermost
             # metric declares. A metric can dispatch to another, and the
             # harness only ever holds the wrapper: `checks` routing a row to
@@ -730,7 +730,6 @@ class EvaluationHarness:
             # reading the wrapper scored that judge 0.0 here and 0.7 on a
             # direct call -- the same contract split the previous round closed,
             # reopened one layer down.
-            carried = consume_declared_fallback(exc)
             fallback = declared if carried is None else carried
             return 0.0 if fallback is None else max(0.0, min(1.0, float(fallback)))
 
@@ -739,6 +738,16 @@ class EvaluationHarness:
             try:
                 return metric(output, example.expected, example), False
             except Exception as exc:
+                # Both notes this attempt may carry come off here, once,
+                # whatever happens next -- because five paths leave this block
+                # and only two of them used to read the fallback. The three
+                # that did not left it on the exception: the retry `continue`
+                # (so a *successful* retry still leaked one) and both transient
+                # returns. An exception instance is routinely reused, so a
+                # later metric declaring `0.2` scored the earlier one's `0.7`.
+                # Consuming at the single entrance rather than at each exit is
+                # what makes that unable to recur.
+                carried = consume_declared_fallback(exc)
                 # A metric that runs its own retry loop (LLMJudge does) stamps
                 # the error when its budget is spent. Retrying here as well
                 # would multiply the budgets and reset the backoff, adding
@@ -759,7 +768,7 @@ class EvaluationHarness:
                             index,
                             exc,
                         )
-                        return _permanent(exc), False
+                        return _permanent(carried), False
                     logger.warning(
                         "Metric %s failed transiently on example %d (its own retries "
                         "were already spent); excluded from the score: %s",
@@ -797,7 +806,7 @@ class EvaluationHarness:
                     )
                     return 0.0, True
                 logger.warning("Metric %s raised on example %d: %s", metric.name, index, exc)
-                return _permanent(exc), False
+                return _permanent(carried), False
 
     def _build_report(self, results_iter: Any) -> EvaluationReport:
         """Aggregate a stream of per-example results into a report."""

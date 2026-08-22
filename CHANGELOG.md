@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Three of the five exits from the metric retry loop never consumed the
+  fallback note.** Consuming it was added where the note is *read* -- the two
+  permanent-failure returns -- and the other three exits left it on the
+  exception: the retry `continue`, so a **successful** retry still leaked one,
+  and both transient returns. A later metric declaring `on_error=0.2` then
+  scored the earlier one's `0.7`.
+
+  The note is consumed once at the block's single entrance now, and every exit
+  reads the local. Consuming at one entrance rather than at each exit is what
+  makes this unable to recur: the previous fix was correct for the paths it
+  covered and had to be repeated on every path anyone adds later, which is the
+  same shape as a list beside a rule.
+
 - **A comment delimiter inside a CSS string was treated as a delimiter.** The
   comment sweep was a pattern run before the block was tokenized, so it deleted
   everything between two strings that each held one:
