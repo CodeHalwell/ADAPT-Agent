@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-24
+
+### Added
+
+- **`EvaluationHarness(concurrency=)`**, a per-instance default used when a call
+  site passes none. `0.3.0` added `concurrency` to `evaluate`/`aevaluate`, but an
+  `Optimizer` calls `harness.evaluate(target, dataset)` with no keyword
+  arguments -- so the knob could not reach the one path that needs it, being
+  `max_evals x len(dataset)` round trips rather than a single pass. A per-call
+  argument still wins where one is given.
+- **`adapt_agent.optimization.retry`**: `RetryPolicy`, `is_transient_error` and
+  `retry_after_seconds`, all duck-typed so no provider SDK is imported. Pass
+  `RetryPolicy(attempts=1)` to classify transient failures without retrying
+  them, or `is_transient=` to supply your own classifier.
+
 ### Fixed
 
 - **A `.` or `#` with no name kept its valid prefix.** `.x#` is not a
@@ -1152,21 +1167,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RetryPolicy` is frozen, so `harness.retry.attempts = 1` raises instead of
   silently reconfiguring every other evaluation in the process.
 
-### Added
-
-- **`EvaluationHarness(concurrency=)`**, a per-instance default used when a call
-  site passes none. `0.3.0` added `concurrency` to `evaluate`/`aevaluate`, but an
-  `Optimizer` calls `harness.evaluate(target, dataset)` with no keyword
-  arguments -- so the knob could not reach the one path that needs it, being
-  `max_evals x len(dataset)` round trips rather than a single pass. A per-call
-  argument still wins where one is given.
-- **`adapt_agent.optimization.retry`**: `RetryPolicy`, `is_transient_error` and
-  `retry_after_seconds`, all duck-typed so no provider SDK is imported. Pass
-  `RetryPolicy(attempts=1)` to classify transient failures without retrying
-  them, or `is_transient=` to supply your own classifier.
-
-## [0.3.1] - 2026-08-21
-
 ### Security
 
 - **`0.3.0` on PyPI ships the mapping-key screening bypass; `0.3.1` is the
@@ -1184,6 +1184,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The fix itself, and the two event-loop fixes released alongside it, are
   described under `[0.3.0]` below -- that entry documents the code as merged,
   which is what `0.3.1` is the first artifact to contain.
+
 
 ## [0.3.0] - 2026-08-21
 
