@@ -31,12 +31,15 @@ imports an agent framework or an LLM SDK.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import shutil
 import sys
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -55,6 +58,14 @@ from adapt_agent.exceptions import SkillError
 
 #: The entrypoint file every skill directory must contain.
 SKILL_FILE = "SKILL.md"
+
+#: Written into an installed skill directory to record where it came from.
+#: Dotted so it sorts out of the way and no agent scanning for ``SKILL.md``
+#: mistakes it for content. Absent from an install made before this existed,
+#: and from a hand-copied directory -- both of which read as "unknown" rather
+#: than as up to date, because an install that cannot say what it is is
+#: exactly the case this file exists to stop being invisible.
+MANIFEST_FILE = ".adapt-skill.json"
 
 #: Where each install target places skill directories, relative to its root.
 #: ``project`` is resolved against the working directory (or an explicit root),
@@ -148,12 +159,97 @@ class InstallResult:
     #: ``True`` when an existing installation at :attr:`path` was replaced.
     replaced: bool = False
 
+    #: The library version that produced this install, recorded in its manifest.
+    version: str = ""
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.skill.name,
             "path": str(self.path),
             "files": list(self.files),
             "replaced": self.replaced,
+            "version": self.version,
+        }
+
+
+@dataclass
+class InstalledSkill:
+    """What an installed skill directory says about itself.
+
+    Read back from :data:`MANIFEST_FILE`. ``None`` from :func:`installed_skill`
+    means there is no manifest to read, which is not the same as "not
+    installed": a directory copied by hand, or installed by a version that
+    predates manifests, has files but cannot say which version they are.
+    """
+
+    name: str
+    version: str
+    installed_at: str
+    path: Path
+    #: Relative path -> SHA-256 of the bytes written at install time.
+    digests: dict[str, str]
+
+
+@dataclass
+class SkillStatus:
+    """How an installed skill compares to the running library.
+
+    The distinction that matters is between the three unhappy answers, because
+    they need different fixes: *missing* (install it), *unknown* (no manifest --
+    reinstall so it can be tracked), and *stale* (reinstall to pick up the
+    current guidance). ``modified`` is orthogonal to all three: it lists files
+    that differ from what was installed, which is the case where ``--force``
+    would discard someone's edits.
+    """
+
+    name: str
+    path: Path
+    running_version: str
+    installed_version: str | None
+    present: bool
+    modified: tuple[str, ...] = ()
+
+    @property
+    def unknown(self) -> bool:
+        """Installed, but with no manifest to say which version it is."""
+        return self.present and self.installed_version is None
+
+    @property
+    def stale(self) -> bool:
+        """Installed, known, and not the version now running."""
+        return self.installed_version is not None and self.installed_version != self.running_version
+
+    @property
+    def current(self) -> bool:
+        """Installed, known to match the running version, and unedited."""
+        return self.present and not self.unknown and not self.stale and not self.modified
+
+    def summary(self) -> str:
+        """One line naming the state and, where there is one, the fix."""
+        if not self.present:
+            return f"{self.name}: not installed at {self.path}"
+        if self.unknown:
+            return f"{self.name}: installed at {self.path}, version unknown (no manifest)"
+        if self.stale:
+            return (
+                f"{self.name}: installed {self.installed_version}, "
+                f"running {self.running_version} -- stale"
+            )
+        if self.modified:
+            return f"{self.name}: {self.running_version}, locally modified ({len(self.modified)})"
+        return f"{self.name}: {self.running_version}, up to date"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "path": str(self.path),
+            "running_version": self.running_version,
+            "installed_version": self.installed_version,
+            "present": self.present,
+            "modified": list(self.modified),
+            "unknown": self.unknown,
+            "stale": self.stale,
+            "current": self.current,
         }
 
 
@@ -380,6 +476,7 @@ def install_skill(
         staged = staging / resolved.name
         previous = staging / "previous"
         _materialize(resolved, staged)
+        version = _write_manifest(resolved, staged)
         if replaced:
             # Move the old install aside rather than deleting it, so a failure
             # during the swap can put it back.
@@ -405,6 +502,139 @@ def install_skill(
         path=target_dir,
         files=resolved.files,
         replaced=replaced,
+        version=version,
+    )
+
+
+def _running_version() -> str:
+    """The version of the library doing the installing.
+
+    Imported here rather than at module scope: ``adapt_agent/__init__.py``
+    pulls in the adapters, the detector and the optimizer, and this module is
+    otherwise cheap to import. Read from the package rather than restated,
+    because a second copy of a version string is a list beside a rule and this
+    codebase has paid for that five times already.
+    """
+    from adapt_agent import __version__
+
+    return __version__
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _write_manifest(skill: Skill, destination: Path) -> str:
+    """Record what was installed into ``destination``. Returns the version.
+
+    The file list is derived from what was actually written, never restated:
+    a hand-kept second list is the failure this whole change exists to close.
+    """
+    version = _running_version()
+    digests = {}
+    for relative in skill.files:
+        digests[relative] = _digest(destination.joinpath(*relative.split("/")).read_bytes())
+    manifest = {
+        "skill": skill.name,
+        "version": version,
+        "installed_at": datetime.now(timezone.utc).isoformat(),
+        "files": digests,
+    }
+    (destination / MANIFEST_FILE).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return version
+
+
+def installed_skill(path: str | Path) -> InstalledSkill | None:
+    """Read the manifest of an installed skill directory, or ``None``.
+
+    ``None`` covers every way a directory can fail to say what it is -- no
+    manifest, unreadable, not JSON, or JSON of the wrong shape. They are one
+    answer on purpose: each means the same thing to a caller, that the install
+    cannot be trusted to report its own version, and each has the same fix.
+
+    Never raises. This is a diagnostic, and a diagnostic that fails on a
+    damaged file tells you least exactly when you need it most.
+    """
+    manifest_path = Path(path) / MANIFEST_FILE
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    name, version = raw.get("skill"), raw.get("version")
+    if not isinstance(name, str) or not isinstance(version, str):
+        return None
+    files = raw.get("files")
+    digests = (
+        {k: v for k, v in files.items() if isinstance(k, str) and isinstance(v, str)}
+        if isinstance(files, dict)
+        else {}
+    )
+    installed_at = raw.get("installed_at")
+    return InstalledSkill(
+        name=name,
+        version=version,
+        installed_at=installed_at if isinstance(installed_at, str) else "",
+        path=Path(path),
+        digests=digests,
+    )
+
+
+def skill_status(
+    skill: str | Skill,
+    destination: str | Path | None = None,
+    *,
+    target: str = "project",
+    root: str | Path | None = None,
+) -> SkillStatus:
+    """Compare an installed skill against the running library.
+
+    Resolves the destination exactly as :func:`install_skill` does, so what it
+    reports is what an install would replace.
+
+    An installed skill does not update itself when the library is upgraded, and
+    nothing in the directory said which version it was -- so a copy could sit
+    there feeding an agent guidance for a release two versions back, including
+    documented behaviour that had since been fixed, and the only way to find
+    out was to diff it against the wheel by hand. That happened.
+    """
+    resolved = skill if isinstance(skill, Skill) else get_skill(skill)
+    skills_dir = (
+        Path(destination) if destination is not None else default_destination(target, root=root)
+    )
+    path = skills_dir / resolved.name
+    running = _running_version()
+    if not path.is_dir():
+        return SkillStatus(
+            name=resolved.name,
+            path=path,
+            running_version=running,
+            installed_version=None,
+            present=False,
+        )
+    record = installed_skill(path)
+    modified: list[str] = []
+    if record is not None:
+        for relative, expected in sorted(record.digests.items()):
+            try:
+                actual = _digest(path.joinpath(*relative.split("/")).read_bytes())
+            except OSError:
+                # Unreadable or gone since install -- a difference from what was
+                # written, which is what `modified` means.
+                modified.append(relative)
+                continue
+            if actual != expected:
+                modified.append(relative)
+    return SkillStatus(
+        name=resolved.name,
+        path=path,
+        running_version=running,
+        installed_version=None if record is None else record.version,
+        present=True,
+        modified=tuple(modified),
     )
 
 
@@ -448,13 +678,18 @@ __all__ = [
     "MAX_DESCRIPTION_LENGTH",
     "MAX_NAME_LENGTH",
     "SKILL_FILE",
+    "MANIFEST_FILE",
     "InstallResult",
+    "InstalledSkill",
     "Skill",
+    "SkillStatus",
     "available_skills",
     "default_destination",
     "get_skill",
     "install_all",
     "install_skill",
+    "installed_skill",
     "parse_frontmatter",
+    "skill_status",
     "validate_skill",
 ]

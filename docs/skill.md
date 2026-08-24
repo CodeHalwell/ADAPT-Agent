@@ -60,6 +60,45 @@ Upgrading the library does not move the copy already on disk. Re-run
 `adapt install skill --force` after `pip install -U adapt-agent` to pick up the
 new version.
 
+## Checking an installation is current
+
+Forgetting that re-run is silent, and the cost is not cosmetic: an agent reads
+whatever `SKILL.md` is on disk, so a copy left behind by an old release keeps
+prescribing its behaviour — including anything since fixed — with nothing in
+the directory to say so. That happened in a real deployment, and it took a
+hand diff against the wheel to find.
+
+```bash
+adapt skills --check              # exit 0 if current, 1 if missing, stale, or unversioned
+adapt skills --check --target user
+adapt skills --check --dir path/to/skills
+adapt skills --check --json
+```
+
+The exit code is the useful part: put it beside the lint step in CI and a
+forgotten re-run fails the build instead of quietly shipping old guidance.
+
+```
+adapt-agent: installed 0.2.0, running 0.3.2 -- stale
+
+Install with: adapt install skill adapt-agent --force
+```
+
+Each install records what produced it in a `.adapt-skill.json` manifest beside
+the skill files, which is what `--check` reads. Four states are reported and
+they need different fixes:
+
+| State | Meaning | Fix |
+| --- | --- | --- |
+| up to date | matches the running library, unedited | none |
+| stale | installed by an older release | `--force` reinstall |
+| version unknown | no manifest — installed before manifests existed, or copied by hand | `--force` reinstall |
+| locally modified | files differ from what was installed | your call; `--force` discards the edits |
+
+A local edit is reported but does **not** fail the check. Editing your own copy
+is a supported thing to do, and a check that broke the build over it would only
+teach people to stop running the check.
+
 ## Listing what is bundled
 
 ```bash
