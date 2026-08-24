@@ -1,8 +1,23 @@
 name: Release
 
-# Publishes adapt-agent to PyPI when a version tag is pushed.
+# Publishes adapt-agent to PyPI, two ways:
 #
-#   git tag -a v0.2.0 -m "v0.2.0" && git push origin v0.2.0
+#   1. Merge a commit to `main` that bumps `adapt_agent.__version__`. The
+#      pipeline notices the version is not on PyPI yet and releases it,
+#      creating the `vX.Y.Z` tag itself.
+#   2. Push a version tag by hand, as before:
+#        git tag -a v0.2.0 -m "v0.2.0" && git push origin v0.2.0
+#
+# Either way the `pypi` environment's required reviewer still has to approve
+# before anything is uploaded -- "automatic" here means no tag ceremony, not
+# no human.
+#
+# Whether to release is decided by asking PyPI whether the version already
+# exists, not by diffing against the previous commit: that answer is correct
+# for a revert, a re-run, a merge commit, and a hand-pushed tag alike, and it
+# is the same index the upload would go to. If PyPI cannot be reached the
+# answer is "do not publish" -- a missed release is recoverable and a wrong
+# one is not.
 #
 # Building and publishing are done with uv (`uv build` / `uv publish`).
 # Authentication uses PyPI Trusted Publishing (OIDC) -- there is no API token
@@ -10,10 +25,12 @@ name: Release
 # docs/releasing.md; without it the publish step fails with an auth error.
 #
 # `workflow_dispatch` runs the same pipeline against TestPyPI (or PyPI) so the
-# whole path can be rehearsed before cutting a real tag.
+# whole path can be rehearsed before cutting a real release.
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -30,9 +47,11 @@ on:
 permissions:
   contents: read
 
-# Never let two releases race to the same index.
+# Never let two releases race to the same index. Keyed on the workflow rather
+# than the ref: two commits landing on main in quick succession are different
+# refs but the same release, and they must not both try to upload it.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -40,11 +59,13 @@ jobs:
   #    Catches the classic "tagged v0.3.0, shipped 0.2.0" mistake before a
   #    single artifact is built.
   version:
-    name: Check tag matches package version
+    name: Resolve version and decide whether to release
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       prerelease: ${{ steps.resolve.outputs.prerelease }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      release: ${{ steps.resolve.outputs.release }}
     steps:
       - uses: actions/checkout@v7
 
@@ -75,6 +96,7 @@ jobs:
           fi
 
           echo "version=${package_version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${package_version}" >> "$GITHUB_OUTPUT"
           # PEP 440 pre-release segments mark the GitHub Release as a pre-release.
           if printf '%s' "${package_version}" | grep -Eq '(a|b|rc|dev)[0-9]*$'; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
@@ -82,10 +104,49 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
+          # Is there anything to release? A hand-pushed tag and a manual run
+          # both say so explicitly. A push to main has to be asked, because
+          # most commits do not bump the version -- and the authority on
+          # "already released" is the index the upload would go to, not a diff
+          # against the previous commit, which gets reverts, re-runs and merge
+          # commits wrong.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          url="https://pypi.org/pypi/adapt-agent/${package_version}/json"
+          # `|| true` rather than `|| echo 000`: curl already writes 000 to
+          # stdout when it never got a response, so the echo *appends* a second
+          # one and the status reads "000000". Harmless -- it falls to the
+          # catch-all either way -- but it would print that in the warning.
+          # The `||` itself is load-bearing under `set -e`, which would
+          # otherwise abort on curl's non-zero exit.
+          status="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 --retry-delay 2 \
+                      --max-time 30 "${url}" || true)"
+          case "${status}" in
+            404)
+              echo "PyPI has no ${package_version}; releasing it."
+              echo "release=true" >> "$GITHUB_OUTPUT"
+              ;;
+            200)
+              echo "adapt-agent ${package_version} is already on PyPI; nothing to release."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # Fail closed. Not knowing is not the same as knowing it is new,
+              # and a PyPI filename can never be reused.
+              echo "::warning::PyPI returned ${status} for ${url}; not releasing."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
   # 2. Gate the release on exactly the checks that guard main (lint, the
   #    3.10-3.14 test matrix, and a build smoke test) by reusing ci.yml.
   ci:
     name: CI
+    needs: version
+    if: needs.version.outputs.release == 'true'
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
@@ -94,6 +155,7 @@ jobs:
   build:
     name: Build and validate distributions
     needs: [version, ci]
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -198,7 +260,7 @@ jobs:
   publish-testpypi:
     name: Publish to TestPyPI
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -227,8 +289,14 @@ jobs:
   # 4b. The real thing: a pushed v* tag (or an explicit manual choice).
   publish-pypi:
     name: Publish to PyPI
-    if: github.event_name == 'push' || inputs.target == 'pypi'
-    needs: build
+    # NOT `github.event_name == 'push'`: that is true for a push to *any*
+    # branch, so with `main` among the triggers it would attempt a publish on
+    # every commit. The gate is what says a release is wanted; the event only
+    # says which index a manual run picked.
+    if: >-
+      needs.version.outputs.release == 'true'
+      && (github.event_name != 'workflow_dispatch' || inputs.target == 'pypi')
+    needs: [version, build]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -257,7 +325,15 @@ jobs:
   # 5. Record the release on GitHub with the same artifacts that went to PyPI.
   github-release:
     name: Create GitHub Release
-    if: github.event_name == 'push'
+    # Also creates the tag when the release came from a version bump rather
+    # than a hand-pushed tag, which is why it runs *after* the upload: the tag
+    # then always means "this is on PyPI", with no window where one exists
+    # without the other.
+    #
+    # A tag created here with the default GITHUB_TOKEN does not trigger another
+    # workflow run -- GitHub's recursion guard -- which is exactly why this run
+    # publishes rather than tagging and expecting to be re-entered.
+    if: github.event_name == 'push' && needs.version.outputs.release == 'true'
     needs: [version, publish-pypi]
     runs-on: ubuntu-latest
     permissions:
@@ -274,11 +350,15 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          # The version's own tag, never `github.ref_name`: on a push to main
+          # that is the branch, and this would cut a release called "main".
+          TAG: ${{ needs.version.outputs.tag }}
           PRERELEASE: ${{ needs.version.outputs.prerelease }}
         run: |
           set -euo pipefail
-          flags=(--generate-notes --title "$TAG")
+          # --target pins the tag to the commit that was built and published,
+          # and is a no-op when the tag already exists from a manual push.
+          flags=(--generate-notes --title "$TAG" --target "$GITHUB_SHA")
           if [ "$PRERELEASE" = "true" ]; then
             flags+=(--prerelease)
           fi

@@ -193,6 +193,23 @@ def main(args: list[str] | None = None) -> int:
 
     skills_parser = subparsers.add_parser("skills", help="List the bundled agent skills")
     skills_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Compare the installed skills against this library version and "
+        "exit non-zero if any is missing, stale, or of unknown version.",
+    )
+    skills_parser.add_argument(
+        "--target",
+        choices=_SKILL_TARGETS,
+        default="project",
+        help="Which installation --check inspects (default: project).",
+    )
+    skills_parser.add_argument(
+        "--dir",
+        dest="directory",
+        help="Explicit skills directory for --check, overriding --target.",
+    )
+    skills_parser.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON output"
     )
 
@@ -487,8 +504,9 @@ def _cmd_install(args: Any) -> int:
 
     for result in results:
         verb = "Updated" if result.replaced else "Installed"
+        version = f" v{result.version}" if result.version else ""
         print(
-            f"{verb} the '{result.skill.name}' skill "
+            f"{verb} the '{result.skill.name}' skill{version} "
             f"({len(result.files)} files) -> {_display_path(result.path)}"
         )
     where = "this project" if args.target == "project" and not args.directory else "you"
@@ -505,6 +523,9 @@ def _cmd_skills(args: Any) -> int:
     except Exception as exc:
         return _fail(exc, args.json)
 
+    if getattr(args, "check", False):
+        return _cmd_skills_check(args, skills)
+
     if args.json:
         print(json.dumps({"skills": [s.to_dict() for s in skills]}, indent=2))
         return 0
@@ -520,6 +541,60 @@ def _cmd_skills(args: Any) -> int:
             print(f"    {_first_sentence(skill.description)}")
     print()
     print(f"Install with: {_prog_name()} install skill [NAME] [--target project|user]")
+    return 0
+
+
+def _cmd_skills_check(args: Any, skills: list[Any]) -> int:
+    """Report installed-vs-running for each bundled skill; non-zero if any is not current.
+
+    An installed skill does not follow the library when it is upgraded, and
+    until it carried a manifest nothing in the directory said which version it
+    was -- so a stale copy could feed an agent guidance from an older release,
+    including behaviour that had since been fixed, and only a hand diff against
+    the wheel would show it. The exit code is the point: this belongs in CI
+    next to the lint step, not in someone's memory.
+    """
+    from adapt_agent.skills import skill_status
+
+    try:
+        statuses = [skill_status(skill, args.directory, target=args.target) for skill in skills]
+    except Exception as exc:
+        return _fail(exc, args.json)
+
+    # Locally modified is *not* a failure: someone editing their own copy on
+    # purpose is a supported thing to do, and failing a build over it would
+    # teach people to stop running the check. Reported, not enforced.
+    outdated = [s for s in statuses if not s.present or s.unknown or s.stale]
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "status": "ok" if not outdated else "outdated",
+                    "skills": [s.to_dict() for s in statuses],
+                },
+                indent=2,
+            )
+        )
+        return 1 if outdated else 0
+
+    if not statuses:
+        print("No bundled skills to check.")
+        return 0
+
+    for status in statuses:
+        print(f"  {status.summary()}")
+    if outdated:
+        names = " ".join(sorted({s.name for s in outdated}))
+        # `--force` only when something is there to replace: telling someone to
+        # force an install that has no existing directory reads as though the
+        # command were dangerous when it is the ordinary first install.
+        force = " --force" if any(s.present for s in outdated) else ""
+        print()
+        print(f"Install with: {_prog_name()} install skill {names}{force}")
+        return 1
+    print()
+    print("Installed skills match this library version.")
     return 0
 
 

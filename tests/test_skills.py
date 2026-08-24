@@ -16,6 +16,7 @@ import pytest
 from adapt_agent.exceptions import SkillError
 from adapt_agent.optimization.evals import evaluate_agent
 from adapt_agent.skills import (
+    MANIFEST_FILE,
     MAX_DESCRIPTION_LENGTH,
     MAX_NAME_LENGTH,
     SKILL_FILE,
@@ -238,7 +239,10 @@ def test_install_copies_every_file(tmp_path):
     on_disk = sorted(
         p.relative_to(result.path).as_posix() for p in result.path.rglob("*") if p.is_file()
     )
-    assert on_disk == sorted(result.skill.files)
+    # Every skill file, plus the install manifest and nothing else. Stated as
+    # an exact set rather than "the files are present", so a stray artefact is
+    # still caught -- which is how the manifest itself first showed up here.
+    assert on_disk == sorted([*result.skill.files, MANIFEST_FILE])
     assert (result.path / SKILL_FILE).read_text(encoding="utf-8").startswith("---")
 
 
@@ -957,3 +961,167 @@ def test_documented_output_extractor_values_are_usable():
         output_extractor=api.extract_output_payload,
     )
     assert report.aggregate["checks"] == 1.0
+
+
+# -- an installed skill has to say which version it is -------------------------
+
+
+def _install(tmp_path):
+    from adapt_agent.skills import install_skill
+
+    return install_skill("adapt-agent", root=tmp_path)
+
+
+def test_an_install_records_the_version_that_made_it(tmp_path) -> None:
+    """The gap this closes: nothing in an installed directory said what it was.
+
+    An installed skill does not follow the library when it is upgraded, so a
+    0.2.0 copy sat in a project feeding an agent guidance for a release two
+    behind — including two documented behaviours that had since been fixed —
+    and the only way anyone found out was by diffing it against the wheel by
+    hand. Reported from a real deployment, not imagined.
+    """
+    import json
+
+    from adapt_agent import __version__
+    from adapt_agent.skills import installed_skill
+
+    result = _install(tmp_path)
+    assert result.version == __version__
+
+    manifest = json.loads((result.path / MANIFEST_FILE).read_text(encoding="utf-8"))
+    assert manifest["skill"] == "adapt-agent"
+    assert manifest["version"] == __version__
+
+    record = installed_skill(result.path)
+    assert record is not None
+    assert record.version == __version__
+    # Derived from what was written, never a second hand-kept list: the file
+    # set here has to be exactly the skill's own files.
+    assert set(record.digests) == set(result.skill.files)
+
+
+def test_the_manifest_is_not_mistaken_for_skill_content(tmp_path) -> None:
+    """It is an install record, not part of the skill.
+
+    So it stays out of `files`, and its name keeps it out of the way of any
+    agent scanning the directory for `SKILL.md`.
+    """
+    result = _install(tmp_path)
+    assert MANIFEST_FILE not in result.files
+    assert MANIFEST_FILE.startswith(".")
+    assert (result.path / "SKILL.md").exists()
+
+
+def test_status_separates_the_three_unhappy_answers(tmp_path) -> None:
+    """Missing, unknown and stale need different fixes, so they are different states.
+
+    `unknown` is the one worth stating: a directory installed before manifests
+    existed, or copied by hand, has files but cannot say which version they
+    are — and reading that as "up to date" would hide exactly the case this
+    change exists to surface.
+    """
+    import json
+
+    from adapt_agent import __version__
+    from adapt_agent.skills import skill_status
+
+    missing = skill_status("adapt-agent", root=tmp_path)
+    assert (missing.present, missing.stale, missing.unknown) == (False, False, False)
+    assert not missing.current
+
+    result = _install(tmp_path)
+    fresh = skill_status("adapt-agent", root=tmp_path)
+    assert fresh.current
+    assert fresh.installed_version == __version__
+    assert not (fresh.stale or fresh.unknown or fresh.modified)
+
+    path = result.path / MANIFEST_FILE
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["version"] = "0.2.0"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    stale = skill_status("adapt-agent", root=tmp_path)
+    assert stale.stale and not stale.current
+    assert stale.installed_version == "0.2.0"
+
+    path.unlink()
+    unknown = skill_status("adapt-agent", root=tmp_path)
+    assert unknown.unknown and unknown.present
+    assert not unknown.stale, "no manifest is not the same as a version mismatch"
+    assert not unknown.current
+
+
+def test_a_local_edit_is_reported_but_is_not_staleness(tmp_path) -> None:
+    """Editing your own copy is supported; it must not read as an old version.
+
+    Kept apart because the fixes differ — a stale install wants reinstalling,
+    an edited one wants a decision — and because `--force` on an edited copy is
+    the case that silently discards someone's work.
+    """
+    from adapt_agent import __version__
+    from adapt_agent.skills import skill_status
+
+    result = _install(tmp_path)
+    skill_md = result.path / "SKILL.md"
+    skill_md.write_text(skill_md.read_text(encoding="utf-8") + "\nlocal\n", encoding="utf-8")
+
+    status = skill_status("adapt-agent", root=tmp_path)
+    assert status.modified == ("SKILL.md",)
+    assert not status.stale
+    assert status.installed_version == __version__
+    assert not status.current
+
+
+def test_a_file_deleted_since_install_counts_as_modified(tmp_path) -> None:
+    """Gone is a difference from what was written, not a reason to raise.
+
+    Reached by deleting a file the manifest lists — a half-copied directory, a
+    partial `git checkout`, someone tidying a reference file. Worth its own
+    test because the branch is an `except OSError` that nothing else exercises,
+    and an untested branch in a diagnostic is a diagnostic nobody has run.
+    """
+    from adapt_agent.skills import skill_status
+
+    result = _install(tmp_path)
+    doomed = sorted(f for f in result.skill.files if f != "SKILL.md")[0]
+    (result.path / doomed).unlink()
+
+    status = skill_status("adapt-agent", root=tmp_path)
+    assert status.modified == (doomed,)
+    assert not status.stale, "a missing file is not an old version"
+    assert not status.current
+
+
+def test_a_damaged_manifest_reads_as_unknown_rather_than_raising(tmp_path) -> None:
+    """A diagnostic that raises tells you least exactly when you need it most.
+
+    Every way the file can fail to answer — absent, unreadable, not JSON, JSON
+    of the wrong shape, or missing the two fields that matter — is one answer,
+    because each means the install cannot report its version and each has the
+    same fix.
+    """
+    from adapt_agent.skills import installed_skill, skill_status
+
+    result = _install(tmp_path)
+    path = result.path / MANIFEST_FILE
+    for damaged in ("{not json", "[]", '"a string"', "{}", '{"skill": "adapt-agent"}', ""):
+        path.write_text(damaged, encoding="utf-8")
+        assert installed_skill(result.path) is None, damaged
+        assert skill_status("adapt-agent", root=tmp_path).unknown, damaged
+
+
+def test_reinstalling_replaces_a_stale_manifest(tmp_path) -> None:
+    """The documented fix has to actually work, end to end."""
+    import json
+
+    from adapt_agent.skills import install_skill, skill_status
+
+    result = _install(tmp_path)
+    path = result.path / MANIFEST_FILE
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["version"] = "0.2.0"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert skill_status("adapt-agent", root=tmp_path).stale
+
+    install_skill("adapt-agent", root=tmp_path, force=True)
+    assert skill_status("adapt-agent", root=tmp_path).current

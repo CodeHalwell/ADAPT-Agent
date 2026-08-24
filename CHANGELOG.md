@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Releasing is now a version bump plus a merge, not a tag push.**
+  `release.yml` also runs on `main`, asks PyPI whether `__version__` is
+  published yet, and releases it when it is not — creating the `vX.Y.Z` tag
+  itself, *after* the upload, so a tag always means "this is on PyPI". Pushing
+  a tag by hand still works and takes the same path.
+
+  Whether to release is decided by querying the index the upload would go to,
+  not by diffing against the previous commit: that answer stays correct for a
+  revert, a re-run, a merge commit, and a branch that lands out of order. When
+  PyPI cannot be reached the answer is *no release* — a missed release is
+  recoverable, and a PyPI filename can never be reused.
+
+  **Automatic does not mean unattended**: the `pypi` environment's required
+  reviewer still gates the upload. What goes away is the tag ceremony, not the
+  human — which is also the backstop against a stray version bump publishing
+  itself.
+
+  Two conditions had to change rather than be extended, and both would have
+  misfired the moment `main` joined the triggers: `publish-pypi` keyed off
+  `github.event_name == 'push'`, which is true for a *branch* push and would
+  have attempted an upload on every commit; and `github-release` used
+  `github.ref_name` as the tag, which on a `main` push is the string `main`.
+  An ordinary commit now costs one short job that finds the version already
+  published and skips everything downstream.
+
+### Added
+
+- **`adapt skills --check`, because an installed skill could not say which
+  version it was.** Installing copies files into `.claude/skills/`, and
+  upgrading the library does not move that copy — documented, but silent when
+  forgotten, and nothing in the directory recorded where it came from. A 0.2.0
+  copy therefore sat in a real project under a newer library, feeding an agent
+  guidance for a release two behind including two behaviours that had since
+  been fixed, and the only way it surfaced was a hand diff against the wheel.
+
+  Each install now writes a `.adapt-skill.json` manifest recording the library
+  version, the timestamp, and a SHA-256 per file — derived from what was
+  actually written, never a second hand-kept list. `adapt skills --check`
+  compares it to the running library and **exits non-zero**, so the check
+  belongs in CI beside the lint step rather than in someone's memory.
+
+  Four states, because they need different fixes: up to date, *stale* (an older
+  release), *version unknown* (no manifest — installed before this existed, or
+  copied by hand), and *locally modified*. The third is the one worth naming:
+  reading "cannot say" as "up to date" would hide exactly the case this exists
+  to surface. A local edit is reported but does **not** fail the check — editing
+  your own copy is supported, and failing a build over it would only teach
+  people to stop running the check.
+
+  New API alongside the CLI: `skill_status()`, `installed_skill()`,
+  `InstalledSkill`, `SkillStatus`, `MANIFEST_FILE`, and `InstallResult.version`.
+  `installed_skill()` never raises — absent, unreadable, malformed and
+  wrong-shaped manifests are one answer, since each means the install cannot
+  report its version and each has the same fix. A diagnostic that fails on a
+  damaged file tells you least exactly when you need it most.
+
+
 ## [0.3.1] - 2026-08-24
 
 ### Added
