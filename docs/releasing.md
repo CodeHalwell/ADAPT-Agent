@@ -1,15 +1,23 @@
 # Releasing to PyPI
 
-Releases are cut by pushing a version tag. A GitHub Actions workflow
+Releases are cut by **bumping `__version__` and merging to `main`**. A GitHub
+Actions workflow
 ([`.github/workflows/release.yml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/.github/workflows/release.yml))
-runs the full test matrix, builds and validates the distributions with
-[uv](https://docs.astral.sh/uv/), publishes them to PyPI with `uv publish`, and
-opens a GitHub Release.
+notices the new version, runs the full test matrix, builds and validates the
+distributions with [uv](https://docs.astral.sh/uv/), publishes them to PyPI with
+`uv publish`, creates the `vX.Y.Z` tag, and opens a GitHub Release.
+
+Pushing a tag by hand still works and does exactly the same thing:
 
 ```bash
 git tag -a v0.3.0 -m "v0.3.0"
 git push origin v0.3.0
 ```
+
+**Automatic does not mean unattended.** The `pypi` environment's required
+reviewer still has to approve before anything is uploaded — the bump removes
+the tag ceremony, not the human. That approval is the backstop against a stray
+version bump publishing itself, so keep the reviewer configured.
 
 Authentication uses **PyPI Trusted Publishing** (OIDC): GitHub proves the
 workflow's identity to PyPI directly, so there is no API token stored in this
@@ -79,18 +87,30 @@ dependency resolution.
    disagrees with it.
 2. **Update `CHANGELOG.md`.** Rename the `[Unreleased]` heading to the new
    version with today's date, and open a fresh `[Unreleased]` section above it.
-3. **Merge that to `main`** through the usual PR flow, so CI has run on the
-   exact commit you are about to tag.
-4. **Tag and push:**
+3. **Merge that to `main`** through the usual PR flow. Merging is what starts
+   the release: the workflow asks PyPI whether the new version exists yet, and
+   publishes it when it does not.
+4. **Watch the run** under Actions → Release, and approve the publish step when
+   it pauses on the `pypi` environment.
 
-   ```bash
-   git checkout main && git pull
-   git tag -a v0.3.0 -m "v0.3.0"
-   git push origin v0.3.0
-   ```
+That is the whole flow — no tag to push. The workflow creates `vX.Y.Z` itself,
+after the upload succeeds, so a tag always means "this is on PyPI".
 
-5. **Watch the run** under Actions → Release. If the `pypi` environment has a
-   required reviewer, approve the publish step when it pauses.
+Pushing a tag by hand is still supported and takes the same path, which is
+useful when you want the tag to exist before the publish, or to re-run a
+release whose upload failed.
+
+### Why it asks PyPI rather than diffing the commit
+
+"Has this version already been released?" is answered by querying the index the
+upload would go to, not by comparing `__version__` against the previous commit.
+That answer stays correct for a revert, a re-run, a merge commit, a hand-pushed
+tag, and a branch that lands out of order. If PyPI cannot be reached the answer
+is *no release* — a missed release is recoverable, and a PyPI filename can never
+be reused.
+
+An ordinary commit to `main` therefore costs one short job: the version check
+runs, finds the version already published, and everything downstream is skipped.
 
 Versions follow [Semantic Versioning](https://semver.org/). A PEP 440
 pre-release suffix (`v0.3.0rc1`, `v0.3.0b1`, `v0.3.0.dev1`) is detected
@@ -103,14 +123,15 @@ after deletion — so the pipeline front-loads everything that could go wrong:
 
 | Stage | Check |
 | --- | --- |
-| `version` | The tag matches `adapt_agent.__version__`, so `v0.3.0` cannot ship `0.2.0`. |
-| `ci` | The same lint, type-check and 3.10–3.14 test matrix that guards `main`, re-run on the tagged commit. |
+| `version` | Whether the version is already on PyPI — a published version is never republished. |
+| `version` | On a hand-pushed tag, that the tag matches `adapt_agent.__version__`, so `v0.3.0` cannot ship `0.2.0`. |
+| `ci` | The same lint, type-check and 3.10–3.14 test matrix that guards `main`, re-run on the released commit. |
 | `build` | Built with `uv build --no-sources`, then `twine check --strict` (via `uvx`) on both artifacts. |
 | `build` | The built filenames carry the expected version. |
 | `build` | The wheel really contains `SKILL.md` and its reference files, `py.typed`, and both console scripts; the sdist carries the skill too. |
 | `build` | A clean `uv venv` installs the wheel, runs `adapt --version`, and runs `adapt install skill` end to end. |
 | `publish-pypi` | `uv publish --trusted-publishing always` in the `pypi` environment. PEP 740 attestations are generated and uploaded by default, and `--check-url` makes a re-run skip files already on the index. |
-| `github-release` | Creates the GitHub Release with generated notes and attaches the exact artifacts that went to PyPI. |
+| `github-release` | Creates the tag (when it does not already exist) and the GitHub Release, with generated notes and the exact artifacts that went to PyPI. |
 
 The skill and console-script assertions exist because those are *packaging
 data*, not code: if a `package-data` glob stopped matching, the tests would

@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Releasing is now a version bump plus a merge, not a tag push.**
+  `release.yml` also runs on `main`, asks PyPI whether `__version__` is
+  published yet, and releases it when it is not — creating the `vX.Y.Z` tag
+  itself, *after* the upload, so a tag always means "this is on PyPI". Pushing
+  a tag by hand still works and takes the same path.
+
+  Whether to release is decided by querying the index the upload would go to,
+  not by diffing against the previous commit: that answer stays correct for a
+  revert, a re-run, a merge commit, and a branch that lands out of order. When
+  PyPI cannot be reached the answer is *no release* — a missed release is
+  recoverable, and a PyPI filename can never be reused.
+
+  **Automatic does not mean unattended**: the `pypi` environment's required
+  reviewer still gates the upload. What goes away is the tag ceremony, not the
+  human — which is also the backstop against a stray version bump publishing
+  itself.
+
+  Two conditions had to change rather than be extended, and both would have
+  misfired the moment `main` joined the triggers: `publish-pypi` keyed off
+  `github.event_name == 'push'`, which is true for a *branch* push and would
+  have attempted an upload on every commit; and `github-release` used
+  `github.ref_name` as the tag, which on a `main` push is the string `main`.
+  An ordinary commit now costs one short job that finds the version already
+  published and skips everything downstream.
+
 ### Added
 
 - **`adapt skills --check`, because an installed skill could not say which
