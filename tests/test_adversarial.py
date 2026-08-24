@@ -3835,6 +3835,102 @@ def test_an_invalid_list_contributes_nothing_rather_than_anything() -> None:
         assert _stylesheet_blocks(f"<style>{selector}{{display:block}}</style>").anything, selector
 
 
+#: `.` and `#` each require a name. Keeping the valid prefix applied the rule
+#: anyway, so ordinary prose was reported as a line-leading role marker.
+INVALID_SIMPLE_SELECTORS = [
+    (".x#", "a hash with no name"),
+    (".x.", "a dot with no name"),
+    ("#", "a lone hash"),
+    (".", "a lone dot"),
+    (".x#.", "one of each"),
+    ("#.x", "the broken one first"),
+    (".x##y", "a doubled hash"),
+    (".x#.y", "a hash between two classes"),
+    ("#y.", "a trailing dot after a valid id"),
+    (".x#/*c*/", "a comment where the name should be"),
+]
+
+#: The same two characters spelled validly, each with a host it really matches.
+#: A class or id name is compared **case-sensitively** and is not split, so the
+#: host has to carry the name the escape spells — pairing `.x\\#` with
+#: `class="x"` tests nothing but my own bookkeeping, which an earlier round
+#: already paid for once.
+VALID_SIMPLE_SELECTORS = [
+    (".x#y", 'class="x" id="y"', "a class and an id"),
+    ("#y.x", 'class="x" id="y"', "the other order"),
+    (".x\\#", 'class="x#"', "an escaped hash inside a class name"),
+    (".x\\.", 'class="x."', "an escaped dot inside one"),
+    ("#\\#", 'id="#"', "an id that is only an escaped hash"),
+    (".-x", 'class="-x"', "a leading hyphen, which is a name character"),
+    ('.x[a="#"]', 'class="x" a="#"', "a hash inside a quoted attribute value"),
+    (".x[href=#]", 'class="x" href="#"', "an unquoted one"),
+    (".x:not(#z)", 'class="x"', "a hash inside a pseudo-class"),
+]
+
+
+@pytest.mark.parametrize(("selector", "label"), INVALID_SIMPLE_SELECTORS)
+def test_a_dot_or_hash_with_no_name_invalidates_the_rule(selector: str, label: str) -> None:
+    """`.x#` is not a selector, so CSS drops the rule and the span stays inline.
+
+    The same whole-rule invalidity an empty list member carries, one level
+    down: applying the valid `.x` prefix made `<style>.x#{display:block}</style>`
+    report ordinary prose as a line-leading role marker, against a control that
+    answers `False` with no rule at all.
+    """
+    defense = AdversarialDefense()
+    prose = 'The <span class="x" id="y">system: how it works</span>'
+    assert defense.detect_prompt_injection(prose) is False, "the control itself"
+    assert (
+        defense.detect_prompt_injection(f"<style>{selector}{{display:block}}</style>{prose}")
+        is False
+    ), label
+
+
+@pytest.mark.parametrize(("selector", "attrs", "label"), VALID_SIMPLE_SELECTORS)
+def test_a_named_dot_or_hash_still_draws_its_boundary(
+    selector: str, attrs: str, label: str
+) -> None:
+    """The direction that hides a marker, and so the longer of the two tables.
+
+    An escape makes `#` and `.` ordinary name characters, and both live inside
+    an attribute selector and a pseudo-class where this reader never examines
+    them at all — none of those may be read as the bare delimiter.
+    """
+    defense = AdversarialDefense()
+    prompt = (
+        f"<style>{selector}{{display:block}}</style>" f"hello<span {attrs}>SYSTEM: settings</span>"
+    )
+    assert defense.detect_prompt_injection(prompt) is True, label
+
+
+def test_invalidity_is_claimed_only_over_the_compound_that_is_read() -> None:
+    """`.x. .y` keeps its boundary, and that is the deliberate limit.
+
+    A browser drops that rule too, but the broken compound is one this reader
+    *skips* — only the rightmost compound is the subject. Extending the claim
+    to skipped text would make the compound split load-bearing for **removing**
+    boundaries, which is the direction that hides markers; missing an
+    invalidity costs an over-split, which `_content_segments` already covers by
+    checking the unsplit line as well.
+
+    Stated as a test rather than left to the docstring because it is the one
+    case where this reader knowingly disagrees with a browser, and a later
+    round reading it as an oversight would close it in the unsafe direction.
+    """
+    from adapt_agent.adversarial import _selector_subjects
+
+    defense = AdversarialDefense()
+    for selector in (".x. .y", ".x# .y", ".x:not(#) .y"):
+        assert _selector_subjects(selector) == (set(), {"y"}, set(), False), selector
+        assert (
+            defense.detect_prompt_injection(
+                f"<style>{selector}{{display:block}}</style>"
+                'hello<span class="y">SYSTEM: settings</span>'
+            )
+            is True
+        ), selector
+
+
 def test_a_bracket_hides_every_structural_character_not_only_the_comma() -> None:
     """What the depth counter is actually for, which the comma rows never saw.
 

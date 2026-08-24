@@ -7,7 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-24
+
+### Added
+
+- **`EvaluationHarness(concurrency=)`**, a per-instance default used when a call
+  site passes none. `0.3.0` added `concurrency` to `evaluate`/`aevaluate`, but an
+  `Optimizer` calls `harness.evaluate(target, dataset)` with no keyword
+  arguments -- so the knob could not reach the one path that needs it, being
+  `max_evals x len(dataset)` round trips rather than a single pass. A per-call
+  argument still wins where one is given.
+- **`adapt_agent.optimization.retry`**: `RetryPolicy`, `is_transient_error` and
+  `retry_after_seconds`, all duck-typed so no provider SDK is imported. Pass
+  `RetryPolicy(attempts=1)` to classify transient failures without retrying
+  them, or `is_transient=` to supply your own classifier.
+
 ### Fixed
+
+- **A `.` or `#` with no name kept its valid prefix.** `.x#` is not a
+  selector — both characters *require* a name — so CSS drops the rule around
+  it and the element stays inline. Applying the `.x` prefix anyway made
+  `<style>.x#{display:block}</style>` report ordinary prose as a line-leading
+  role marker, against a control that answers `False` with no rule at all. Ten
+  spellings reached it, including a lone `#`, a lone `.`, and a comment sitting
+  where the name should be.
+
+  The same whole-rule invalidity an empty list member carries, one level down —
+  and scoped the same deliberately narrow way. Invalidity is claimed only over
+  the compound this reader actually **reads**, which is the subject. `.x. .y`
+  keeps drawing its boundary even though a browser drops that rule too, because
+  the broken compound is one this reader skips; extending the claim to skipped
+  text would make the compound split load-bearing for *removing* boundaries,
+  which is the direction that hides markers, while missing an invalidity costs
+  an over-split that `_content_segments` already covers by checking the unsplit
+  line as well. That limit is pinned by its own test rather than left to a
+  docstring, so a later round cannot read it as an oversight and close it the
+  unsafe way. Nine valid spellings are pinned alongside — an escaped `#` or `.`
+  inside a name, an id that is only an escaped hash, and both characters inside
+  an attribute selector and a pseudo-class, where this reader never examines
+  them at all — each with a host it genuinely matches.
 
 - **An empty member in a selector list invalidated only itself.** In CSS an
   invalid selector is a property of the *rule*, not of the member that is
@@ -1129,21 +1167,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RetryPolicy` is frozen, so `harness.retry.attempts = 1` raises instead of
   silently reconfiguring every other evaluation in the process.
 
-### Added
-
-- **`EvaluationHarness(concurrency=)`**, a per-instance default used when a call
-  site passes none. `0.3.0` added `concurrency` to `evaluate`/`aevaluate`, but an
-  `Optimizer` calls `harness.evaluate(target, dataset)` with no keyword
-  arguments -- so the knob could not reach the one path that needs it, being
-  `max_evals x len(dataset)` round trips rather than a single pass. A per-call
-  argument still wins where one is given.
-- **`adapt_agent.optimization.retry`**: `RetryPolicy`, `is_transient_error` and
-  `retry_after_seconds`, all duck-typed so no provider SDK is imported. Pass
-  `RetryPolicy(attempts=1)` to classify transient failures without retrying
-  them, or `is_transient=` to supply your own classifier.
-
-## [0.3.1] - 2026-08-21
-
 ### Security
 
 - **`0.3.0` on PyPI ships the mapping-key screening bypass; `0.3.1` is the
@@ -1161,6 +1184,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The fix itself, and the two event-loop fixes released alongside it, are
   described under `[0.3.0]` below -- that entry documents the code as merged,
   which is what `0.3.1` is the first artifact to contain.
+
 
 ## [0.3.0] - 2026-08-21
 
