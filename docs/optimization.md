@@ -104,13 +104,13 @@ framework.
 
 | Framework | What gets discovered |
 | --- | --- |
-| **CrewAI** | per-agent `role`/`goal`/`backstory` (prompt), `llm` model + temperature/max_tokens, `tools`, `max_iter`; per-task `description`/`expected_output` |
-| **OpenAI Agents SDK** | `instructions`, `model`, `model_settings` (temperature/top_p/max_tokens), `tools`, `handoffs` (routing) -- recurses into handed-off sub-agents |
-| **Google ADK** | `instruction`/`global_instruction`, `model`, `generate_content_config`, `tools`, `sub_agents` (routing) -- recurses |
-| **Pydantic AI** | system prompt(s), `model`, `model_settings` temperature, tools |
-| **Microsoft Agent Framework** | `instructions`, model + temperature/top_p/max_tokens off the chat client, tools |
-| **Claude Agent SDK** | `system_prompt` (str or preset `append`), `model`, `allowed_tools`/`disallowed_tools`, `max_turns`, `permission_mode` |
-| **LangGraph** | best-effort structural walk of compiled-graph nodes for prompts, bound model + temperature, tools (declare extra params for prompts buried in closures) |
+| **CrewAI** | per-agent `role`/`goal`/`backstory` (prompt), `llm` model + temperature/top_p/max_tokens, `tools`, `max_iter`, `allow_delegation` (a searchable routing switch); per-task `description`/`expected_output` (a task's `name` becomes its component, so exported configs survive task reordering) |
+| **OpenAI Agents SDK** | `instructions` and `handoff_description` (both prompts), `model`, `model_settings` (temperature/top_p/max_tokens), `tools`, `handoffs` (routing) -- recurses into handed-off sub-agents, and binds a `Handoff` wrapper's `tool_description` (the text the routing LLM reads) |
+| **Google ADK** | `instruction`/`global_instruction`, `model`, `generate_content_config` (temperature/top_p/top_k/max_output_tokens), `tools`, `sub_agents` (routing) -- recurses |
+| **Pydantic AI** | system prompt(s), `model`, `model_settings` (temperature/top_p/max_tokens, frequency/presence penalties), tools |
+| **Microsoft Agent Framework** | `instructions`, model (a chat-client attribute, or `model_id` in `default_options`), temperature/top_p/max_tokens + frequency/presence penalties, tools, skills |
+| **Claude Agent SDK** | `system_prompt` (str or preset `append`), `model`, `allowed_tools`/`disallowed_tools`, `max_turns`, `max_thinking_tokens`, `permission_mode`; each subagent definition in `agents` contributes its `prompt`/`description` (prompts), `model`, `tools` and `skills` |
+| **LangGraph** | best-effort structural walk of compiled-graph nodes for prompts, bound model + temperature/top_p/max_tokens, tools (declare extra params for prompts buried in closures) |
 
 ```python
 from adapt_agent.optimization.introspection import detect, introspect

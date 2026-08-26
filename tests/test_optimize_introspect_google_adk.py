@@ -178,6 +178,18 @@ def test_max_output_tokens_is_bounded():
     assert mot.bounds == (1, 32000)
 
 
+def test_top_k_bound_when_present():
+    config = FakeGenerateConfig(temperature=0.7)
+    config.top_k = 20
+    agent = FakeLlmAgent(name="sampler", instruction="hi", generate_content_config=config)
+    params = introspect(agent)
+    top_k = next(p for p in params if p.name == "sampler.top_k")
+    assert top_k.kind is ParameterKind.HYPERPARAM
+    assert top_k.bounds == (1, 40)
+    top_k.write(10)
+    assert config.top_k == 10
+
+
 def test_predicate_rejects_unrelated_object():
     assert adk._predicate(object()) is False
 

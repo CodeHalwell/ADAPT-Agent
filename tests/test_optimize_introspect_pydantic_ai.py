@@ -57,6 +57,27 @@ def test_temperature_setter_roundtrips() -> None:
     assert agent.model_settings["temperature"] == 0.2
 
 
+def test_penalties_in_model_settings_bound() -> None:
+    agent = FakeAgent()
+    agent.model_settings["frequency_penalty"] = 0.3
+    agent.model_settings["presence_penalty"] = -0.2
+    params = {p.name: p for p in introspect(agent)}
+
+    frequency = params["agent.frequency_penalty"]
+    assert frequency.kind is ParameterKind.HYPERPARAM
+    assert frequency.bounds == (-2.0, 2.0)
+    presence = params["agent.presence_penalty"]
+    assert presence.bounds == (-2.0, 2.0)
+    presence.write(0.1)
+    assert agent.model_settings["presence_penalty"] == 0.1
+
+
+def test_unset_penalties_emit_no_parameters() -> None:
+    params = {p.name for p in introspect(FakeAgent())}
+    assert "agent.frequency_penalty" not in params
+    assert "agent.presence_penalty" not in params
+
+
 def test_predicate_rejects_unrelated_object() -> None:
     assert _predicate(object()) is False
 

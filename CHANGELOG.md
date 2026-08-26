@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Framework introspection reaches the knobs that steer multi-agent behaviour,
+  not just the ones on the front agent.** Two whole categories of tunable text
+  were invisible to the optimizer:
+
+  - *OpenAI Agents SDK*: an agent's `handoff_description` -- the text a routing
+    agent reads when deciding whether to delegate to it -- is now a PROMPT
+    parameter, and a `Handoff` **wrapper** in a `handoffs` list now contributes
+    its `tool_description` (as `<agent>_handoff.tool_description`). A wrapper
+    holds its agent inside an `on_invoke_handoff` closure, so the sub-agent
+    itself is structurally unreachable -- but the description is what the
+    routing LLM actually reads, and it is the part worth tuning. Previously a
+    topology built with `handoff(...)` lost the wrapped branch entirely, and
+    nothing tuned routing text anywhere.
+
+  - *Claude Agent SDK*: the subagent definitions in `options.agents` are now
+    introspected -- each definition's `prompt` and `description` (both
+    prompts: one steers the specialist, the other steers delegation *to* it),
+    its `model`, and its `tools`/`skills` lists (with the same drop-one
+    ablation candidates every other tool list gets), namespaced under the
+    slugged subagent name. Both real `AgentDefinition` objects and the plain
+    mappings the SDK also accepts are handled, and a subagent whose name
+    collides with the root component is skipped rather than allowed to produce
+    duplicate parameter names. The `agents` field was already recognised (it
+    stopped vetoing detection in 0.3.x) but its contents were never bound, so
+    a multi-agent Claude setup exposed only the orchestrator's knobs.
+
+- **Sampling knobs the frameworks expose but introspection didn't.** Each is
+  bound with the same duck-typing rules as its neighbours (only when present,
+  only when the value has the right shape): CrewAI LLM objects gain `top_p`;
+  Google ADK `generate_content_config` gains `top_k` (bounded (1, 40), valid
+  for every Gemini generation so a gridded candidate never becomes a runtime
+  rejection); Pydantic AI `model_settings` and Microsoft Agent Framework
+  agents/clients/`default_options` gain `frequency_penalty` and
+  `presence_penalty` (bounded (-2.0, 2.0)); LangGraph bound chat models gain
+  `top_p`.
+
+- **CrewAI `allow_delegation` is a searchable ROUTING parameter** with
+  `[True, False]` candidates -- whether an agent may hand work to its
+  crew-mates is a real topology decision the optimizer can now measure instead
+  of inherit. Bound only when the live value is a genuine `bool`.
+
+- **Microsoft Agent Framework: the model is found even when the client hides
+  it.** When none of the client's model attributes exist, the per-agent
+  `model_id` override in `default_options` now binds as the MODEL parameter
+  (the client still wins when both are present). Previously such an agent had
+  no model knob at all despite the identifier sitting in its options mapping.
+
+- **Claude Agent SDK: `max_thinking_tokens`** binds as a HYPERPARAM (bounds
+  (1024, 32000) -- the floor is the API's minimum thinking budget) on SDK
+  versions that carry it as a flat option.
+
+### Changed
+
+- **OpenAI Agents SDK `model_settings.max_tokens` now carries bounds
+  (1, 32000)**, like every other framework's max-tokens knob. Boundless, its
+  search space collapsed to the current value -- `enumerate_candidates()`
+  returned one option and the numeric proposer skipped it -- so it appeared in
+  every report as a parameter the optimizer could never actually move.
+
+- **CrewAI tasks with a `name` are namespaced under it** (slugged), falling
+  back to the positional `task_<index>` only when nameless. A name survives
+  reordering the task list; an index silently rebinds every exported tuned
+  config to a different task. A config exported before this release for a
+  *named* task addresses `task_<index>` and will no longer re-apply -- re-run
+  `to_config()` (unnamed tasks are unaffected).
+
 ## [0.3.2] - 2026-08-24
 
 ### Changed

@@ -13,9 +13,9 @@ importing ``google.adk``: everything is discovered by duck-typing with
 For each agent we expose its ``instruction`` and ``global_instruction`` prompts
 (only when they are plain strings), its model (a string identifier, or an
 introspected model object's ``model``/``model_name``), the
-``temperature``/``top_p``/``max_output_tokens`` hyperparameters from its
-``generate_content_config``, its ``tools`` allow-list, and its ``sub_agents``
-routing list. Nested ``sub_agents`` are introspected recursively and namespaced
+``temperature``/``top_p``/``top_k``/``max_output_tokens`` hyperparameters from
+its ``generate_content_config``, its ``tools`` allow-list, and its
+``sub_agents`` routing list. Nested ``sub_agents`` are introspected recursively and namespaced
 under their own component names; an ``id()`` visited set guards against cycles.
 
 Importing this module registers the introspector under the ``"google_adk"`` key.
@@ -93,6 +93,16 @@ def _introspect_generate_config(config: Any, component: str) -> list[Parameter]:
             ParameterKind.HYPERPARAM,
             component=component,
             bounds=(0.0, 1.0),
+        ),
+        # Kept within (1, 40): valid for every Gemini generation, so a gridded
+        # candidate never turns into a runtime rejection mid-search.
+        bind_attr(
+            config,
+            "top_k",
+            f"{component}.top_k",
+            ParameterKind.HYPERPARAM,
+            component=component,
+            bounds=(1, 40),
         ),
         bind_attr(
             config,

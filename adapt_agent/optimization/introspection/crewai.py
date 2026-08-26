@@ -8,9 +8,12 @@ importing ``crewai``: everything is discovered by duck-typing with ``getattr``.
 
 For each agent we expose its ``role``/``goal``/``backstory`` prompts, its model
 (a string identifier, or an introspected LLM object's
-``model``/``temperature``/``max_tokens``), its ``tools`` allow-list, and its
-``max_iter`` hyperparameter. For each task we expose its ``description`` and
-``expected_output`` prompts.
+``model``/``temperature``/``top_p``/``max_tokens``), its ``tools`` allow-list,
+its ``max_iter`` hyperparameter, and its ``allow_delegation`` routing switch
+(with ``[True, False]`` candidates, so the optimizer can search whether letting
+the agent delegate helps or hurts). For each task we expose its ``description``
+and ``expected_output`` prompts, named after the task's ``name`` when it has one
+(falling back to the positional ``task_<index>``).
 
 Importing this module registers the introspector under the ``"crewai"`` key.
 """
@@ -75,6 +78,14 @@ def _introspect_llm(llm: Any, component: str) -> list[Parameter]:
             ParameterKind.HYPERPARAM,
             component=component,
             bounds=(0.0, 2.0),
+        ),
+        bind_attr(
+            llm,
+            "top_p",
+            f"{component}.top_p",
+            ParameterKind.HYPERPARAM,
+            component=component,
+            bounds=(0.0, 1.0),
         ),
         bind_attr(
             llm,
@@ -144,12 +155,35 @@ def _introspect_agent(agent: Any, index: int) -> list[Parameter]:
     if max_iter is not None:
         params.append(max_iter)
 
+    # ``allow_delegation`` decides whether this agent may hand work to its
+    # crew-mates -- a routing switch, and with explicit candidates a genuinely
+    # searchable one: the optimizer can measure whether delegation helps or
+    # just adds hops. Bound only when it is a real bool, so a Mock-ish or
+    # unset attribute never turns into a knob.
+    if isinstance(getattr(agent, "allow_delegation", None), bool):
+        delegation = bind_attr(
+            agent,
+            "allow_delegation",
+            f"{component}.allow_delegation",
+            ParameterKind.ROUTING,
+            component=component,
+            candidates=[True, False],
+        )
+        if delegation is not None:
+            params.append(delegation)
+
     return params
 
 
 def _introspect_task(task: Any, index: int) -> list[Parameter]:
-    """Introspect a single CrewAI ``Task``."""
-    component = f"task_{index}"
+    """Introspect a single CrewAI ``Task``.
+
+    A task with a ``name`` is namespaced under it (slugged): the name survives
+    reordering the task list, where a positional ``task_<index>`` silently
+    rebinds every exported config to a different task. Nameless tasks keep the
+    positional fallback.
+    """
+    component = _slug(getattr(task, "name", None)) or f"task_{index}"
     candidates = [
         bind_attr(
             task,

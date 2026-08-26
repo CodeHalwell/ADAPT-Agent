@@ -2,17 +2,24 @@
 
 The `OpenAI Agents SDK <https://openai.github.io/openai-agents-python>`_ models an
 agent as an ``Agent`` object carrying ``instructions`` (a system prompt, either a
-string or a callable), a ``model`` (a string identifier or a ``Model`` object),
-``model_settings`` (temperature / top_p / max_tokens), a list of ``tools``, and a
-list of ``handoffs`` to other agents or ``Handoff`` wrappers. The handoffs list is
-what makes an orchestrator route work between sub-agents, so it is also the signal
-that distinguishes this framework from the other supported ones.
+string or a callable), a ``handoff_description`` (the text a routing agent reads
+when deciding to delegate to this agent), a ``model`` (a string identifier or a
+``Model`` object), ``model_settings`` (temperature / top_p / max_tokens), a list
+of ``tools``, and a list of ``handoffs`` to other agents or ``Handoff`` wrappers.
+The handoffs list is what makes an orchestrator route work between sub-agents, so
+it is also the signal that distinguishes this framework from the other supported
+ones.
 
 This module turns a live ``Agent`` into tunable
 :class:`~adapt_agent.optimization.parameters.Parameter` objects bound to the agent
 in place, recursing into handed-off sub-agents so multi-agent topologies are fully
-covered. It never imports ``agents``; everything is duck-typed via ``getattr`` /
-``hasattr`` so importing this module is safe with nothing installed.
+covered. A handoff entry may also be a ``Handoff`` *wrapper* (built with
+``handoff(...)``) rather than a bare agent; the wrapped agent lives inside an
+``on_invoke_handoff`` closure and cannot be reached structurally, but the
+wrapper's ``tool_description`` -- the text the routing LLM actually reads -- is
+bound as a PROMPT so the routing surface stays tunable. It never imports
+``agents``; everything is duck-typed via ``getattr`` / ``hasattr`` so importing
+this module is safe with nothing installed.
 """
 
 from __future__ import annotations
@@ -74,6 +81,23 @@ def _looks_like_agent(obj: Any) -> bool:
         return False
 
 
+def _looks_like_handoff(obj: Any) -> bool:
+    """Return ``True`` if a handoff entry is a ``Handoff`` wrapper object.
+
+    A ``Handoff`` carries ``tool_description`` and ``agent_name`` but no
+    ``instructions`` (the wrapped agent is captured inside its
+    ``on_invoke_handoff`` closure, not held as an attribute).
+    """
+    try:
+        return (
+            hasattr(obj, "tool_description")
+            and hasattr(obj, "agent_name")
+            and not hasattr(obj, "instructions")
+        )
+    except Exception:
+        return False
+
+
 def _introspect_model(obj: Any, component: str, params: list[Parameter]) -> None:
     """Append model-related parameters for ``obj.model`` (string or object)."""
     model = getattr(obj, "model", None)
@@ -122,12 +146,17 @@ def _introspect_model_settings(obj: Any, component: str, params: list[Parameter]
     )
     if top_p is not None:
         params.append(top_p)
+    # Bounded like every other framework's max_tokens: without bounds the knob
+    # has no search space at all -- ``enumerate_candidates`` collapses to the
+    # current value and the numeric proposer skips it -- so it silently sat in
+    # every report as a parameter the optimizer could never actually move.
     max_tokens = bind_attr(
         settings,
         "max_tokens",
         f"{component}.max_tokens",
         ParameterKind.HYPERPARAM,
         component=component,
+        bounds=(1, 32000),
     )
     if max_tokens is not None:
         params.append(max_tokens)
@@ -156,6 +185,20 @@ def _introspect_agent(obj: Any, params: list[Parameter], visited: set[int]) -> N
         )
         if prompt is not None:
             params.append(prompt)
+
+    # handoff_description -> PROMPT. This is the text a *routing* agent reads
+    # when deciding whether to delegate here, so in a multi-agent topology it
+    # steers routing quality as directly as the instructions steer answers.
+    if isinstance(getattr(obj, "handoff_description", None), str):
+        description = bind_attr(
+            obj,
+            "handoff_description",
+            f"{component}.handoff_description",
+            ParameterKind.PROMPT,
+            component=component,
+        )
+        if description is not None:
+            params.append(description)
 
     _introspect_model(obj, component, params)
     _introspect_model_settings(obj, component, params)
@@ -195,11 +238,41 @@ def _introspect_agent(obj: Any, params: list[Parameter], visited: set[int]) -> N
 
     # Recurse into handed-off sub-agents so orchestrator+subagent topologies are
     # covered; each child's params are namespaced under its own component name.
+    # A ``Handoff`` wrapper cannot be recursed into (its agent is closed over,
+    # not held), but its ``tool_description`` is still bound: that text is what
+    # the routing LLM reads to pick the handoff, so it is the tunable part.
     handoffs = getattr(obj, "handoffs", None)
     if isinstance(handoffs, (list, tuple)):
         for child in handoffs:
             if _looks_like_agent(child):
                 _introspect_agent(child, params, visited)
+            elif _looks_like_handoff(child):
+                _introspect_handoff(child, params, visited)
+
+
+def _introspect_handoff(wrapper: Any, params: list[Parameter], visited: set[int]) -> None:
+    """Bind a ``Handoff`` wrapper's ``tool_description`` as a PROMPT parameter.
+
+    The component is ``"<agent_name>_handoff"`` so it can never collide with the
+    wrapped agent's own component if that agent is also reachable bare elsewhere
+    in the topology. ``visited`` keeps a wrapper that appears on several agents
+    from binding (and colliding with) itself twice.
+    """
+    if id(wrapper) in visited:
+        return
+    visited.add(id(wrapper))
+    if not isinstance(getattr(wrapper, "tool_description", None), str):
+        return
+    component = f"{_slugify(getattr(wrapper, 'agent_name', None))}_handoff"
+    description = bind_attr(
+        wrapper,
+        "tool_description",
+        f"{component}.tool_description",
+        ParameterKind.PROMPT,
+        component=component,
+    )
+    if description is not None:
+        params.append(description)
 
 
 def _introspect(obj: Any) -> list[Parameter]:
