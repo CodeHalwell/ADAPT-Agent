@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Optimizers stop paying for configurations they have already measured.**
+  Every optimizer now carries an evaluation cache (`cache_evaluations=True`)
+  keyed on the *live parameter state* at evaluation time, living for exactly
+  one `optimize` call. `PipelineOptimizer` injects one shared cache into its
+  stages -- and this is where the money was: each stage begins by evaluating
+  its baseline over the full dataset, and each stage's baseline *is* the
+  previous stage's winner, already measured. The default four-stage
+  `make_default_optimizer` pipeline was spending five full-dataset baseline
+  passes per run, four of them redundant; they are now cache hits. Keying on
+  the live state (not the candidate diff) is what makes those hits happen,
+  since a stage baseline and the winning trial that produced it reach the
+  same state through different configs.
+
+  The cost machinery this loop already had is deliberately untouched:
+  incomplete reports (rows lost to transient provider failures) are never
+  cached, so the baseline's re-run-on-incomplete path always re-measures, and
+  a cache hit still performs the restore/apply so proposers observe identical
+  live state either way. Live objects in the state (tool lists holding
+  callables) key by identity -- distinct-but-equal objects miss rather than
+  falsely hit, which only costs a re-run. Trial histories are unchanged:
+  cached trials record the same scores in the same order, so results are
+  byte-identical for a deterministic agent. Pass `cache_evaluations=False`
+  (per optimizer or per stage -- a stage's opt-out is respected inside a
+  caching pipeline) to re-measure every configuration, e.g. to average out a
+  stochastic agent.
+
 - **Every supported framework is now drivable through one entry point --
   including the three whose agents cannot run themselves.** An OpenAI Agents
   SDK `Agent` is a configuration object executed by `Runner.run_sync(agent,

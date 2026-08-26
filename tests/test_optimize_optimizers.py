@@ -630,3 +630,141 @@ def test_dedup_handles_unhashable_lists():
 def test_dedup_mixed_hashable_unhashable():
     out = _dedup([1, [1], 1, [1], "a"])
     assert out == [1, [1], "a"]
+
+
+# -- evaluation cache ---------------------------------------------------------
+#
+# Re-measuring a configuration already scored in the same run is pure waste for
+# a deterministic agent, and the default pipeline paid it five times over in
+# stage baselines alone. These tests count actual agent invocations.
+
+
+def _counting_agent(prompt_candidates):
+    """A toy agent whose runner counts invocations."""
+    state = {"prompt": "BAD"}
+    counter = {"runs": 0}
+
+    def runner(question):
+        counter["runs"] += 1
+        return ANSWERS[question] if GOOD_PROMPT in str(state["prompt"]) else "WRONG"
+
+    params = [
+        Parameter(
+            name="prompt",
+            kind=ParameterKind.PROMPT,
+            candidates=prompt_candidates,
+            getter=lambda: state["prompt"],
+            setter=lambda v: state.__setitem__("prompt", v),
+        )
+    ]
+    agent = OptimizableAgent.from_callable(runner, parameters=params, name="counting-toy")
+    return counter, agent
+
+
+def _run_two_stage_pipeline(*, cache: bool, stage_cache: bool | None = None):
+    """Run a two-stage grid pipeline; return (agent_runs, result)."""
+    counter, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    per_stage = cache if stage_cache is None else stage_cache
+    stages = [
+        GridSearchOptimizer(harness(), max_evals=8, cache_evaluations=per_stage),
+        GridSearchOptimizer(harness(), max_evals=8, cache_evaluations=per_stage),
+    ]
+    pipe = PipelineOptimizer(harness(), stages, max_evals=16, cache_evaluations=cache)
+    result = pipe.optimize(agent, dataset())
+    return counter["runs"], result
+
+
+def test_pipeline_cache_skips_redundant_full_dataset_passes():
+    runs_cached, result_cached = _run_two_stage_pipeline(cache=True)
+    runs_uncached, result_uncached = _run_two_stage_pipeline(cache=False)
+
+    # Identical outcome: same winner, same score, same trial history scores.
+    assert result_cached.best_score == result_uncached.best_score == 1.0
+    assert result_cached.best_config == result_uncached.best_config
+    assert [t.score for t in result_cached.history] == [t.score for t in result_uncached.history]
+
+    # Uncached: baseline runs for the pipeline and both stages, plus both grid
+    # candidates per stage = 7 full-dataset passes. Cached: only the pipeline
+    # baseline and the single novel configuration are ever run.
+    n = len(dataset())
+    assert runs_uncached == 7 * n
+    assert runs_cached == 2 * n
+
+
+def test_stage_level_cache_opt_out_is_respected():
+    # Stages built with cache_evaluations=False ignore the injected pipeline
+    # cache entirely (they re-measure), even though the pipeline itself caches.
+    runs, result = _run_two_stage_pipeline(cache=True, stage_cache=False)
+    assert result.best_score == 1.0
+    assert runs == 7 * len(dataset())
+
+
+def test_eval_config_reuses_the_baseline_report_for_identical_state():
+    from adapt_agent.optimization.optimizers import _bind_baseline
+
+    counter, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    data = dataset()
+    opt = GridSearchOptimizer(harness())
+    opt._eval_cache = {}
+
+    baseline = opt._evaluate_baseline(agent, data)
+    _bind_baseline(opt, agent.snapshot())
+    # An empty config restores the exact baseline state -> served from cache.
+    assert opt._eval_config(agent, {}, data) is baseline
+    assert counter["runs"] == len(data)
+
+
+def test_incomplete_reports_are_never_cached():
+    from adapt_agent.optimization.evaluation import EvaluationReport
+    from adapt_agent.optimization.optimizers import _bind_baseline
+
+    class StubHarness:
+        """Returns scripted reports; counts evaluate() calls."""
+
+        def __init__(self, reports):
+            self.reports = list(reports)
+            self.calls = 0
+
+        def evaluate(self, target, data):
+            self.calls += 1
+            return self.reports.pop(0)
+
+    def report(*, transient: int) -> EvaluationReport:
+        return EvaluationReport(
+            aggregate={"exact_match": 1.0},
+            primary_metric="exact_match",
+            n_transient_errors=transient,
+            n_evaluated=4,
+        )
+
+    stub = StubHarness(
+        [report(transient=1), report(transient=1), report(transient=0), report(transient=0)]
+    )
+    _, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    data = dataset()
+    opt = GridSearchOptimizer(stub)
+    opt._eval_cache = {}
+    _bind_baseline(opt, agent.snapshot())
+
+    config = {"prompt": GOOD_PROMPT}
+    # Incomplete reports pass through uncached: the same config re-evaluates.
+    assert opt._eval_config(agent, config, data).is_complete is False
+    assert opt._eval_config(agent, config, data).is_complete is False
+    assert stub.calls == 2
+    # A complete report is cached: the fourth request never reaches the harness.
+    assert opt._eval_config(agent, config, data).is_complete is True
+    assert opt._eval_config(agent, config, data).is_complete is True
+    assert stub.calls == 3
+
+
+def test_cache_is_cleared_between_optimize_calls():
+    # A fresh optimize() must own a fresh cache: the attribute is reset after
+    # each run, so nothing leaks across runs (or across datasets whose id()
+    # might be recycled once the first dataset is garbage-collected).
+    counter, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    opt = GridSearchOptimizer(harness(), max_evals=8)
+    opt.optimize(agent, dataset())
+    assert opt._eval_cache is None
+    first = counter["runs"]
+    opt.optimize(agent, dataset())
+    assert counter["runs"] > first
