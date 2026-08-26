@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,12 @@ class OptimizationResult:
     #: comparable with :attr:`best_score`. ``True`` when there was no
     #: validation set at all -- there is nothing partial about not running.
     validation_complete: bool = True
+    #: Wall-clock seconds for the whole ``optimize`` call (baseline, search,
+    #: and validation). ``0.0`` for a hand-built result never produced by a
+    #: real run. Reported alongside the per-trial elapsed time in verbose
+    #: logging (see :meth:`Optimizer._record`), so a long run's total cost is
+    #: visible in the same place its progress was.
+    duration_seconds: float = 0.0
 
     @property
     def improved(self) -> bool:
@@ -271,7 +278,8 @@ class OptimizationResult:
                         f"improvement={provenance['improvement']:+.4f} "
                         f"validation={provenance['validation_score']}"
                         f"{'' if provenance['validation_complete'] else ' (PARTIAL)'} "
-                        f"over {provenance['n_evals']} evals.\n"
+                        f"over {provenance['n_evals']} evals in "
+                        f"{provenance['duration_seconds']:.1f}s.\n"
                         "# Review this diff before committing: prompts here were "
                         "machine-written.\n"
                     ) + text
@@ -290,6 +298,7 @@ class OptimizationResult:
             # persisted result is read long after the run's logs are gone.
             "validation_complete": self.validation_complete,
             "n_evals": self.n_evals,
+            "duration_seconds": self.duration_seconds,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -301,6 +310,7 @@ class OptimizationResult:
             "validation_score": self.validation_score,
             "validation_complete": self.validation_complete,
             "n_evals": self.n_evals,
+            "duration_seconds": self.duration_seconds,
             "best_config": self.best_config,
             "recommendations": list(self.recommendations),
         }
@@ -309,7 +319,7 @@ class OptimizationResult:
         return (
             f"OptimizationResult(baseline={self.baseline_score:.3f}, "
             f"best={self.best_score:.3f}, improvement={self.improvement:+.3f}, "
-            f"evals={self.n_evals})"
+            f"evals={self.n_evals}, duration={self.duration_seconds:.1f}s)"
         )
 
 
@@ -326,12 +336,40 @@ class Optimizer:
             LLM judge's score wobbles by far more than ``1e-9`` between runs, so a
             near-zero threshold would "accept" candidates that only won by jitter.
         judge: Optional LLM judge made available to proposers.
+        cache_evaluations: Reuse the report of an already-measured
+            configuration instead of re-running the agent over the dataset
+            (default ``True``). The cache is keyed on this optimizer's
+            ``harness`` *and* the *live parameter state* at evaluation time --
+            the harness because a report is only reusable by the evaluator
+            that would have produced it, and the live state (rather than the
+            candidate diff) because that is what lets a stage baseline hit a
+            previous stage's winning trial reached through a different
+            config. It lives for one ``optimize`` call -- or one pipeline
+            run, where :class:`PipelineOptimizer` shares one cache across
+            stages that carry the same harness, so each such stage's baseline
+            stops costing a full-dataset pass. Only complete reports are
+            reused, so the transient-failure machinery (baseline re-runs,
+            incomplete-trial exclusion) is unaffected. Set ``False`` to
+            re-measure every configuration -- e.g. when agent outputs are
+            stochastic enough that you want repeated measurements of
+            identical configurations. A pipeline's own ``False`` also
+            suppresses caching in every stage for that run, even one left at
+            its own default ``True``; a stage's own ``False`` inside a
+            caching pipeline is still respected.
         suggest_tools: When True *and* a ``judge`` is set, after the search the
             optimizer asks the judge to propose NEW tools/skills for components
             that own a TOOL/SKILL parameter and records them as advisory
             ``recommendations`` (never applied automatically). Off by default;
             :func:`make_default_optimizer` turns it on when a judge is present.
-        verbose: Emit per-trial logging at INFO level.
+        verbose: Emit per-trial logging at INFO level: each trial logs its
+            position out of the run's evaluation budget (``max_evals``) and
+            the wall-clock time elapsed since the run started (e.g.
+            ``trial 5/60 score=0.7100 ACCEPT (142.3s elapsed)``), so a long
+            run distinguishes "still working" from "hung" without needing an
+            external progress indicator. The denominator is each optimizer's
+            own budget: a :class:`PipelineOptimizer` stage logs against its
+            *own* (budget-clamped) ``max_evals``, and the pipeline itself logs
+            against the shared overall budget.
     """
 
     strategy_name = "optimizer"
@@ -345,6 +383,7 @@ class Optimizer:
         min_improvement: float = 1e-3,
         judge: Any = None,
         suggest_tools: bool = False,
+        cache_evaluations: bool = True,
         verbose: bool = False,
     ):
         self.harness = harness
@@ -353,6 +392,7 @@ class Optimizer:
         self.min_improvement = min_improvement
         self.judge = judge
         self.suggest_tools = suggest_tools
+        self.cache_evaluations = cache_evaluations
         self.verbose = verbose
         self._rng = random.Random(seed)
         # Set per-run by the search strategy before evaluating candidates; the
@@ -360,6 +400,14 @@ class Optimizer:
         self._baseline_snapshot: dict[str, Any] = {}
         # Shared advisory-suggestion sink, replaced per ``optimize`` call.
         self._recommendations: list[str] = []
+        # Evaluation-report cache: owned per ``optimize`` call, or injected by
+        # a PipelineOptimizer so its stages share hits. ``None`` = no cache.
+        self._eval_cache: dict[str, EvaluationReport] | None = None
+        # Wall-clock start of the current ``optimize`` call, for verbose
+        # per-trial elapsed-time logging and the result's duration_seconds.
+        # Reset at the top of every call, since one optimizer instance is
+        # commonly reused across several runs.
+        self._run_started_at: float = 0.0
 
     # -- public API ------------------------------------------------------------
 
@@ -384,54 +432,71 @@ class Optimizer:
         if not dataset:
             raise ValueError("Cannot optimize against an empty dataset")
 
-        baseline_snapshot = target.snapshot()
-        baseline_report = self._evaluate_baseline(target, dataset)
-        baseline_score = baseline_report.score
-        if self.verbose:
-            logger.info("[%s] baseline score=%.4f", self.strategy_name, baseline_score)
+        # Own a fresh evaluation cache for this run -- unless one was injected
+        # (a PipelineOptimizer sharing hits across its stages), which outlives
+        # this call and is left alone.
+        owns_cache = self.cache_evaluations and self._eval_cache is None
+        if owns_cache:
+            self._eval_cache = {}
+        self._run_started_at = time.perf_counter()
+        try:
+            baseline_snapshot = target.snapshot()
+            baseline_report = self._evaluate_baseline(target, dataset)
+            baseline_score = baseline_report.score
+            if self.verbose:
+                logger.info(
+                    "[%s] baseline score=%.4f (search budget: up to %d evals)",
+                    self.strategy_name,
+                    baseline_score,
+                    self.max_evals,
+                )
 
-        # One shared sink threaded through every ProposalContext and read back
-        # after the search (proposers may append advisory suggestions to it).
-        self._recommendations = []
+            # One shared sink threaded through every ProposalContext and read back
+            # after the search (proposers may append advisory suggestions to it).
+            self._recommendations = []
 
-        state = _SearchState(
-            best_config={},
-            best_score=baseline_score,
-            best_report=baseline_report,
-            baseline_snapshot=baseline_snapshot,
-            history=[],
-        )
-        self._search(target, dataset, state)
+            state = _SearchState(
+                best_config={},
+                best_score=baseline_score,
+                best_report=baseline_report,
+                baseline_snapshot=baseline_snapshot,
+                history=[],
+            )
+            self._search(target, dataset, state)
 
-        # Apply the winning configuration permanently to the live agent.
-        target.restore(baseline_snapshot)
-        if state.best_config:
-            target.apply(state.best_config)
+            # Apply the winning configuration permanently to the live agent.
+            target.restore(baseline_snapshot)
+            if state.best_config:
+                target.apply(state.best_config)
 
-        validation_score: float | None = None
-        validation_complete = True
-        if val_dataset:
-            validation_report = self._evaluate_validation(target, val_dataset)
-            validation_score = validation_report.score
-            validation_complete = validation_report.is_complete
+            validation_score: float | None = None
+            validation_complete = True
+            if val_dataset:
+                validation_report = self._evaluate_validation(target, val_dataset)
+                validation_score = validation_report.score
+                validation_complete = validation_report.is_complete
 
-        recommendations = list(self._recommendations)
-        recommendations.extend(self._suggest_tools(target, state))
+            recommendations = list(self._recommendations)
+            recommendations.extend(self._suggest_tools(target, state))
 
-        result = OptimizationResult(
-            best_config=state.best_config,
-            best_score=state.best_score,
-            baseline_score=baseline_score,
-            baseline_config=baseline_snapshot,
-            history=state.history,
-            best_report=state.best_report,
-            validation_score=validation_score,
-            validation_complete=validation_complete,
-            recommendations=recommendations,
-        )
-        if self.verbose:
-            logger.info("[%s] %r", self.strategy_name, result)
-        return result
+            result = OptimizationResult(
+                best_config=state.best_config,
+                best_score=state.best_score,
+                baseline_score=baseline_score,
+                baseline_config=baseline_snapshot,
+                history=state.history,
+                best_report=state.best_report,
+                validation_score=validation_score,
+                validation_complete=validation_complete,
+                recommendations=recommendations,
+                duration_seconds=time.perf_counter() - self._run_started_at,
+            )
+            if self.verbose:
+                logger.info("[%s] %r", self.strategy_name, result)
+            return result
+        finally:
+            if owns_cache:
+                self._eval_cache = None
 
     # -- strategy hook ---------------------------------------------------------
 
@@ -449,13 +514,88 @@ class Optimizer:
         """Evaluate a *full* config relative to the baseline snapshot.
 
         Restores the baseline first so configs compose predictably regardless of
-        whatever the previous trial left applied.
+        whatever the previous trial left applied. When evaluation caching is on
+        and this exact live state has already been measured against this
+        dataset, the recorded report is returned without re-running the agent
+        -- the restore/apply still happens, so live-state side effects (what
+        proposers read off the components) are identical either way.
         """
         target.restore(self._current_baseline)
         if config:
             target.apply(config)
+        cached = self._cached_report(target, dataset)
+        if cached is not None:
+            return cached
         report = self.harness.evaluate(target, dataset)
+        self._store_report(target, dataset, report)
         return report
+
+    # -- evaluation cache ------------------------------------------------------
+
+    def _cache_key(self, target: OptimizableAgent, dataset: GoldenDataset) -> str | None:
+        """Key the harness and the *live* parameter state against a dataset.
+
+        The key renders every parameter's current value with ``repr``: equal
+        primitives (prompts, models, temperatures) collide -- a hit -- while
+        live objects (tool lists holding callables) render by identity, so two
+        distinct-but-equal objects miss rather than falsely hit, which only
+        costs a re-run. Keyed on the live snapshot rather than the candidate
+        diff so a stage baseline and the previous stage's winning trial -- the
+        same state reached through different configs -- share a key.
+
+        The harness is part of the key because a report is only reusable by an
+        evaluator that would have produced it: a pipeline may be assembled
+        from stages carrying *different* harnesses (other metrics, another
+        judge), and without the harness in the key such a stage would rank its
+        candidates against scores measured by a different evaluator. Stages
+        sharing one harness instance -- how :func:`make_default_optimizer`
+        builds pipelines -- still share hits. Returns ``None`` (no caching)
+        when the state cannot be rendered.
+        """
+        try:
+            state = target.snapshot()
+            rendered = ",".join(f"{name}={state[name]!r}" for name in sorted(state))
+        except Exception:
+            return None
+        return f"{id(self.harness)}|{id(dataset)}|{rendered}"
+
+    def _cached_report(
+        self, target: OptimizableAgent, dataset: GoldenDataset
+    ) -> EvaluationReport | None:
+        """Return the recorded report for the current live state, if any.
+
+        Attribute access is defensive (``getattr`` with a disabled default)
+        because ``_evaluate_baseline`` is a documented extension point also
+        exercised on minimal subclasses that skip ``Optimizer.__init__``.
+        """
+        cache: dict[str, EvaluationReport] | None = getattr(self, "_eval_cache", None)
+        if cache is None or not getattr(self, "cache_evaluations", False):
+            return None
+        key = self._cache_key(target, dataset)
+        if key is None:
+            return None
+        report = cache.get(key)
+        if report is not None and self.verbose:
+            logger.info("[%s] evaluation cache hit", self.strategy_name)
+        return report
+
+    def _store_report(
+        self, target: OptimizableAgent, dataset: GoldenDataset, report: EvaluationReport
+    ) -> None:
+        """Record a report for the current live state.
+
+        Incomplete reports (rows lost to transient provider failures) are never
+        stored: their scores are means over a subset, and freezing one would
+        also defeat the baseline's deliberate re-run-on-incomplete machinery.
+        """
+        cache: dict[str, EvaluationReport] | None = getattr(self, "_eval_cache", None)
+        if cache is None or not getattr(self, "cache_evaluations", False):
+            return
+        if not report.is_complete:
+            return
+        key = self._cache_key(target, dataset)
+        if key is not None:
+            cache[key] = report
 
     def _evaluate_baseline(
         self, target: OptimizableAgent, dataset: GoldenDataset
@@ -475,9 +615,19 @@ class Optimizer:
         logged warning is too easy to lose in a long run's output, and the
         failure mode it precedes is a wrong answer wearing the costume of a
         valid one.
+
+        With evaluation caching on, a baseline whose exact state was already
+        measured in this run reuses that report -- which is how a pipeline
+        stage's baseline (the previous stage's winner) stops costing a
+        full-dataset pass. Only complete reports are ever cached, so the
+        re-run-on-incomplete path below always operates on fresh evaluations.
         """
+        cached = self._cached_report(target, dataset)
+        if cached is not None:
+            return cached
         report = self.harness.evaluate(target, dataset)
         if report.is_complete:
+            self._store_report(target, dataset, report)
             return report
         logger.warning(
             "[%s] baseline scored %.4f over %d of %d rows (%d transient failures); re-running",
@@ -497,6 +647,7 @@ class Optimizer:
                 f"as the winner. Lower the concurrency, widen the retry policy, or wait for "
                 f"the provider to recover."
             )
+        self._store_report(target, dataset, retried)
         return retried
 
     def _evaluate_validation(
@@ -580,12 +731,17 @@ class Optimizer:
             state.best_score = report.score
             state.best_report = report
         if self.verbose:
+            # Position out of the run's budget plus wall-clock elapsed time --
+            # not just the score -- so a long run distinguishes "still
+            # working" from "hung" without an external progress indicator.
             logger.info(
-                "[%s] trial #%d score=%.4f %s",
+                "[%s] trial %d/%d score=%.4f %s (%.1fs elapsed)",
                 self.strategy_name,
                 len(state.history),
+                self.max_evals,
                 report.score,
                 "ACCEPT" if accepted else "",
+                time.perf_counter() - self._run_started_at,
             )
         return accepted
 
@@ -981,66 +1137,130 @@ class PipelineOptimizer(Optimizer):
         parameters: list[Parameter] | None = None,
     ) -> OptimizationResult:
         target = wrap(agent, runner=runner, components=components, parameters=parameters)
-        baseline_snapshot = target.snapshot()
-        baseline_score = self._evaluate_baseline(target, dataset).score
 
-        combined_history: list[Trial] = []
-        combined_recommendations: list[str] = []
-        best_config: dict[str, Any] = {}
-        best_score = baseline_score
-        best_report: EvaluationReport | None = None
+        # One evaluation cache for the whole pipeline. Injected into every
+        # stage, so a stage's baseline -- the previous stage's winner, already
+        # measured -- comes back as a cache hit instead of a full-dataset pass
+        # (the default four-stage pipeline otherwise re-runs the baseline five
+        # times). Stages that were built with ``cache_evaluations=False`` see
+        # the injected dict but never read or write it.
+        owns_cache = self.cache_evaluations and self._eval_cache is None
+        if owns_cache:
+            self._eval_cache = {}
+        shared_cache = self._eval_cache
+        # This method overrides Optimizer.optimize() entirely rather than
+        # calling super(), so the base class's verbose start/trial/finish
+        # logging never runs for the *pipeline* itself (each stage still logs
+        # its own trials against its own budget, via its own optimize() call).
+        # Without a line marking stage transitions, a long default pipeline
+        # -- bootstrap, then prompts, then models, then tools -- reads as one
+        # continuous, unexplained pause between each stage's own output.
+        self._run_started_at = time.perf_counter()
+        try:
+            baseline_snapshot = target.snapshot()
+            baseline_score = self._evaluate_baseline(target, dataset).score
+            if self.verbose:
+                logger.info(
+                    "[%s] baseline score=%.4f (%d stage(s), search budget: up to %d evals)",
+                    self.strategy_name,
+                    baseline_score,
+                    len(self.stages),
+                    self.max_evals,
+                )
 
-        for stage in self.stages:
-            # Enforce a shared budget so the pipeline never exceeds the documented
-            # max_evals hard cap, regardless of each stage's own max_evals.
-            remaining = self.max_evals - len(combined_history)
-            if remaining <= 0:
-                break
-            original_max = stage.max_evals
-            stage.max_evals = min(original_max, remaining)
-            try:
-                stage_result = stage.optimize(target, dataset)  # applies stage best in place
-            finally:
-                stage.max_evals = original_max
-            combined_history.extend(stage_result.history)
-            combined_recommendations.extend(stage_result.recommendations)
-            # The live target now carries this stage's best; accumulate the diff.
-            if stage_result.best_score >= best_score:
-                best_score = stage_result.best_score
-                best_config.update(stage_result.best_config)
-                best_report = stage_result.best_report or best_report
+            combined_history: list[Trial] = []
+            combined_recommendations: list[str] = []
+            best_config: dict[str, Any] = {}
+            best_score = baseline_score
+            best_report: EvaluationReport | None = None
 
-        # Live agent already has the cumulative best applied by the final stage
-        # that improved; ensure consistency by re-applying the accumulated config.
-        target.restore(baseline_snapshot)
-        if best_config:
-            target.apply(best_config)
+            for stage_index, stage in enumerate(self.stages, start=1):
+                # Enforce a shared budget so the pipeline never exceeds the documented
+                # max_evals hard cap, regardless of each stage's own max_evals.
+                remaining = self.max_evals - len(combined_history)
+                if remaining <= 0:
+                    break
+                if self.verbose:
+                    logger.info(
+                        "[%s] stage %d/%d (%s) starting: %d/%d evals used so far "
+                        "(%.1fs elapsed)",
+                        self.strategy_name,
+                        stage_index,
+                        len(self.stages),
+                        stage.strategy_name,
+                        len(combined_history),
+                        self.max_evals,
+                        time.perf_counter() - self._run_started_at,
+                    )
+                original_max = stage.max_evals
+                # ``getattr`` because a stage may be a minimal Optimizer
+                # subclass that skipped ``__init__`` -- the same pattern the
+                # cache helpers themselves tolerate.
+                original_cache = getattr(stage, "_eval_cache", None)
+                original_cache_flag = getattr(stage, "cache_evaluations", False)
+                stage.max_evals = min(original_max, remaining)
+                stage._eval_cache = shared_cache
+                # A pipeline-level opt-out must reach the stages: with the
+                # shared cache merely absent, a stage's own default flag would
+                # quietly build a private per-stage cache and repeated
+                # configurations would still be reused -- exactly what
+                # ``cache_evaluations=False`` promises to prevent. A stage's
+                # own opt-out inside a caching pipeline is still respected.
+                stage.cache_evaluations = original_cache_flag and self.cache_evaluations
+                try:
+                    stage_result = stage.optimize(target, dataset)  # applies stage best in place
+                finally:
+                    stage.max_evals = original_max
+                    stage._eval_cache = original_cache
+                    stage.cache_evaluations = original_cache_flag
+                combined_history.extend(stage_result.history)
+                combined_recommendations.extend(stage_result.recommendations)
+                # The live target now carries this stage's best; accumulate the diff.
+                if stage_result.best_score >= best_score:
+                    best_score = stage_result.best_score
+                    best_config.update(stage_result.best_config)
+                    best_report = stage_result.best_report or best_report
 
-        validation_report = self._evaluate_validation(target, val_dataset) if val_dataset else None
-        validation_score = validation_report.score if validation_report else None
-        validation_complete = validation_report.is_complete if validation_report else True
+            # Live agent already has the cumulative best applied by the final stage
+            # that improved; ensure consistency by re-applying the accumulated config.
+            target.restore(baseline_snapshot)
+            if best_config:
+                target.apply(best_config)
 
-        # Optionally run the pipeline-level tool suggestion on the cumulative best,
-        # then dedupe so a repeated suggestion from several stages appears once.
-        pipeline_state = _SearchState(
-            best_config=best_config,
-            best_score=best_score,
-            best_report=best_report,
-            baseline_snapshot=baseline_snapshot,
-            history=combined_history,
-        )
-        combined_recommendations.extend(self._suggest_tools(target, pipeline_state))
-        return OptimizationResult(
-            best_config=best_config,
-            best_score=best_score,
-            baseline_score=baseline_score,
-            baseline_config=baseline_snapshot,
-            history=combined_history,
-            best_report=best_report,
-            validation_score=validation_score,
-            validation_complete=validation_complete,
-            recommendations=_dedup(combined_recommendations),
-        )
+            validation_report = (
+                self._evaluate_validation(target, val_dataset) if val_dataset else None
+            )
+            validation_score = validation_report.score if validation_report else None
+            validation_complete = validation_report.is_complete if validation_report else True
+
+            # Optionally run the pipeline-level tool suggestion on the cumulative best,
+            # then dedupe so a repeated suggestion from several stages appears once.
+            pipeline_state = _SearchState(
+                best_config=best_config,
+                best_score=best_score,
+                best_report=best_report,
+                baseline_snapshot=baseline_snapshot,
+                history=combined_history,
+            )
+            combined_recommendations.extend(self._suggest_tools(target, pipeline_state))
+            result = OptimizationResult(
+                best_config=best_config,
+                best_score=best_score,
+                baseline_score=baseline_score,
+                baseline_config=baseline_snapshot,
+                history=combined_history,
+                best_report=best_report,
+                validation_score=validation_score,
+                validation_complete=validation_complete,
+                recommendations=_dedup(combined_recommendations),
+                duration_seconds=time.perf_counter() - self._run_started_at,
+            )
+            if self.verbose:
+                logger.info("[%s] %r", self.strategy_name, result)
+            return result
+        finally:
+            if owns_cache:
+                self._eval_cache = None
 
     def _search(
         self, target: OptimizableAgent, dataset: GoldenDataset, state: _SearchState

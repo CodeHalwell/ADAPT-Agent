@@ -55,9 +55,12 @@ _CAPITALS = {
 def make_runner(agent: Agent):
     """Return an offline runner that reads the agent's LIVE instructions.
 
-    A real deployment would do ``return Runner.run_sync(agent, prompt).final_output``.
-    Here we simulate that: the agent only answers cleanly (just the city name)
-    when its instructions demand a terse answer -- so the optimizer can measurably
+    A real deployment needs no hand-written runner at all: with the SDK
+    installed, ``OptimizableAgent.from_agent(agent)`` (and ``evaluate_agent``)
+    drive the agent through ``Runner.run_sync`` automatically -- see
+    ``adapt_agent.optimization.runners.openai_agents_runner``. Here we simulate
+    that offline: the agent only answers cleanly (just the city name) when its
+    instructions demand a terse answer -- so the optimizer can measurably
     improve quality by rewriting ``instructions``.
     """
 

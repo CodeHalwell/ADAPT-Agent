@@ -24,13 +24,32 @@ class FakeModelSettings:
 class FakeAgent:
     """Mimics ``agents.Agent`` (instructions / model / settings / tools / handoffs)."""
 
-    def __init__(self, name, instructions, model="gpt-4o", handoffs=None, tools=None):
+    def __init__(
+        self,
+        name,
+        instructions,
+        model="gpt-4o",
+        handoffs=None,
+        tools=None,
+        handoff_description=None,
+    ):
         self.name = name
         self.instructions = instructions
+        self.handoff_description = handoff_description
         self.model = model
         self.model_settings = FakeModelSettings()
         self.tools = tools if tools is not None else []
         self.handoffs = handoffs if handoffs is not None else []
+
+
+class FakeHandoff:
+    """Mimics ``agents.Handoff``: a wrapper with no reachable agent object."""
+
+    def __init__(self, tool_name, tool_description, agent_name):
+        self.tool_name = tool_name
+        self.tool_description = tool_description
+        self.agent_name = agent_name
+        self.on_invoke_handoff = lambda *a, **k: None
 
 
 def _make_orchestrator():
@@ -183,3 +202,66 @@ def test_recursion_guards_against_cycles():
     names = {p.name for p in params}
     assert "a_agent.instructions" in names
     assert "b_agent.instructions" in names
+
+
+def test_handoff_description_bound_as_prompt():
+    sub = FakeAgent(
+        "Research Agent",
+        "You research things.",
+        handoff_description="Specialist agent for research questions",
+    )
+    root = FakeAgent("Triage Agent", "You triage.", handoffs=[sub])
+    params = introspect(root)
+    by_name = {p.name: p for p in params}
+
+    description = by_name["research_agent.handoff_description"]
+    assert description.kind is ParameterKind.PROMPT
+    description.write("Expert for deep research and citations")
+    assert sub.handoff_description == "Expert for deep research and citations"
+    assert description.read() == "Expert for deep research and citations"
+
+
+def test_unset_handoff_description_emits_no_prompt():
+    root = FakeAgent("Plain Agent", "Hi.")  # handoff_description stays None
+    names = {p.name for p in introspect(root)}
+    assert "plain_agent.handoff_description" not in names
+
+
+def test_model_settings_max_tokens_is_a_real_search_space():
+    # Boundless, the knob enumerated to just its current value -- a parameter
+    # the optimizer could see but never move.
+    root = FakeAgent("Bounded Agent", "Hi.")
+    by_name = {p.name: p for p in introspect(root)}
+    max_tokens = by_name["bounded_agent.max_tokens"]
+    assert max_tokens.bounds == (1, 32000)
+    assert len(max_tokens.enumerate_candidates()) > 1
+
+
+def test_handoff_wrapper_tool_description_bound_as_prompt():
+    wrapper = FakeHandoff(
+        tool_name="transfer_to_research_agent",
+        tool_description="Handles research questions",
+        agent_name="Research Agent",
+    )
+    root = FakeAgent("Triage Agent", "You triage.", handoffs=[wrapper])
+    params = introspect(root)
+    by_name = {p.name: p for p in params}
+
+    description = by_name["research_agent_handoff.tool_description"]
+    assert description.kind is ParameterKind.PROMPT
+    description.write("Handles research and literature review requests")
+    assert wrapper.tool_description == "Handles research and literature review requests"
+
+    # The wrapper contributes only its routing text -- there is no reachable
+    # agent behind it to introspect.
+    wrapper_params = [p for p in params if p.component == "research_agent_handoff"]
+    assert len(wrapper_params) == 1
+
+
+def test_handoff_wrapper_shared_by_two_agents_bound_once():
+    wrapper = FakeHandoff("transfer", "Shared specialist", "Shared Agent")
+    left = FakeAgent("Left Agent", "l", handoffs=[wrapper])
+    root = FakeAgent("Root Agent", "r", handoffs=[left, wrapper])
+    params = introspect(root)
+    names = [p.name for p in params]
+    assert names.count("shared_agent_handoff.tool_description") == 1

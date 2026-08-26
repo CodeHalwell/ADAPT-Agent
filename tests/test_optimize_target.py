@@ -60,6 +60,47 @@ def test_from_agent_with_explicit_runner_and_component_name():
     assert target.components["thing"] is sentinel
 
 
+def test_from_agent_falls_back_to_framework_runner_for_openai_shaped_agent(monkeypatch):
+    """An agent with no run method is driven through the framework machinery.
+
+    An OpenAI Agents ``Agent`` is a configuration object executed by
+    ``Runner.run_sync(agent, input)``; previously ``from_agent`` raised
+    TypeError for it and every caller hand-wrote the runner lambda.
+    """
+
+    class RunResult:
+        def __init__(self, final_output):
+            self.final_output = final_output
+
+    class FakeRunner:
+        def run_sync(self, agent, input_data, **kwargs):
+            return RunResult(f"{agent.instructions} -> {input_data}")
+
+    monkeypatch.setattr(
+        "adapt_agent.optimization.runners._load_openai_agents_runner", lambda: FakeRunner()
+    )
+
+    class OpenAIShapedAgent:
+        def __init__(self):
+            self.name = "Solo Agent"
+            self.instructions = "You answer."
+            self.tools = []
+            self.handoffs = []
+
+    agent = OpenAIShapedAgent()
+    target = OptimizableAgent.from_agent(agent, name="solo")
+    # Driven via the delegated runner, with the final output extracted to text.
+    assert target.run("q") == "You answer. -> q"
+    # Introspection still sees the framework object's knobs (namespaced under
+    # the component name from_agent registered the object as).
+    assert any(p.name == "agent.solo_agent.instructions" for p in target.parameters)
+
+
+def test_from_agent_still_raises_for_unrunnable_unknown_objects():
+    with pytest.raises(TypeError):
+        OptimizableAgent.from_agent(object())
+
+
 # -- from_components ----------------------------------------------------------
 
 
@@ -137,6 +178,140 @@ def test_declared_param_collides_with_introspected_raises():
     collide = next(iter(names))
     dup = Parameter(name=collide, kind=ParameterKind.PROMPT, value="x")
     with pytest.raises(ValueError):
+        OptimizableAgent.from_agent(
+            crew, runner=crew.kickoff, component_name="crew", parameters=[dup]
+        )
+
+
+def _fake_crew_with_role():
+    """A CrewAI-shaped fake whose single agent introspects a ``role`` PROMPT."""
+
+    class FakeAgent:
+        def __init__(self):
+            self.role = "Researcher"
+            self.goal = "find things"
+            self.backstory = "experienced"
+
+    class FakeCrew:
+        def __init__(self):
+            self.agents = [FakeAgent()]
+
+        def kickoff(self, x):
+            return x
+
+    return FakeCrew()
+
+
+def test_exclude_drops_the_named_introspected_parameter():
+    crew = _fake_crew_with_role()
+    baseline = OptimizableAgent.from_agent(crew, runner=crew.kickoff, component_name="crew")
+    names = {p.name for p in baseline.parameters}
+    target_name = next(n for n in names if n.endswith(".role"))
+
+    excluded = OptimizableAgent.from_agent(
+        crew, runner=crew.kickoff, component_name="crew", exclude={target_name}
+    )
+    assert target_name not in {p.name for p in excluded.parameters}
+    # Everything else introspection found is untouched.
+    assert names - {target_name} <= {p.name for p in excluded.parameters}
+
+
+def test_exclude_resolves_two_knobs_on_one_storage():
+    """The exact reported failure: a hand-bound knob under a different name
+    than an introspected one, both pointing at the same underlying storage.
+
+    Without ``exclude`` both exist -- doubling that part of the search and
+    letting whichever is applied last silently overwrite the other's
+    candidate. ``exclude`` drops the introspected duplicate, leaving the
+    hand-bound parameter as the sole knob for that storage.
+    """
+    crew = _fake_crew_with_role()
+    agent_obj = crew.agents[0]
+    baseline_names = {
+        p.name
+        for p in OptimizableAgent.from_agent(
+            crew, runner=crew.kickoff, component_name="crew"
+        ).parameters
+    }
+    introspected_role_name = next(n for n in baseline_names if n.endswith(".role"))
+
+    role_alias = Parameter(
+        name="crew.role_alias",
+        kind=ParameterKind.PROMPT,
+        value=agent_obj.role,
+        getter=lambda: agent_obj.role,
+        setter=lambda v: setattr(agent_obj, "role", v),
+    )
+
+    # Without exclude: two names, one storage.
+    duplicated = OptimizableAgent.from_agent(
+        crew, runner=crew.kickoff, component_name="crew", parameters=[role_alias]
+    )
+    assert {introspected_role_name, "crew.role_alias"} <= {p.name for p in duplicated.parameters}
+
+    # With exclude: the introspected duplicate is gone; the hand-bound knob
+    # remains the only way to tune this storage, and it still works.
+    fixed = OptimizableAgent.from_agent(
+        crew,
+        runner=crew.kickoff,
+        component_name="crew",
+        parameters=[role_alias],
+        exclude={introspected_role_name},
+    )
+    names = {p.name for p in fixed.parameters}
+    assert introspected_role_name not in names
+    assert "crew.role_alias" in names
+    fixed.apply({"crew.role_alias": "Senior Researcher"})
+    assert agent_obj.role == "Senior Researcher"
+
+
+def test_exclude_of_a_name_introspection_never_found_is_a_noop():
+    crew = _fake_crew_with_role()
+    agent = OptimizableAgent.from_agent(
+        crew, runner=crew.kickoff, component_name="crew", exclude={"crew.does_not_exist"}
+    )
+    assert any(p.name.endswith(".role") for p in agent.parameters)
+
+
+def test_replace_true_lets_a_declared_parameter_override_the_introspected_one():
+    crew = _fake_crew_with_role()
+    agent_obj = crew.agents[0]
+    names = {
+        p.name
+        for p in OptimizableAgent.from_agent(
+            crew, runner=crew.kickoff, component_name="crew"
+        ).parameters
+    }
+    role_name = next(n for n in names if n.endswith(".role"))
+
+    calls = []
+    custom = Parameter(
+        name=role_name,
+        kind=ParameterKind.PROMPT,
+        value=agent_obj.role,
+        getter=lambda: agent_obj.role,
+        setter=lambda v: (calls.append(v), setattr(agent_obj, "role", v)),
+    )
+    agent = OptimizableAgent.from_agent(
+        crew, runner=crew.kickoff, component_name="crew", parameters=[custom], replace=True
+    )
+    assert agent.search_space[role_name] is custom
+    agent.apply({role_name: "Lead Researcher"})
+    assert calls == ["Lead Researcher"]  # the custom setter ran, not the introspected one
+    assert agent_obj.role == "Lead Researcher"
+
+
+def test_replace_false_default_still_raises_on_collision():
+    crew = _fake_crew_with_role()
+    names = {
+        p.name
+        for p in OptimizableAgent.from_agent(
+            crew, runner=crew.kickoff, component_name="crew"
+        ).parameters
+    }
+    role_name = next(n for n in names if n.endswith(".role"))
+    dup = Parameter(name=role_name, kind=ParameterKind.PROMPT, value="x")
+    with pytest.raises(ValueError, match="collides"):
         OptimizableAgent.from_agent(
             crew, runner=crew.kickoff, component_name="crew", parameters=[dup]
         )
@@ -244,6 +419,22 @@ def test_add_parameter_duplicate_raises():
     agent = OptimizableAgent.from_callable(lambda x: x, parameters=[p])
     with pytest.raises(ValueError):
         agent.add_parameter(Parameter(name="dup", kind=ParameterKind.PROMPT, value=2))
+
+
+def test_add_parameter_replace_true_swaps_it_in():
+    p = Parameter(name="dup", kind=ParameterKind.PROMPT, value=1)
+    agent = OptimizableAgent.from_callable(lambda x: x, parameters=[p])
+    replacement = Parameter(name="dup", kind=ParameterKind.PROMPT, value=2)
+    agent.add_parameter(replacement, replace=True)
+    assert agent.search_space["dup"] is replacement
+    assert len(agent.parameters) == 1
+
+
+def test_search_space_remove_drops_a_knob_with_no_replacement():
+    p = Parameter(name="dup", kind=ParameterKind.PROMPT, value=1)
+    agent = OptimizableAgent.from_callable(lambda x: x, parameters=[p])
+    assert agent.search_space.remove("dup") is True
+    assert len(agent.parameters) == 0
 
 
 # -- describe -----------------------------------------------------------------
@@ -425,3 +616,61 @@ def test_wrap_object_with_explicit_runner():
     target = wrap(sentinel, runner=lambda x: f"run:{x}")
     assert target.run("p") == "run:p"
     assert target.components["agent"] is sentinel
+
+
+# -- wrap: exclude/replace forwarding ------------------------------------------
+
+
+def test_wrap_components_forwards_exclude():
+    crew = _fake_crew_with_role()
+    names = {
+        p.name
+        for p in OptimizableAgent.from_agent(
+            crew, runner=crew.kickoff, component_name="crew"
+        ).parameters
+    }
+    role_name = next(n for n in names if n.endswith(".role"))
+
+    target = wrap(crew.kickoff, components={"crew": crew}, exclude={role_name})
+    assert role_name not in {p.name for p in target.parameters}
+
+
+def test_wrap_agent_path_forwards_replace():
+    class Agent:
+        def __init__(self):
+            self.value = 1
+
+        def run(self, x):
+            return x
+
+    agent_obj = Agent()
+    custom = Parameter(
+        name="agent.value",
+        kind=ParameterKind.HYPERPARAM,
+        value=1,
+        getter=lambda: agent_obj.value,
+        setter=lambda v: setattr(agent_obj, "value", v),
+    )
+    # First build establishes the introspected-or-declared baseline name...
+    baseline = wrap(agent_obj, parameters=[custom])
+    assert baseline.search_space["agent.value"] is custom
+    # ...then a second declaration under the same name needs replace=True.
+    other = Parameter(name="agent.value", kind=ParameterKind.HYPERPARAM, value=2)
+    with pytest.raises(ValueError):
+        wrap(agent_obj, parameters=[custom, other])
+    replaced = wrap(agent_obj, parameters=[custom], replace=True)
+    assert replaced.search_space["agent.value"] is custom
+
+
+def test_wrap_callable_path_forwards_replace():
+    # from_callable has no components to introspect, so the only way to
+    # exercise collision handling here is two same-named declared parameters
+    # in one list. Sequential add() means the second collides with the first
+    # already in the space -- confirming replace=True actually reaches
+    # OptimizableAgent.from_callable rather than being silently dropped by wrap.
+    p = Parameter(name="agent.knob", kind=ParameterKind.HYPERPARAM, value=1)
+    other = Parameter(name="agent.knob", kind=ParameterKind.HYPERPARAM, value=2)
+    with pytest.raises(ValueError):
+        wrap(lambda x: x, parameters=[p, other])
+    replaced = wrap(lambda x: x, parameters=[p, other], replace=True)
+    assert replaced.search_space["agent.knob"] is other

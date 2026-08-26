@@ -92,6 +92,45 @@ def test_callable_provider_typeerror_fallback():
     assert calls == ["hi"]
 
 
+def test_callable_provider_dropping_system_logs_a_warning(caplog):
+    # A callable that cannot accept `system` is still supported, but silently
+    # dropping the grading rubric is the worst failure mode for a judge -- it
+    # keeps returning confident-looking scores while grading blind. The drop
+    # must be logged, not swallowed.
+    def fn(prompt):
+        return "ok"
+
+    p = CallableProvider(fn)
+    with caplog.at_level("WARNING"):
+        result = p("hi", system="grade strictly against this rubric")
+    assert result == "ok"
+    assert any("system" in r.message for r in caplog.records)
+
+
+def test_callable_provider_dropping_non_system_override_is_silent(caplog):
+    # Only `system` carries information a judge cannot function without;
+    # a callable ignoring e.g. `temperature` is an ordinary, unremarkable stub.
+    def fn(prompt):
+        return "ok"
+
+    p = CallableProvider(fn)
+    with caplog.at_level("WARNING"):
+        result = p("hi", temperature=0.7)
+    assert result == "ok"
+    assert caplog.records == []
+
+
+def test_callable_provider_accepting_system_never_warns(caplog):
+    def fn(prompt, **kw):
+        return f"{prompt}:{kw.get('system')}"
+
+    p = CallableProvider(fn)
+    with caplog.at_level("WARNING"):
+        result = p("hi", system="rubric")
+    assert result == "hi:rubric"
+    assert caplog.records == []
+
+
 def test_callable_provider_coerces_non_str_result():
     p = CallableProvider(lambda prompt: 12345)
     assert p("x") == "12345"

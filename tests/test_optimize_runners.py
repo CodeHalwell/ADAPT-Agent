@@ -9,8 +9,10 @@ import pytest
 from adapt_agent.optimization.runners import (
     AUTO,
     adk_runner,
+    claude_agent_runner,
     framework_runner,
     langgraph_inputs,
+    openai_agents_runner,
 )
 
 # -- langgraph_inputs ----------------------------------------------------------
@@ -269,3 +271,221 @@ def test_adk_runner_bare_agent_without_sdk_raises_helpful_error():
 
     with pytest.raises(ImportError, match="google-adk"):
         adk_runner(BareAgent())
+
+
+# -- openai_agents_runner --------------------------------------------------------
+
+
+class _RunResult:
+    """OpenAI-Agents-shaped run result: carries ``final_output``."""
+
+    def __init__(self, final_output):
+        self.final_output = final_output
+
+
+class _FakeOpenAIRunner:
+    """``agents.Runner``-shaped: a ``run_sync(agent, input, **kw)`` entrypoint."""
+
+    def __init__(self):
+        self.calls = []
+
+    def run_sync(self, agent, input_data, **kwargs):
+        self.calls.append((agent, input_data, kwargs))
+        return _RunResult(f"final: {input_data}")
+
+
+def test_openai_agents_runner_drives_run_sync_and_extracts():
+    agent = object()
+    fake = _FakeOpenAIRunner()
+    run = openai_agents_runner(agent, runner=fake)
+    assert run("what is 2+2?") == "final: what is 2+2?"
+    assert fake.calls == [(agent, "what is 2+2?", {})]
+
+
+def test_openai_agents_runner_forwards_run_kwargs():
+    fake = _FakeOpenAIRunner()
+    run = openai_agents_runner(object(), runner=fake, run_kwargs={"max_turns": 3})
+    run("q")
+    assert fake.calls[0][2] == {"max_turns": 3}
+
+
+def test_openai_agents_runner_output_extractor_none_keeps_raw():
+    run = openai_agents_runner(object(), runner=_FakeOpenAIRunner(), output_extractor=None)
+    result = run("q")
+    assert isinstance(result, _RunResult)
+
+
+def test_openai_agents_runner_awaits_async_run_fallback():
+    class AsyncOnlyRunner:
+        async def run(self, agent, input_data, **kwargs):
+            return _RunResult(f"async: {input_data}")
+
+    run = openai_agents_runner(object(), runner=AsyncOnlyRunner())
+    assert run("hi") == "async: hi"
+
+
+def test_openai_agents_runner_rejects_runner_without_entrypoints():
+    with pytest.raises(TypeError, match="run_sync"):
+        openai_agents_runner(object(), runner=object())
+
+
+def test_openai_agents_runner_without_sdk_raises_helpful_error():
+    try:
+        import agents  # noqa: F401
+
+        pytest.skip("openai-agents installed; the lazy-import error path is not reachable")
+    except ImportError:
+        pass
+    with pytest.raises(ImportError, match="openai-agents"):
+        openai_agents_runner(object())
+
+
+# -- claude_agent_runner ---------------------------------------------------------
+
+
+class _TextBlock:
+    def __init__(self, text):
+        self.text = text
+
+
+class _AssistantMessage:
+    """Claude-SDK-shaped assistant message: ``content`` blocks + a role."""
+
+    def __init__(self, text):
+        self.role = "assistant"
+        self.content = [_TextBlock(text)]
+
+
+class _ClaudeResultMessage:
+    """Claude-SDK-shaped ``ResultMessage``: ``subtype`` + final ``result`` text."""
+
+    def __init__(self, result):
+        self.subtype = "success"
+        self.result = result
+
+
+def _fake_query(transcript):
+    """A ``claude_agent_sdk.query``-shaped async generator factory."""
+    calls = []
+
+    def query(*, prompt, options):
+        calls.append({"prompt": prompt, "options": options})
+
+        async def _stream():
+            yield _AssistantMessage("thinking...")
+            yield _ClaudeResultMessage(f"{transcript}: {prompt}")
+
+        return _stream()
+
+    return query, calls
+
+
+def test_claude_agent_runner_drives_query_and_extracts():
+    options = object()
+    query, calls = _fake_query("answer")
+    run = claude_agent_runner(options, query_fn=query)
+    assert run("what is 2+2?") == "answer: what is 2+2?"
+    # The prompt and the *same live* options object were passed through.
+    assert calls == [{"prompt": "what is 2+2?", "options": options}]
+
+
+def test_claude_agent_runner_reads_live_options_each_call():
+    options = object()
+    query, calls = _fake_query("a")
+    run = claude_agent_runner(options, query_fn=query)
+    run("one")
+    run("two")
+    assert [c["options"] for c in calls] == [options, options]
+
+
+def test_claude_agent_runner_output_extractor_none_returns_messages():
+    query, _ = _fake_query("raw")
+    run = claude_agent_runner(object(), query_fn=query, output_extractor=None)
+    messages = run("q")
+    assert isinstance(messages, list) and len(messages) == 2
+    assert isinstance(messages[-1], _ClaudeResultMessage)
+
+
+def test_claude_agent_runner_without_sdk_raises_helpful_error():
+    try:
+        import claude_agent_sdk  # noqa: F401
+
+        pytest.skip("claude-agent-sdk installed; the lazy-import error path is not reachable")
+    except ImportError:
+        pass
+    with pytest.raises(ImportError, match="claude-agent-sdk"):
+        claude_agent_runner(object())
+
+
+# -- framework_runner delegation -------------------------------------------------
+#
+# Objects that are not runnable on their own (no run method, not callable) are
+# delegated by detected framework instead of raising TypeError. Loader helpers
+# are monkeypatched so no SDK is needed.
+
+
+class _FakeOpenAIAgent:
+    """OpenAI-Agents-shaped: instructions + tools + handoffs list, no run method."""
+
+    def __init__(self):
+        self.name = "Triage Agent"
+        self.instructions = "You triage."
+        self.tools = []
+        self.handoffs = []
+
+
+def test_framework_runner_delegates_openai_agents_shaped_agent(monkeypatch):
+    fake = _FakeOpenAIRunner()
+    monkeypatch.setattr("adapt_agent.optimization.runners._load_openai_agents_runner", lambda: fake)
+    agent = _FakeOpenAIAgent()
+    run = framework_runner(agent)
+    assert run("route me") == "final: route me"
+    assert fake.calls[0][0] is agent
+
+
+class _FakeClaudeOptions:
+    """Claude-options-shaped: system_prompt + allowed_tools, nothing runnable."""
+
+    def __init__(self):
+        self.system_prompt = "You are helpful."
+        self.allowed_tools = ["Read"]
+
+
+def test_framework_runner_delegates_claude_options(monkeypatch):
+    query, calls = _fake_query("claude")
+    monkeypatch.setattr("adapt_agent.optimization.runners._load_claude_agent_query", lambda: query)
+    options = _FakeClaudeOptions()
+    run = framework_runner(options)
+    assert run("hello") == "claude: hello"
+    assert calls[0]["options"] is options
+
+
+def test_framework_runner_custom_input_adapter_applies_before_delegation(monkeypatch):
+    fake = _FakeOpenAIRunner()
+    monkeypatch.setattr("adapt_agent.optimization.runners._load_openai_agents_runner", lambda: fake)
+    run = framework_runner(_FakeOpenAIAgent(), input_adapter=lambda s: s.upper())
+    assert run("shout") == "final: SHOUT"
+
+
+def test_framework_runner_delegates_bare_adk_agent_to_adk_runner():
+    try:
+        import google.adk  # noqa: F401
+
+        pytest.skip("google-adk installed; the delegation error path is not reachable")
+    except ImportError:
+        pass
+
+    class BareAdkAgent:
+        name = "solo"
+        instruction = "hi"
+        sub_agents: list = []
+
+    # Reaching adk_runner's install-hint error (rather than TypeError) proves
+    # the bare agent was routed to the ADK driving machinery.
+    with pytest.raises(ImportError, match="google-adk"):
+        framework_runner(BareAdkAgent())
+
+
+def test_framework_runner_still_raises_for_unrunnable_unknown_objects():
+    with pytest.raises(TypeError, match="Cannot evaluate object"):
+        framework_runner(object())

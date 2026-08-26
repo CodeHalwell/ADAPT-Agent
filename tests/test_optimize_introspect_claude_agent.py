@@ -241,4 +241,107 @@ def test_a_real_options_object_with_subagents_is_introspectable() -> None:
     )
     options.agents = {"researcher": {"description": "d", "prompt": "p"}}
     assert detect(options) == "claude_agent"
-    assert any(p.kind is ParameterKind.PROMPT for p in introspect(options))
+    params = {p.name: p for p in introspect(options)}
+    assert params["researcher.prompt"].kind is ParameterKind.PROMPT
+    assert params["researcher.description"].kind is ParameterKind.PROMPT
+
+
+def test_subagent_definition_objects_are_introspected() -> None:
+    """An ``AgentDefinition``-shaped subagent contributes its own knobs."""
+    reviewer = types.SimpleNamespace(
+        description="Reviews code for security issues",
+        prompt="You are an expert security reviewer.",
+        model="claude-opus-4-8",
+        tools=["Read", "Grep"],
+    )
+    options = types.SimpleNamespace(
+        system_prompt="You orchestrate.",
+        allowed_tools=["Task"],
+        agents={"code-reviewer": reviewer},
+    )
+    by_name = {p.name: p for p in introspect(options)}
+
+    prompt = by_name["code-reviewer.prompt"]
+    assert prompt.kind is ParameterKind.PROMPT
+    assert by_name["code-reviewer.description"].kind is ParameterKind.PROMPT
+    assert by_name["code-reviewer.model"].kind is ParameterKind.MODEL
+    assert by_name["code-reviewer.model"].read() == "claude-opus-4-8"
+
+    tools = by_name["code-reviewer.tools"]
+    assert tools.kind is ParameterKind.TOOL
+    assert tools.candidates is not None
+    assert tools.candidates[0] == ["Read", "Grep"]
+    assert ["Grep"] in tools.candidates
+
+    # The setter writes onto the live definition object.
+    prompt.write("You are a meticulous security reviewer.")
+    assert reviewer.prompt == "You are a meticulous security reviewer."
+
+
+def test_subagent_skills_bound_as_skill_kind() -> None:
+    researcher = types.SimpleNamespace(
+        description="d", prompt="p", skills=["web-search", "citations"]
+    )
+    options = types.SimpleNamespace(
+        system_prompt="hi",
+        allowed_tools=["Task"],
+        agents={"researcher": researcher},
+    )
+    by_name = {p.name: p for p in introspect(options)}
+    skills = by_name["researcher.skills"]
+    assert skills.kind is ParameterKind.SKILL
+    assert skills.candidates is not None
+    assert ["citations"] in skills.candidates
+
+
+def test_dict_shaped_subagent_definition_setter_mutates_mapping() -> None:
+    definition = {"description": "d", "prompt": "p", "model": "sonnet", "tools": ["Read"]}
+    options = types.SimpleNamespace(
+        system_prompt="hi",
+        allowed_tools=["Task"],
+        agents={"researcher": definition},
+    )
+    by_name = {p.name: p for p in introspect(options)}
+
+    assert by_name["researcher.model"].kind is ParameterKind.MODEL
+    by_name["researcher.prompt"].write("Research rigorously.")
+    assert definition["prompt"] == "Research rigorously."
+    # A single tool has no meaningful subset search.
+    assert by_name["researcher.tools"].candidates is None
+
+
+def test_subagent_named_agent_does_not_collide_with_root_component() -> None:
+    """A subagent slugging to the root component name must not duplicate names.
+
+    Duplicate names would make ``SearchSpace.add`` raise downstream; the root's
+    binding wins and the colliding subagent knob is skipped.
+    """
+    options = types.SimpleNamespace(
+        system_prompt="hi",
+        model="claude-sonnet-4-5",
+        allowed_tools=["Task"],
+        agents={"agent": types.SimpleNamespace(description="d", prompt="p", model="haiku")},
+    )
+    params = introspect(options)
+    names = [p.name for p in params]
+    assert len(names) == len(set(names))
+    by_name = {p.name: p for p in params}
+    # The root options model keeps the "agent.model" name...
+    assert by_name["agent.model"].read() == "claude-sonnet-4-5"
+    # ...while the subagent's non-colliding prompts are still bound.
+    assert by_name["agent.prompt"].read() == "p"
+    assert by_name["agent.description"].read() == "d"
+
+
+def test_max_thinking_tokens_bound_when_present() -> None:
+    opts = types.SimpleNamespace(
+        system_prompt="hi",
+        model="claude-sonnet-4-5",
+        allowed_tools=["Read"],
+        max_turns=10,
+        max_thinking_tokens=8000,
+    )
+    by_name = {p.name: p for p in introspect(opts)}
+    thinking = by_name["agent.max_thinking_tokens"]
+    assert thinking.kind is ParameterKind.HYPERPARAM
+    assert thinking.bounds == (1024, 32000)

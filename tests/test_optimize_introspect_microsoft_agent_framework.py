@@ -241,6 +241,59 @@ def test_attribute_layout_wins_over_default_options() -> None:
     assert prompts[0].value == "Attribute wins."
 
 
+def test_penalties_discovered_from_default_options() -> None:
+    agent = _options_agent(frequency_penalty=0.2, presence_penalty=-0.1)
+    params = {p.name: p for p in introspect(agent)}
+
+    frequency = params["triage_bot.frequency_penalty"]
+    assert frequency.kind is ParameterKind.HYPERPARAM
+    assert frequency.bounds == (-2.0, 2.0)
+    assert frequency.value == 0.2
+    presence = params["triage_bot.presence_penalty"]
+    assert presence.bounds == (-2.0, 2.0)
+    presence.write(0.5)
+    assert agent.default_options["presence_penalty"] == 0.5
+
+
+def test_penalties_discovered_from_client_attributes() -> None:
+    client = FakeChatClient("gpt-4o", 0.5)
+    client.frequency_penalty = 0.1
+    agent = FakeChatAgent(name="Penalty Bot", instructions="Help.", chat_client=client)
+    params = {p.name: p for p in introspect(agent)}
+
+    frequency = params["penalty_bot.frequency_penalty"]
+    assert frequency.kind is ParameterKind.HYPERPARAM
+    assert frequency.bounds == (-2.0, 2.0)
+
+
+def test_model_id_from_default_options_when_client_exposes_none() -> None:
+    """A per-agent model override in the options mapping is the model knob.
+
+    Some clients expose no model attribute at all; without the mapping fallback
+    the whole agent had no MODEL parameter even though ``model_id`` sat right in
+    ``default_options``.
+    """
+    agent = FakeOptionsAgent(
+        name="Override Bot",
+        default_options={"instructions": "Hi.", "model_id": "gpt-4o"},
+        client=object(),  # exposes none of the model attributes
+    )
+    params = {p.name: p for p in introspect(agent)}
+
+    model = params["override_bot.model"]
+    assert model.kind is ParameterKind.MODEL
+    assert model.value == "gpt-4o"
+    model.write("gpt-4o-mini")
+    assert agent.default_options["model_id"] == "gpt-4o-mini"
+
+
+def test_client_model_wins_over_default_options_model_id() -> None:
+    agent = _options_agent(model_id="options-model")  # client also has model_id
+    params = [p for p in introspect(agent) if p.kind is ParameterKind.MODEL]
+    assert len(params) == 1
+    assert params[0].value == "gpt-4o-mini"  # the client's, not the mapping's
+
+
 def test_pydantic_ai_style_agent_is_not_claimed() -> None:
     """The client check is load-bearing: Pydantic AI also has instructions+run.
 

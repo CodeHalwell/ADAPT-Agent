@@ -7,6 +7,203 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`verbose=True` now reports where a long run actually is, not just what it
+  found.** Per-trial logging showed a candidate's score with no sense of
+  position or pace -- indistinguishable, over a run measured in hours, from a
+  hang. Every optimizer's trial log now includes the trial's position out of
+  the run's evaluation budget and the wall-clock time elapsed since the run
+  started (`trial 5/60 score=0.7100 ACCEPT (142.3s elapsed)`), and the
+  baseline-start line states the budget up front
+  (`baseline score=0.4100 (search budget: up to 60 evals)`).
+  `PipelineOptimizer` -- which overrides `optimize()` entirely and so never
+  ran the base class's verbose logging for itself, only ever forwarding
+  `verbose` into each stage -- now also logs its own stage transitions
+  (`stage 2/4 (coordinate_ascent) starting: 15/60 evals used so far (203.1s
+  elapsed)`) and a completion summary, so a multi-stage `make_default_optimizer`
+  pipeline no longer reads as one unexplained pause between each stage's own
+  output.
+
+  `OptimizationResult` gained `duration_seconds` (wall-clock time for the
+  whole `optimize` call), appended at the end of the dataclass per its
+  append-only convention, surfaced in `to_dict()`, `repr()`, and the
+  provenance header `to_config()` writes to a tuned-config file.
+
+- **`OptimizableAgent` (and every `from_*` constructor, plus `wrap()`) gained
+  `exclude=` and `replace=`, so introspection catching up to a hand-bound
+  workaround no longer silently doubles a knob.** Parameters are opaque
+  getter/setter closures, so the library cannot detect that two of them target
+  the *same* underlying storage under *different* names — only that two names
+  collide, which already raised. The gap: a caller hand-binds a parameter to
+  work around introspection missing a knob (a real, documented, and until now
+  the *only* supported reason to declare extra parameters), a later release
+  teaches introspection to find that same knob under its own name, and the two
+  now coexist pointing at one piece of storage — doubling that part of the
+  search space and letting whichever knob an optimizer applies last silently
+  overwrite the other's candidate. Nothing raised, because the names never
+  matched.
+
+  `exclude={"agent.instructions", ...}` removes named introspected parameters
+  from the space before declared `parameters` are merged in — the fix for the
+  reported shape, where the hand-bound and introspected knobs have different
+  names. `replace=True` instead lets a declared parameter *under the same
+  name* as an introspected one win outright, for overriding how a knob with a
+  name you want to keep is read/written. The default collision behavior
+  (`ValueError`) is unchanged — an unintended same-name clash is still caught,
+  since `replace` is opt-in. New primitives underneath: `SearchSpace.remove(name)`
+  (drop a knob, never raises for a missing name) and `SearchSpace.add(parameter,
+  replace=True)`; `OptimizableAgent.add_parameter(parameter, replace=True)`
+  exposes the same override after construction.
+
+### Fixed
+
+- **A completion callable that could not accept `system=` made the judge
+  grade silently without its rubric.** Every judge call
+  (`score`/`critique`/`compare`/`improve_prompt`) sends the grading
+  rubric/instructions via `complete(prompt, system=...)`. A callable
+  conforming to the *documented* `CompletionFn` shape — a plain
+  `def f(prompt: str) -> str`, exactly the form shown in the quick-start
+  example — raises `TypeError` on that call, and both places that catch it
+  (`CallableProvider.complete`, and `LLMJudge._invoke` for a bare callable
+  passed directly) fell back to `complete(prompt)`, dropping the rubric with
+  no warning. The judge kept returning normal-looking scores, indistinguishable
+  from a working judge, while silently grading blind on every call — a search
+  can burn its entire budget on an oracle that was never actually applying the
+  rubric. Both fallback sites now emit a `logger.warning` naming the dropped
+  keyword and how to fix the callable's signature; behavior is otherwise
+  unchanged; nothing raises. `CompletionFn`'s type widened from
+  `Callable[[str], str]` to `Callable[..., str]` to stop documenting a
+  signature that silently loses information in practice.
+
+- **Optimizers stop paying for configurations they have already measured.**
+  Every optimizer now carries an evaluation cache (`cache_evaluations=True`)
+  keyed on the *live parameter state* at evaluation time, living for exactly
+  one `optimize` call. `PipelineOptimizer` injects one shared cache into its
+  stages -- and this is where the money was: each stage begins by evaluating
+  its baseline over the full dataset, and each stage's baseline *is* the
+  previous stage's winner, already measured. The default four-stage
+  `make_default_optimizer` pipeline was spending five full-dataset baseline
+  passes per run, four of them redundant; they are now cache hits. Keying on
+  the live state (not the candidate diff) is what makes those hits happen,
+  since a stage baseline and the winning trial that produced it reach the
+  same state through different configs.
+
+  The cost machinery this loop already had is deliberately untouched:
+  incomplete reports (rows lost to transient provider failures) are never
+  cached, so the baseline's re-run-on-incomplete path always re-measures, and
+  a cache hit still performs the restore/apply so proposers observe identical
+  live state either way. Live objects in the state (tool lists holding
+  callables) key by identity -- distinct-but-equal objects miss rather than
+  falsely hit, which only costs a re-run. Trial histories are unchanged:
+  cached trials record the same scores in the same order, so results are
+  byte-identical for a deterministic agent. Pass `cache_evaluations=False`
+  (per optimizer or per stage -- a stage's opt-out is respected inside a
+  caching pipeline) to re-measure every configuration, e.g. to average out a
+  stochastic agent.
+
+- **Every supported framework is now drivable through one entry point --
+  including the three whose agents cannot run themselves.** An OpenAI Agents
+  SDK `Agent` is a configuration object executed by `Runner.run_sync(agent,
+  input)`; a Claude Agent SDK setup is a `ClaudeAgentOptions` driven by
+  `query(prompt=..., options=...)`; a bare Google ADK agent runs inside a
+  session-holding `Runner`. `resolve_runner` knows none of that, so
+  `evaluate_agent(...)`, `framework_runner(...)` and
+  `OptimizableAgent.from_agent(...)` -- the documented "point it at your agent"
+  entry points -- raised `TypeError` for exactly these frameworks, and every
+  example hand-wrote the driving lambda the SDK documents anyway.
+
+  Two new runner builders close the gap, mirroring `adk_runner`:
+
+  - **`openai_agents_runner(agent, *, runner=None, run_kwargs=None,
+    output_extractor=...)`** drives the agent through the SDK's `Runner`
+    (imported lazily; inject anything with a compatible `run_sync` -- or an
+    async `run`, which is awaited -- for tests and custom runners), forwarding
+    `run_kwargs` (e.g. `max_turns`, a shared `context`) to every call.
+  - **`claude_agent_runner(options, *, query_fn=None, output_extractor=...)`**
+    drives `query`, draining the async message stream synchronously and
+    extracting the final `ResultMessage` text. The options object is closed
+    over, not copied -- so the runner always reads the *live* object the
+    introspected parameters mutate, which is exactly what optimization needs.
+
+  `framework_runner` now **delegates by detected framework** when an object
+  exposes no run method at all (OpenAI Agents -> `openai_agents_runner`,
+  Claude options -> `claude_agent_runner`, bare ADK agent -> `adk_runner`),
+  and `OptimizableAgent.from_agent` falls back to `framework_runner` when
+  `resolve_runner` finds nothing runnable. Directly-runnable frameworks are
+  untouched -- resolution is attempted first and wins, so existing behaviour
+  (including framework-native outputs) is byte-identical; the fallback only
+  replaces a `TypeError`, never a working runner. A missing SDK surfaces as an
+  `ImportError` naming the extra to install, which is strictly more useful
+  than the `TypeError` it replaces. Both builders are exported from
+  `adapt_agent.optimization` and `adapt_agent.evaluation`.
+
+- **Framework introspection reaches the knobs that steer multi-agent behaviour,
+  not just the ones on the front agent.** Two whole categories of tunable text
+  were invisible to the optimizer:
+
+  - *OpenAI Agents SDK*: an agent's `handoff_description` -- the text a routing
+    agent reads when deciding whether to delegate to it -- is now a PROMPT
+    parameter, and a `Handoff` **wrapper** in a `handoffs` list now contributes
+    its `tool_description` (as `<agent>_handoff.tool_description`). A wrapper
+    holds its agent inside an `on_invoke_handoff` closure, so the sub-agent
+    itself is structurally unreachable -- but the description is what the
+    routing LLM actually reads, and it is the part worth tuning. Previously a
+    topology built with `handoff(...)` lost the wrapped branch entirely, and
+    nothing tuned routing text anywhere.
+
+  - *Claude Agent SDK*: the subagent definitions in `options.agents` are now
+    introspected -- each definition's `prompt` and `description` (both
+    prompts: one steers the specialist, the other steers delegation *to* it),
+    its `model`, and its `tools`/`skills` lists (with the same drop-one
+    ablation candidates every other tool list gets), namespaced under the
+    slugged subagent name. Both real `AgentDefinition` objects and the plain
+    mappings the SDK also accepts are handled, and a subagent whose name
+    collides with the root component is skipped rather than allowed to produce
+    duplicate parameter names. The `agents` field was already recognised (it
+    stopped vetoing detection in 0.3.x) but its contents were never bound, so
+    a multi-agent Claude setup exposed only the orchestrator's knobs.
+
+- **Sampling knobs the frameworks expose but introspection didn't.** Each is
+  bound with the same duck-typing rules as its neighbours (only when present,
+  only when the value has the right shape): CrewAI LLM objects gain `top_p`;
+  Google ADK `generate_content_config` gains `top_k` (bounded (1, 40), valid
+  for every Gemini generation so a gridded candidate never becomes a runtime
+  rejection); Pydantic AI `model_settings` and Microsoft Agent Framework
+  agents/clients/`default_options` gain `frequency_penalty` and
+  `presence_penalty` (bounded (-2.0, 2.0)); LangGraph bound chat models gain
+  `top_p`.
+
+- **CrewAI `allow_delegation` is a searchable ROUTING parameter** with
+  `[True, False]` candidates -- whether an agent may hand work to its
+  crew-mates is a real topology decision the optimizer can now measure instead
+  of inherit. Bound only when the live value is a genuine `bool`.
+
+- **Microsoft Agent Framework: the model is found even when the client hides
+  it.** When none of the client's model attributes exist, the per-agent
+  `model_id` override in `default_options` now binds as the MODEL parameter
+  (the client still wins when both are present). Previously such an agent had
+  no model knob at all despite the identifier sitting in its options mapping.
+
+- **Claude Agent SDK: `max_thinking_tokens`** binds as a HYPERPARAM (bounds
+  (1024, 32000) -- the floor is the API's minimum thinking budget) on SDK
+  versions that carry it as a flat option.
+
+### Changed
+
+- **OpenAI Agents SDK `model_settings.max_tokens` now carries bounds
+  (1, 32000)**, like every other framework's max-tokens knob. Boundless, its
+  search space collapsed to the current value -- `enumerate_candidates()`
+  returned one option and the numeric proposer skipped it -- so it appeared in
+  every report as a parameter the optimizer could never actually move.
+
+- **CrewAI tasks with a `name` are namespaced under it** (slugged), falling
+  back to the positional `task_<index>` only when nameless. A name survives
+  reordering the task list; an index silently rebinds every exported tuned
+  config to a different task. A config exported before this release for a
+  *named* task addresses `task_<index>` and will no longer re-apply -- re-run
+  `to_config()` (unnamed tasks are unaffected).
+
 ## [0.3.2] - 2026-08-24
 
 ### Changed
@@ -66,6 +263,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrong-shaped manifests are one answer, since each means the install cannot
   report its version and each has the same fix. A diagnostic that fails on a
   damaged file tells you least exactly when you need it most.
+
+### Fixed
+
+- **The evaluation cache could serve a report across two different
+  evaluators.** The cache key covered only the dataset identity and live
+  parameter state, so a `PipelineOptimizer` assembled from stages carrying
+  *different* harnesses (different metrics, a different judge) could let one
+  stage reuse a report another stage's harness produced, ranking candidates
+  against the wrong scores. The harness identity is now part of the key;
+  stages sharing one harness instance (how `make_default_optimizer` builds
+  pipelines) still share hits.
+- **A pipeline-level `cache_evaluations=False` didn't reach its stages.**
+  `PipelineOptimizer(..., cache_evaluations=False)` cleared the *shared*
+  cache, but a stage left at its own default (`True`) then built a private
+  per-stage cache anyway, so repeated configurations were still served from
+  cache instead of re-measured. The pipeline's opt-out now suppresses stage
+  caching for the run; a stage's own opt-out inside a caching pipeline is
+  still respected.
+- **Two CrewAI tasks with the same (or identically-slugged) `name` collided.**
+  0.3.2's task-naming-by-`name` change (below) could make two tasks emit the
+  same component (`research_task.description` for both), and constructing the
+  `OptimizableAgent` raised `ValueError: Duplicate parameter name`. Colliding
+  names are now disambiguated with the task's positional index, so upgrading
+  to named-task components can no longer break agents whose tasks share a
+  name.
+- **`PipelineOptimizer` assumed every stage carries a live `Optimizer`
+  state.** Cache injection read `stage._eval_cache` unconditionally, which
+  raised `AttributeError` for a minimal `Optimizer` subclass that
+  intentionally skips `Optimizer.__init__` (a pattern the cache's own read/
+  write helpers already tolerate via `getattr`). Stage attribute access is
+  now equally defensive.
 
 
 ## [0.3.1] - 2026-08-24

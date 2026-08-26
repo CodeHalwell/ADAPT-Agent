@@ -189,6 +189,16 @@ def _model_params(runnable: Any, component: str) -> list[Parameter]:
     params.append(
         bind_attr(
             model,
+            "top_p",
+            f"{component}.top_p",
+            ParameterKind.HYPERPARAM,
+            component=component,
+            bounds=(0.0, 1.0),
+        )
+    )
+    params.append(
+        bind_attr(
+            model,
             "max_tokens",
             f"{component}.max_tokens",
             ParameterKind.HYPERPARAM,

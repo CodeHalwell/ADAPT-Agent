@@ -256,11 +256,18 @@ def _model_params(obj: Any, component: str) -> list[Parameter]:
 
 
 def _model_settings_params(obj: Any, component: str) -> list[Parameter]:
-    """Bind HYPERPARAM parameters held in the ``model_settings`` dict."""
+    """Bind HYPERPARAM parameters held in the ``model_settings`` dict.
+
+    The penalty keys are part of Pydantic AI's common ``ModelSettings`` shape;
+    like every mapping binding here they are only emitted when the user actually
+    set them.
+    """
     specs = (
         ("temperature", "agent.temperature", (0.0, 2.0)),
         ("top_p", "agent.top_p", (0.0, 1.0)),
         ("max_tokens", "agent.max_tokens", (1, 32000)),
+        ("frequency_penalty", "agent.frequency_penalty", (-2.0, 2.0)),
+        ("presence_penalty", "agent.presence_penalty", (-2.0, 2.0)),
     )
     params: list[Parameter | None] = [
         bind_mapping_key(

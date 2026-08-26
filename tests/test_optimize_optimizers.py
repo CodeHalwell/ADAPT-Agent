@@ -335,6 +335,87 @@ def test_coordinate_ascent_verbose_logs(caplog):
     assert any("baseline" in r.message for r in caplog.records)
 
 
+def test_verbose_trial_logging_reports_position_and_elapsed_time(caplog):
+    # The whole point: "trial N of the budget" plus elapsed time, not just a
+    # bare score, so a long run's progress (vs. hung) is visible in the log.
+    import logging
+
+    max_evals = 7
+    state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
+    with caplog.at_level(logging.INFO, logger="adapt_agent.optimization.optimizers"):
+        CoordinateAscentOptimizer(harness(), seed=0, verbose=True, max_evals=max_evals).optimize(
+            agent, dataset()
+        )
+
+    trial_lines = [r.message for r in caplog.records if "trial " in r.message]
+    assert trial_lines, "expected at least one per-trial log line"
+    for line in trial_lines:
+        # "trial <n>/<max_evals> score=... (<elapsed>s elapsed)"
+        assert f"/{max_evals}" in line
+        assert "elapsed)" in line
+
+
+def test_baseline_log_states_the_search_budget(caplog):
+    import logging
+
+    state, agent = build_toy(prompt="BAD", gate="prompt")
+    with caplog.at_level(logging.INFO, logger="adapt_agent.optimization.optimizers"):
+        CoordinateAscentOptimizer(harness(), seed=0, verbose=True, max_evals=12).optimize(
+            agent, dataset()
+        )
+    baseline_lines = [r.message for r in caplog.records if "baseline score" in r.message]
+    assert baseline_lines
+    assert "up to 12 evals" in baseline_lines[0]
+
+
+def test_result_carries_duration_seconds():
+    state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
+    res = CoordinateAscentOptimizer(harness(), seed=0).optimize(agent, dataset())
+    assert res.duration_seconds > 0.0
+    assert res.duration_seconds < 30.0  # a toy, in-process agent finishes quickly
+    assert res.to_dict()["duration_seconds"] == res.duration_seconds
+    assert f"duration={res.duration_seconds:.1f}s" in repr(res)
+
+
+def test_to_config_header_reports_duration(tmp_path):
+    state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
+    res = CoordinateAscentOptimizer(harness(), seed=0).optimize(agent, dataset())
+    path = tmp_path / "tuned.yaml"
+    res.to_config(path)
+    text = path.read_text()
+    assert "evals in" in text and "s.\n" in text
+
+
+def test_pipeline_verbose_logs_stage_transitions(caplog):
+    import logging
+
+    state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
+    stages = [
+        GridSearchOptimizer(harness(), max_evals=4, verbose=True),
+        GridSearchOptimizer(harness(), max_evals=4, verbose=True),
+    ]
+    pipe = PipelineOptimizer(harness(), stages, max_evals=8, verbose=True)
+    with caplog.at_level(logging.INFO, logger="adapt_agent.optimization.optimizers"):
+        pipe.optimize(agent, dataset())
+
+    stage_lines = [r.message for r in caplog.records if "stage " in r.message]
+    assert any("stage 1/2" in line for line in stage_lines)
+    assert any("stage 2/2" in line for line in stage_lines)
+    # The pipeline's own summary line, distinct from each stage's own.
+    assert any(r.message.startswith("[pipeline]") for r in caplog.records)
+
+
+def test_pipeline_result_duration_covers_the_whole_run():
+    state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
+    stages = [
+        GridSearchOptimizer(harness(), max_evals=4),
+        GridSearchOptimizer(harness(), max_evals=4),
+    ]
+    pipe = PipelineOptimizer(harness(), stages, max_evals=8)
+    res = pipe.optimize(agent, dataset())
+    assert res.duration_seconds > 0.0
+
+
 # -- BootstrapFewShotOptimizer ------------------------------------------------
 
 
@@ -630,3 +711,196 @@ def test_dedup_handles_unhashable_lists():
 def test_dedup_mixed_hashable_unhashable():
     out = _dedup([1, [1], 1, [1], "a"])
     assert out == [1, [1], "a"]
+
+
+# -- evaluation cache ---------------------------------------------------------
+#
+# Re-measuring a configuration already scored in the same run is pure waste for
+# a deterministic agent, and the default pipeline paid it five times over in
+# stage baselines alone. These tests count actual agent invocations.
+
+
+def _counting_agent(prompt_candidates):
+    """A toy agent whose runner counts invocations."""
+    state = {"prompt": "BAD"}
+    counter = {"runs": 0}
+
+    def runner(question):
+        counter["runs"] += 1
+        return ANSWERS[question] if GOOD_PROMPT in str(state["prompt"]) else "WRONG"
+
+    params = [
+        Parameter(
+            name="prompt",
+            kind=ParameterKind.PROMPT,
+            candidates=prompt_candidates,
+            getter=lambda: state["prompt"],
+            setter=lambda v: state.__setitem__("prompt", v),
+        )
+    ]
+    agent = OptimizableAgent.from_callable(runner, parameters=params, name="counting-toy")
+    return counter, agent
+
+
+def _run_two_stage_pipeline(*, cache: bool, stage_cache: bool | None = None):
+    """Run a two-stage grid pipeline; return (agent_runs, result).
+
+    One harness instance is shared by the pipeline and both stages -- the
+    shape ``make_default_optimizer`` builds -- because the cache is scoped to
+    the harness: reports measured by different evaluators are never reused.
+    """
+    counter, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    shared_harness = harness()
+    per_stage = cache if stage_cache is None else stage_cache
+    stages = [
+        GridSearchOptimizer(shared_harness, max_evals=8, cache_evaluations=per_stage),
+        GridSearchOptimizer(shared_harness, max_evals=8, cache_evaluations=per_stage),
+    ]
+    pipe = PipelineOptimizer(shared_harness, stages, max_evals=16, cache_evaluations=cache)
+    result = pipe.optimize(agent, dataset())
+    return counter["runs"], result
+
+
+def test_pipeline_cache_skips_redundant_full_dataset_passes():
+    runs_cached, result_cached = _run_two_stage_pipeline(cache=True)
+    runs_uncached, result_uncached = _run_two_stage_pipeline(cache=False)
+
+    # Identical outcome: same winner, same score, same trial history scores.
+    assert result_cached.best_score == result_uncached.best_score == 1.0
+    assert result_cached.best_config == result_uncached.best_config
+    assert [t.score for t in result_cached.history] == [t.score for t in result_uncached.history]
+
+    # Uncached: baseline runs for the pipeline and both stages, plus both grid
+    # candidates per stage = 7 full-dataset passes. Cached: only the pipeline
+    # baseline and the single novel configuration are ever run.
+    n = len(dataset())
+    assert runs_uncached == 7 * n
+    assert runs_cached == 2 * n
+
+
+def test_stage_level_cache_opt_out_is_respected():
+    # Stages built with cache_evaluations=False ignore the injected pipeline
+    # cache entirely (they re-measure), even though the pipeline itself caches.
+    runs, result = _run_two_stage_pipeline(cache=True, stage_cache=False)
+    assert result.best_score == 1.0
+    assert runs == 7 * len(dataset())
+
+
+def test_eval_config_reuses_the_baseline_report_for_identical_state():
+    from adapt_agent.optimization.optimizers import _bind_baseline
+
+    counter, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    data = dataset()
+    opt = GridSearchOptimizer(harness())
+    opt._eval_cache = {}
+
+    baseline = opt._evaluate_baseline(agent, data)
+    _bind_baseline(opt, agent.snapshot())
+    # An empty config restores the exact baseline state -> served from cache.
+    assert opt._eval_config(agent, {}, data) is baseline
+    assert counter["runs"] == len(data)
+
+
+def test_incomplete_reports_are_never_cached():
+    from adapt_agent.optimization.evaluation import EvaluationReport
+    from adapt_agent.optimization.optimizers import _bind_baseline
+
+    class StubHarness:
+        """Returns scripted reports; counts evaluate() calls."""
+
+        def __init__(self, reports):
+            self.reports = list(reports)
+            self.calls = 0
+
+        def evaluate(self, target, data):
+            self.calls += 1
+            return self.reports.pop(0)
+
+    def report(*, transient: int) -> EvaluationReport:
+        return EvaluationReport(
+            aggregate={"exact_match": 1.0},
+            primary_metric="exact_match",
+            n_transient_errors=transient,
+            n_evaluated=4,
+        )
+
+    stub = StubHarness(
+        [report(transient=1), report(transient=1), report(transient=0), report(transient=0)]
+    )
+    _, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    data = dataset()
+    opt = GridSearchOptimizer(stub)
+    opt._eval_cache = {}
+    _bind_baseline(opt, agent.snapshot())
+
+    config = {"prompt": GOOD_PROMPT}
+    # Incomplete reports pass through uncached: the same config re-evaluates.
+    assert opt._eval_config(agent, config, data).is_complete is False
+    assert opt._eval_config(agent, config, data).is_complete is False
+    assert stub.calls == 2
+    # A complete report is cached: the fourth request never reaches the harness.
+    assert opt._eval_config(agent, config, data).is_complete is True
+    assert opt._eval_config(agent, config, data).is_complete is True
+    assert stub.calls == 3
+
+
+def test_cache_is_cleared_between_optimize_calls():
+    # A fresh optimize() must own a fresh cache: the attribute is reset after
+    # each run, so nothing leaks across runs (or across datasets whose id()
+    # might be recycled once the first dataset is garbage-collected).
+    counter, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    opt = GridSearchOptimizer(harness(), max_evals=8)
+    opt.optimize(agent, dataset())
+    assert opt._eval_cache is None
+    first = counter["runs"]
+    opt.optimize(agent, dataset())
+    assert counter["runs"] > first
+
+
+def test_cache_is_scoped_to_the_harness():
+    # A report is only reusable by the evaluator that produced it: stages built
+    # with a *different* harness must re-measure rather than rank their
+    # candidates against another evaluator's scores.
+    counter, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    harness_a, harness_b = harness(), harness()  # distinct instances
+    stages = [
+        GridSearchOptimizer(harness_a, max_evals=8),
+        GridSearchOptimizer(harness_b, max_evals=8),
+    ]
+    pipe = PipelineOptimizer(harness_a, stages, max_evals=16)
+    result = pipe.optimize(agent, dataset())
+
+    assert result.best_score == 1.0
+    # Stage 1 shares the pipeline's harness and reuses its baseline (and the
+    # no-op grid candidate), measuring only the improved config. Stage 2's
+    # harness differs, so nothing from stage 1 is reusable: its baseline and
+    # the non-baseline candidate are measured fresh (its other candidate
+    # matches its own baseline measurement). 1 + 1 + 2 full-dataset passes.
+    assert counter["runs"] == 4 * len(dataset())
+
+
+def test_pipeline_cache_opt_out_reaches_default_stages():
+    # Pipeline-level cache_evaluations=False must also stop stages (left at
+    # their default True) from quietly building private per-stage caches.
+    runs, result = _run_two_stage_pipeline(cache=False, stage_cache=True)
+    assert result.best_score == 1.0
+    assert runs == 7 * len(dataset())
+
+
+def test_pipeline_tolerates_stage_that_skipped_optimizer_init():
+    # Stage cache injection must be defensive: a minimal Optimizer subclass
+    # that skips __init__ (a pattern the cache helpers support) has no
+    # _eval_cache / cache_evaluations attributes.
+    class MinimalStage(Optimizer):
+        def __init__(self, h):
+            self.harness = h
+            self.verbose = False
+            self.max_evals = 2
+
+        def optimize(self, agent, dataset, **kwargs):
+            return OptimizationResult(best_config={}, best_score=0.0, baseline_score=0.0)
+
+    _, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    pipe = PipelineOptimizer(harness(), [MinimalStage(harness())])
+    result = pipe.optimize(agent, dataset())  # must not raise AttributeError
+    assert result.baseline_score == 0.0

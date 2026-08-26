@@ -118,6 +118,8 @@ _HYPERPARAMS: tuple[tuple[str, tuple[float, float]], ...] = (
     ("temperature", (0.0, 2.0)),
     ("top_p", (0.0, 1.0)),
     ("max_tokens", (1, 32000)),
+    ("frequency_penalty", (-2.0, 2.0)),
+    ("presence_penalty", (-2.0, 2.0)),
 )
 
 
@@ -220,6 +222,7 @@ def _introspect(obj: Any) -> list[Parameter]:
             params.append(instructions)
 
         client = _client_of(obj)
+        found_model = False
         if client is not None:
             for attr in _MODEL_ATTRS:
                 model = bind_attr(
@@ -231,8 +234,25 @@ def _introspect(obj: Any) -> list[Parameter]:
                 )
                 if model is not None:
                     params.append(model)
+                    found_model = True
                     break
             params.extend(_introspect_hyperparams(client, component))
+
+        # A per-agent model override can live in ``default_options`` ("model_id"
+        # is a ChatOptions key) rather than on the client -- for a client that
+        # exposes no model attribute at all, this is the only place the model
+        # is tunable from.
+        if not found_model:
+            model = bind_mapping_key(
+                obj,
+                _OPTIONS_ATTR,
+                "model_id",
+                f"{component}.model",
+                ParameterKind.MODEL,
+                component=component,
+            )
+            if model is not None:
+                params.append(model)
 
         # Sampling settings may live on the agent itself, or in its options
         # mapping, rather than on the client. First source found wins per knob.

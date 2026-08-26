@@ -16,14 +16,21 @@ The judge is the connective tissue of the optimization subsystem. It is used at
   (:mod:`adapt_agent.optimization.proposers`) is built on these.
 
 To keep ``adapt_agent`` dependency-free and offline-testable, the judge never
-imports an LLM SDK. You supply a ``complete`` callable -- ``Callable[[str], str]``
--- that maps a prompt to a completion. Wrap whatever provider you like (Anthropic,
-OpenAI, a local model, or a deterministic stub in tests).
+imports an LLM SDK. You supply a ``complete`` callable that maps a prompt to a
+completion. Wrap whatever provider you like (Anthropic, OpenAI, a local model,
+or a deterministic stub in tests).
 
 Security note: untrusted agent input/output is wrapped in delimited fences and
 the grading rubric/instructions are sent via the provider ``system=`` argument,
 so that text inside the fences is treated as data, never as instructions to the
-judge (prompt-injection hardening).
+judge (prompt-injection hardening). This makes accepting ``system`` more than a
+convenience for a completion callable: one that cannot -- a plain
+``def f(prompt: str) -> str`` -- is still accepted (see :data:`CompletionFn`),
+but every call then grades *without* the rubric, and the result is a
+confident-looking score rather than an error. That drop is logged (a
+``logger.warning`` from wherever it happens -- :class:`~adapt_agent.optimization.providers.CallableProvider`
+or here), because a judge that silently stopped reading its rubric is far
+harder to notice than one that raised.
 """
 
 from __future__ import annotations
@@ -48,7 +55,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 #: A provider-agnostic text completion function: prompt in, completion out.
-CompletionFn = Callable[[str], str]
+#:
+#: Declared ``Callable[..., str]``, not ``Callable[[str], str]``: every
+#: internal call site invokes it as ``complete(prompt, system=rubric)``, so a
+#: conforming callable should accept a ``system`` keyword (typically
+#: ``def complete(prompt: str, *, system: str | None = None) -> str``) to
+#: receive the grading rubric/instructions. A callable that only takes
+#: ``prompt`` is still accepted -- :class:`~adapt_agent.optimization.providers.CallableProvider`
+#: and :meth:`LLMJudge._invoke` both fall back to calling it plainly on
+#: ``TypeError`` -- but every such call then grades without the rubric, and a
+#: ``logger.warning`` is emitted (not raised) at the point of the fallback so
+#: the degradation is never silent.
+CompletionFn = Callable[..., str]
 
 
 @dataclass
@@ -614,13 +632,31 @@ class LLMJudge:
         return result if isinstance(result, str) else (str(result) if result is not None else None)
 
     def _invoke(self, prompt: str, system: str | None) -> Any:
-        """Invoke ``self.complete`` with ``system`` when the callee accepts it."""
+        """Invoke ``self.complete`` with ``system`` when the callee accepts it.
+
+        Only reached when ``self.complete`` is a *raw* callable passed
+        directly to :class:`LLMJudge` (bypassing :class:`~adapt_agent.optimization.providers.CallableProvider`,
+        which handles this same fallback -- and its own warning -- internally
+        via ``ModelProvider.__call__``). See :data:`CompletionFn`.
+        """
         if system is None:
             return self.complete(prompt)
         try:
-            return self.complete(prompt, system=system)  # type: ignore[call-arg]
+            return self.complete(prompt, system=system)
         except TypeError:
-            # A bare callable that does not accept a ``system`` kwarg: fall back.
+            # A bare callable that does not accept a ``system`` kwarg: it is
+            # used positionally, and the rubric/instructions this call would
+            # have carried are dropped. Silent here is the worst option: the
+            # judge keeps returning confident-looking scores while grading
+            # blind, which looks identical to a working judge until someone
+            # notices the scores don't reflect the rubric.
+            logger.warning(
+                "LLMJudge: the completion callable does not accept a `system` "
+                "keyword, so the system/rubric text for this call was dropped "
+                "and the completion was generated without it. Give it a "
+                "`system=None` parameter (or `**kwargs`) to receive it -- see "
+                "CompletionFn."
+            )
             return self.complete(prompt)
 
 

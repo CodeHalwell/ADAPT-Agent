@@ -299,6 +299,34 @@ def test_searchspace_rejects_duplicate():
         s.add(make_param("a"))
 
 
+def test_searchspace_add_replace_true_swaps_the_existing_parameter():
+    s = SearchSpace([make_param("a")])
+    replacement = make_param("a")
+    s.add(replacement, replace=True)
+    assert s["a"] is replacement
+    assert len(s) == 1
+
+
+def test_searchspace_add_replace_true_is_a_plain_add_for_a_new_name():
+    s = SearchSpace()
+    p = make_param("a")
+    s.add(p, replace=True)  # nothing to replace; behaves like a normal add
+    assert s["a"] is p
+
+
+def test_searchspace_remove_existing_returns_true():
+    s = SearchSpace([make_param("a"), make_param("b")])
+    assert s.remove("a") is True
+    assert "a" not in s
+    assert s.names == ["b"]
+
+
+def test_searchspace_remove_missing_returns_false_and_does_not_raise():
+    s = SearchSpace([make_param("a")])
+    assert s.remove("does-not-exist") is False
+    assert len(s) == 1
+
+
 def test_searchspace_contains_non_string():
     s = SearchSpace([make_param("a")])
     assert (123 in s) is False

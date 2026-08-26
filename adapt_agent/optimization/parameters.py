@@ -220,11 +220,31 @@ class SearchSpace:
         for param in parameters:
             self.add(param)
 
-    def add(self, parameter: Parameter) -> None:
-        """Add a parameter, rejecting duplicate names."""
-        if parameter.name in self._params:
+    def add(self, parameter: Parameter, *, replace: bool = False) -> None:
+        """Add a parameter.
+
+        Raises :class:`ValueError` on a duplicate name unless ``replace=True``,
+        in which case the existing parameter under that name is silently
+        dropped first. The default stays a hard error because a same-name
+        collision is usually a genuine mistake (a typo, two components that
+        happened to introspect to the same name); ``replace=True`` is the
+        explicit opt-in for the one case where it is not -- a caller
+        deliberately overriding how a knob is read/written (e.g. a hand-built
+        getter/setter standing in for one introspection now also discovers).
+        """
+        if parameter.name in self._params and not replace:
             raise ValueError(f"Duplicate parameter name: {parameter.name!r}")
         self._params[parameter.name] = parameter
+
+    def remove(self, name: str) -> bool:
+        """Drop the parameter named ``name``, if present.
+
+        Returns ``True`` if a parameter was removed, ``False`` if ``name``
+        was not present -- never raises, so a caller excluding a set of
+        candidate names does not need to first check which ones actually
+        exist (e.g. because a framework version stopped introspecting one).
+        """
+        return self._params.pop(name, None) is not None
 
     def __iter__(self) -> Iterator[Parameter]:
         return iter(self._params.values())

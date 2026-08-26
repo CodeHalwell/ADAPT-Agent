@@ -186,3 +186,96 @@ def test_fallback_component_name_without_role() -> None:
     crew = FakeCrew(agents=[RolelessAgent()], tasks=[])
     params = introspect(crew)
     assert any(p.name == "agent_0.goal" for p in params)
+
+
+def test_llm_object_top_p_bound() -> None:
+    llm = FakeLLM("gpt-4o", 0.3, 512)
+    llm.top_p = 0.9
+    agent = FakeAgent(
+        role="Researcher",
+        goal="Find facts",
+        backstory="An analyst",
+        llm=llm,
+        tools=[],
+        max_iter=10,
+    )
+    by_name = {p.name: p for p in introspect(FakeCrew(agents=[agent], tasks=[]))}
+    top_p = by_name["researcher.top_p"]
+    assert top_p.kind is ParameterKind.HYPERPARAM
+    assert top_p.bounds == (0.0, 1.0)
+    top_p.write(0.5)
+    assert llm.top_p == 0.5
+
+
+def test_allow_delegation_is_a_searchable_routing_knob() -> None:
+    agent = FakeAgent(
+        role="Manager",
+        goal="Coordinate",
+        backstory="A manager",
+        llm="gpt-4o",
+        tools=[],
+        max_iter=10,
+    )
+    agent.allow_delegation = False
+    by_name = {p.name: p for p in introspect(FakeCrew(agents=[agent], tasks=[]))}
+
+    delegation = by_name["manager.allow_delegation"]
+    assert delegation.kind is ParameterKind.ROUTING
+    assert delegation.candidates == [True, False]
+    assert delegation.optimizable
+    delegation.write(True)
+    assert agent.allow_delegation is True
+
+
+def test_non_bool_allow_delegation_not_bound() -> None:
+    agent = FakeAgent(
+        role="Odd",
+        goal="g",
+        backstory="b",
+        llm="gpt-4o",
+        tools=[],
+        max_iter=10,
+    )
+    agent.allow_delegation = "yes"  # not a real bool -> not a knob
+    names = {p.name for p in introspect(FakeCrew(agents=[agent], tasks=[]))}
+    assert "odd.allow_delegation" not in names
+
+
+def test_named_task_gets_a_stable_component_name() -> None:
+    task = FakeTask(description="Research the topic", expected_output="A summary")
+    task.name = "Research Task"
+    crew = FakeCrew(agents=[], tasks=[task])
+    by_name = {p.name: p for p in introspect(crew)}
+
+    assert by_name["research_task.description"].kind is ParameterKind.PROMPT
+    assert by_name["research_task.expected_output"].kind is ParameterKind.PROMPT
+    assert "task_0.description" not in by_name
+
+
+def test_duplicate_task_names_get_unique_components() -> None:
+    first = FakeTask(description="Research A", expected_output="Out A")
+    second = FakeTask(description="Research B", expected_output="Out B")
+    first.name = "Research Task"
+    second.name = "Research Task"  # same slug as the first
+    crew = FakeCrew(agents=[], tasks=[first, second])
+    params = introspect(crew)
+    names = [p.name for p in params]
+
+    assert len(names) == len(set(names))
+    by_name = {p.name: p for p in params}
+    assert by_name["research_task.description"].read() == "Research A"
+    assert by_name["research_task_1.description"].read() == "Research B"
+
+
+def test_task_name_colliding_with_positional_fallback_is_disambiguated() -> None:
+    named = FakeTask(description="Named", expected_output="Out")
+    named.name = "task 1"  # slugs to the nameless task's positional fallback
+    nameless = FakeTask(description="Nameless", expected_output="Out")
+    crew = FakeCrew(agents=[], tasks=[named, nameless])
+    params = introspect(crew)
+    names = [p.name for p in params]
+
+    assert len(names) == len(set(names))
+    by_name = {p.name: p for p in params}
+    assert by_name["task_1.description"].read() == "Named"
+    assert by_name["task_1_1.description"].read() == "Nameless"

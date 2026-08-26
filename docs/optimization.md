@@ -69,6 +69,16 @@ print(result.best_config)   # the winning prompt/model/... values
   agent = OptimizableAgent.from_agent(my_crew)         # or graph, Agent, options...
   ```
 
+  A framework-native run method (`run_sync`/`invoke`/`kickoff`/`run`) is
+  resolved automatically. Frameworks whose agents are **not directly
+  runnable** work too: an OpenAI Agents `Agent` is driven through the SDK's
+  `Runner.run_sync`, a Claude Agent SDK options object through `query`, and a
+  bare Google ADK agent inside a fresh-session `Runner` -- with results
+  unwrapped to final response text (see
+  `framework_runner` / `openai_agents_runner` / `claude_agent_runner` /
+  `adk_runner` in `adapt_agent.optimization.runners`). Pass `runner=` to take
+  over the driving yourself.
+
 * **Many components (specialists, orchestrator + sub-agents), code in many files**
 
   ```python
@@ -96,6 +106,49 @@ print(result.best_config)   # the winning prompt/model/... values
   ))
   ```
 
+### Resolving collisions with introspection
+
+A declared parameter whose `name` collides with an introspected one raises
+`ValueError` by default -- an accidental same-name clash is far more often a
+real mistake than an intentional override. Two constructor kwargs
+(`OptimizableAgent`, every `from_*`, and `wrap()`) cover the two cases where a
+collision is *not* a mistake:
+
+* **`exclude`** -- introspected parameter names to drop before your declared
+  `parameters` are merged in. Use this when a framework upgrade starts
+  introspecting a knob you already hand-bound *under a different name* onto
+  the same underlying storage -- e.g. your own parameter reads/writes
+  `options.default_options["instructions"]` as `"agent.system_prompt"`, and a
+  newer introspector also discovers it as `"agent.instructions"`. Same
+  storage, different names, so the duplicate-name check never catches it: both
+  knobs coexist, doubling that part of the search and letting whichever one an
+  optimizer applies last silently overwrite the other's candidate.
+
+  ```python
+  agent = OptimizableAgent.from_agent(
+      my_agent,
+      parameters=[my_hand_bound_system_prompt],   # "agent.system_prompt"
+      exclude={"agent.instructions"},              # the newly-discovered duplicate
+  )
+  ```
+
+* **`replace=True`** -- lets a declared parameter *under the same name* as an
+  introspected one win instead of raising, for when you want your own
+  getter/setter behind a knob whose name you want unchanged (so existing
+  exported configs still `apply()` cleanly):
+
+  ```python
+  agent = OptimizableAgent.from_agent(
+      my_agent,
+      parameters=[Parameter(name="agent.instructions", ..., setter=my_setter)],
+      replace=True,
+  )
+  ```
+
+`agent.add_parameter(parameter, replace=True)` does the same after
+construction; `agent.search_space.remove(name)` drops a knob with no
+replacement at all.
+
 ## Going deep into each framework
 
 Introspection turns a live framework object into bound `Parameter`s. It is
@@ -104,13 +157,13 @@ framework.
 
 | Framework | What gets discovered |
 | --- | --- |
-| **CrewAI** | per-agent `role`/`goal`/`backstory` (prompt), `llm` model + temperature/max_tokens, `tools`, `max_iter`; per-task `description`/`expected_output` |
-| **OpenAI Agents SDK** | `instructions`, `model`, `model_settings` (temperature/top_p/max_tokens), `tools`, `handoffs` (routing) -- recurses into handed-off sub-agents |
-| **Google ADK** | `instruction`/`global_instruction`, `model`, `generate_content_config`, `tools`, `sub_agents` (routing) -- recurses |
-| **Pydantic AI** | system prompt(s), `model`, `model_settings` temperature, tools |
-| **Microsoft Agent Framework** | `instructions`, model + temperature/top_p/max_tokens off the chat client, tools |
-| **Claude Agent SDK** | `system_prompt` (str or preset `append`), `model`, `allowed_tools`/`disallowed_tools`, `max_turns`, `permission_mode` |
-| **LangGraph** | best-effort structural walk of compiled-graph nodes for prompts, bound model + temperature, tools (declare extra params for prompts buried in closures) |
+| **CrewAI** | per-agent `role`/`goal`/`backstory` (prompt), `llm` model + temperature/top_p/max_tokens, `tools`, `max_iter`, `allow_delegation` (a searchable routing switch); per-task `description`/`expected_output` (a task's `name` becomes its component, so exported configs survive task reordering) |
+| **OpenAI Agents SDK** | `instructions` and `handoff_description` (both prompts), `model`, `model_settings` (temperature/top_p/max_tokens), `tools`, `handoffs` (routing) -- recurses into handed-off sub-agents, and binds a `Handoff` wrapper's `tool_description` (the text the routing LLM reads) |
+| **Google ADK** | `instruction`/`global_instruction`, `model`, `generate_content_config` (temperature/top_p/top_k/max_output_tokens), `tools`, `sub_agents` (routing) -- recurses |
+| **Pydantic AI** | system prompt(s), `model`, `model_settings` (temperature/top_p/max_tokens, frequency/presence penalties), tools |
+| **Microsoft Agent Framework** | `instructions`, model (a chat-client attribute, or `model_id` in `default_options`), temperature/top_p/max_tokens + frequency/presence penalties, tools, skills |
+| **Claude Agent SDK** | `system_prompt` (str or preset `append`), `model`, `allowed_tools`/`disallowed_tools`, `max_turns`, `max_thinking_tokens`, `permission_mode`; each subagent definition in `agents` contributes its `prompt`/`description` (prompts), `model`, `tools` and `skills` |
+| **LangGraph** | best-effort structural walk of compiled-graph nodes for prompts, bound model + temperature/top_p/max_tokens, tools (declare extra params for prompts buried in closures) |
 
 ```python
 from adapt_agent.optimization.introspection import detect, introspect
@@ -158,6 +211,22 @@ Built-in providers: `anthropic`, `openai`, `azure_openai`, `gemini`, `mistral`,
 (each imports its SDK lazily), plus `callable` and `echo` for offline use.
 Register your own with `register_provider(name, MyProvider)`.
 
+**Give your callable a `system` parameter.** Every judge call sends the
+grading rubric/instructions via `system=` — `judge.score`/`critique`/`compare`/
+`improve_prompt` all call `complete(prompt, system=...)`. A callable that only
+accepts `prompt` (`lambda prompt: ...`) is still accepted — the call falls
+back to `complete(prompt)` on `TypeError` — but every such call then grades
+*without* the rubric and still returns a normal-looking score, so the drop is
+logged (`logger.warning`, not raised) rather than silent:
+
+```python
+# Grades without the rubric on every call -- a logged warning, not an error.
+judge = LLMJudge(lambda prompt: my_model_call(prompt))
+
+# Receives the rubric as intended.
+judge = LLMJudge(lambda prompt, system=None: my_model_call(prompt, system=system))
+```
+
 ## Optimizers
 
 All optimizers share `optimize(agent, dataset, val_dataset=None)` and apply the
@@ -178,6 +247,46 @@ best configuration to the live agent before returning.
 from adapt_agent.optimization import make_default_optimizer
 result = make_default_optimizer(harness, judge=judge, max_evals=60).optimize(agent, data)
 ```
+
+### Evaluation caching
+
+Optimizers reuse the report of a configuration already measured in the same
+run instead of re-running the agent over the dataset (`cache_evaluations=True`
+by default). A `PipelineOptimizer` shares the cache across its stages that
+carry the *same harness*, so each such stage's baseline — the previous
+stage's winner, already measured — stops costing a full-dataset pass; the
+default pipeline saves four such passes per run. The cache is keyed on the
+harness identity and the live parameter state — the harness because a report
+is only reusable by the evaluator that would have produced it, so stages
+built with different metrics or a different judge never share a hit. Only
+*complete* reports are ever cached (the transient-failure machinery is
+unaffected), and the cache never outlives the `optimize` call. Pass
+`cache_evaluations=False` to re-measure every configuration — useful when
+agent outputs are stochastic enough that you want repeated measurements of
+identical configurations to average out; setting it on a `PipelineOptimizer`
+also disables caching in every stage for that run, while a stage's own
+`False` inside a caching pipeline is still respected.
+
+### Watching a long run
+
+Pass `verbose=True` to any optimizer for progress logging at `INFO` level:
+each trial logs its position out of the run's evaluation budget and the
+wall-clock time elapsed since the run started, so a run measured in hours
+distinguishes "still working" from "hung" without an external progress
+indicator:
+
+```
+[coordinate_ascent] baseline score=0.4100 (search budget: up to 60 evals)
+[coordinate_ascent] trial 5/60 score=0.7100 ACCEPT (142.3s elapsed)
+[coordinate_ascent] trial 6/60 score=0.6800  (187.9s elapsed)
+```
+
+A `PipelineOptimizer` also logs its own stage transitions (`stage 2/4
+(coordinate_ascent) starting: 15/60 evals used so far (203.1s elapsed)`) in
+addition to each stage's own per-trial lines against that stage's own
+(budget-clamped) `max_evals`. The finished `OptimizationResult` carries the
+total wall-clock time as `duration_seconds`, included in `to_dict()`, `repr()`,
+and the provenance header `to_config()` writes.
 
 ## Evaluation reports
 

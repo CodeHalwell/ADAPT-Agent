@@ -220,12 +220,45 @@ report = evaluate_agent(agent, "golden.jsonl")
 structured (non-text) `output_type` survives extraction unchanged -- score it
 with `json_subset` or your own callable.
 
-### CrewAI, OpenAI Agents SDK, Claude Agent SDK
+### CrewAI
 
-`Crew.kickoff` results (`CrewOutput.raw`), OpenAI Agents `RunResult`s
-(`final_output`), and Claude Agent SDK message streams (`ResultMessage` /
-content blocks) are recognised the same way -- pass the `Crew`, a
-runner-driving callable, or the governed adapter and go.
+```python
+report = evaluate_agent(my_crew, "golden.jsonl")   # Crew.kickoff; CrewOutput.raw scored
+```
+
+### OpenAI Agents SDK
+
+An OpenAI Agents `Agent` has no run method of its own -- the SDK executes it
+with `Runner.run_sync(agent, input)`. Pass the `Agent` straight in and that
+machinery is used automatically (`RunResult.final_output` is scored); use
+`openai_agents_runner` when you need to customise the run:
+
+```python
+from adapt_agent.evaluation import evaluate_agent, openai_agents_runner
+
+report = evaluate_agent(triage_agent, "golden.jsonl")            # needs openai-agents
+
+runner = openai_agents_runner(triage_agent, run_kwargs={"max_turns": 5})
+report = evaluate_agent(runner, "golden.jsonl")
+```
+
+(`Runner.run_sync` refuses to run inside an already-running event loop -- the
+SDK's own constraint -- so drive evals from sync code.)
+
+### Claude Agent SDK
+
+A Claude agent is a `ClaudeAgentOptions` object driven by
+`query(prompt=..., options=...)`. Pass the options object straight in -- the
+async message stream is drained and the final `ResultMessage` text scored --
+or build the runner explicitly with `claude_agent_runner`:
+
+```python
+from adapt_agent.evaluation import claude_agent_runner, evaluate_agent
+
+report = evaluate_agent(options, "golden.jsonl")                 # needs claude-agent-sdk
+
+runner = claude_agent_runner(options)   # same machinery, explicit
+```
 
 ## Output extraction
 

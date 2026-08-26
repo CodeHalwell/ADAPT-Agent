@@ -56,6 +56,21 @@ def test_detect_routes_to_langgraph() -> None:
     assert detect(_make_graph()) == "langgraph"
 
 
+def test_model_top_p_bound_when_present() -> None:
+    model = FakeModel(model_name="gpt-4o", temperature=0.4)
+    model.top_p = 0.9
+    graph = FakeCompiledGraph(
+        nodes={"writer": FakeNode(FakeRunnable(system_prompt="Write.", model=model))}
+    )
+    by_name = {p.name: p for p in introspect(graph)}
+
+    top_p = by_name["writer.top_p"]
+    assert top_p.kind is ParameterKind.HYPERPARAM
+    assert top_p.bounds == (0.0, 1.0)
+    top_p.write(0.5)
+    assert model.top_p == 0.5
+
+
 def test_predicate_false_for_unrelated_object() -> None:
     assert _predicate(object()) is False
     assert detect(object()) is None

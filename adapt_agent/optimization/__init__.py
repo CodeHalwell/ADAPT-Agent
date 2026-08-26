@@ -115,7 +115,13 @@ from adapt_agent.optimization.retry import (
     RetryPolicy,
     is_transient_error,
 )
-from adapt_agent.optimization.runners import adk_runner, framework_runner, langgraph_inputs
+from adapt_agent.optimization.runners import (
+    adk_runner,
+    claude_agent_runner,
+    framework_runner,
+    langgraph_inputs,
+    openai_agents_runner,
+)
 from adapt_agent.optimization.target import OptimizableAgent, wrap
 
 __all__ = [
@@ -175,6 +181,8 @@ __all__ = [
     "framework_runner",
     "langgraph_inputs",
     "adk_runner",
+    "openai_agents_runner",
+    "claude_agent_runner",
     # target
     "OptimizableAgent",
     "wrap",
