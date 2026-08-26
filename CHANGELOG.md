@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Fixed
+
+- **A completion callable that could not accept `system=` made the judge
+  grade silently without its rubric.** Every judge call
+  (`score`/`critique`/`compare`/`improve_prompt`) sends the grading
+  rubric/instructions via `complete(prompt, system=...)`. A callable
+  conforming to the *documented* `CompletionFn` shape — a plain
+  `def f(prompt: str) -> str`, exactly the form shown in the quick-start
+  example — raises `TypeError` on that call, and both places that catch it
+  (`CallableProvider.complete`, and `LLMJudge._invoke` for a bare callable
+  passed directly) fell back to `complete(prompt)`, dropping the rubric with
+  no warning. The judge kept returning normal-looking scores, indistinguishable
+  from a working judge, while silently grading blind on every call — a search
+  can burn its entire budget on an oracle that was never actually applying the
+  rubric. Both fallback sites now emit a `logger.warning` naming the dropped
+  keyword and how to fix the callable's signature; behavior is otherwise
+  unchanged; nothing raises. `CompletionFn`'s type widened from
+  `Callable[[str], str]` to `Callable[..., str]` to stop documenting a
+  signature that silently loses information in practice.
 
 - **Optimizers stop paying for configurations they have already measured.**
   Every optimizer now carries an evaluation cache (`cache_evaluations=True`)

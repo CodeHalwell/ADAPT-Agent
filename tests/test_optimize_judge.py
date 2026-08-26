@@ -152,6 +152,31 @@ def test_score_custom_scale():
     assert judge.score("i", "o").score == pytest.approx(0.5)
 
 
+def test_bare_callable_dropping_system_logs_a_warning(caplog):
+    # A judge built directly from a bare, single-arg callable (LLMJudge(fn),
+    # not LLMJudge(CallableProvider(fn))) is the documented, tested pattern
+    # throughout this file via `const(...)`. It works -- but every such call
+    # grades without the rubric passed via `system`, so the drop must be
+    # visible rather than indistinguishable from a working judge.
+    judge = LLMJudge(const('{"score": 10, "pass": true}'))
+    with caplog.at_level("WARNING"):
+        result = judge.score("i", "o")
+    assert result.score == pytest.approx(1.0)
+    assert any("system" in r.message for r in caplog.records)
+
+
+def test_bare_callable_accepting_system_never_warns(caplog):
+    def fn(prompt, system=None):
+        assert system  # the rubric was actually received
+        return '{"score": 10, "pass": true}'
+
+    judge = LLMJudge(fn)
+    with caplog.at_level("WARNING"):
+        result = judge.score("i", "o")
+    assert result.score == pytest.approx(1.0)
+    assert caplog.records == []
+
+
 # -- compare() -----------------------------------------------------------------
 
 

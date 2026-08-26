@@ -168,6 +168,22 @@ Built-in providers: `anthropic`, `openai`, `azure_openai`, `gemini`, `mistral`,
 (each imports its SDK lazily), plus `callable` and `echo` for offline use.
 Register your own with `register_provider(name, MyProvider)`.
 
+**Give your callable a `system` parameter.** Every judge call sends the
+grading rubric/instructions via `system=` — `judge.score`/`critique`/`compare`/
+`improve_prompt` all call `complete(prompt, system=...)`. A callable that only
+accepts `prompt` (`lambda prompt: ...`) is still accepted — the call falls
+back to `complete(prompt)` on `TypeError` — but every such call then grades
+*without* the rubric and still returns a normal-looking score, so the drop is
+logged (`logger.warning`, not raised) rather than silent:
+
+```python
+# Grades without the rubric on every call -- a logged warning, not an error.
+judge = LLMJudge(lambda prompt: my_model_call(prompt))
+
+# Receives the rubric as intended.
+judge = LLMJudge(lambda prompt, system=None: my_model_call(prompt, system=system))
+```
+
 ## Optimizers
 
 All optimizers share `optimize(agent, dataset, val_dataset=None)` and apply the

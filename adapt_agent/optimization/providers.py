@@ -204,7 +204,13 @@ class CallableProvider(ModelProvider):
 
     The most direct way to plug in a custom client, a cached function, or a
     deterministic stub in tests. The wrapped callable may optionally accept
-    keyword overrides; if it does not, they are ignored.
+    keyword overrides; if it does not, they are ignored -- **except**
+    ``system``, which callers such as :class:`~adapt_agent.optimization.judge.LLMJudge`
+    use to carry the grading rubric. A callable that cannot accept it is still
+    supported (dropping ``system`` is a legitimate choice for a fixed-response
+    test stub), but the drop is logged rather than silent: a judge that grades
+    without its rubric returns confident-looking scores indistinguishable from
+    a working judge, which is a worse failure than a loud one.
     """
 
     name = "callable"
@@ -220,6 +226,14 @@ class CallableProvider(ModelProvider):
             result = self._fn(prompt, **overrides)
         except TypeError:
             # The wrapped callable does not accept overrides; call plainly.
+            if "system" in overrides:
+                logger.warning(
+                    "CallableProvider: the wrapped callable does not accept a "
+                    "`system` keyword, so the system/rubric text for this call "
+                    "was dropped and the completion was generated without it. "
+                    "Give the callable a `system=None` parameter (or `**kwargs`) "
+                    "to receive it -- see CompletionFn in adapt_agent.optimization.judge."
+                )
             result = self._fn(prompt)
         return result if isinstance(result, str) else str(result)
 
