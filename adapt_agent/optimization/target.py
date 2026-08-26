@@ -31,7 +31,7 @@ Example -- an orchestrator with two specialist sub-agents::
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from adapt_agent.optimization.evaluation import _RUN_METHOD_NAMES, resolve_runner
@@ -49,6 +49,25 @@ class OptimizableAgent:
         parameters: Explicit parameters to expose (merged with introspected ones).
         components: ``{name: framework_object}`` to introspect for parameters.
         name: Human-readable identifier used in reports.
+        exclude: Introspected parameter names to drop before ``parameters`` is
+            merged in. For when a framework upgrade starts introspecting a knob
+            you already hand-bound *under a different name* onto the same
+            underlying storage (e.g. your own parameter reads/writes
+            ``options.default_options["instructions"]`` as
+            ``"agent.system_prompt"``, and introspection now also discovers it
+            as ``"agent.instructions"``): same storage, different names, so the
+            duplicate-name check below never catches it, and the optimizer
+            silently gets two knobs for one prompt -- doubling that part of the
+            search and letting whichever knob is tried last overwrite the
+            other's candidate. Naming the newly-introspected one here removes
+            it from the space entirely, leaving your hand-bound parameter as
+            the sole knob for that storage.
+        replace: When ``True``, a declared parameter in ``parameters`` whose
+            name collides with an introspected one *replaces* it instead of
+            raising. Default ``False`` keeps the collision a hard error, since
+            an unintended same-name clash (a typo, two components introspecting
+            to the same name) is far more often a real mistake than an
+            intentional override.
     """
 
     def __init__(
@@ -58,6 +77,8 @@ class OptimizableAgent:
         parameters: list[Parameter] | None = None,
         components: dict[str, Any] | None = None,
         name: str = "agent",
+        exclude: Iterable[str] | None = None,
+        replace: bool = False,
     ):
         if not callable(runner):
             raise TypeError("OptimizableAgent runner must be callable")
@@ -69,14 +90,24 @@ class OptimizableAgent:
         # Introspected parameters first (stable, framework-derived names) ...
         for param in introspect_components(self.components):
             space.add(param)
-        # ... then explicit declarations (allowed to add knobs frameworks miss).
+        # ... minus any the caller wants dropped before anything else sees them
+        # (a name absent from the space -- introspection changed, or never
+        # found it -- is not an error: excluding a knob that turned out not to
+        # exist is a no-op, not a mistake).
+        for excluded_name in exclude or ():
+            space.remove(excluded_name)
+        # ... then explicit declarations (allowed to add knobs frameworks miss,
+        # and -- with replace=True -- to override how an introspected one is
+        # read/written without renaming it).
         for param in parameters or []:
-            if param.name in space:
+            if param.name in space and not replace:
                 raise ValueError(
                     f"Declared parameter {param.name!r} collides with an "
-                    f"introspected parameter; rename it to disambiguate."
+                    f"introspected parameter; rename it to disambiguate, pass "
+                    f"replace=True to override it, or exclude={{{param.name!r}}} "
+                    f"to drop the introspected one first."
                 )
-            space.add(param)
+            space.add(param, replace=replace)
         self._space = space
 
     # -- constructors ----------------------------------------------------------
@@ -89,15 +120,25 @@ class OptimizableAgent:
         runner: Callable[[Any], Any] | None = None,
         parameters: list[Parameter] | None = None,
         name: str = "agent",
+        exclude: Iterable[str] | None = None,
+        replace: bool = False,
     ) -> OptimizableAgent:
         """Build from named framework objects.
 
         If ``runner`` is omitted and exactly one component is directly runnable
         (callable, has ``run``, or has ``execute``), it becomes the runner.
+        See the class docstring for ``exclude``/``replace``.
         """
         if runner is None:
             runner = cls._infer_runner(components)
-        return cls(runner, parameters=parameters, components=components, name=name)
+        return cls(
+            runner,
+            parameters=parameters,
+            components=components,
+            name=name,
+            exclude=exclude,
+            replace=replace,
+        )
 
     @classmethod
     def from_agent(
@@ -108,6 +149,8 @@ class OptimizableAgent:
         component_name: str = "agent",
         parameters: list[Parameter] | None = None,
         name: str = "agent",
+        exclude: Iterable[str] | None = None,
+        replace: bool = False,
     ) -> OptimizableAgent:
         """Build from a single framework object (the common single-agent case).
 
@@ -119,7 +162,7 @@ class OptimizableAgent:
         (driven inside a ``Runner``) -- falls back to
         :func:`~adapt_agent.optimization.runners.framework_runner`, which knows
         each framework's driving machinery and unwraps results to final
-        response text.
+        response text. See the class docstring for ``exclude``/``replace``.
         """
         run = runner if runner is not None else _default_agent_runner(agent)
         return cls(
@@ -127,6 +170,8 @@ class OptimizableAgent:
             parameters=parameters,
             components={component_name: agent},
             name=name,
+            exclude=exclude,
+            replace=replace,
         )
 
     @classmethod
@@ -137,9 +182,18 @@ class OptimizableAgent:
         parameters: list[Parameter] | None = None,
         components: dict[str, Any] | None = None,
         name: str = "agent",
+        exclude: Iterable[str] | None = None,
+        replace: bool = False,
     ) -> OptimizableAgent:
         """Build from a plain runner plus optional components/parameters."""
-        return cls(runner, parameters=parameters, components=components, name=name)
+        return cls(
+            runner,
+            parameters=parameters,
+            components=components,
+            name=name,
+            exclude=exclude,
+            replace=replace,
+        )
 
     @staticmethod
     def _infer_runner(components: dict[str, Any]) -> Callable[[Any], Any]:
@@ -173,9 +227,16 @@ class OptimizableAgent:
     def parameters_of_kind(self, kind: ParameterKind) -> list[Parameter]:
         return self._space.of_kind(kind)
 
-    def add_parameter(self, parameter: Parameter) -> None:
-        """Declare an extra parameter after construction."""
-        self._space.add(parameter)
+    def add_parameter(self, parameter: Parameter, *, replace: bool = False) -> None:
+        """Declare an extra parameter after construction.
+
+        Raises :class:`ValueError` if ``parameter.name`` is already taken
+        (introspected or previously added) unless ``replace=True``, which
+        drops the existing one first -- see the class docstring's ``replace``
+        for when that is the right call. To remove an introspected knob
+        entirely with no replacement, use ``search_space.remove(name)``.
+        """
+        self._space.add(parameter, replace=replace)
 
     def add_tool_parameter(
         self,
@@ -328,12 +389,17 @@ def wrap(
     components: dict[str, Any] | None = None,
     parameters: list[Parameter] | None = None,
     name: str = "agent",
+    exclude: Iterable[str] | None = None,
+    replace: bool = False,
 ) -> OptimizableAgent:
     """Coerce a variety of inputs into an :class:`OptimizableAgent`.
 
-    Accepts an existing :class:`OptimizableAgent` (returned as-is), a plain
-    runner callable, or a single framework object. This is the convenience entry
-    optimizers use so users can pass whatever they have.
+    Accepts an existing :class:`OptimizableAgent` (returned as-is -- ``exclude``/
+    ``replace`` are then ignored, since its search space is already built; pass
+    them to the ``from_*`` constructor that built it instead), a plain runner
+    callable, or a single framework object. This is the convenience entry
+    optimizers use so users can pass whatever they have. See
+    :class:`OptimizableAgent` for what ``exclude``/``replace`` do.
     """
     if isinstance(target, OptimizableAgent):
         return target
@@ -343,10 +409,16 @@ def wrap(
             runner=runner or (target if callable(target) else None),
             parameters=parameters,
             name=name,
+            exclude=exclude,
+            replace=replace,
         )
     if callable(target) and runner is None:
-        return OptimizableAgent.from_callable(target, parameters=parameters, name=name)
-    return OptimizableAgent.from_agent(target, runner=runner, parameters=parameters, name=name)
+        return OptimizableAgent.from_callable(
+            target, parameters=parameters, name=name, exclude=exclude, replace=replace
+        )
+    return OptimizableAgent.from_agent(
+        target, runner=runner, parameters=parameters, name=name, exclude=exclude, replace=replace
+    )
 
 
 __all__ = ["OptimizableAgent", "wrap"]

@@ -106,6 +106,49 @@ print(result.best_config)   # the winning prompt/model/... values
   ))
   ```
 
+### Resolving collisions with introspection
+
+A declared parameter whose `name` collides with an introspected one raises
+`ValueError` by default -- an accidental same-name clash is far more often a
+real mistake than an intentional override. Two constructor kwargs
+(`OptimizableAgent`, every `from_*`, and `wrap()`) cover the two cases where a
+collision is *not* a mistake:
+
+* **`exclude`** -- introspected parameter names to drop before your declared
+  `parameters` are merged in. Use this when a framework upgrade starts
+  introspecting a knob you already hand-bound *under a different name* onto
+  the same underlying storage -- e.g. your own parameter reads/writes
+  `options.default_options["instructions"]` as `"agent.system_prompt"`, and a
+  newer introspector also discovers it as `"agent.instructions"`. Same
+  storage, different names, so the duplicate-name check never catches it: both
+  knobs coexist, doubling that part of the search and letting whichever one an
+  optimizer applies last silently overwrite the other's candidate.
+
+  ```python
+  agent = OptimizableAgent.from_agent(
+      my_agent,
+      parameters=[my_hand_bound_system_prompt],   # "agent.system_prompt"
+      exclude={"agent.instructions"},              # the newly-discovered duplicate
+  )
+  ```
+
+* **`replace=True`** -- lets a declared parameter *under the same name* as an
+  introspected one win instead of raising, for when you want your own
+  getter/setter behind a knob whose name you want unchanged (so existing
+  exported configs still `apply()` cleanly):
+
+  ```python
+  agent = OptimizableAgent.from_agent(
+      my_agent,
+      parameters=[Parameter(name="agent.instructions", ..., setter=my_setter)],
+      replace=True,
+  )
+  ```
+
+`agent.add_parameter(parameter, replace=True)` does the same after
+construction; `agent.search_space.remove(name)` drops a knob with no
+replacement at all.
+
 ## Going deep into each framework
 
 Introspection turns a live framework object into bound `Parameter`s. It is

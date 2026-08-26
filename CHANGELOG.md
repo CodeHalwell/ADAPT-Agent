@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`OptimizableAgent` (and every `from_*` constructor, plus `wrap()`) gained
+  `exclude=` and `replace=`, so introspection catching up to a hand-bound
+  workaround no longer silently doubles a knob.** Parameters are opaque
+  getter/setter closures, so the library cannot detect that two of them target
+  the *same* underlying storage under *different* names — only that two names
+  collide, which already raised. The gap: a caller hand-binds a parameter to
+  work around introspection missing a knob (a real, documented, and until now
+  the *only* supported reason to declare extra parameters), a later release
+  teaches introspection to find that same knob under its own name, and the two
+  now coexist pointing at one piece of storage — doubling that part of the
+  search space and letting whichever knob an optimizer applies last silently
+  overwrite the other's candidate. Nothing raised, because the names never
+  matched.
+
+  `exclude={"agent.instructions", ...}` removes named introspected parameters
+  from the space before declared `parameters` are merged in — the fix for the
+  reported shape, where the hand-bound and introspected knobs have different
+  names. `replace=True` instead lets a declared parameter *under the same
+  name* as an introspected one win outright, for overriding how a knob with a
+  name you want to keep is read/written. The default collision behavior
+  (`ValueError`) is unchanged — an unintended same-name clash is still caught,
+  since `replace` is opt-in. New primitives underneath: `SearchSpace.remove(name)`
+  (drop a knob, never raises for a missing name) and `SearchSpace.add(parameter,
+  replace=True)`; `OptimizableAgent.add_parameter(parameter, replace=True)`
+  exposes the same override after construction.
+
 ### Fixed
 
 - **A completion callable that could not accept `system=` made the judge
