@@ -175,15 +175,35 @@ def _introspect_agent(agent: Any, index: int) -> list[Parameter]:
     return params
 
 
-def _introspect_task(task: Any, index: int) -> list[Parameter]:
+def _unique_component(component: str, index: int, used: set[str]) -> str:
+    """Return ``component``, suffixed with the positional index while taken.
+
+    Two tasks may share a name (or names that slug identically), and a name
+    can even slug to another task's positional fallback. Identical components
+    would emit identical parameter names -- a duplicate ``SearchSpace`` entry
+    downstream -- where the positional components could never collide. The
+    index is unique per task, so one suffix round settles ordinary collisions;
+    the loop covers a name crafted to match the suffixed form as well.
+    """
+    candidate = component
+    while candidate in used:
+        candidate = f"{candidate}_{index}"
+    used.add(candidate)
+    return candidate
+
+
+def _introspect_task(task: Any, index: int, used: set[str]) -> list[Parameter]:
     """Introspect a single CrewAI ``Task``.
 
     A task with a ``name`` is namespaced under it (slugged): the name survives
     reordering the task list, where a positional ``task_<index>`` silently
     rebinds every exported config to a different task. Nameless tasks keep the
-    positional fallback.
+    positional fallback, and a component already claimed by an earlier task is
+    disambiguated with the positional index (see :func:`_unique_component`).
     """
-    component = _slug(getattr(task, "name", None)) or f"task_{index}"
+    component = _unique_component(
+        _slug(getattr(task, "name", None)) or f"task_{index}", index, used
+    )
     candidates = [
         bind_attr(
             task,
@@ -210,9 +230,10 @@ def _introspect(obj: Any) -> list[Parameter]:
         agents = getattr(obj, "agents", None) or []
         for i, agent in enumerate(agents):
             params.extend(_introspect_agent(agent, i))
+        used_task_components: set[str] = set()
         tasks = getattr(obj, "tasks", None) or []
         for i, task in enumerate(tasks):
-            params.extend(_introspect_task(task, i))
+            params.extend(_introspect_task(task, i, used_task_components))
     except Exception:
         return params
     return params

@@ -193,14 +193,20 @@ result = make_default_optimizer(harness, judge=judge, max_evals=60).optimize(age
 
 Optimizers reuse the report of a configuration already measured in the same
 run instead of re-running the agent over the dataset (`cache_evaluations=True`
-by default). A `PipelineOptimizer` shares the cache across its stages, so each
-stage's baseline — the previous stage's winner, already measured — stops
-costing a full-dataset pass; the default pipeline saves four such passes per
-run. The cache is keyed on the live parameter state, only *complete* reports
-are ever reused (the transient-failure machinery is unaffected), and it never
-outlives the `optimize` call. Pass `cache_evaluations=False` to re-measure
-every configuration — useful when agent outputs are stochastic enough that you
-want repeated measurements of identical configurations to average out.
+by default). A `PipelineOptimizer` shares the cache across its stages that
+carry the *same harness*, so each such stage's baseline — the previous
+stage's winner, already measured — stops costing a full-dataset pass; the
+default pipeline saves four such passes per run. The cache is keyed on the
+harness identity and the live parameter state — the harness because a report
+is only reusable by the evaluator that would have produced it, so stages
+built with different metrics or a different judge never share a hit. Only
+*complete* reports are ever cached (the transient-failure machinery is
+unaffected), and the cache never outlives the `optimize` call. Pass
+`cache_evaluations=False` to re-measure every configuration — useful when
+agent outputs are stochastic enough that you want repeated measurements of
+identical configurations to average out; setting it on a `PipelineOptimizer`
+also disables caching in every stage for that run, while a stage's own
+`False` inside a caching pipeline is still respected.
 
 ## Evaluation reports
 

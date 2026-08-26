@@ -250,3 +250,32 @@ def test_named_task_gets_a_stable_component_name() -> None:
     assert by_name["research_task.description"].kind is ParameterKind.PROMPT
     assert by_name["research_task.expected_output"].kind is ParameterKind.PROMPT
     assert "task_0.description" not in by_name
+
+
+def test_duplicate_task_names_get_unique_components() -> None:
+    first = FakeTask(description="Research A", expected_output="Out A")
+    second = FakeTask(description="Research B", expected_output="Out B")
+    first.name = "Research Task"
+    second.name = "Research Task"  # same slug as the first
+    crew = FakeCrew(agents=[], tasks=[first, second])
+    params = introspect(crew)
+    names = [p.name for p in params]
+
+    assert len(names) == len(set(names))
+    by_name = {p.name: p for p in params}
+    assert by_name["research_task.description"].read() == "Research A"
+    assert by_name["research_task_1.description"].read() == "Research B"
+
+
+def test_task_name_colliding_with_positional_fallback_is_disambiguated() -> None:
+    named = FakeTask(description="Named", expected_output="Out")
+    named.name = "task 1"  # slugs to the nameless task's positional fallback
+    nameless = FakeTask(description="Nameless", expected_output="Out")
+    crew = FakeCrew(agents=[], tasks=[named, nameless])
+    params = introspect(crew)
+    names = [p.name for p in params]
+
+    assert len(names) == len(set(names))
+    by_name = {p.name: p for p in params}
+    assert by_name["task_1.description"].read() == "Named"
+    assert by_name["task_1_1.description"].read() == "Nameless"

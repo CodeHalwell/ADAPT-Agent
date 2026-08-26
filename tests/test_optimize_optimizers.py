@@ -662,14 +662,20 @@ def _counting_agent(prompt_candidates):
 
 
 def _run_two_stage_pipeline(*, cache: bool, stage_cache: bool | None = None):
-    """Run a two-stage grid pipeline; return (agent_runs, result)."""
+    """Run a two-stage grid pipeline; return (agent_runs, result).
+
+    One harness instance is shared by the pipeline and both stages -- the
+    shape ``make_default_optimizer`` builds -- because the cache is scoped to
+    the harness: reports measured by different evaluators are never reused.
+    """
     counter, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    shared_harness = harness()
     per_stage = cache if stage_cache is None else stage_cache
     stages = [
-        GridSearchOptimizer(harness(), max_evals=8, cache_evaluations=per_stage),
-        GridSearchOptimizer(harness(), max_evals=8, cache_evaluations=per_stage),
+        GridSearchOptimizer(shared_harness, max_evals=8, cache_evaluations=per_stage),
+        GridSearchOptimizer(shared_harness, max_evals=8, cache_evaluations=per_stage),
     ]
-    pipe = PipelineOptimizer(harness(), stages, max_evals=16, cache_evaluations=cache)
+    pipe = PipelineOptimizer(shared_harness, stages, max_evals=16, cache_evaluations=cache)
     result = pipe.optimize(agent, dataset())
     return counter["runs"], result
 
@@ -768,3 +774,52 @@ def test_cache_is_cleared_between_optimize_calls():
     first = counter["runs"]
     opt.optimize(agent, dataset())
     assert counter["runs"] > first
+
+
+def test_cache_is_scoped_to_the_harness():
+    # A report is only reusable by the evaluator that produced it: stages built
+    # with a *different* harness must re-measure rather than rank their
+    # candidates against another evaluator's scores.
+    counter, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    harness_a, harness_b = harness(), harness()  # distinct instances
+    stages = [
+        GridSearchOptimizer(harness_a, max_evals=8),
+        GridSearchOptimizer(harness_b, max_evals=8),
+    ]
+    pipe = PipelineOptimizer(harness_a, stages, max_evals=16)
+    result = pipe.optimize(agent, dataset())
+
+    assert result.best_score == 1.0
+    # Stage 1 shares the pipeline's harness and reuses its baseline (and the
+    # no-op grid candidate), measuring only the improved config. Stage 2's
+    # harness differs, so nothing from stage 1 is reusable: its baseline and
+    # the non-baseline candidate are measured fresh (its other candidate
+    # matches its own baseline measurement). 1 + 1 + 2 full-dataset passes.
+    assert counter["runs"] == 4 * len(dataset())
+
+
+def test_pipeline_cache_opt_out_reaches_default_stages():
+    # Pipeline-level cache_evaluations=False must also stop stages (left at
+    # their default True) from quietly building private per-stage caches.
+    runs, result = _run_two_stage_pipeline(cache=False, stage_cache=True)
+    assert result.best_score == 1.0
+    assert runs == 7 * len(dataset())
+
+
+def test_pipeline_tolerates_stage_that_skipped_optimizer_init():
+    # Stage cache injection must be defensive: a minimal Optimizer subclass
+    # that skips __init__ (a pattern the cache helpers support) has no
+    # _eval_cache / cache_evaluations attributes.
+    class MinimalStage(Optimizer):
+        def __init__(self, h):
+            self.harness = h
+            self.verbose = False
+            self.max_evals = 2
+
+        def optimize(self, agent, dataset, **kwargs):
+            return OptimizationResult(best_config={}, best_score=0.0, baseline_score=0.0)
+
+    _, agent = _counting_agent(["BAD", GOOD_PROMPT])
+    pipe = PipelineOptimizer(harness(), [MinimalStage(harness())])
+    result = pipe.optimize(agent, dataset())  # must not raise AttributeError
+    assert result.baseline_score == 0.0

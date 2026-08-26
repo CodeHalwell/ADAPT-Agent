@@ -328,16 +328,24 @@ class Optimizer:
         judge: Optional LLM judge made available to proposers.
         cache_evaluations: Reuse the report of an already-measured
             configuration instead of re-running the agent over the dataset
-            (default ``True``). The cache is keyed on the *live parameter
-            state* at evaluation time and lives for one ``optimize`` call --
-            or one pipeline run, where :class:`PipelineOptimizer` shares it
-            across stages so each stage's baseline (the previous stage's
-            winner, already measured) stops costing a full-dataset pass.
-            Only complete reports are reused, so the transient-failure
-            machinery (baseline re-runs, incomplete-trial exclusion) is
-            unaffected. Set ``False`` to re-measure every configuration --
-            e.g. when agent outputs are stochastic enough that you want
-            repeated measurements of identical configurations.
+            (default ``True``). The cache is keyed on this optimizer's
+            ``harness`` *and* the *live parameter state* at evaluation time --
+            the harness because a report is only reusable by the evaluator
+            that would have produced it, and the live state (rather than the
+            candidate diff) because that is what lets a stage baseline hit a
+            previous stage's winning trial reached through a different
+            config. It lives for one ``optimize`` call -- or one pipeline
+            run, where :class:`PipelineOptimizer` shares one cache across
+            stages that carry the same harness, so each such stage's baseline
+            stops costing a full-dataset pass. Only complete reports are
+            reused, so the transient-failure machinery (baseline re-runs,
+            incomplete-trial exclusion) is unaffected. Set ``False`` to
+            re-measure every configuration -- e.g. when agent outputs are
+            stochastic enough that you want repeated measurements of
+            identical configurations. A pipeline's own ``False`` also
+            suppresses caching in every stage for that run, even one left at
+            its own default ``True``; a stage's own ``False`` inside a
+            caching pipeline is still respected.
         suggest_tools: When True *and* a ``judge`` is set, after the search the
             optimizer asks the judge to propose NEW tools/skills for components
             that own a TOOL/SKILL parameter and records them as advisory
@@ -495,7 +503,7 @@ class Optimizer:
     # -- evaluation cache ------------------------------------------------------
 
     def _cache_key(self, target: OptimizableAgent, dataset: GoldenDataset) -> str | None:
-        """Key the *live* parameter state against a dataset, or ``None``.
+        """Key the harness and the *live* parameter state against a dataset.
 
         The key renders every parameter's current value with ``repr``: equal
         primitives (prompts, models, temperatures) collide -- a hit -- while
@@ -503,15 +511,23 @@ class Optimizer:
         distinct-but-equal objects miss rather than falsely hit, which only
         costs a re-run. Keyed on the live snapshot rather than the candidate
         diff so a stage baseline and the previous stage's winning trial -- the
-        same state reached through different configs -- share a key. Returns
-        ``None`` (no caching) when the state cannot be rendered.
+        same state reached through different configs -- share a key.
+
+        The harness is part of the key because a report is only reusable by an
+        evaluator that would have produced it: a pipeline may be assembled
+        from stages carrying *different* harnesses (other metrics, another
+        judge), and without the harness in the key such a stage would rank its
+        candidates against scores measured by a different evaluator. Stages
+        sharing one harness instance -- how :func:`make_default_optimizer`
+        builds pipelines -- still share hits. Returns ``None`` (no caching)
+        when the state cannot be rendered.
         """
         try:
             state = target.snapshot()
             rendered = ",".join(f"{name}={state[name]!r}" for name in sorted(state))
         except Exception:
             return None
-        return f"{id(dataset)}|{rendered}"
+        return f"{id(self.harness)}|{id(dataset)}|{rendered}"
 
     def _cached_report(
         self, target: OptimizableAgent, dataset: GoldenDataset
@@ -1114,14 +1130,26 @@ class PipelineOptimizer(Optimizer):
                 if remaining <= 0:
                     break
                 original_max = stage.max_evals
-                original_cache = stage._eval_cache
+                # ``getattr`` because a stage may be a minimal Optimizer
+                # subclass that skipped ``__init__`` -- the same pattern the
+                # cache helpers themselves tolerate.
+                original_cache = getattr(stage, "_eval_cache", None)
+                original_cache_flag = getattr(stage, "cache_evaluations", False)
                 stage.max_evals = min(original_max, remaining)
                 stage._eval_cache = shared_cache
+                # A pipeline-level opt-out must reach the stages: with the
+                # shared cache merely absent, a stage's own default flag would
+                # quietly build a private per-stage cache and repeated
+                # configurations would still be reused -- exactly what
+                # ``cache_evaluations=False`` promises to prevent. A stage's
+                # own opt-out inside a caching pipeline is still respected.
+                stage.cache_evaluations = original_cache_flag and self.cache_evaluations
                 try:
                     stage_result = stage.optimize(target, dataset)  # applies stage best in place
                 finally:
                     stage.max_evals = original_max
                     stage._eval_cache = original_cache
+                    stage.cache_evaluations = original_cache_flag
                 combined_history.extend(stage_result.history)
                 combined_recommendations.extend(stage_result.recommendations)
                 # The live target now carries this stage's best; accumulate the diff.

@@ -197,6 +197,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report its version and each has the same fix. A diagnostic that fails on a
   damaged file tells you least exactly when you need it most.
 
+### Fixed
+
+- **The evaluation cache could serve a report across two different
+  evaluators.** The cache key covered only the dataset identity and live
+  parameter state, so a `PipelineOptimizer` assembled from stages carrying
+  *different* harnesses (different metrics, a different judge) could let one
+  stage reuse a report another stage's harness produced, ranking candidates
+  against the wrong scores. The harness identity is now part of the key;
+  stages sharing one harness instance (how `make_default_optimizer` builds
+  pipelines) still share hits.
+- **A pipeline-level `cache_evaluations=False` didn't reach its stages.**
+  `PipelineOptimizer(..., cache_evaluations=False)` cleared the *shared*
+  cache, but a stage left at its own default (`True`) then built a private
+  per-stage cache anyway, so repeated configurations were still served from
+  cache instead of re-measured. The pipeline's opt-out now suppresses stage
+  caching for the run; a stage's own opt-out inside a caching pipeline is
+  still respected.
+- **Two CrewAI tasks with the same (or identically-slugged) `name` collided.**
+  0.3.2's task-naming-by-`name` change (below) could make two tasks emit the
+  same component (`research_task.description` for both), and constructing the
+  `OptimizableAgent` raised `ValueError: Duplicate parameter name`. Colliding
+  names are now disambiguated with the task's positional index, so upgrading
+  to named-task components can no longer break agents whose tasks share a
+  name.
+- **`PipelineOptimizer` assumed every stage carries a live `Optimizer`
+  state.** Cache injection read `stage._eval_cache` unconditionally, which
+  raised `AttributeError` for a minimal `Optimizer` subclass that
+  intentionally skips `Optimizer.__init__` (a pattern the cache's own read/
+  write helpers already tolerate via `getattr`). Stage attribute access is
+  now equally defensive.
+
 
 ## [0.3.1] - 2026-08-24
 
