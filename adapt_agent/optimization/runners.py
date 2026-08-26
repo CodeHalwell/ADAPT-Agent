@@ -2,28 +2,42 @@
 
 :func:`~adapt_agent.optimization.evaluation.resolve_runner` already turns most
 framework objects into a ``Callable[[input], output]`` (finding ``run_sync`` /
-``invoke`` / ``kickoff`` / ``run`` and materialising async results). Two gaps
+``invoke`` / ``kickoff`` / ``run`` and materialising async results). Three gaps
 remain when running *evals* from a golden dataset of plain strings:
 
 * the produced output is framework-native (an ``AgentRunResult``, a LangGraph
-  state mapping, an event stream) rather than the final response text, and
+  state mapping, an event stream) rather than the final response text,
 * some frameworks do not accept a plain string input -- a LangGraph
   message-state graph wants ``{"messages": [...]}``, and a Google ADK agent is
-  driven through a ``Runner`` with a session and a ``Content`` message.
+  driven through a ``Runner`` with a session and a ``Content`` message, and
+* some frameworks' agent objects are not runnable *at all* on their own -- an
+  OpenAI Agents SDK ``Agent`` is driven by ``agents.Runner.run_sync(agent,
+  input)``, and a Claude Agent SDK setup is an options object driven by
+  ``claude_agent_sdk.query(prompt=..., options=...)``.
 
-This module closes both gaps:
+This module closes all three:
 
 * :func:`framework_runner` -- wrap any supported agent as
   ``Callable[[input], text]``: input adaptation (auto-detected for LangGraph),
   sync/async resolution, then output extraction via
-  :func:`~adapt_agent.optimization.extractors.extract_output_text`.
+  :func:`~adapt_agent.optimization.extractors.extract_output_text`. An object
+  with no run method of its own is *delegated* by detected framework: an OpenAI
+  Agents ``Agent`` to :func:`openai_agents_runner`, a Claude Agent SDK options
+  object to :func:`claude_agent_runner`, a bare Google ADK agent to
+  :func:`adk_runner` -- so every supported framework is drivable through the one
+  entry point.
 * :func:`langgraph_inputs` -- the string -> message-state input adapter.
 * :func:`adk_runner` -- drive a Google ADK agent (or prebuilt ``Runner``)
   synchronously with a fresh session per call, returning final response text.
+* :func:`openai_agents_runner` -- drive an OpenAI Agents SDK ``Agent`` through
+  the SDK's ``Runner``.
+* :func:`claude_agent_runner` -- drive a Claude Agent SDK options object
+  through ``query``, draining the async message stream synchronously.
 
 Importing this module never imports an agent framework; ``google.adk`` /
-``google.genai`` are imported lazily inside :func:`adk_runner` only when a bare
-agent (rather than a prebuilt runner) or a plain-string message needs them.
+``google.genai`` / ``agents`` / ``claude_agent_sdk`` are imported lazily inside
+the runner builders, only when the corresponding framework object actually needs
+them.
 """
 
 from __future__ import annotations
@@ -70,9 +84,30 @@ def framework_runner(
         A synchronous ``Callable[[input], output]`` (async agents are awaited /
         drained internally) suitable for
         :meth:`EvaluationHarness.evaluate <adapt_agent.optimization.evaluation.EvaluationHarness.evaluate>`.
+
+    Raises:
+        TypeError: When the object exposes no run method, is not callable, and
+            is not detected as a delegatable framework object.
+        ImportError: When a delegated framework's SDK is needed but not
+            installed (the message names the extra to install).
     """
-    runner = resolve_runner(agent)
     adapter = _resolve_input_adapter(agent, input_adapter)
+    try:
+        runner = resolve_runner(agent)
+    except TypeError:
+        # Not directly runnable. Some frameworks are *by design* driven by
+        # separate machinery -- delegate by detected framework rather than
+        # bouncing the user to a hand-written lambda.
+        delegated = _delegated_runner(agent, output_extractor)
+        if delegated is None:
+            raise
+        if adapter is None:
+            return delegated
+
+        def _adapted(input_data: Any) -> Any:
+            return delegated(adapter(input_data))
+
+        return _adapted
 
     def _run(input_data: Any) -> Any:
         if adapter is not None:
@@ -162,7 +197,164 @@ def adk_runner(
     return _run
 
 
+def openai_agents_runner(
+    agent: Any,
+    *,
+    runner: Any = None,
+    run_kwargs: Mapping[str, Any] | None = None,
+    output_extractor: Callable[[Any], Any] | None = extract_output_text,
+) -> Callable[[Any], Any]:
+    """Drive an OpenAI Agents SDK ``Agent``: ``input -> final response text``.
+
+    An OpenAI Agents ``Agent`` is a configuration dataclass with no run method
+    of its own -- the SDK executes it with ``agents.Runner.run_sync(agent,
+    input)``. This helper hides that behind a plain callable the
+    :class:`~adapt_agent.optimization.evaluation.EvaluationHarness` (and every
+    optimizer) can drive.
+
+    Args:
+        agent: The OpenAI Agents ``Agent`` (the *starting* agent -- handoffs
+            from it run as normal).
+        runner: The object whose ``run_sync(agent, input, ...)`` executes the
+            agent. Defaults to the SDK's ``agents.Runner`` class, imported
+            lazily here. Anything with a compatible ``run_sync`` (or an async
+            ``run``, which is awaited) works -- useful for tests and for the
+            SDK's own subclassable runners.
+        run_kwargs: Extra keyword arguments forwarded to every run call (e.g.
+            ``{"max_turns": 5}`` or a shared ``context``).
+        output_extractor: Applied to each ``RunResult``;
+            :func:`~adapt_agent.optimization.extractors.extract_output_text`
+            by default (yields ``final_output`` as text). ``None`` returns the
+            raw ``RunResult``.
+
+    Returns:
+        A synchronous ``Callable[[input], output]``.
+
+    Raises:
+        ImportError: When the SDK is needed (no ``runner`` supplied) but not
+            installed.
+        TypeError: When ``runner`` exposes neither ``run_sync`` nor ``run``.
+
+    Note:
+        ``Runner.run_sync`` refuses to run inside an already-running event
+        loop (the SDK's own constraint); drive evals from sync code, or pass a
+        ``runner`` wrapping the async API appropriately.
+    """
+    run_cls = runner if runner is not None else _load_openai_agents_runner()
+    run_method = getattr(run_cls, "run_sync", None)
+    if not callable(run_method):
+        run_method = getattr(run_cls, "run", None)
+    if not callable(run_method):
+        raise TypeError(
+            "openai_agents_runner: runner must expose run_sync(agent, input) or "
+            f"an awaitable run(agent, input); got {type(run_cls)!r}"
+        )
+    kwargs = dict(run_kwargs or {})
+
+    def _run(input_data: Any) -> Any:
+        output = _materialize(run_method(agent, input_data, **kwargs))
+        if output_extractor is not None:
+            output = output_extractor(output)
+        return output
+
+    return _run
+
+
+def claude_agent_runner(
+    options: Any,
+    *,
+    query_fn: Callable[..., Any] | None = None,
+    output_extractor: Callable[[Any], Any] | None = extract_output_text,
+) -> Callable[[Any], Any]:
+    """Drive a Claude Agent SDK setup: ``input -> final response text``.
+
+    The Claude Agent SDK has no agent object to call -- a configured
+    ``ClaudeAgentOptions`` is passed to ``claude_agent_sdk.query(prompt=...,
+    options=...)``, which returns an async stream of messages. This helper
+    hides that behind a plain synchronous callable: the stream is drained, and
+    the final ``ResultMessage`` text extracted.
+
+    Because ``options`` is closed over (not copied), the returned runner always
+    reads the *live* object -- exactly what
+    :class:`~adapt_agent.optimization.target.OptimizableAgent` needs, since the
+    introspected parameters mutate that same options object between runs.
+
+    Args:
+        options: The ``ClaudeAgentOptions`` (or options-shaped) object.
+        query_fn: The query callable, ``claude_agent_sdk.query`` by default
+            (imported lazily here). Must accept ``prompt=`` and ``options=``
+            keywords and return an awaitable or (async) message stream.
+        output_extractor: Applied to the drained message list;
+            :func:`~adapt_agent.optimization.extractors.extract_output_text`
+            by default (yields the ``ResultMessage`` text). ``None`` returns
+            the raw message list.
+
+    Returns:
+        A synchronous ``Callable[[input], output]``.
+
+    Raises:
+        ImportError: When ``claude-agent-sdk`` is needed (no ``query_fn``
+            supplied) but not installed.
+    """
+    fn = query_fn if query_fn is not None else _load_claude_agent_query()
+
+    def _run(input_data: Any) -> Any:
+        output = _materialize(fn(prompt=input_data, options=options))
+        if output_extractor is not None:
+            output = output_extractor(output)
+        return output
+
+    return _run
+
+
 # -- internals -----------------------------------------------------------------
+
+
+def _delegated_runner(
+    agent: Any, output_extractor: Callable[[Any], Any] | None
+) -> Callable[[Any], Any] | None:
+    """Build a runner for an object that is only drivable via framework machinery.
+
+    Returns ``None`` when the object is not detected as one of the delegatable
+    frameworks, so the caller can surface the original resolution error.
+    """
+    from adapt_agent.optimization.introspection import detect
+
+    try:
+        detected = detect(agent)
+    except Exception:
+        return None
+    if detected == "openai_agents":
+        return openai_agents_runner(agent, output_extractor=output_extractor)
+    if detected == "claude_agent":
+        return claude_agent_runner(agent, output_extractor=output_extractor)
+    if detected == "google_adk":
+        return adk_runner(agent, output_extractor=output_extractor)
+    return None
+
+
+def _load_openai_agents_runner() -> Any:
+    try:
+        from agents import Runner
+    except ImportError as exc:  # pragma: no cover - exercised without the SDK
+        raise ImportError(
+            "openai_agents_runner needs the OpenAI Agents SDK to drive the "
+            "agent: pip install 'adapt-agent[openai-agents]'. Alternatively "
+            "pass runner= (anything exposing run_sync(agent, input))."
+        ) from exc
+    return Runner
+
+
+def _load_claude_agent_query() -> Any:
+    try:
+        from claude_agent_sdk import query
+    except ImportError as exc:  # pragma: no cover - exercised without the SDK
+        raise ImportError(
+            "claude_agent_runner needs claude-agent-sdk to drive the agent: "
+            "pip install 'adapt-agent[claude-agent]'. Alternatively pass "
+            "query_fn= (a callable like claude_agent_sdk.query)."
+        ) from exc
+    return query
 
 
 def _resolve_input_adapter(
@@ -241,4 +433,11 @@ def _adk_user_message(input_data: Any) -> Any:
     return types.Content(role="user", parts=[types.Part(text=input_data)])
 
 
-__all__ = ["AUTO", "adk_runner", "framework_runner", "langgraph_inputs"]
+__all__ = [
+    "AUTO",
+    "adk_runner",
+    "claude_agent_runner",
+    "framework_runner",
+    "langgraph_inputs",
+    "openai_agents_runner",
+]

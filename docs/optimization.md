@@ -69,6 +69,16 @@ print(result.best_config)   # the winning prompt/model/... values
   agent = OptimizableAgent.from_agent(my_crew)         # or graph, Agent, options...
   ```
 
+  A framework-native run method (`run_sync`/`invoke`/`kickoff`/`run`) is
+  resolved automatically. Frameworks whose agents are **not directly
+  runnable** work too: an OpenAI Agents `Agent` is driven through the SDK's
+  `Runner.run_sync`, a Claude Agent SDK options object through `query`, and a
+  bare Google ADK agent inside a fresh-session `Runner` -- with results
+  unwrapped to final response text (see
+  `framework_runner` / `openai_agents_runner` / `claude_agent_runner` /
+  `adk_runner` in `adapt_agent.optimization.runners`). Pass `runner=` to take
+  over the driving yourself.
+
 * **Many components (specialists, orchestrator + sub-agents), code in many files**
 
   ```python

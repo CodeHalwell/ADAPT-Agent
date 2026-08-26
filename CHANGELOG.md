@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Every supported framework is now drivable through one entry point --
+  including the three whose agents cannot run themselves.** An OpenAI Agents
+  SDK `Agent` is a configuration object executed by `Runner.run_sync(agent,
+  input)`; a Claude Agent SDK setup is a `ClaudeAgentOptions` driven by
+  `query(prompt=..., options=...)`; a bare Google ADK agent runs inside a
+  session-holding `Runner`. `resolve_runner` knows none of that, so
+  `evaluate_agent(...)`, `framework_runner(...)` and
+  `OptimizableAgent.from_agent(...)` -- the documented "point it at your agent"
+  entry points -- raised `TypeError` for exactly these frameworks, and every
+  example hand-wrote the driving lambda the SDK documents anyway.
+
+  Two new runner builders close the gap, mirroring `adk_runner`:
+
+  - **`openai_agents_runner(agent, *, runner=None, run_kwargs=None,
+    output_extractor=...)`** drives the agent through the SDK's `Runner`
+    (imported lazily; inject anything with a compatible `run_sync` -- or an
+    async `run`, which is awaited -- for tests and custom runners), forwarding
+    `run_kwargs` (e.g. `max_turns`, a shared `context`) to every call.
+  - **`claude_agent_runner(options, *, query_fn=None, output_extractor=...)`**
+    drives `query`, draining the async message stream synchronously and
+    extracting the final `ResultMessage` text. The options object is closed
+    over, not copied -- so the runner always reads the *live* object the
+    introspected parameters mutate, which is exactly what optimization needs.
+
+  `framework_runner` now **delegates by detected framework** when an object
+  exposes no run method at all (OpenAI Agents -> `openai_agents_runner`,
+  Claude options -> `claude_agent_runner`, bare ADK agent -> `adk_runner`),
+  and `OptimizableAgent.from_agent` falls back to `framework_runner` when
+  `resolve_runner` finds nothing runnable. Directly-runnable frameworks are
+  untouched -- resolution is attempted first and wins, so existing behaviour
+  (including framework-native outputs) is byte-identical; the fallback only
+  replaces a `TypeError`, never a working runner. A missing SDK surfaces as an
+  `ImportError` naming the extra to install, which is strictly more useful
+  than the `TypeError` it replaces. Both builders are exported from
+  `adapt_agent.optimization` and `adapt_agent.evaluation`.
+
 - **Framework introspection reaches the knobs that steer multi-agent behaviour,
   not just the ones on the front agent.** Two whole categories of tunable text
   were invisible to the optimizer:

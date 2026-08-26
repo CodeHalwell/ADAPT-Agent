@@ -40,7 +40,13 @@ from adapt_agent.optimization.metrics import (
     regex_match,
     token_f1,
 )
-from adapt_agent.optimization.runners import adk_runner, framework_runner, langgraph_inputs
+from adapt_agent.optimization.runners import (
+    adk_runner,
+    claude_agent_runner,
+    framework_runner,
+    langgraph_inputs,
+    openai_agents_runner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -209,4 +215,6 @@ __all__ = [
     "framework_runner",
     "langgraph_inputs",
     "adk_runner",
+    "openai_agents_runner",
+    "claude_agent_runner",
 ]

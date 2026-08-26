@@ -78,10 +78,14 @@ OPTIONS = FakeOptions()
 def run_agent(question: str) -> str:
     """Deterministic stand-in for ``query(prompt, options=OPTIONS)``.
 
-    The "quality" of the answer depends on the live OPTIONS: a precise system
-    prompt and the stronger model yield a clean one-word capital; otherwise the
-    answer is hedged and wrong-shaped. This gives the optimizer a real gradient
-    to climb -- in a real setup the SDK's actual model does this for you.
+    With the real SDK installed no stand-in is needed:
+    ``OptimizableAgent.from_agent(OPTIONS)`` (and ``evaluate_agent``) drive the
+    live options through ``query`` automatically -- see
+    ``adapt_agent.optimization.runners.claude_agent_runner``. The "quality" of
+    the answer here depends on the live OPTIONS: a precise system prompt and
+    the stronger model yield a clean one-word capital; otherwise the answer is
+    hedged and wrong-shaped. This gives the optimizer a real gradient to climb
+    -- in a real setup the SDK's actual model does this for you.
     """
     country = question.replace("What is the capital of", "").strip(" ?")
     precise = "ONLY" in OPTIONS.system_prompt or "city name" in OPTIONS.system_prompt.lower()

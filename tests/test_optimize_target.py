@@ -60,6 +60,47 @@ def test_from_agent_with_explicit_runner_and_component_name():
     assert target.components["thing"] is sentinel
 
 
+def test_from_agent_falls_back_to_framework_runner_for_openai_shaped_agent(monkeypatch):
+    """An agent with no run method is driven through the framework machinery.
+
+    An OpenAI Agents ``Agent`` is a configuration object executed by
+    ``Runner.run_sync(agent, input)``; previously ``from_agent`` raised
+    TypeError for it and every caller hand-wrote the runner lambda.
+    """
+
+    class RunResult:
+        def __init__(self, final_output):
+            self.final_output = final_output
+
+    class FakeRunner:
+        def run_sync(self, agent, input_data, **kwargs):
+            return RunResult(f"{agent.instructions} -> {input_data}")
+
+    monkeypatch.setattr(
+        "adapt_agent.optimization.runners._load_openai_agents_runner", lambda: FakeRunner()
+    )
+
+    class OpenAIShapedAgent:
+        def __init__(self):
+            self.name = "Solo Agent"
+            self.instructions = "You answer."
+            self.tools = []
+            self.handoffs = []
+
+    agent = OpenAIShapedAgent()
+    target = OptimizableAgent.from_agent(agent, name="solo")
+    # Driven via the delegated runner, with the final output extracted to text.
+    assert target.run("q") == "You answer. -> q"
+    # Introspection still sees the framework object's knobs (namespaced under
+    # the component name from_agent registered the object as).
+    assert any(p.name == "agent.solo_agent.instructions" for p in target.parameters)
+
+
+def test_from_agent_still_raises_for_unrunnable_unknown_objects():
+    with pytest.raises(TypeError):
+        OptimizableAgent.from_agent(object())
+
+
 # -- from_components ----------------------------------------------------------
 
 

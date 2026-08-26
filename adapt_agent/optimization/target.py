@@ -109,8 +109,19 @@ class OptimizableAgent:
         parameters: list[Parameter] | None = None,
         name: str = "agent",
     ) -> OptimizableAgent:
-        """Build from a single framework object (the common single-agent case)."""
-        run = runner if runner is not None else resolve_runner(agent)
+        """Build from a single framework object (the common single-agent case).
+
+        When no ``runner`` is given, a framework-native run method is resolved
+        (``run_sync``/``invoke``/``kickoff``/``run``, a bare callable, a
+        governed ``execute``). An object with none of those -- an OpenAI Agents
+        ``Agent`` (the SDK drives it via ``Runner.run_sync``), a Claude Agent
+        SDK options object (driven via ``query``), a bare Google ADK agent
+        (driven inside a ``Runner``) -- falls back to
+        :func:`~adapt_agent.optimization.runners.framework_runner`, which knows
+        each framework's driving machinery and unwraps results to final
+        response text.
+        """
+        run = runner if runner is not None else _default_agent_runner(agent)
         return cls(
             run,
             parameters=parameters,
@@ -276,6 +287,29 @@ class OptimizableAgent:
             f"OptimizableAgent(name={self.name!r}, components={list(self.components)}, "
             f"params={len(self._space)}, optimizable={len(self._space.optimizable())})"
         )
+
+
+def _default_agent_runner(agent: Any) -> Callable[[Any], Any]:
+    """Resolve how to drive ``agent`` when the caller supplied no runner.
+
+    A framework-native run method (or bare callable / governed ``execute``)
+    wins, preserving framework-native outputs exactly as before. Only when
+    nothing is directly runnable does this fall back to
+    :func:`~adapt_agent.optimization.runners.framework_runner`, which delegates
+    by detected framework (OpenAI Agents ``Runner``, Claude Agent SDK
+    ``query``, a Google ADK ``Runner``) and extracts final response text --
+    previously these agents raised ``TypeError`` here and forced every caller
+    to hand-write the driving lambda the SDK documents anyway.
+    """
+    try:
+        return resolve_runner(agent)
+    except TypeError:
+        # Imported lazily to keep this module import-light; framework_runner
+        # re-raises the same TypeError when the object is not a recognisable
+        # framework either, so the error surface is unchanged for junk inputs.
+        from adapt_agent.optimization.runners import framework_runner
+
+        return framework_runner(agent)
 
 
 def _is_runnable(obj: Any) -> bool:
