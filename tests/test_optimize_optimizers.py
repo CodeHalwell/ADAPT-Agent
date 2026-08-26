@@ -335,6 +335,87 @@ def test_coordinate_ascent_verbose_logs(caplog):
     assert any("baseline" in r.message for r in caplog.records)
 
 
+def test_verbose_trial_logging_reports_position_and_elapsed_time(caplog):
+    # The whole point: "trial N of the budget" plus elapsed time, not just a
+    # bare score, so a long run's progress (vs. hung) is visible in the log.
+    import logging
+
+    max_evals = 7
+    state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
+    with caplog.at_level(logging.INFO, logger="adapt_agent.optimization.optimizers"):
+        CoordinateAscentOptimizer(harness(), seed=0, verbose=True, max_evals=max_evals).optimize(
+            agent, dataset()
+        )
+
+    trial_lines = [r.message for r in caplog.records if "trial " in r.message]
+    assert trial_lines, "expected at least one per-trial log line"
+    for line in trial_lines:
+        # "trial <n>/<max_evals> score=... (<elapsed>s elapsed)"
+        assert f"/{max_evals}" in line
+        assert "elapsed)" in line
+
+
+def test_baseline_log_states_the_search_budget(caplog):
+    import logging
+
+    state, agent = build_toy(prompt="BAD", gate="prompt")
+    with caplog.at_level(logging.INFO, logger="adapt_agent.optimization.optimizers"):
+        CoordinateAscentOptimizer(harness(), seed=0, verbose=True, max_evals=12).optimize(
+            agent, dataset()
+        )
+    baseline_lines = [r.message for r in caplog.records if "baseline score" in r.message]
+    assert baseline_lines
+    assert "up to 12 evals" in baseline_lines[0]
+
+
+def test_result_carries_duration_seconds():
+    state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
+    res = CoordinateAscentOptimizer(harness(), seed=0).optimize(agent, dataset())
+    assert res.duration_seconds > 0.0
+    assert res.duration_seconds < 30.0  # a toy, in-process agent finishes quickly
+    assert res.to_dict()["duration_seconds"] == res.duration_seconds
+    assert f"duration={res.duration_seconds:.1f}s" in repr(res)
+
+
+def test_to_config_header_reports_duration(tmp_path):
+    state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
+    res = CoordinateAscentOptimizer(harness(), seed=0).optimize(agent, dataset())
+    path = tmp_path / "tuned.yaml"
+    res.to_config(path)
+    text = path.read_text()
+    assert "evals in" in text and "s.\n" in text
+
+
+def test_pipeline_verbose_logs_stage_transitions(caplog):
+    import logging
+
+    state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
+    stages = [
+        GridSearchOptimizer(harness(), max_evals=4, verbose=True),
+        GridSearchOptimizer(harness(), max_evals=4, verbose=True),
+    ]
+    pipe = PipelineOptimizer(harness(), stages, max_evals=8, verbose=True)
+    with caplog.at_level(logging.INFO, logger="adapt_agent.optimization.optimizers"):
+        pipe.optimize(agent, dataset())
+
+    stage_lines = [r.message for r in caplog.records if "stage " in r.message]
+    assert any("stage 1/2" in line for line in stage_lines)
+    assert any("stage 2/2" in line for line in stage_lines)
+    # The pipeline's own summary line, distinct from each stage's own.
+    assert any(r.message.startswith("[pipeline]") for r in caplog.records)
+
+
+def test_pipeline_result_duration_covers_the_whole_run():
+    state, agent = build_toy(prompt="BAD", gate="prompt", prompt_candidates=["BAD", GOOD_PROMPT])
+    stages = [
+        GridSearchOptimizer(harness(), max_evals=4),
+        GridSearchOptimizer(harness(), max_evals=4),
+    ]
+    pipe = PipelineOptimizer(harness(), stages, max_evals=8)
+    res = pipe.optimize(agent, dataset())
+    assert res.duration_seconds > 0.0
+
+
 # -- BootstrapFewShotOptimizer ------------------------------------------------
 
 

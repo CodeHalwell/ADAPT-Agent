@@ -267,6 +267,27 @@ identical configurations to average out; setting it on a `PipelineOptimizer`
 also disables caching in every stage for that run, while a stage's own
 `False` inside a caching pipeline is still respected.
 
+### Watching a long run
+
+Pass `verbose=True` to any optimizer for progress logging at `INFO` level:
+each trial logs its position out of the run's evaluation budget and the
+wall-clock time elapsed since the run started, so a run measured in hours
+distinguishes "still working" from "hung" without an external progress
+indicator:
+
+```
+[coordinate_ascent] baseline score=0.4100 (search budget: up to 60 evals)
+[coordinate_ascent] trial 5/60 score=0.7100 ACCEPT (142.3s elapsed)
+[coordinate_ascent] trial 6/60 score=0.6800  (187.9s elapsed)
+```
+
+A `PipelineOptimizer` also logs its own stage transitions (`stage 2/4
+(coordinate_ascent) starting: 15/60 evals used so far (203.1s elapsed)`) in
+addition to each stage's own per-trial lines against that stage's own
+(budget-clamped) `max_evals`. The finished `OptimizationResult` carries the
+total wall-clock time as `duration_seconds`, included in `to_dict()`, `repr()`,
+and the provenance header `to_config()` writes.
+
 ## Evaluation reports
 
 `EvaluationHarness.evaluate(agent, dataset)` returns an `EvaluationReport`:

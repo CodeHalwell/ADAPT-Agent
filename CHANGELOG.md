@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`verbose=True` now reports where a long run actually is, not just what it
+  found.** Per-trial logging showed a candidate's score with no sense of
+  position or pace -- indistinguishable, over a run measured in hours, from a
+  hang. Every optimizer's trial log now includes the trial's position out of
+  the run's evaluation budget and the wall-clock time elapsed since the run
+  started (`trial 5/60 score=0.7100 ACCEPT (142.3s elapsed)`), and the
+  baseline-start line states the budget up front
+  (`baseline score=0.4100 (search budget: up to 60 evals)`).
+  `PipelineOptimizer` -- which overrides `optimize()` entirely and so never
+  ran the base class's verbose logging for itself, only ever forwarding
+  `verbose` into each stage -- now also logs its own stage transitions
+  (`stage 2/4 (coordinate_ascent) starting: 15/60 evals used so far (203.1s
+  elapsed)`) and a completion summary, so a multi-stage `make_default_optimizer`
+  pipeline no longer reads as one unexplained pause between each stage's own
+  output.
+
+  `OptimizationResult` gained `duration_seconds` (wall-clock time for the
+  whole `optimize` call), appended at the end of the dataclass per its
+  append-only convention, surfaced in `to_dict()`, `repr()`, and the
+  provenance header `to_config()` writes to a tuned-config file.
+
 - **`OptimizableAgent` (and every `from_*` constructor, plus `wrap()`) gained
   `exclude=` and `replace=`, so introspection catching up to a hand-bound
   workaround no longer silently doubles a knob.** Parameters are opaque
