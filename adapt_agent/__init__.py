@@ -4,7 +4,7 @@ ADAPT-Agent: Adversarial Defense & Policy Training for LLM Agents
 A comprehensive library for LLM agent optimization and security.
 """
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 # Core exports
 # Framework adapters
