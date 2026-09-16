@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from typing import Any, Optional
+from collections import deque
 
 
 class AgentObserver:
@@ -35,7 +36,7 @@ class AgentObserver:
         self.max_metric_names = max_metric_names
         # ⚡ Bolt: Using a dict instead of list for O(1) trace lookups
         self._traces: dict[str, dict[str, Any]] = {}
-        self._logs: list[dict[str, Any]] = []
+        self._logs: deque[dict[str, Any]] = deque(maxlen=max_logs) # ⚡ Bolt: Use deque for O(1) bounded eviction
         self._metrics: dict[str, list[float]] = {}
 
     def start_trace(
@@ -62,7 +63,7 @@ class AgentObserver:
             "operation": operation,
             "start_time": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
-            "events": [],
+            "events": deque(maxlen=self.max_events_per_trace), # ⚡ Bolt: Use deque for O(1) bounded eviction
             "status": "active",
         }
         self._traces[trace_id] = trace
@@ -119,9 +120,6 @@ class AgentObserver:
         # ⚡ Bolt: Replaced O(N) loop with O(1) dictionary lookup
         if trace_id in self._traces:
             self._traces[trace_id]["events"].append(event)
-            # SECURITY: Prevent unbounded memory growth
-            if len(self._traces[trace_id]["events"]) > self.max_events_per_trace:
-                self._traces[trace_id]["events"].pop(0)
 
     def log(
         self,
@@ -147,10 +145,6 @@ class AgentObserver:
         }
         self._logs.append(log_entry)
 
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._logs) > self.max_logs:
-            self._logs.pop(0)
-
     def record_metric(
         self,
         metric_name: str,
@@ -163,17 +157,13 @@ class AgentObserver:
             value: Metric value
         """
         if metric_name not in self._metrics:
-            self._metrics[metric_name] = []
+            self._metrics[metric_name] = deque(maxlen=self.max_metrics) # ⚡ Bolt: Use deque for O(1) bounded eviction
             # SECURITY: Prevent memory exhaustion from unbounded dictionary
             if len(self._metrics) > self.max_metric_names:
                 oldest_metric = next(iter(self._metrics))
                 del self._metrics[oldest_metric]
 
         self._metrics[metric_name].append(value)
-
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._metrics[metric_name]) > self.max_metrics:
-            self._metrics[metric_name].pop(0)
 
     def get_traces(
         self,
