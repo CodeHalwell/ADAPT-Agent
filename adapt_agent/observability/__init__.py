@@ -1,5 +1,6 @@
 """Observability and monitoring for LLM agents."""
 
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -35,8 +36,8 @@ class AgentObserver:
         self.max_metric_names = max_metric_names
         # ⚡ Bolt: Using a dict instead of list for O(1) trace lookups
         self._traces: dict[str, dict[str, Any]] = {}
-        self._logs: list[dict[str, Any]] = []
-        self._metrics: dict[str, list[float]] = {}
+        self._logs: deque[dict[str, Any]] = deque(maxlen=max_logs)
+        self._metrics: dict[str, deque[float]] = {}
 
     def start_trace(
         self,
@@ -62,7 +63,7 @@ class AgentObserver:
             "operation": operation,
             "start_time": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
-            "events": [],
+            "events": deque(maxlen=self.max_events_per_trace),
             "status": "active",
         }
         self._traces[trace_id] = trace
@@ -119,9 +120,6 @@ class AgentObserver:
         # ⚡ Bolt: Replaced O(N) loop with O(1) dictionary lookup
         if trace_id in self._traces:
             self._traces[trace_id]["events"].append(event)
-            # SECURITY: Prevent unbounded memory growth
-            if len(self._traces[trace_id]["events"]) > self.max_events_per_trace:
-                self._traces[trace_id]["events"].pop(0)
 
     def log(
         self,
@@ -147,10 +145,6 @@ class AgentObserver:
         }
         self._logs.append(log_entry)
 
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._logs) > self.max_logs:
-            self._logs.pop(0)
-
     def record_metric(
         self,
         metric_name: str,
@@ -163,17 +157,13 @@ class AgentObserver:
             value: Metric value
         """
         if metric_name not in self._metrics:
-            self._metrics[metric_name] = []
+            self._metrics[metric_name] = deque(maxlen=self.max_metrics)
             # SECURITY: Prevent memory exhaustion from unbounded dictionary
             if len(self._metrics) > self.max_metric_names:
                 oldest_metric = next(iter(self._metrics))
                 del self._metrics[oldest_metric]
 
         self._metrics[metric_name].append(value)
-
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._metrics[metric_name]) > self.max_metrics:
-            self._metrics[metric_name].pop(0)
 
     def get_traces(
         self,
@@ -199,25 +189,25 @@ class AgentObserver:
                     continue
                 if status and t["status"] != status:
                     continue
-                results.append(t)
+                t_copy = t.copy()
+                t_copy["events"] = list(t["events"])
+                results.append(t_copy)
                 if len(results) >= limit:
                     break
             results.reverse()
             return results
 
         # ⚡ Bolt: Use a single-pass list comprehension with combined conditions to avoid intermediate array allocations and O(N) passes
-        if agent_id and status:
-            return [
-                t
-                for t in self._traces.values()
-                if t["agent_id"] == agent_id and t["status"] == status
-            ]
-        if agent_id:
-            return [t for t in self._traces.values() if t["agent_id"] == agent_id]
-        if status:
-            return [t for t in self._traces.values() if t["status"] == status]
-
-        return list(self._traces.values())
+        results = []
+        for t in self._traces.values():
+            if agent_id and t["agent_id"] != agent_id:
+                continue
+            if status and t["status"] != status:
+                continue
+            t_copy = t.copy()
+            t_copy["events"] = list(t["events"])
+            results.append(t_copy)
+        return results
 
     def get_logs(
         self,
@@ -250,18 +240,14 @@ class AgentObserver:
             return results
 
         # ⚡ Bolt: Use a single-pass list comprehension with combined conditions to avoid intermediate array allocations and O(N) passes
-        if level and agent_id:
-            return [
-                log
-                for log in self._logs
-                if log["level"] == level and log.get("agent_id") == agent_id
-            ]
-        if level:
-            return [log for log in self._logs if log["level"] == level]
-        if agent_id:
-            return [log for log in self._logs if log.get("agent_id") == agent_id]
-
-        return list(self._logs)
+        results = []
+        for log in self._logs:
+            if level and log["level"] != level:
+                continue
+            if agent_id and log.get("agent_id") != agent_id:
+                continue
+            results.append(dict(log))
+        return results
 
     def get_metric_stats(self, metric_name: str) -> dict[str, float]:
         """Get statistics for a metric.

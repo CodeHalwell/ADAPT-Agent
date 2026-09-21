@@ -11,7 +11,7 @@ def test_start_and_end_trace_status_and_result():
     )
     assert trace["status"] == "active"
     assert trace["metadata"] == {"k": "v"}
-    assert trace["events"] == []
+    assert list(trace["events"]) == []
 
     observer.end_trace("t1", status="failed", result={"error": "boom"})
     traces = observer.get_traces()
