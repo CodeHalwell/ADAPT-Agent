@@ -78,3 +78,6 @@
 ## 2024-07-28 - Replace list.pop(0) with bounded deque for O(1) eviction
 **Learning:** In `adapt_agent/evaluation/__init__.py`, maintaining a bounded history using `list.pop(0)` creates an O(N) performance bottleneck because it requires shifting all subsequent elements in the array.
 **Action:** Use `collections.deque(maxlen=...)` instead of a list when maintaining a fixed-size ring buffer, as it automatically evicts the oldest item in O(1) time when appended to.
+## 2024-05-32 - O(1) exception chain traversal
+**Learning:** In `adapt_agent/optimization/retry.py`, extracting elements from a list using `pop(0)` to process an exception chain creates an $O(N)$ bottleneck, which becomes $O(N^2)$ overall.
+**Action:** Replace `list` with `collections.deque` and `pop(0)` with `popleft()` for $O(1)$ operations from the front of the queue.

@@ -28,6 +28,7 @@ import threading
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from collections import deque
 from typing import Any, Literal, cast
 
 #: Non-5xx status codes worth retrying: throttling, request timeouts, a
@@ -205,9 +206,9 @@ def _exception_chain(exc: BaseException) -> list[BaseException]:
     """
     chain: list[BaseException] = []
     seen: set[int] = set()
-    pending: list[BaseException] = [exc]
+    pending: deque[BaseException] = deque([exc])
     while pending:
-        current = pending.pop(0)
+        current = pending.popleft()
         if id(current) in seen:
             continue
         seen.add(id(current))
