@@ -1,5 +1,6 @@
 """Observability and monitoring for LLM agents."""
 
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -35,8 +36,9 @@ class AgentObserver:
         self.max_metric_names = max_metric_names
         # ⚡ Bolt: Using a dict instead of list for O(1) trace lookups
         self._traces: dict[str, dict[str, Any]] = {}
-        self._logs: list[dict[str, Any]] = []
-        self._metrics: dict[str, list[float]] = {}
+        # ⚡ Bolt: Replaced list with bounded deque for O(1) eviction
+        self._logs: deque[dict[str, Any]] = deque(maxlen=max_logs)
+        self._metrics: dict[str, deque[float]] = {}
 
     def start_trace(
         self,
@@ -62,7 +64,7 @@ class AgentObserver:
             "operation": operation,
             "start_time": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
-            "events": [],
+            "events": deque(maxlen=self.max_events_per_trace),
             "status": "active",
         }
         self._traces[trace_id] = trace
@@ -72,7 +74,7 @@ class AgentObserver:
             oldest_trace_id = next(iter(self._traces))
             del self._traces[oldest_trace_id]
 
-        return trace
+        return {**trace, "events": list(trace["events"])}
 
     def end_trace(
         self,
@@ -119,9 +121,6 @@ class AgentObserver:
         # ⚡ Bolt: Replaced O(N) loop with O(1) dictionary lookup
         if trace_id in self._traces:
             self._traces[trace_id]["events"].append(event)
-            # SECURITY: Prevent unbounded memory growth
-            if len(self._traces[trace_id]["events"]) > self.max_events_per_trace:
-                self._traces[trace_id]["events"].pop(0)
 
     def log(
         self,
@@ -147,10 +146,6 @@ class AgentObserver:
         }
         self._logs.append(log_entry)
 
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._logs) > self.max_logs:
-            self._logs.pop(0)
-
     def record_metric(
         self,
         metric_name: str,
@@ -163,17 +158,13 @@ class AgentObserver:
             value: Metric value
         """
         if metric_name not in self._metrics:
-            self._metrics[metric_name] = []
+            self._metrics[metric_name] = deque(maxlen=self.max_metrics)
             # SECURITY: Prevent memory exhaustion from unbounded dictionary
             if len(self._metrics) > self.max_metric_names:
                 oldest_metric = next(iter(self._metrics))
                 del self._metrics[oldest_metric]
 
         self._metrics[metric_name].append(value)
-
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._metrics[metric_name]) > self.max_metrics:
-            self._metrics[metric_name].pop(0)
 
     def get_traces(
         self,
@@ -199,7 +190,7 @@ class AgentObserver:
                     continue
                 if status and t["status"] != status:
                     continue
-                results.append(t)
+                results.append({**t, "events": list(t["events"])})
                 if len(results) >= limit:
                     break
             results.reverse()
@@ -208,16 +199,16 @@ class AgentObserver:
         # ⚡ Bolt: Use a single-pass list comprehension with combined conditions to avoid intermediate array allocations and O(N) passes
         if agent_id and status:
             return [
-                t
+                {**t, "events": list(t["events"])}
                 for t in self._traces.values()
                 if t["agent_id"] == agent_id and t["status"] == status
             ]
         if agent_id:
-            return [t for t in self._traces.values() if t["agent_id"] == agent_id]
+            return [{**t, "events": list(t["events"])} for t in self._traces.values() if t["agent_id"] == agent_id]
         if status:
-            return [t for t in self._traces.values() if t["status"] == status]
+            return [{**t, "events": list(t["events"])} for t in self._traces.values() if t["status"] == status]
 
-        return list(self._traces.values())
+        return [{**t, "events": list(t["events"])} for t in self._traces.values()]
 
     def get_logs(
         self,
