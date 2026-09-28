@@ -99,3 +99,7 @@
 **Vulnerability:** The firewall truncated potentially massive input strings by applying python `.replace()` on the first N characters. This had two vulnerabilities: first, an O(N) DoS on massive strings because string copying/replacement occurs over potentially massive arrays if the string wasn't properly pre-truncated, and second, if a string was strictly truncated to N characters *after* escaping, partial escape sequences like `\` could be written to event logs, corrupting metadata or downstream log parsers. Additionally, `_check` applied truncation *before* escaping, which meant escaping could push the string over the maximum allowed length.
 **Learning:** String truncation for security event logging must be perfectly length-bounded and safe from partial escape sequences, while escaping must happen *after* an initial protective truncation to prevent O(N) performance DoS on massive inputs.
 **Prevention:** Implement boundary-aware string truncation functions that truncate before escaping (for DoS protection), replace, truncate *again* strictly, and then aggressively strip dangling backslashes (`\`) left behind at the exact boundary.
+## 2024-05-20 - Precise truncation of escaped strings
+**Vulnerability:** Heuristic checks for string truncation could strip legitimate trailing backslashes.
+**Learning:** Heuristics based on odd character counts or trailing strings can mutate legitimate inputs.
+**Prevention:** Use a boundary-aware binary search on the unescaped string to reliably enforce length limits without bisecting multi-character escapes.
