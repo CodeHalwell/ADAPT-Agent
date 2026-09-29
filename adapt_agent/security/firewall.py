@@ -135,13 +135,18 @@ class Firewall:
     def _truncate_escaped(text: str, max_length: int) -> str:
         """Safely truncate text to max_length after escaping to prevent partial escapes."""
         truncated = text[:max_length]
-        escaped = truncated.replace("\n", "\\n").replace("\r", "\\r")
-        if len(escaped) <= max_length:
-            return escaped
-        safe = escaped[:max_length]
-        if safe.endswith("\\") and escaped[max_length] in ("n", "r"):
-            safe = safe[:-1]
-        return safe
+        # Binary search to find max valid length without splitting multi-char escapes
+        low, high = 0, len(truncated)
+        best = 0
+        while low <= high:
+            mid = (low + high) // 2
+            escaped = truncated[:mid].replace("\n", "\\n").replace("\r", "\\r")
+            if len(escaped) <= max_length:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        return truncated[:best].replace("\n", "\\n").replace("\r", "\\r")
 
     @staticmethod
     def _redact_snippet(content: str) -> str:
