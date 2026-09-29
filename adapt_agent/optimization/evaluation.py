@@ -732,7 +732,11 @@ class EvaluationHarness:
             # direct call -- the same contract split the previous round closed,
             # reopened one layer down.
             fallback = declared if carried is None else carried
-            return 0.0 if fallback is None else max(0.0, min(1.0, float(fallback)))
+            if fallback is None:
+                return 0.0
+            val = float(fallback)
+            # OPTIMIZATION: chained ternary is faster than max(min()) for scalar clamping
+            return 0.0 if val < 0.0 else 1.0 if val > 1.0 else val
 
         attempt = 1
         while True:

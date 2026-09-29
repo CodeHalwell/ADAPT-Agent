@@ -815,8 +815,11 @@ def _normalize_score(raw: Any, scale: int, default: float, is_normalized: bool =
     else:
         return default
     if is_normalized:
-        return max(0.0, min(1.0, value))
-    return max(0.0, min(1.0, value / scale))
+        # OPTIMIZATION: chained ternary is faster than max(min()) for scalar clamping
+        return 0.0 if value < 0.0 else 1.0 if value > 1.0 else value
+    val = value / scale
+    # OPTIMIZATION: chained ternary is faster than max(min()) for scalar clamping
+    return 0.0 if val < 0.0 else 1.0 if val > 1.0 else val
 
 
 def _extract_string_list(text: str, *, key: str) -> list[str]:
