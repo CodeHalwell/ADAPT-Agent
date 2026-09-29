@@ -111,7 +111,9 @@ class NumericProposer(Proposer):
         if isinstance(current, (int, float)):
             span = (high - low) or 1.0
             for delta in (-0.2, -0.1, 0.1, 0.2):
-                cand = param._coerce_numeric(min(high, max(low, current + delta * span)))
+                val = current + delta * span
+                # OPTIMIZATION: chained ternary is faster than max(min()) for scalar clamping
+                cand = param._coerce_numeric(low if val < low else high if val > high else val)
                 if cand != current and cand not in out:
                     out.append(cand)
         # Random exploration to escape local optima.

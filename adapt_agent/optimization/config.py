@@ -595,8 +595,9 @@ def _validate_bounds(spec: ParameterSpec) -> tuple[float, float] | None:
         # Clamp BOTH ends into [0, max_temp] so a range entirely above the max
         # (e.g. [3.0, 4.0] with max 2.0) collapses to a valid (2.0, 2.0) rather
         # than an inverted (3.0, 2.0) that would later fail Parameter validation.
-        clamped_low = min(max(low, 0.0), max_temp)
-        clamped_high = min(max(high, 0.0), max_temp)
+        # OPTIMIZATION: chained ternary is faster than max(min()) for scalar clamping
+        clamped_low = 0.0 if low < 0.0 else max_temp if low > max_temp else low
+        clamped_high = 0.0 if high < 0.0 else max_temp if high > max_temp else high
         if (clamped_low, clamped_high) != (low, high):
             logger.warning(
                 "parameter %s temperature bounds %s exceed the allowable range "

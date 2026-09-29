@@ -188,11 +188,13 @@ class ModelProvider(ABC):
                     self.max_temperature,
                     self.model,
                 )
-            result["temperature"] = min(max(temperature, 0.0), self.max_temperature)
+            # OPTIMIZATION: chained ternary is faster than max(min()) for scalar clamping
+            result["temperature"] = 0.0 if temperature < 0.0 else self.max_temperature if temperature > self.max_temperature else temperature
 
         top_p = overrides.get("top_p")
         if top_p is not None:
-            result["top_p"] = min(max(top_p, 0.0), 1.0)
+            # OPTIMIZATION: chained ternary is faster than max(min()) for scalar clamping
+            result["top_p"] = 0.0 if top_p < 0.0 else 1.0 if top_p > 1.0 else top_p
         return result
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic

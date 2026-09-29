@@ -90,7 +90,9 @@ class TrustManager:
             Updated trust score
         """
         current_score = self.get_trust_score(agent_id)
-        new_score = max(self.min_trust, min(self.max_trust, current_score + delta))
+        val = current_score + delta
+        # OPTIMIZATION: chained ternary is faster than max(min()) for scalar clamping
+        new_score = self.min_trust if val < self.min_trust else self.max_trust if val > self.max_trust else val
 
         # Insert/update and mark as most-recently-used.
         self._trust_scores[agent_id] = new_score
@@ -164,8 +166,9 @@ class TrustManager:
         current_score = self.get_trust_score(agent_id)
         factor_sum = sum(factors.values())
 
+        val = current_score + factor_sum
         trust_score: TrustScore = {
-            "score": max(self.min_trust, min(self.max_trust, current_score + factor_sum)),
+            "score": self.min_trust if val < self.min_trust else self.max_trust if val > self.max_trust else val, # OPTIMIZATION: avoids max(min()) overhead
             "confidence": 0.8,
             "factors": factors,
             "timestamp": datetime.now(timezone.utc).isoformat(),
