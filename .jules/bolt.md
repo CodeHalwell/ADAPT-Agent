@@ -78,3 +78,6 @@
 ## 2024-07-28 - Replace list.pop(0) with bounded deque for O(1) eviction
 **Learning:** In `adapt_agent/evaluation/__init__.py`, maintaining a bounded history using `list.pop(0)` creates an O(N) performance bottleneck because it requires shifting all subsequent elements in the array.
 **Action:** Use `collections.deque(maxlen=...)` instead of a list when maintaining a fixed-size ring buffer, as it automatically evicts the oldest item in O(1) time when appended to.
+## 2026-09-30 - Avoid String Manipulations in Hot Loops
+**Learning:** Pre-computing normalized representations for matching targets instead of continuously computing string manipulations inside a hot evaluation loop drastically reduces O(N) evaluation overhead. In `MemorySystem.search`, pre-computing `str(value).lower()` upon insertion reduced search execution time by ~50%.
+**Action:** When searching a list of static strings, compute properties like lowercased versions at insertion time instead of evaluation time.

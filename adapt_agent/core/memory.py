@@ -50,6 +50,7 @@ class MemorySystem:
         memory_item = {
             "key": key,
             "value": value,
+            "value_lower": str(value).lower(),
             "metadata": metadata or {},
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "access_count": 0,
@@ -84,6 +85,7 @@ class MemorySystem:
         for existing in self._long_term_memory:
             if existing["key"] == key:
                 existing["value"] = value
+                existing["value_lower"] = str(value).lower()
                 if metadata is not None:
                     existing["metadata"] = metadata
                 # Preserve the strongest signal of importance.
@@ -94,6 +96,7 @@ class MemorySystem:
         memory_item = {
             "key": key,
             "value": value,
+            "value_lower": str(value).lower(),
             "metadata": metadata or {},
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "access_count": access_count,
@@ -159,7 +162,8 @@ class MemorySystem:
         query_lower = query.lower()
         for item in reversed(memory):
             # Simple substring search (can be enhanced with semantic search)
-            if query_lower in str(item["value"]).lower():
+            # ⚡ Bolt: Fast lookup using pre-computed lowercase representation
+            if query_lower in item.get("value_lower", str(item["value"]).lower()):
                 item["access_count"] += 1
                 results.append(item)
                 if len(results) >= limit:
