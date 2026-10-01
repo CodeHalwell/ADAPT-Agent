@@ -78,3 +78,6 @@
 ## 2024-07-28 - Replace list.pop(0) with bounded deque for O(1) eviction
 **Learning:** In `adapt_agent/evaluation/__init__.py`, maintaining a bounded history using `list.pop(0)` creates an O(N) performance bottleneck because it requires shifting all subsequent elements in the array.
 **Action:** Use `collections.deque(maxlen=...)` instead of a list when maintaining a fixed-size ring buffer, as it automatically evicts the oldest item in O(1) time when appended to.
+## 2024-05-20 - Scalar Clamping Optimization
+**Learning:** Using built-in functions like `max(low, min(high, value))` for scalar clamping introduces significant function call overhead in hot loops compared to simple conditionals.
+**Action:** Replace nested `max/min` calls with chained ternary operators (e.g., `low if value < low else high if value > high else value`) for scalar clamping to optimize performance.
