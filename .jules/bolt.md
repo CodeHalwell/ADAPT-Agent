@@ -78,3 +78,6 @@
 ## 2024-07-28 - Replace list.pop(0) with bounded deque for O(1) eviction
 **Learning:** In `adapt_agent/evaluation/__init__.py`, maintaining a bounded history using `list.pop(0)` creates an O(N) performance bottleneck because it requires shifting all subsequent elements in the array.
 **Action:** Use `collections.deque(maxlen=...)` instead of a list when maintaining a fixed-size ring buffer, as it automatically evicts the oldest item in O(1) time when appended to.
+## 2023-10-02 - Chained ternary operator optimization
+**Learning:** For clamping scalar values in Python, replacing nested built-in function calls like `max(low, min(high, value))` with a chained ternary operator (`low if value < low else high if value > high else value`) avoids function call overhead and executes significantly faster.
+**Action:** Use chained ternary operators instead of nested min/max for simple bounds clamping in hot loops or frequently evaluated paths.
