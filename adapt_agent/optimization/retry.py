@@ -26,6 +26,7 @@ import random
 import re
 import threading
 import weakref
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
@@ -205,9 +206,10 @@ def _exception_chain(exc: BaseException) -> list[BaseException]:
     """
     chain: list[BaseException] = []
     seen: set[int] = set()
-    pending: list[BaseException] = [exc]
+    # ⚡ Bolt: Use deque for O(1) popleft instead of O(N) list.pop(0)
+    pending: deque[BaseException] = deque([exc])
     while pending:
-        current = pending.pop(0)
+        current = pending.popleft()
         if id(current) in seen:
             continue
         seen.add(id(current))

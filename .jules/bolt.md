@@ -78,3 +78,6 @@
 ## 2024-07-28 - Replace list.pop(0) with bounded deque for O(1) eviction
 **Learning:** In `adapt_agent/evaluation/__init__.py`, maintaining a bounded history using `list.pop(0)` creates an O(N) performance bottleneck because it requires shifting all subsequent elements in the array.
 **Action:** Use `collections.deque(maxlen=...)` instead of a list when maintaining a fixed-size ring buffer, as it automatically evicts the oldest item in O(1) time when appended to.
+## 2024-10-25 - Avoid O(N) list pops in queue processing
+**Learning:** Using `list.pop(0)` inside a while loop (as seen in `_exception_chain`) causes an O(N^2) operation because `list.pop(0)` takes O(N) time as it shifts all elements to the left.
+**Action:** Use `collections.deque` and `deque.popleft()` for O(1) queue processing instead of standard lists to avoid O(N) performance penalties on large sequences.
