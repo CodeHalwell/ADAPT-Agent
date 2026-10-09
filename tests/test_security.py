@@ -136,3 +136,13 @@ def test_taint_tracker_get_stats():
     # So: HIGH -> {source1, source3} = 2, LOW -> {source2} = 1
     assert stats["taint_level_distribution"][TaintLevel.HIGH.value] == 2
     assert stats["taint_level_distribution"][TaintLevel.LOW.value] == 1
+
+def test_truncate_escaped():
+    """Test boundary-aware string truncation of multi-character escapes."""
+    from adapt_agent.security.firewall import Firewall
+    # Should not strip backslash if it's a valid trailing character
+    assert Firewall._truncate_escaped("a\n\\n", 4) == "a\\n\\"
+    # Should completely truncate partial \n
+    assert Firewall._truncate_escaped("abc\n", 4) == "abc"
+    # Should keep complete \n and stop
+    assert Firewall._truncate_escaped("a\nb\nc", 5) == "a\\nb"
