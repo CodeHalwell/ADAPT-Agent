@@ -1,5 +1,6 @@
 """Observability and monitoring for LLM agents."""
 
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -35,7 +36,7 @@ class AgentObserver:
         self.max_metric_names = max_metric_names
         # ⚡ Bolt: Using a dict instead of list for O(1) trace lookups
         self._traces: dict[str, dict[str, Any]] = {}
-        self._logs: list[dict[str, Any]] = []
+        self._logs: deque[dict[str, Any]] = deque(maxlen=max_logs)
         self._metrics: dict[str, list[float]] = {}
 
     def start_trace(
@@ -146,10 +147,6 @@ class AgentObserver:
             "metadata": metadata or {},
         }
         self._logs.append(log_entry)
-
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._logs) > self.max_logs:
-            self._logs.pop(0)
 
     def record_metric(
         self,

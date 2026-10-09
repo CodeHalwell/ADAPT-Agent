@@ -78,3 +78,6 @@
 ## 2024-07-28 - Replace list.pop(0) with bounded deque for O(1) eviction
 **Learning:** In `adapt_agent/evaluation/__init__.py`, maintaining a bounded history using `list.pop(0)` creates an O(N) performance bottleneck because it requires shifting all subsequent elements in the array.
 **Action:** Use `collections.deque(maxlen=...)` instead of a list when maintaining a fixed-size ring buffer, as it automatically evicts the oldest item in O(1) time when appended to.
+## 2024-10-27 - Replace list.pop(0) with bounded deque for logs
+**Learning:** In `adapt_agent/observability/__init__.py`, maintaining a bounded log history using `list.pop(0)` creates an O(N) performance bottleneck because it shifts all subsequent elements.
+**Action:** Use `collections.deque(maxlen=...)` instead of a list when maintaining a fixed-size ring buffer for logs, as it evicts the oldest item in O(1) time automatically.
