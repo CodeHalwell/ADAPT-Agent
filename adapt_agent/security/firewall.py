@@ -138,10 +138,21 @@ class Firewall:
         escaped = truncated.replace("\n", "\\n").replace("\r", "\\r")
         if len(escaped) <= max_length:
             return escaped
-        safe = escaped[:max_length]
-        if safe.endswith("\\") and escaped[max_length] in ("n", "r"):
-            safe = safe[:-1]
-        return safe
+
+        low = 0
+        high = len(truncated)
+        best_mid = 0
+
+        while low <= high:
+            mid = (low + high) // 2
+            escaped_len = mid + truncated.count("\n", 0, mid) + truncated.count("\r", 0, mid)
+            if escaped_len <= max_length:
+                best_mid = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        return truncated[:best_mid].replace("\n", "\\n").replace("\r", "\\r")
 
     @staticmethod
     def _redact_snippet(content: str) -> str:
