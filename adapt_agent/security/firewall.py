@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from re import Pattern
@@ -78,7 +79,7 @@ class Firewall:
         self._blocked_patterns: list[Pattern] = []
         self._allowed_patterns: list[Pattern] = []
         self._custom_filters: list[Callable[[str], bool]] = []
-        self._security_events: list[SecurityEvent] = []
+        self._security_events: deque[SecurityEvent] = deque(maxlen=max_events)
         self._blocked_count = 0
         self.max_content_length = max_content_length
         self.max_events = max_events
@@ -313,7 +314,7 @@ class Firewall:
         Returns:
             List of security events
         """
-        events = self._security_events
+        events = list(self._security_events)
 
         if severity:
             # ⚡ Bolt: Fast path for finding limited recent events with a specific severity
@@ -370,7 +371,3 @@ class Firewall:
             "metadata": metadata,
         }
         self._security_events.append(event)
-
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._security_events) > self.max_events:
-            self._security_events.pop(0)
