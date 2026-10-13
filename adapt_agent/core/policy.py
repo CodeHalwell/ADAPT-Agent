@@ -3,6 +3,7 @@
 import ast
 import logging
 import operator
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -90,7 +91,8 @@ class PolicyEnforcer:
         self.max_violations = max_violations
         self.fail_closed = fail_closed
         self._rules: dict[str, PolicyRule] = {}
-        self._violations: list[dict[str, Any]] = []
+        # ⚡ Bolt: Use deque(maxlen=...) for O(1) eviction instead of O(N) list.pop(0)
+        self._violations: deque[dict[str, Any]] = deque(maxlen=max_violations)
         self._rule_handlers: dict[str, Callable] = {}
 
     def add_rule(
@@ -231,7 +233,8 @@ class PolicyEnforcer:
         Returns:
             List of violation records
         """
-        violations = self._violations
+        # Cast deque to list to support slicing and serialization
+        violations = list(self._violations)
 
         if severity:
             # ⚡ Bolt: Fast path for finding limited recent violations with a specific severity
@@ -388,10 +391,7 @@ class PolicyEnforcer:
             "data": data,
         }
         self._violations.append(violation)
-
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._violations) > self.max_violations:
-            self._violations.pop(0)
+        # deque(maxlen=...) handles unbounded memory growth automatically
 
     def _handle_violation(self, rule: PolicyRule) -> None:
         """Handle a policy violation.
