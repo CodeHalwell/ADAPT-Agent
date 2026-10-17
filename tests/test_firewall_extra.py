@@ -252,3 +252,13 @@ def test_blocked_pattern_with_ignorecase_flag():
     firewall.add_blocked_pattern(r"secret", flags=re.IGNORECASE)
 
     assert firewall.check_input("SECRET value") is False
+
+def test_truncate_escaped_no_mangle_legitimate_backslashes():
+    from adapt_agent.security.firewall import Firewall
+    # Legitimate trailing backslash that shouldn't be stripped
+    res = Firewall._truncate_escaped("a\nb\\n", 5)
+    assert res == "a\\nb\\"
+
+    # Should safely truncate the escape without bisecting
+    res2 = Firewall._truncate_escaped("1234\n\\n", 7)
+    assert res2 == "1234\\n\\"
