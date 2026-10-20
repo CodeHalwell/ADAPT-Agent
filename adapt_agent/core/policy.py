@@ -3,6 +3,7 @@
 import ast
 import logging
 import operator
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -90,7 +91,8 @@ class PolicyEnforcer:
         self.max_violations = max_violations
         self.fail_closed = fail_closed
         self._rules: dict[str, PolicyRule] = {}
-        self._violations: list[dict[str, Any]] = []
+        # ⚡ Bolt: Replace O(N) list.pop(0) ring buffer with O(1) collections.deque
+        self._violations: deque[dict[str, Any]] = deque(maxlen=max_violations)
         self._rule_handlers: dict[str, Callable] = {}
 
     def add_rule(
@@ -247,9 +249,9 @@ class PolicyEnforcer:
             return [v for v in violations if v["severity"] == severity]
 
         if limit:
-            return violations[-limit:]
+            return list(violations)[-limit:]
 
-        return violations
+        return list(violations)
 
     def _evaluate_condition(
         self,
@@ -388,10 +390,6 @@ class PolicyEnforcer:
             "data": data,
         }
         self._violations.append(violation)
-
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._violations) > self.max_violations:
-            self._violations.pop(0)
 
     def _handle_violation(self, rule: PolicyRule) -> None:
         """Handle a policy violation.
