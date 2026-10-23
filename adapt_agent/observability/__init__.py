@@ -94,6 +94,21 @@ class AgentObserver:
             trace["status"] = status
             trace["result"] = result
 
+    @staticmethod
+    def _truncate_escaped(text: str, max_length: int) -> str:
+        bounded = text[:max_length]
+        escaped = bounded.replace("\n", "\\n").replace("\r", "\\r")
+        if len(escaped) <= max_length:
+            return escaped
+        best = 0
+        length = 0
+        for i, c in enumerate(bounded):
+            length += 2 if c in ("\n", "\r") else 1
+            if length > max_length:
+                best = i
+                break
+        return bounded[:best].replace("\n", "\\n").replace("\r", "\\r")
+
     def log_event(
         self,
         trace_id: str,
@@ -111,7 +126,7 @@ class AgentObserver:
         """
         event = {
             "event_type": event_type,
-            "description": description[:10000].replace("\n", "\\n").replace("\r", "\\r"),
+            "description": self._truncate_escaped(description, 10000),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
         }
@@ -140,7 +155,7 @@ class AgentObserver:
         """
         log_entry = {
             "level": level,
-            "message": message[:10000].replace("\n", "\\n").replace("\r", "\\r"),
+            "message": self._truncate_escaped(message, 10000),
             "agent_id": agent_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {},
