@@ -81,3 +81,6 @@
 ## 2024-08-01 - Avoid String Manipulations in Hot Search Loops
 **Learning:** In `adapt_agent/core/memory.py`, redundantly calling `str(item["value"]).lower()` on every loop iteration inside the `search()` method created an O(N) evaluation overhead due to continuous string manipulation and allocation during search.
 **Action:** Always pre-compute and store normalized search representations (like lowercased strings) at insertion time instead of dynamically computing them during reads, significantly reducing traversal overhead.
+## 2024-10-23 - Optimize Ring Buffer Eviction with deque
+**Learning:** Maintaining a bounded history or ring buffer using `list.pop(0)` creates an O(N) performance bottleneck as it shifts all elements.
+**Action:** Use `collections.deque(maxlen=...)` instead for automatic O(1) eviction. Since `deque` is not natively JSON-serializable, ensure functions returning these collections cast them back to a `list` to maintain compatibility.
