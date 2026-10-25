@@ -103,3 +103,7 @@
 **Vulnerability:** The `_truncate_escaped` heuristic string processing (like checking `endswith("\\")`) could misidentify legitimate trailing backslashes as partial escapes and wrongly strip them, altering data integrity and risking an IndexError if string indices exceed bounds.
 **Learning:** Checking string boundaries for truncation heuristics often leads to edge cases or logic bugs when character substitutions expand length. Using boundary-aware binary search maps unescaped points precisely without dissecting escapes.
 **Prevention:** Always bound string loops, and rely on bounded string methods (like `count` over slices via offsets) to avoid O(N) memory allocations, using binary search mapped over bounded ranges instead of naive string matching for truncation.
+## 2024-10-27 - Fix log poisoning in AdversarialDefense analysis results
+**Vulnerability:** The AdversarialDefense.analyze_input method returned a truncated snippet of the user input but did not sanitize it by replacing newline and carriage return characters.
+**Learning:** Even sanitized output returned in analysis results can be manipulated to break log formatting and inject fake entries if newlines are not escaped when the result dictionary is logged by the caller.
+**Prevention:** Explicitly sanitize and escape newline/carriage return characters on input snippets returned in analysis result dictionaries before passing them back to the caller.
