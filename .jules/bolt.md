@@ -81,3 +81,6 @@
 ## 2024-08-01 - Avoid String Manipulations in Hot Search Loops
 **Learning:** In `adapt_agent/core/memory.py`, redundantly calling `str(item["value"]).lower()` on every loop iteration inside the `search()` method created an O(N) evaluation overhead due to continuous string manipulation and allocation during search.
 **Action:** Always pre-compute and store normalized search representations (like lowercased strings) at insertion time instead of dynamically computing them during reads, significantly reducing traversal overhead.
+## 2024-10-26 - Replace list.pop(0) with bounded deque for O(1) eviction
+**Learning:** In `adapt_agent/adversarial/__init__.py`, maintaining a bounded history using `list.pop(0)` creates an O(N) performance bottleneck because it requires shifting all subsequent elements in the array.
+**Action:** Use `collections.deque(maxlen=...)` instead of a list when maintaining a fixed-size ring buffer, as it automatically evicts the oldest item in O(1) time when appended to.
