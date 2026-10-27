@@ -81,3 +81,7 @@
 ## 2024-08-01 - Avoid String Manipulations in Hot Search Loops
 **Learning:** In `adapt_agent/core/memory.py`, redundantly calling `str(item["value"]).lower()` on every loop iteration inside the `search()` method created an O(N) evaluation overhead due to continuous string manipulation and allocation during search.
 **Action:** Always pre-compute and store normalized search representations (like lowercased strings) at insertion time instead of dynamically computing them during reads, significantly reducing traversal overhead.
+
+## 2025-02-27 - Replace O(N) list.pop(0) with O(1) collections.deque
+**Learning:** Using `list.pop(0)` to manage a bounded list buffer introduces an O(N) shift operation on every insertion once the limit is reached, which causes a performance bottleneck over time.
+**Action:** Use `collections.deque(maxlen=...)` which handles bounding and eviction automatically with O(1) performance.
