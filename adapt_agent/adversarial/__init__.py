@@ -6,6 +6,7 @@ import html
 import re
 import string
 import unicodedata
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, NamedTuple
 
@@ -2090,7 +2091,8 @@ class AdversarialDefense:
         """
         self._attack_patterns: list[str] = []
         self._attack_patterns_tuple: list[tuple[str, str]] = []
-        self._detected_attacks: list[dict[str, Any]] = []
+        # ⚡ Bolt: deque(maxlen) bounds history in O(1) without list.pop(0).
+        self._detected_attacks: deque[dict[str, Any]] = deque(maxlen=max_attacks)
         self._defense_strategies: dict[str, Any] = {}
         self.max_attacks = max_attacks
         self.max_content_length = max_content_length
@@ -2331,10 +2333,6 @@ class AdversarialDefense:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._detected_attacks.append(attack)
-
-        # SECURITY: Prevent unbounded memory growth.
-        if len(self._detected_attacks) > self.max_attacks:
-            self._detected_attacks.pop(0)
 
 
 __all__ = ["AdversarialDefense"]
