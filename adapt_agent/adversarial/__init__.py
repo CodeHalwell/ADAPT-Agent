@@ -2236,7 +2236,7 @@ class AdversarialDefense:
                 f"Input length {len(input_text)} exceeds maximum allowed {self.max_content_length}",
             )
             return {
-                "input": input_text[:100],  # Truncated for privacy.
+                "input": input_text[:100].replace("\n", "\\n").replace("\r", "\\r"),  # Truncated and sanitized.
                 "threats_detected": ["content_too_long"],
                 "is_safe": False,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2265,7 +2265,7 @@ class AdversarialDefense:
             threats.append("custom_pattern")
 
         return {
-            "input": input_text[:100],  # Truncated for privacy.
+            "input": input_text[:100].replace("\n", "\\n").replace("\r", "\\r"),  # Truncated and sanitized.
             "threats_detected": threats,
             "is_safe": len(threats) == 0,
             "timestamp": datetime.now(timezone.utc).isoformat(),
