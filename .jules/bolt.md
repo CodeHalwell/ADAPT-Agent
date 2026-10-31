@@ -81,6 +81,9 @@
 ## 2024-08-01 - Avoid String Manipulations in Hot Search Loops
 **Learning:** In `adapt_agent/core/memory.py`, redundantly calling `str(item["value"]).lower()` on every loop iteration inside the `search()` method created an O(N) evaluation overhead due to continuous string manipulation and allocation during search.
 **Action:** Always pre-compute and store normalized search representations (like lowercased strings) at insertion time instead of dynamically computing them during reads, significantly reducing traversal overhead.
+## 2024-05-20 - Fast Path for Empty Governance Controls
+**Learning:** `GovernanceGate.scan_input` unconditionally called `extract_texts(payload)`, which performs a recursive traversal of the entire payload structure to collect strings, even when no security controls (`firewall` or `defense`) were configured. This adds unnecessary object inspection and O(N) extraction overhead on every agent execution in environments where these controls are disabled.
+**Action:** When designing governance or security gates that traverse payloads, add an early return fast-path (`if self.firewall is None and self.defense is None: return []`) before initiating recursive text extraction.
 ## 2024-10-28 - O(1) Ring Buffer Eviction
 **Learning:** Using `list.pop(0)` to bound an array creates an O(N) performance bottleneck because it requires shifting all subsequent elements in memory.
 **Action:** Use `collections.deque(maxlen=...)` to maintain a bounded history with automatic O(1) eviction instead of a `list`.
