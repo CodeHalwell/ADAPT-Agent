@@ -87,3 +87,6 @@
 ## 2024-10-28 - O(1) Ring Buffer Eviction
 **Learning:** Using `list.pop(0)` to bound an array creates an O(N) performance bottleneck because it requires shifting all subsequent elements in memory.
 **Action:** Use `collections.deque(maxlen=...)` to maintain a bounded history with automatic O(1) eviction instead of a `list`.
+## 2024-11-05 - O(1) Ring Buffer Eviction
+**Learning:** Using `list.pop(0)` to bound the logs array creates an O(N) performance bottleneck because it requires shifting all subsequent elements in memory.
+**Action:** Use `collections.deque(maxlen=...)` to maintain a bounded history with automatic O(1) eviction instead of a `list`.
