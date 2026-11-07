@@ -107,3 +107,7 @@
 **Vulnerability:** The AdversarialDefense.analyze_input method returned a truncated snippet of the user input but did not sanitize it by replacing newline and carriage return characters.
 **Learning:** Even sanitized output returned in analysis results can be manipulated to break log formatting and inject fake entries if newlines are not escaped when the result dictionary is logged by the caller.
 **Prevention:** Explicitly sanitize and escape newline/carriage return characters on input snippets returned in analysis result dictionaries before passing them back to the caller.
+## 2024-11-07 - Log Poisoning in Adversarial Attack Indicators
+**Vulnerability:** The `indicator` field in `AdversarialDefense._record_attack` stored matched attack snippets without sanitizing control characters, leading to potential log poisoning.
+**Learning:** Even extracted indicators from matched patterns are user input snippets and must be strictly sanitized.
+**Prevention:** Always explicitly sanitize all returned user input snippets (e.g., escaping `\n` to `\\n` and `\r` to `\\r` after truncation) before storing them in security event logs or analysis results.

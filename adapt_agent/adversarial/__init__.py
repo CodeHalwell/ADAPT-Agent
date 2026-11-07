@@ -2331,7 +2331,9 @@ class AdversarialDefense:
             "content": content[:256]
             .replace("\n", "\\n")
             .replace("\r", "\\r")[:100],  # Truncated and sanitized.
-            "indicator": indicator,
+            "indicator": indicator[:256]
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")[:100],  # Truncated and sanitized.
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._detected_attacks.append(attack)
