@@ -87,3 +87,6 @@
 ## 2024-10-28 - O(1) Ring Buffer Eviction
 **Learning:** Using `list.pop(0)` to bound an array creates an O(N) performance bottleneck because it requires shifting all subsequent elements in memory.
 **Action:** Use `collections.deque(maxlen=...)` to maintain a bounded history with automatic O(1) eviction instead of a `list`.
+## 2024-11-09 - O(N) Pop Left Bottleneck in Observability Metrics
+**Learning:** Using `list.pop(0)` to limit metric history arrays creates an O(N) performance bottleneck because it shifts all elements, which accumulates overhead across high-volume observability calls.
+**Action:** Replace `list` bounded by `.pop(0)` with `collections.deque(maxlen=...)` to leverage O(1) ring buffer eviction. Ensure typed dictionaries that hold these values are updated to expect `deque[float]`.
