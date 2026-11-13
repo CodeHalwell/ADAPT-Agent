@@ -742,8 +742,14 @@ _IGNORED = shutil.ignore_patterns(
 )
 
 
-def _run_suite(workdir: Path, timeout: float) -> tuple[bool, str]:
-    """Run pytest in ``workdir``. Returns ``(passed, one-line detail)``."""
+def _run_suite(
+    workdir: Path, timeout: float, *, only: str | None = None, deselect: tuple[str, ...] = ()
+) -> tuple[bool, str]:
+    """Run pytest in ``workdir``. Returns ``(passed, one-line detail)``.
+
+    ``only`` runs a single test id instead of the suite; ``deselect`` leaves
+    test ids out. Both exist for :func:`_check` to confirm a kill.
+    """
     env = dict(os.environ)
     # The scratch copy must win over any installed (or editable) adapt_agent,
     # and no bytecode may be cached: a mutant the same size as the original,
@@ -754,6 +760,9 @@ def _run_suite(workdir: Path, timeout: float) -> tuple[bool, str]:
     # Selects the derandomized Hypothesis profile (tests/conftest.py): whether a
     # mutant is caught must not depend on which examples happened to be drawn.
     env["CI"] = "1"
+    # Wide enough that pytest prints a failing test's full id, which a
+    # confirmation run needs verbatim.
+    env["COLUMNS"] = "1000"
     cmd = [
         sys.executable,
         "-m",
@@ -768,7 +777,10 @@ def _run_suite(workdir: Path, timeout: float) -> tuple[bool, str]:
         # would "kill" every mutant, including ones no real test notices, and
         # this whole check would pass while proving nothing.
         f"--ignore={_SELF_TEST}",
+        *(f"--deselect={test_id}" for test_id in deselect),
     ]
+    if only is not None:
+        cmd.append(only)
     try:
         proc = subprocess.run(
             cmd, cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout
@@ -780,6 +792,43 @@ def _run_suite(workdir: Path, timeout: float) -> tuple[bool, str]:
     failed = next((ln for ln in lines if ln.startswith(("FAILED tests", "ERROR tests"))), "")
     detail = failed or (lines[-1] if lines else proc.stderr.strip()[-200:])
     return proc.returncode == 0, detail
+
+
+def _failing_test_id(detail: str) -> str | None:
+    """The test id from a ``FAILED tests/...::name - reason`` summary line."""
+    for prefix in ("FAILED ", "ERROR "):
+        if detail.startswith(prefix + "tests"):
+            return detail[len(prefix) :].split(" - ", 1)[0].strip()
+    return None
+
+
+def _confirmed_run(workdir: Path, timeout: float, attempts: int = 3) -> tuple[bool, str]:
+    """Run the suite against a mutated tree, crediting only reproducible kills.
+
+    The suite stops at its first failure, and under several parallel workers
+    that first failure is occasionally a *timing* test that would have failed
+    with or without the mutant. Counting that as a kill hides a real survivor
+    behind a flake -- CI credited one mutant to an unrelated performance test.
+
+    So a failure is confirmed by re-running that one test alone against the
+    same mutated tree. If it fails again the mutant is killed. If it passes it
+    was a flake: the suite is run again without that test, so the mutant has to
+    be caught by something that actually depends on it.
+    """
+    flaky: list[str] = []
+    passed, detail = _run_suite(workdir, timeout)
+    for _ in range(attempts):
+        if passed:
+            return True, detail
+        test_id = _failing_test_id(detail)
+        if test_id is None:
+            return False, detail  # a timeout or a collection error: noticed
+        still_fails = not _run_suite(workdir, timeout, only=test_id)[0]
+        if still_fails:
+            return False, detail
+        flaky.append(test_id)
+        passed, detail = _run_suite(workdir, timeout, deselect=tuple(flaky))
+    return passed, detail
 
 
 @dataclass
@@ -798,7 +847,7 @@ def _check(mutant: Mutant, workdirs: queue.Queue[Path], timeout: float) -> Outco
             return Outcome(mutant, "STALE", "an anchor was not found exactly once")
         target.write_text(mutant.apply(source), encoding="utf-8")
         try:
-            passed, detail = _run_suite(workdir, timeout)
+            passed, detail = _confirmed_run(workdir, timeout)
         finally:
             target.write_text(source, encoding="utf-8")
         return Outcome(mutant, "SURVIVED" if passed else "killed", detail)

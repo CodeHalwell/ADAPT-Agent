@@ -62,7 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The mutation check grew to 78 mutants, adding the governed adapter and every
   gate call in every framework integration. That exposed the OpenAI Agents hooks
   as untested whenever the SDK is absent (as in CI); 
-  `tests/test_openai_hooks_stubbed.py` now drives them against a stub.
+  `tests/test_openai_hooks_stubbed.py` now drives them against a stub. Its first
+  run in CI found the same gap in the Claude Agent SDK hook, masked locally by
+  the SDK being installed; `tests/test_claude_hooks_stubbed.py` closes it.
 - `PolicyEnforcer.evaluate_rules(state=..., message=...)` dry-runs every rule
   against an example and reports `"violation"`, `"pass"` or `"error"` per rule,
   with no side effects -- for asserting in your own tests that a rule can fire.

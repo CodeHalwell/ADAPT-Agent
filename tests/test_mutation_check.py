@@ -88,3 +88,48 @@ def test_this_file_is_excluded_from_mutant_runs():
     assert Path(__file__).resolve() == (REPO_ROOT / module._SELF_TEST).resolve()
     source = (REPO_ROOT / "scripts" / "mutation_check.py").read_text(encoding="utf-8")
     assert 'f"--ignore={_SELF_TEST}"' in source
+
+
+def test_a_kill_is_only_credited_when_the_failing_test_fails_again(monkeypatch, tmp_path):
+    """A timing flake that happens to fail first must not count as a kill.
+
+    Simulated: the first full run "fails" on a flaky test that then passes when
+    run alone; with it deselected the suite passes -- so the mutant survived.
+    """
+    module = _load()
+    calls = []
+
+    def fake_run(workdir, timeout, *, only=None, deselect=()):
+        calls.append((only, deselect))
+        if only is not None:
+            return True, "1 passed"  # the "failing" test passes on its own
+        if deselect:
+            return True, "all passed"
+        return False, "FAILED tests/test_perf.py::test_is_fast[big input] - AssertionError: slow"
+
+    monkeypatch.setattr(module, "_run_suite", fake_run)
+    passed, _ = module._confirmed_run(tmp_path, 60)
+
+    assert passed, "an unreproducible failure was credited as a kill"
+    flaky = "tests/test_perf.py::test_is_fast[big input]"
+    assert calls == [(None, ()), (flaky, ()), (None, (flaky,))]
+
+
+def test_a_reproducible_failure_is_a_kill(monkeypatch, tmp_path):
+    module = _load()
+    line = "FAILED tests/test_guard.py::test_limit - assert False"
+    monkeypatch.setattr(module, "_run_suite", lambda *a, **k: (False, line))
+    assert module._confirmed_run(tmp_path, 60) == (False, line)
+
+
+def test_a_timeout_or_collection_error_is_a_kill_without_confirmation(monkeypatch, tmp_path):
+    module = _load()
+    calls = []
+
+    def fake_run(workdir, timeout, *, only=None, deselect=()):
+        calls.append(only)
+        return False, "timed out after 60s"
+
+    monkeypatch.setattr(module, "_run_suite", fake_run)
+    assert module._confirmed_run(tmp_path, 60) == (False, "timed out after 60s")
+    assert calls == [None]
