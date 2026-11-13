@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`PolicyEnforcer.add_rule` rejects a condition it could never evaluate.**
+  A condition using a function call (`len(...)`), attribute access, `not`, a
+  slice, an unsupported operator, or a name other than `state`/`message` used
+  to register and then error on every evaluation -- which, under the default
+  `fail_closed=False`, meant the rule silently never fired while looking
+  installed. These are all decidable from the text, so they now raise
+  `ValueError` at registration. **This can break code that registers such a
+  rule**; the rule was not doing anything. `adapt validate` applies the same
+  check, and the bundled `examples/config.example.json` -- which shipped one
+  such rule -- is fixed.
+- **Optimizers no longer apply a configuration that regresses on held-out
+  data.** With a `val_dataset`, the training winner is applied only if it does
+  not score worse than the untuned agent on that set (beyond
+  `validation_tolerance`, default `1e-3`). A rejected run leaves the agent
+  untouched and returns `validation_rejected=True`, an empty `best_config`, and
+  the discarded values in `rejected_config`. Previously the held-out score was
+  reported and ignored. Costs one extra pass over `val_dataset`; opt out with
+  `validation_gate=False`. Applies to every optimizer, `PipelineOptimizer`
+  included, and so to `adapt optimize --val-data` and `adapt train`.
+
+### Added
+
+- `PolicyEnforcer.evaluate_rules(state=..., message=...)` dry-runs every rule
+  against an example and reports `"violation"`, `"pass"` or `"error"` per rule,
+  with no side effects -- for asserting in your own tests that a rule can fire.
+- `adapt_agent.core.policy.validate_condition`.
+- `OptimizationResult.validation_baseline_score`, `.validation_rejected` and
+  `.rejected_config` (appended; positional construction is unaffected).
+- `scripts/mutation_check.py` and a `mutation` CI job: re-introduces 53
+  security bugs one at a time -- every historical vulnerability in
+  `.jules/sentinel.md` among them -- and fails if the suite stays green. Its
+  first run found seven guarantees no test pinned (five of them previously
+  fixed vulnerabilities); regression tests for all seven are added.
+- `.github/CODEOWNERS` covering the security modules, the tests, and CI.
+
+### Fixed
+
+- `docs/security.md` described the firewall as allow-first. It is block-first
+  by default: an allowed pattern never overrides a block unless
+  `whitelist_mode=True`, which the page did not mention. The page also now
+  states that the policy engine fails open by default, and gains a "What is not
+  covered" section.
+
 ## [0.4.0] - 2026-08-27
 
 ### Added

@@ -230,7 +230,51 @@ judge = LLMJudge(lambda prompt, system=None: my_model_call(prompt, system=system
 ## Optimizers
 
 All optimizers share `optimize(agent, dataset, val_dataset=None)` and apply the
-best configuration to the live agent before returning.
+best configuration to the live agent before returning — subject to the
+validation gate below.
+
+### The validation gate
+
+A search is rewarded for whatever raises the score on the data it can see. That
+includes a prompt that has memorised the training rows, and one that scores
+better by dropping an instruction the dataset happens not to exercise. The
+held-out set is the one thing the search cannot have fitted, so when you pass
+one it gets the final say:
+
+```python
+train, holdout = data.split(0.8, seed=0)
+result = optimizer.optimize(agent, train, val_dataset=holdout)
+
+if result.validation_rejected:
+    # The training winner scored worse than the untuned agent on `holdout`.
+    # Nothing was applied: the agent is exactly as you passed it in.
+    print(result.rejected_config)          # what was discarded, for inspection
+    print(result.recommendations[-1])      # the two scores, in words
+```
+
+| Field | Meaning |
+| --- | --- |
+| `validation_score` | Held-out score of the configuration that is **applied**. |
+| `validation_baseline_score` | Held-out score of the untuned agent. |
+| `validation_rejected` | The training winner regressed on held-out data and was discarded; `best_config` is empty. |
+| `rejected_config` | The discarded configuration. Never applied, never exported by `save()`. |
+
+Things to know:
+
+* The gate costs one extra pass over `val_dataset` (the baseline's).
+* It rejects only when the tuned score is more than `validation_tolerance`
+  (default `1e-3`) below the baseline's, so judge noise does not trip it.
+* It rejects only on a comparison it can trust. If throttling cost either
+  held-out pass some rows, the result is reported with
+  `validation_complete=False` and the configuration is left applied, as before.
+* Without a `val_dataset` there is nothing to gate on, and the training winner
+  is applied unconditionally. **Always hold data back.**
+* `Optimizer(..., validation_gate=False)` restores the old report-only
+  behaviour.
+
+The gate checks the score, not the content. It will not notice a rewritten
+prompt that lost a safety instruction if your held-out rows never probe for it —
+put such rows in the dataset, and read `best_config` before shipping it.
 
 * **`CoordinateAscentOptimizer`** -- greedy per-parameter improvement via
   proposers; the flagship for prompt / few-shot tuning and where the LLM judge

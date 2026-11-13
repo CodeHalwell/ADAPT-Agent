@@ -904,3 +904,180 @@ def test_pipeline_tolerates_stage_that_skipped_optimizer_init():
     pipe = PipelineOptimizer(harness(), [MinimalStage(harness())])
     result = pipe.optimize(agent, dataset())  # must not raise AttributeError
     assert result.baseline_score == 0.0
+
+
+# -- validation gate ----------------------------------------------------------
+#
+# The search is rewarded for whatever raises the training score. A held-out set
+# is the one thing it cannot have fitted, so a config that wins on training and
+# loses on held-out data must not be applied.
+
+_TRAIN_QS = ["t0", "t1", "t2"]
+_HELD_OUT_QS = ["h0", "h1"]
+
+
+def _overfitting_toy(candidates=("SAFE", "OVERFIT", "BETTER")):
+    """An agent with one honest prompt and one that only memorised training.
+
+    * ``SAFE``    (baseline): right on held-out rows, and on one training row.
+    * ``OVERFIT``: right on every training row, wrong on every held-out row.
+    * ``BETTER`` : right everywhere.
+    """
+    state = {"prompt": "SAFE"}
+
+    def runner(question):
+        prompt = state["prompt"]
+        if prompt == "BETTER":
+            return f"ans-{question}"
+        if prompt == "OVERFIT":
+            return f"ans-{question}" if question in _TRAIN_QS else "WRONG"
+        return f"ans-{question}" if question in (*_HELD_OUT_QS, "t0") else "WRONG"
+
+    params = [
+        Parameter(
+            name="prompt",
+            kind=ParameterKind.PROMPT,
+            candidates=list(candidates),
+            getter=lambda: state["prompt"],
+            setter=lambda v: state.__setitem__("prompt", v),
+        )
+    ]
+    agent = OptimizableAgent.from_callable(runner, parameters=params, name="overfit-toy")
+    train = GoldenDataset([Example(inputs=q, expected=f"ans-{q}") for q in _TRAIN_QS])
+    held_out = GoldenDataset([Example(inputs=q, expected=f"ans-{q}") for q in _HELD_OUT_QS])
+    return state, agent, train, held_out
+
+
+def _gate_optimizers(**kw):
+    return {
+        "grid": lambda: GridSearchOptimizer(harness(), seed=0, **kw),
+        "pipeline": lambda: PipelineOptimizer(
+            harness(), [GridSearchOptimizer(harness(), seed=0)], seed=0, **kw
+        ),
+    }
+
+
+@pytest.mark.parametrize("name", ["grid", "pipeline"])
+def test_gate_refuses_a_config_that_wins_on_training_but_loses_on_held_out(name):
+    state, agent, train, held_out = _overfitting_toy(candidates=("SAFE", "OVERFIT"))
+    res = _gate_optimizers()[name]().optimize(agent, train, val_dataset=held_out)
+
+    # The live agent is exactly as it was handed in.
+    assert state["prompt"] == "SAFE"
+    assert res.validation_rejected is True
+    assert res.rejected_config == {"prompt": "OVERFIT"}
+    # ...and the result does not offer the rejected config for export.
+    assert res.best_config == {}
+    assert res.improved is False
+    assert res.best_score == res.baseline_score
+    # validation_score describes the config that IS applied: the baseline.
+    assert res.validation_score == 1.0
+    assert res.validation_baseline_score == 1.0
+    assert any("Validation gate" in r and "NOT applied" in r for r in res.recommendations)
+    assert res.to_dict()["validation_rejected"] is True
+    assert res._provenance()["validation_rejected"] is True
+
+
+@pytest.mark.parametrize("name", ["grid", "pipeline"])
+def test_gate_applies_a_config_that_also_holds_up_on_held_out(name):
+    state, agent, train, held_out = _overfitting_toy(candidates=("SAFE", "BETTER"))
+    res = _gate_optimizers()[name]().optimize(agent, train, val_dataset=held_out)
+
+    assert state["prompt"] == "BETTER"
+    assert res.validation_rejected is False
+    assert res.rejected_config == {}
+    assert res.best_config == {"prompt": "BETTER"}
+    assert res.validation_score == 1.0
+    assert res.validation_baseline_score == 1.0
+
+
+@pytest.mark.parametrize("name", ["grid", "pipeline"])
+def test_gate_can_be_switched_off(name):
+    state, agent, train, held_out = _overfitting_toy(candidates=("SAFE", "OVERFIT"))
+    res = _gate_optimizers(validation_gate=False)[name]().optimize(
+        agent, train, val_dataset=held_out
+    )
+
+    assert state["prompt"] == "OVERFIT"
+    assert res.validation_rejected is False
+    assert res.best_config == {"prompt": "OVERFIT"}
+    # The regression is still *reported*; it is just not acted on.
+    assert res.validation_score == 0.0
+
+
+def test_gate_tolerance_allows_a_drop_inside_the_noise_band():
+    state, agent, train, held_out = _overfitting_toy(candidates=("SAFE", "OVERFIT"))
+    opt = GridSearchOptimizer(harness(), seed=0, validation_tolerance=1.0)
+    res = opt.optimize(agent, train, val_dataset=held_out)
+
+    assert state["prompt"] == "OVERFIT"
+    assert res.validation_rejected is False
+    assert res.validation_baseline_score == 1.0
+    assert res.validation_score == 0.0
+
+
+def test_without_a_held_out_set_the_training_winner_is_applied_as_before():
+    state, agent, train, _ = _overfitting_toy(candidates=("SAFE", "OVERFIT"))
+    res = GridSearchOptimizer(harness(), seed=0).optimize(agent, train)
+
+    assert state["prompt"] == "OVERFIT"
+    assert res.validation_score is None
+    assert res.validation_baseline_score is None
+    assert res.validation_rejected is False
+
+
+def test_gate_measures_the_baseline_once_when_nothing_was_tuned():
+    """No winner means the agent *is* the baseline: one held-out pass, not two."""
+    state, agent, train, held_out = _overfitting_toy(candidates=("SAFE",))
+    calls = []
+    h = harness()
+    original = h.evaluate
+    h.evaluate = lambda target, data: (calls.append(len(data)), original(target, data))[1]
+
+    res = GridSearchOptimizer(h, seed=0).optimize(agent, train, val_dataset=held_out)
+
+    assert res.best_config == {}
+    assert res.validation_rejected is False
+    assert res.validation_score == res.validation_baseline_score == 1.0
+    assert calls.count(len(held_out)) == 1
+
+
+def test_gate_does_not_reject_on_a_held_out_pass_it_could_not_complete():
+    """Two partial means are not over the same rows, so they are not compared.
+
+    When throttling costs the held-out pass a row, the outcome is reported as
+    incomplete -- as it was before the gate existed -- rather than acted on.
+    """
+    from adapt_agent.optimization.retry import RetryPolicy
+
+    state = {"prompt": "SAFE"}
+
+    def runner(question):
+        if question == "h_throttled":
+            raise RuntimeError("429 Too Many Requests")
+        if state["prompt"] == "OVERFIT":
+            return f"ans-{question}" if question in _TRAIN_QS else "WRONG"
+        return f"ans-{question}" if question in ("h0", "t0") else "WRONG"
+
+    params = [
+        Parameter(
+            name="prompt",
+            kind=ParameterKind.PROMPT,
+            candidates=["SAFE", "OVERFIT"],
+            getter=lambda: state["prompt"],
+            setter=lambda v: state.__setitem__("prompt", v),
+        )
+    ]
+    agent = OptimizableAgent.from_callable(runner, parameters=params, name="throttled-toy")
+    train = GoldenDataset([Example(inputs=q, expected=f"ans-{q}") for q in _TRAIN_QS])
+    held_out = GoldenDataset(
+        [Example(inputs=q, expected=f"ans-{q}") for q in ("h0", "h_throttled")]
+    )
+    h = EvaluationHarness(exact_match(), retry=RetryPolicy(attempts=1))
+
+    res = GridSearchOptimizer(h, seed=0).optimize(agent, train, val_dataset=held_out)
+
+    assert res.validation_complete is False
+    assert res.validation_rejected is False
+    assert state["prompt"] == "OVERFIT"
+    assert res.validation_baseline_score is None, "a partial baseline is not a baseline"

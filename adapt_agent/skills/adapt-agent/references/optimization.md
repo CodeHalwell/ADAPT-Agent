@@ -116,7 +116,12 @@ returns a sensible pipeline. All share
 `max_evals`, `seed`, `judge`, `verbose`.
 
 Pass `val_dataset=` to score the winner on held-out data and catch overfitting
-to the training split.
+to the training split. It is a gate, not just a report: a winner that scores
+worse than the untuned agent on the held-out set is **not applied** —
+`result.validation_rejected` is `True`, `result.best_config` is empty, and the
+discarded values are in `result.rejected_config`. Check that flag before
+telling a user their agent was improved. `validation_gate=False` on the
+optimizer turns the gate off.
 
 ## Proposers
 

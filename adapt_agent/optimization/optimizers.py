@@ -89,6 +89,14 @@ class OptimizationResult:
         best_report: The :class:`EvaluationReport` for the winning configuration.
         validation_score: Score of ``best_config`` on a held-out set, if provided.
         validation_complete: Whether that score covered every held-out row.
+        validation_baseline_score: Score of the *untuned* agent on the same
+            held-out set, when it was measured (the validation gate needs it).
+        validation_rejected: ``True`` when the search found a configuration
+            that beat the baseline on the training data but scored worse than
+            the baseline on the held-out set, so it was **not** applied. In
+            that case ``best_config`` is empty, the agent is left as it was,
+            and the discarded configuration is in ``rejected_config``.
+        rejected_config: The configuration the validation gate discarded.
         recommendations: Advisory, human-readable suggestions gathered during the
             run (e.g. new tools/skills the judge proposes). These are never applied
             automatically -- the optimizer only *selects* among existing tools.
@@ -122,6 +130,13 @@ class OptimizationResult:
     #: logging (see :meth:`Optimizer._record`), so a long run's total cost is
     #: visible in the same place its progress was.
     duration_seconds: float = 0.0
+    #: Held-out score of the untuned agent; ``None`` when not measured.
+    validation_baseline_score: float | None = None
+    #: The tuned config won on training data, lost on held-out data, and was
+    #: discarded. See :class:`Optimizer`'s ``validation_gate``.
+    validation_rejected: bool = False
+    #: What the gate discarded -- kept for inspection, never applied.
+    rejected_config: dict[str, Any] = field(default_factory=dict)
 
     @property
     def improved(self) -> bool:
@@ -297,6 +312,8 @@ class OptimizationResult:
             # same number as a whole one until something says otherwise, and a
             # persisted result is read long after the run's logs are gone.
             "validation_complete": self.validation_complete,
+            "validation_baseline_score": self.validation_baseline_score,
+            "validation_rejected": self.validation_rejected,
             "n_evals": self.n_evals,
             "duration_seconds": self.duration_seconds,
         }
@@ -309,6 +326,8 @@ class OptimizationResult:
             "improvement": self.improvement,
             "validation_score": self.validation_score,
             "validation_complete": self.validation_complete,
+            "validation_baseline_score": self.validation_baseline_score,
+            "validation_rejected": self.validation_rejected,
             "n_evals": self.n_evals,
             "duration_seconds": self.duration_seconds,
             "best_config": self.best_config,
@@ -321,6 +340,18 @@ class OptimizationResult:
             f"best={self.best_score:.3f}, improvement={self.improvement:+.3f}, "
             f"evals={self.n_evals}, duration={self.duration_seconds:.1f}s)"
         )
+
+
+@dataclass
+class _ValidationGate:
+    """What the held-out pass found, and what was done about it."""
+
+    score: float | None = None
+    complete: bool = True
+    baseline_score: float | None = None
+    rejected: bool = False
+    rejected_config: dict[str, Any] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
 
 
 class Optimizer:
@@ -336,6 +367,22 @@ class Optimizer:
             LLM judge's score wobbles by far more than ``1e-9`` between runs, so a
             near-zero threshold would "accept" candidates that only won by jitter.
         judge: Optional LLM judge made available to proposers.
+        validation_gate: When ``True`` (default) and ``optimize`` is given a
+            ``val_dataset``, the winning configuration is applied only if it
+            does not score worse than the untuned agent on that held-out set.
+            The search only ever sees the training data, and it is rewarded for
+            whatever raises that one number -- including a prompt that has
+            memorised the training rows, or one that scores better by dropping
+            an instruction the dataset happens not to exercise. The held-out
+            set is the one thing the search cannot have fitted, so it gets the
+            final say. A rejected run leaves the agent exactly as it was and
+            reports ``validation_rejected=True``. Costs one extra pass over
+            ``val_dataset`` (the baseline's). Without a ``val_dataset`` there
+            is nothing to gate on and the training winner is applied as before.
+        validation_tolerance: How far below the baseline's held-out score the
+            tuned configuration may fall before the gate rejects it. Defaults
+            to ``1e-3`` for the same reason as ``min_improvement``: a judge's
+            score is noisy, and a drop inside that noise is not a regression.
         cache_evaluations: Reuse the report of an already-measured
             configuration instead of re-running the agent over the dataset
             (default ``True``). The cache is keyed on this optimizer's
@@ -385,11 +432,15 @@ class Optimizer:
         suggest_tools: bool = False,
         cache_evaluations: bool = True,
         verbose: bool = False,
+        validation_gate: bool = True,
+        validation_tolerance: float = 1e-3,
     ):
         self.harness = harness
         self.max_evals = max_evals
         self.seed = seed
         self.min_improvement = min_improvement
+        self.validation_gate = validation_gate
+        self.validation_tolerance = validation_tolerance
         self.judge = judge
         self.suggest_tools = suggest_tools
         self.cache_evaluations = cache_evaluations
@@ -423,7 +474,10 @@ class Optimizer:
     ) -> OptimizationResult:
         """Optimize ``agent`` against ``dataset`` and return the result.
 
-        The best configuration is applied to the live agent before returning.
+        The best configuration is applied to the live agent before returning --
+        unless a ``val_dataset`` was given and that configuration scores worse
+        than the untuned agent on it, in which case nothing is applied (see
+        ``validation_gate``).
         Extra kwargs (``runner``/``components``/``parameters``) are forwarded to
         :func:`~adapt_agent.optimization.target.wrap` when ``agent`` is not
         already an :class:`OptimizableAgent`.
@@ -469,14 +523,16 @@ class Optimizer:
             if state.best_config:
                 target.apply(state.best_config)
 
-            validation_score: float | None = None
-            validation_complete = True
-            if val_dataset:
-                validation_report = self._evaluate_validation(target, val_dataset)
-                validation_score = validation_report.score
-                validation_complete = validation_report.is_complete
+            gate = self._gate_on_validation(
+                target, val_dataset, baseline_snapshot, state.best_config
+            )
+            if gate.rejected:
+                state.best_config = {}
+                state.best_score = baseline_score
+                state.best_report = baseline_report
 
             recommendations = list(self._recommendations)
+            recommendations.extend(gate.notes)
             recommendations.extend(self._suggest_tools(target, state))
 
             result = OptimizationResult(
@@ -486,10 +542,13 @@ class Optimizer:
                 baseline_config=baseline_snapshot,
                 history=state.history,
                 best_report=state.best_report,
-                validation_score=validation_score,
-                validation_complete=validation_complete,
+                validation_score=gate.score,
+                validation_complete=gate.complete,
                 recommendations=recommendations,
                 duration_seconds=time.perf_counter() - self._run_started_at,
+                validation_baseline_score=gate.baseline_score,
+                validation_rejected=gate.rejected,
+                rejected_config=gate.rejected_config,
             )
             if self.verbose:
                 logger.info("[%s] %r", self.strategy_name, result)
@@ -649,6 +708,62 @@ class Optimizer:
             )
         self._store_report(target, dataset, retried)
         return retried
+
+    def _gate_on_validation(
+        self,
+        target: OptimizableAgent,
+        val_dataset: GoldenDataset | None,
+        baseline_snapshot: dict[str, Any],
+        best_config: dict[str, Any],
+    ) -> _ValidationGate:
+        """Score the winner on held-out data and un-apply it if it regressed.
+
+        On entry the live ``target`` carries ``best_config``. On exit it carries
+        ``best_config`` if the gate passed and the baseline if it did not.
+
+        The gate only *rejects* on a comparison it can trust: both held-out
+        passes complete. A partial pass is a mean over whichever rows survived
+        throttling, and two such means are not over the same rows -- so an
+        incomplete validation is reported (``complete=False``) rather than
+        acted on, exactly as before the gate existed.
+        """
+        if not val_dataset:
+            return _ValidationGate()
+        tuned = self._evaluate_validation(target, val_dataset)
+        if not best_config:
+            # Nothing was tuned: the agent *is* the baseline, measured once.
+            return _ValidationGate(
+                score=tuned.score, complete=tuned.is_complete, baseline_score=tuned.score
+            )
+        if not self.validation_gate:
+            return _ValidationGate(score=tuned.score, complete=tuned.is_complete)
+
+        target.restore(baseline_snapshot)
+        baseline = self._evaluate_validation(target, val_dataset)
+        comparable = tuned.is_complete and baseline.is_complete
+        if comparable and tuned.score < baseline.score - self.validation_tolerance:
+            # Leave the baseline applied: the agent is exactly as it was given.
+            note = (
+                f"Validation gate: the tuned configuration scored {tuned.score:.4f} on the "
+                f"held-out set against {baseline.score:.4f} for the untuned agent, so it was "
+                "NOT applied. The gain on the training data did not generalise; add training "
+                "rows or review OptimizationResult.rejected_config by hand."
+            )
+            logger.warning("[%s] %s", self.strategy_name, note)
+            return _ValidationGate(
+                score=baseline.score,
+                complete=True,
+                baseline_score=baseline.score,
+                rejected=True,
+                rejected_config=dict(best_config),
+                notes=[note],
+            )
+        target.apply(best_config)
+        return _ValidationGate(
+            score=tuned.score,
+            complete=comparable,
+            baseline_score=baseline.score if baseline.is_complete else None,
+        )
 
     def _evaluate_validation(
         self, target: OptimizableAgent, dataset: GoldenDataset
@@ -1158,7 +1273,8 @@ class PipelineOptimizer(Optimizer):
         self._run_started_at = time.perf_counter()
         try:
             baseline_snapshot = target.snapshot()
-            baseline_score = self._evaluate_baseline(target, dataset).score
+            baseline_report = self._evaluate_baseline(target, dataset)
+            baseline_score = baseline_report.score
             if self.verbose:
                 logger.info(
                     "[%s] baseline score=%.4f (%d stage(s), search budget: up to %d evals)",
@@ -1227,11 +1343,12 @@ class PipelineOptimizer(Optimizer):
             if best_config:
                 target.apply(best_config)
 
-            validation_report = (
-                self._evaluate_validation(target, val_dataset) if val_dataset else None
-            )
-            validation_score = validation_report.score if validation_report else None
-            validation_complete = validation_report.is_complete if validation_report else True
+            gate = self._gate_on_validation(target, val_dataset, baseline_snapshot, best_config)
+            if gate.rejected:
+                best_config = {}
+                best_score = baseline_score
+                best_report = baseline_report
+            combined_recommendations.extend(gate.notes)
 
             # Optionally run the pipeline-level tool suggestion on the cumulative best,
             # then dedupe so a repeated suggestion from several stages appears once.
@@ -1250,10 +1367,13 @@ class PipelineOptimizer(Optimizer):
                 baseline_config=baseline_snapshot,
                 history=combined_history,
                 best_report=best_report,
-                validation_score=validation_score,
-                validation_complete=validation_complete,
+                validation_score=gate.score,
+                validation_complete=gate.complete,
                 recommendations=_dedup(combined_recommendations),
                 duration_seconds=time.perf_counter() - self._run_started_at,
+                validation_baseline_score=gate.baseline_score,
+                validation_rejected=gate.rejected,
+                rejected_config=gate.rejected_config,
             )
             if self.verbose:
                 logger.info("[%s] %r", self.strategy_name, result)
