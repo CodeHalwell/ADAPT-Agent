@@ -83,6 +83,9 @@ class Mutant:
         why: The guarantee this mutant breaks, in a few words.
         history: The ``.jules/sentinel.md`` heading this re-opens, if any.
         also: Further journal headings that record the same fix.
+        extra: Further ``(old, new)`` edits in the same file, for a bug that
+            cannot be re-introduced by changing one place. Each ``old`` must
+            also occur exactly once.
     """
 
     id: str
@@ -92,6 +95,17 @@ class Mutant:
     why: str
     history: str = ""
     also: tuple[str, ...] = ()
+    extra: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def edits(self) -> tuple[tuple[str, str], ...]:
+        """Every ``(old, new)`` replacement this mutant makes."""
+        return ((self.old, self.new), *self.extra)
+
+    def apply(self, source: str) -> str:
+        for old, new in self.edits:
+            source = source.replace(old, new)
+        return source
 
     @property
     def reopens(self) -> tuple[str, ...]:
@@ -104,18 +118,20 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "fw-filter-fail-open",
         _FIREWALL,
-        """                        "error": "An error occurred",
-                    },
-                )
-                self._blocked_count += 1
-                return False""",
-        """                        "error": "An error occurred",
-                    },
-                )
-                self._blocked_count += 1
+        """                logger.error("Error in custom filter: %s", e)
+                return False, "custom_filter_error", None""",
+        """                logger.error("Error in custom filter: %s", e)
                 continue""",
         "a custom filter that raises must block",
         "2026-04-21 - Fail-Closed Firewall Design",
+    ),
+    Mutant(
+        "fw-whitelist-waives-cap",
+        _FIREWALL,
+        "if self.max_content_length is not None and len(content) > self.max_content_length:",
+        "if (not (self.whitelist_mode and any(p.fullmatch(content) for p in self._allowed_patterns))"
+        " and self.max_content_length is not None and len(content) > self.max_content_length):",
+        "no allowed pattern can waive the length cap",
     ),
     Mutant(
         "fw-length-cap",
@@ -156,9 +172,15 @@ MUTANTS: tuple[Mutant, ...] = (
         "fw-error-text-leak",
         _FIREWALL,
         '"error": "An error occurred",',
-        '"error": str(e),',
+        '"error": str(detail),',
         "exception text is not copied into event metadata",
         "2024-05-24 - [Information Leakage in Event Metadata]",
+        extra=(
+            (
+                'return False, "custom_filter_error", None',
+                'return False, "custom_filter_error", str(e)',
+            ),
+        ),
     ),
     Mutant(
         "fw-snippet-raw",
@@ -298,8 +320,14 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "policy-fail-closed-ignored",
         _POLICY,
-        "            return self.fail_closed",
-        "            return False",
+        """            return self.fail_closed
+        return outcome == "violation"
+
+    def get_rule_stats""",
+        """            return False
+        return outcome == "violation"
+
+    def get_rule_stats""",
         "fail_closed=True turns an unevaluable rule into a violation",
     ),
     Mutant(
@@ -565,16 +593,18 @@ def stale_mutants(root: Path = REPO_ROOT) -> list[str]:
         if mutant.id in seen:
             problems.append(f"{mutant.id}: duplicate id")
         seen.add(mutant.id)
-        if mutant.old == mutant.new:
-            problems.append(f"{mutant.id}: old and new are identical")
         if mutant.path not in sources:
             path = root / mutant.path
             sources[mutant.path] = path.read_text(encoding="utf-8") if path.is_file() else ""
-        count = sources[mutant.path].count(mutant.old)
-        if count != 1:
-            problems.append(
-                f"{mutant.id}: expected its anchor exactly once in {mutant.path}, found {count}"
-            )
+        for old, new in mutant.edits:
+            if old == new:
+                problems.append(f"{mutant.id}: old and new are identical")
+            count = sources[mutant.path].count(old)
+            if count != 1:
+                problems.append(
+                    f"{mutant.id}: expected its anchor exactly once in {mutant.path}, "
+                    f"found {count}: {old.strip().splitlines()[0][:60]!r}"
+                )
     return problems
 
 
@@ -646,9 +676,9 @@ def _check(mutant: Mutant, workdirs: queue.Queue[Path], timeout: float) -> Outco
     try:
         target = workdir / mutant.path
         source = target.read_text(encoding="utf-8")
-        if source.count(mutant.old) != 1:
-            return Outcome(mutant, "STALE", f"anchor found {source.count(mutant.old)} times")
-        target.write_text(source.replace(mutant.old, mutant.new), encoding="utf-8")
+        if any(source.count(old) != 1 for old, _ in mutant.edits):
+            return Outcome(mutant, "STALE", "an anchor was not found exactly once")
+        target.write_text(mutant.apply(source), encoding="utf-8")
         try:
             passed, detail = _run_suite(workdir, timeout)
         finally:

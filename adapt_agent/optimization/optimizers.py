@@ -367,6 +367,17 @@ class Optimizer:
             LLM judge's score wobbles by far more than ``1e-9`` between runs, so a
             near-zero threshold would "accept" candidates that only won by jitter.
         judge: Optional LLM judge made available to proposers.
+        proposer_judge: A *separate* judge for the proposing side -- critiquing
+            failures and rewriting prompts -- leaving ``judge`` (or whatever
+            judge backs the harness's metric) to do the scoring. When one model
+            both writes a candidate and marks it, the mark is not independent:
+            a model tends to prefer text in its own style, and a rewrite can
+            learn what the marker rewards rather than what the task needs.
+            Pass a judge built on a different model family here to break that
+            loop. Defaults to ``judge``. When the proposing judge turns out to
+            be the scoring judge, the run says so in
+            ``OptimizationResult.recommendations`` -- and the validation gate
+            cannot help, because the same judge scores the held-out set too.
         validation_gate: When ``True`` (default) and ``optimize`` is given a
             ``val_dataset``, the winning configuration is applied only if it
             does not score worse than the untuned agent on that held-out set.
@@ -434,6 +445,7 @@ class Optimizer:
         verbose: bool = False,
         validation_gate: bool = True,
         validation_tolerance: float = 1e-3,
+        proposer_judge: Any = None,
     ):
         self.harness = harness
         self.max_evals = max_evals
@@ -442,6 +454,7 @@ class Optimizer:
         self.validation_gate = validation_gate
         self.validation_tolerance = validation_tolerance
         self.judge = judge
+        self.proposer_judge = proposer_judge
         self.suggest_tools = suggest_tools
         self.cache_evaluations = cache_evaluations
         self.verbose = verbose
@@ -451,6 +464,8 @@ class Optimizer:
         self._baseline_snapshot: dict[str, Any] = {}
         # Shared advisory-suggestion sink, replaced per ``optimize`` call.
         self._recommendations: list[str] = []
+        # Log the shared-judge warning once per optimizer, not once per run.
+        self._shared_judge_warned = False
         # Evaluation-report cache: owned per ``optimize`` call, or injected by
         # a PipelineOptimizer so its stages share hits. ``None`` = no cache.
         self._eval_cache: dict[str, EvaluationReport] | None = None
@@ -508,6 +523,7 @@ class Optimizer:
             # One shared sink threaded through every ProposalContext and read back
             # after the search (proposers may append advisory suggestions to it).
             self._recommendations = []
+            self._recommendations.extend(self._shared_judge_notes())
 
             state = _SearchState(
                 best_config={},
@@ -709,6 +725,47 @@ class Optimizer:
         self._store_report(target, dataset, retried)
         return retried
 
+    @property
+    def _rewriting_judge(self) -> Any:
+        """The judge that critiques and rewrites: ``proposer_judge``, else ``judge``."""
+        return self.proposer_judge if self.proposer_judge is not None else self.judge
+
+    def _shared_judge_notes(self) -> list[str]:
+        """Say so when the judge that writes candidates also marks them.
+
+        "Same judge" means the same object *or* the same underlying completion
+        callable: two ``LLMJudge`` instances over one model are one marker with
+        two rubrics, not an independent second opinion.
+        """
+        rewriting = self._rewriting_judge
+        if rewriting is None:
+            return []
+        scoring = [
+            j
+            for j in (getattr(m, "judge", None) for m in getattr(self.harness, "metrics", []))
+            if j is not None
+        ]
+
+        def same(a: Any, b: Any) -> bool:
+            if a is b:
+                return True
+            ca, cb = getattr(a, "complete", None), getattr(b, "complete", None)
+            return ca is not None and ca is cb
+
+        if not any(same(rewriting, j) for j in scoring):
+            return []
+        note = (
+            "Independence: the judge that rewrites prompts is also the judge that scores "
+            "them, so reported gains may partly reflect the judge preferring its own "
+            "writing. The held-out validation gate does not correct for this (the same "
+            "judge scores it). Pass proposer_judge=<a judge on a different model family>, "
+            "or score with a deterministic metric."
+        )
+        if not self._shared_judge_warned:
+            self._shared_judge_warned = True
+            logger.warning("[%s] %s", self.strategy_name, note)
+        return [note]
+
     def _gate_on_validation(
         self,
         target: OptimizableAgent,
@@ -877,7 +934,7 @@ class Optimizer:
             agent=target,
             dataset=dataset,
             report=report,
-            judge=self.judge,
+            judge=self._rewriting_judge,
             rng=self._rng,
             n=n,
             recommendations=self._recommendations,
@@ -1053,7 +1110,9 @@ class CoordinateAscentOptimizer(Optimizer):
         **kw: Any,
     ):
         super().__init__(harness, **kw)
-        self.proposers = proposers if proposers is not None else default_proposers(self.judge)
+        self.proposers = (
+            proposers if proposers is not None else default_proposers(self._rewriting_judge)
+        )
         self.rounds = rounds
         self.candidates_per_param = candidates_per_param
         self.kinds = kinds
@@ -1139,7 +1198,9 @@ class EvolutionaryOptimizer(Optimizer):
         **kw: Any,
     ):
         super().__init__(harness, **kw)
-        self.proposers = proposers if proposers is not None else default_proposers(self.judge)
+        self.proposers = (
+            proposers if proposers is not None else default_proposers(self._rewriting_judge)
+        )
         self.population = population
         self.generations = generations
         self.mutations_per_parent = mutations_per_parent
@@ -1397,6 +1458,7 @@ def make_default_optimizer(
     verbose: bool = False,
     min_improvement: float | None = None,
     suggest_tools: bool | None = None,
+    proposer_judge: Any = None,
 ) -> PipelineOptimizer:
     """Build a sensible "do all the optimizations" pipeline.
 
@@ -1409,9 +1471,17 @@ def make_default_optimizer(
     ``suggest_tools`` controls whether the pipeline records advisory new-tool/skill
     recommendations: ``None`` (default) auto-enables it whenever a ``judge`` is
     supplied; pass ``True``/``False`` to force it on or off.
+
+    ``proposer_judge`` is a separate judge used for critique and prompt
+    rewriting, so the model that writes a candidate is not the one that scores
+    it (see :class:`Optimizer`).
     """
     per_stage = max(5, max_evals // 4)
     common: dict[str, Any] = {"seed": seed, "judge": judge, "verbose": verbose}
+    if proposer_judge is not None:
+        # A separate judge for critique + rewriting, so the model that writes a
+        # candidate prompt is not the one that marks it.
+        common["proposer_judge"] = proposer_judge
     if min_improvement is not None:
         common["min_improvement"] = min_improvement
     suggest = (judge is not None) if suggest_tools is None else suggest_tools

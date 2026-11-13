@@ -1081,3 +1081,92 @@ def test_gate_does_not_reject_on_a_held_out_pass_it_could_not_complete():
     assert res.validation_rejected is False
     assert state["prompt"] == "OVERFIT"
     assert res.validation_baseline_score is None, "a partial baseline is not a baseline"
+
+
+# -- independent proposer judge -----------------------------------------------
+#
+# The model that writes a candidate prompt should not be the one that marks it.
+
+
+def _recording(reply_for_scoring):
+    """A completion function that records every prompt it is sent."""
+    seen = []
+
+    def complete(prompt, system=None):
+        seen.append(prompt)
+        if "CURRENT INSTRUCTION" in prompt or "Rewrite the instruction" in prompt:
+            return GOOD_PROMPT
+        if "critique" in prompt.lower() or "what is wrong" in prompt.lower():
+            return "CRITIQUE-MARKER: it produced the wrong answer."
+        return reply_for_scoring(prompt)
+
+    return complete, seen
+
+
+def _score_by_answer(prompt):
+    # A scoring judge that passes an output only when it is a real answer.
+    return '{"score": 0}' if "WRONG" in prompt else '{"score": 10}'
+
+
+def test_proposer_judge_does_the_rewriting_and_the_scoring_judge_never_sees_it():
+    state, agent = build_toy(prompt="initial instruction", gate="prompt", prompt_candidates=None)
+    score_complete, score_seen = _recording(_score_by_answer)
+    write_complete, write_seen = _recording(lambda p: "It produced the wrong answer.")
+    scoring = LLMJudge(score_complete)
+    writing = LLMJudge(write_complete)
+
+    res = CoordinateAscentOptimizer(
+        EvaluationHarness(scoring.as_metric()), seed=0, judge=scoring, proposer_judge=writing
+    ).optimize(agent, dataset())
+
+    assert GOOD_PROMPT in str(state["prompt"])
+    assert res.improved
+    # Every rewrite went to the proposer judge...
+    assert any("CURRENT INSTRUCTION" in p or "Rewrite the instruction" in p for p in write_seen)
+    # ...and the scoring judge was only ever asked to score: it was never
+    # asked to rewrite, and never shown the proposer's critique of anything.
+    assert score_seen, "the scoring judge was never consulted"
+    assert not any("CURRENT INSTRUCTION" in p or "Rewrite the instruction" in p for p in score_seen)
+    assert not any("CRITIQUE-MARKER" in p for p in score_seen)
+    assert not any("Independence:" in r for r in res.recommendations)
+
+
+def test_a_judge_that_both_writes_and_marks_is_flagged():
+    _, agent = build_toy(prompt="initial instruction", gate="prompt", prompt_candidates=None)
+    complete, _ = _recording(_score_by_answer)
+    judge = LLMJudge(complete)
+
+    res = CoordinateAscentOptimizer(
+        EvaluationHarness(judge.as_metric()), seed=0, judge=judge
+    ).optimize(agent, dataset())
+
+    assert any(r.startswith("Independence:") for r in res.recommendations)
+
+
+def test_two_judges_over_one_model_are_not_independent():
+    """Different LLMJudge objects, same completion callable: still one marker."""
+    _, agent = build_toy(prompt="initial instruction", gate="prompt", prompt_candidates=None)
+    complete, _ = _recording(_score_by_answer)
+
+    res = CoordinateAscentOptimizer(
+        EvaluationHarness(LLMJudge(complete).as_metric()),
+        seed=0,
+        judge=LLMJudge(complete, adversarial=True),
+    ).optimize(agent, dataset())
+
+    assert any(r.startswith("Independence:") for r in res.recommendations)
+
+
+def test_a_deterministic_metric_is_independent_of_any_judge():
+    _, agent = build_toy(prompt="initial instruction", gate="prompt", prompt_candidates=None)
+    res = CoordinateAscentOptimizer(harness(), seed=0, judge=LLMJudge(fake_complete)).optimize(
+        agent, dataset()
+    )
+    assert not any("Independence:" in r for r in res.recommendations)
+
+
+def test_make_default_optimizer_threads_the_proposer_judge_to_every_stage():
+    writing = LLMJudge(fake_complete)
+    opt = make_default_optimizer(harness(), judge=LLMJudge(fake_complete), proposer_judge=writing)
+    assert all(stage.proposer_judge is writing for stage in opt.stages)
+    assert opt.proposer_judge is writing

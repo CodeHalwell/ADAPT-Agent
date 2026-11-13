@@ -53,11 +53,12 @@ fw = Firewall(max_content_length=10_000, max_events=1000)
 ### `whitelist_mode=True`
 
 `Firewall(whitelist_mode=True)` moves the allowed-pattern check to the
-**front**: content that fully matches any allowed pattern is allowed
-immediately, and nothing else runs — not the blocked patterns, not the custom
-filters, and **not the length cap**. Use it only when the allowed patterns are
-themselves the security boundary, and keep them tight: an allowed pattern of
-`.*` in this mode disables the firewall, including its DoS guard.
+**front**, directly after the length cap: content that fully matches any
+allowed pattern is allowed immediately, and neither the blocked patterns nor the
+custom filters run. Use it only when the allowed patterns are themselves the
+security boundary, and keep them tight: an allowed pattern of `.*` in this mode
+disables pattern and filter screening. The length cap still applies — no allowed
+pattern can waive it.
 
 In neither mode are allowed patterns *restrictive*. They exempt content; they
 never reject it. Content matching no allowed pattern is still allowed once the
@@ -295,7 +296,7 @@ agent is safe. In particular:
 | **Only reachable text is scanned** | Governance scans the strings `extract_texts` can reach: dicts, lists, well-known text attributes, Pydantic models and dataclasses, to a depth of 12. Text inside an arbitrary object's private attributes, binary or encoded payloads, images, and anything nested deeper is not seen. |
 | **Only the governed boundary is scanned** | An adapter screens the input to and output from the agent it wraps. Tool calls, retrievals and sub-agent hops inside that agent are screened only where a native integration hook is installed for them. |
 | **Policy sees state, not content** | Under an adapter, rules are evaluated against `state` only. Registration rejects conditions that could never evaluate, but a rule that references a key your state does not carry still errors at run time — and passes silently unless `fail_closed=True`. |
-| **Allowed patterns do not restrict** | See above: they exempt, they never reject. `whitelist_mode=True` additionally bypasses the length cap for matching content. |
+| **Allowed patterns do not restrict** | See above: they exempt, they never reject. In `whitelist_mode=True` a matching allowed pattern also skips the blocked patterns and custom filters. |
 | **Regex cost** | The length cap bounds input size, and obviously catastrophic patterns are rejected, but that check is a heuristic. A pathological user-supplied pattern can still be slow. |
 | **Trust and taint are bookkeeping** | `TrustManager` and `TaintTracker` record what you tell them. Nothing is enforced unless your code, or a policy rule, acts on the score or taint level. |
 | **Optimization is not a security control** | `adapt_agent.optimization` tunes for a score on your dataset. It does not check that a tuned prompt keeps safety instructions; review `best_config` before shipping it (see [Optimization](optimization.md)). |

@@ -380,3 +380,98 @@ def test_evaluator_itself_refuses_calls_attributes_and_power(condition):
     tree = ast.parse(condition, mode="eval")
     with pytest.raises(ValueError):
         enforcer._eval_node(tree.body, {"state": state})
+
+
+# -- run-time vacuity: a rule that has only ever errored ------------------------
+
+
+def test_rule_stats_count_each_outcome():
+    enforcer = PolicyEnforcer()
+    enforcer.add_rule("low_trust", "d", "state['trust_score'] < 0.5", action="block")
+    enforcer.check_state({"trust_score": 0.2})
+    enforcer.check_state({"trust_score": 0.9})
+    enforcer.check_state({"trust_score": 0.8})
+    enforcer.check_state({})  # the key is missing: cannot be evaluated
+    assert enforcer.get_rule_stats() == {
+        "low_trust": {"violation": 1, "pass": 2, "error": 1, "unresolved": 1}
+    }
+
+
+def test_vacuous_rules_finds_a_rule_that_has_never_been_evaluable():
+    """The documented trap: a `message` rule under something that only checks state.
+
+    Under the default fail-open setting it has silently done nothing since it
+    was installed. Nothing fails; the rule simply never fires.
+    """
+    enforcer = PolicyEnforcer()
+    enforcer.add_rule("no_secrets", "d", "'password' in message['content']", action="block")
+    enforcer.add_rule("needs_tier", "d", "state['tier'] == 'free'", action="block")
+    enforcer.add_rule("low_trust", "d", "state['trust_score'] < 0.5", action="block")
+    enforcer.add_rule("never_checked", "d", "state['x'] == 1")
+
+    assert enforcer.vacuous_rules() == [], "no evidence yet: nothing has been evaluated"
+    enforcer.remove_rule("never_checked")
+
+    for trust in (0.9, 0.2, 0.7):
+        assert "no_secrets" not in enforcer.check_state({"trust_score": trust})
+
+    assert enforcer.vacuous_rules() == ["no_secrets", "needs_tier"]
+
+
+def test_a_missing_key_is_a_quiet_pass_but_is_counted_as_unresolved():
+    """`==` against an absent key does not error -- which is what hides it."""
+    enforcer = PolicyEnforcer()
+    enforcer.add_rule("free_tier", "d", "state['tier'] == 'free'", action="block")
+    assert enforcer.check_state({"trust_score": 0.9}) == []
+    assert enforcer.get_rule_stats()["free_tier"] == {
+        "violation": 0,
+        "pass": 1,
+        "error": 0,
+        "unresolved": 1,
+    }
+    assert enforcer.vacuous_rules() == ["free_tier"]
+
+    enforcer.check_state({"tier": "paid"})  # now it has seen real data once
+    assert enforcer.vacuous_rules() == []
+
+
+def test_a_guarded_lookup_that_short_circuits_is_not_a_missed_lookup():
+    enforcer = PolicyEnforcer()
+    enforcer.add_rule(
+        "admin", "d", "'admin' in state['context'] and state['context']['admin'] == True"
+    )
+    enforcer.check_state({"context": {}})
+    assert enforcer.get_rule_stats()["admin"]["unresolved"] == 0
+
+
+def test_a_rule_that_is_sometimes_out_of_scope_is_not_vacuous():
+    """Mixing check_message and check_state on one enforcer is legitimate."""
+    enforcer = PolicyEnforcer()
+    enforcer.add_rule("msg", "d", "'x' in message['content']")
+    enforcer.add_rule("st", "d", "state['n'] > 1")
+    enforcer.check_state({"n": 0})
+    enforcer.check_message({"role": "user", "content": "y"})
+    assert enforcer.vacuous_rules() == []
+
+
+def test_rule_stats_follow_the_rule_not_the_name():
+    enforcer = PolicyEnforcer()
+    enforcer.add_rule("r", "d", "state['missing'] == 1")
+    enforcer.check_state({})
+    assert enforcer.vacuous_rules() == ["r"]
+
+    enforcer.add_rule("r", "d", "state['n'] == 1")  # replaced: old counts are about the old rule
+    assert enforcer.get_rule_stats() == {
+        "r": {"violation": 0, "pass": 0, "error": 0, "unresolved": 0}
+    }
+    enforcer.remove_rule("r")
+    assert enforcer.get_rule_stats() == {}
+
+
+def test_dry_run_is_not_counted_in_rule_stats():
+    enforcer = PolicyEnforcer()
+    enforcer.add_rule("r", "d", "state['n'] == 1")
+    enforcer.evaluate_rules(state={"n": 1})
+    assert enforcer.get_rule_stats() == {
+        "r": {"violation": 0, "pass": 0, "error": 0, "unresolved": 0}
+    }

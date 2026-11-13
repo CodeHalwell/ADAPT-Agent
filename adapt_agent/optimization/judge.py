@@ -535,7 +535,11 @@ class LLMJudge:
                 propagate_transient=True,
             ).score
 
-        return Metric(name, _fn, needs_example=True, on_error=self.on_error)
+        metric = Metric(name, _fn, needs_example=True, on_error=self.on_error)
+        # So an optimizer can tell that the judge scoring candidates is the one
+        # also writing them -- see `Optimizer(proposer_judge=...)`.
+        metric.judge = self
+        return metric
 
     # -- internals -------------------------------------------------------------
 

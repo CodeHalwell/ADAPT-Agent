@@ -70,6 +70,9 @@ class Metric:
         self.needs_example = needs_example
         self.structural = structural
         self.on_error = None if on_error is None else _clamp(on_error)
+        #: The :class:`~adapt_agent.optimization.judge.LLMJudge` behind this
+        #: metric, when it is model-graded (set by ``LLMJudge.as_metric``).
+        self.judge: Any = None
 
     def __call__(self, output: Any, expected: Any, example: Any = None) -> float:
         try:

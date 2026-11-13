@@ -117,6 +117,11 @@ def validate_condition(condition: str) -> None:
             )
 
 
+#: Context key under which a failed ``state[...]`` lookup is noted during one
+#: rule's evaluation. An object, not a string, so no condition can name it.
+_MISSED_LOOKUP: Any = object()
+
+
 class PolicyEnforcer:
     """Enforces policies and rules on LLM agent behavior.
 
@@ -160,6 +165,9 @@ class PolicyEnforcer:
         self._rules: dict[str, PolicyRule] = {}
         # ⚡ Bolt: Replace O(N) list.pop(0) ring buffer with O(1) collections.deque
         self._violations: deque[dict[str, Any]] = deque(maxlen=max_violations)
+        # Per-rule outcome counts, so a rule that has only ever *errored* can be
+        # found. Bounded by the number of rules (entries die with their rule).
+        self._rule_stats: dict[str, dict[str, int]] = {}
         self._rule_handlers: dict[str, Callable] = {}
 
     def add_rule(
@@ -200,6 +208,9 @@ class PolicyEnforcer:
             "severity": severity,
         }
         self._rules[name] = rule
+        # A re-registered rule is a new rule: old counts would describe the
+        # condition it replaced.
+        self._rule_stats[name] = {"violation": 0, "pass": 0, "error": 0, "unresolved": 0}
 
     def remove_rule(self, name: str) -> bool:
         """Remove a policy rule.
@@ -212,6 +223,7 @@ class PolicyEnforcer:
         """
         if name in self._rules:
             del self._rules[name]
+            self._rule_stats.pop(name, None)
             return True
         return False
 
@@ -257,8 +269,7 @@ class PolicyEnforcer:
         context = {"message": message}
 
         for rule_name, rule in self._rules.items():
-            # Simple condition checking (can be extended with more sophisticated evaluation)
-            if self._evaluate_condition(rule["condition"], context, rule_name):
+            if self._check_rule(rule_name, rule, context):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "message", message)
                 self._handle_violation(rule)
@@ -279,7 +290,7 @@ class PolicyEnforcer:
         context = {"state": state}
 
         for rule_name, rule in self._rules.items():
-            if self._evaluate_condition(rule["condition"], context, rule_name):
+            if self._check_rule(rule_name, rule, context):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "state", state)
                 self._handle_violation(rule)
@@ -378,9 +389,28 @@ class PolicyEnforcer:
             True if condition is met (violation), False otherwise. On an
             evaluation error returns ``self.fail_closed``.
         """
+        outcome = self._outcome(condition, context, rule_name)
+        if outcome == "error":
+            return self.fail_closed
+        return outcome == "violation"
+
+    def _outcome(
+        self,
+        condition: str,
+        context: dict[str, Any],
+        rule_name: str | None = None,
+    ) -> str:
+        """Evaluate a condition to ``"violation"``, ``"pass"`` or ``"error"``.
+
+        The three-way answer :meth:`_evaluate_condition` collapses to a bool.
+        Kept separate so the enforcer can count *errors* per rule: under
+        fail-open an error and a pass are the same ``False`` to the caller, and
+        a rule that only ever errors is indistinguishable from one that is
+        simply never violated.
+        """
         try:
             tree = _parse_condition(condition)
-            return bool(self._eval_node(tree.body, context))
+            return "violation" if self._eval_node(tree.body, context) else "pass"
         except Exception as e:
             label = f" for rule '{rule_name}'" if rule_name else ""
             logger.warning(
@@ -390,7 +420,59 @@ class PolicyEnforcer:
                 e,
                 "VIOLATION (fail_closed)" if self.fail_closed else "no violation (fail_open)",
             )
+            return "error"
+
+    def _check_rule(self, rule_name: str, rule: PolicyRule, context: dict[str, Any]) -> bool:
+        """Evaluate one rule for real: count the outcome, return "violated?"."""
+        context.pop(_MISSED_LOOKUP, None)
+        outcome = self._outcome(rule["condition"], context, rule_name)
+        missed = context.pop(_MISSED_LOOKUP, False)
+        stats = self._rule_stats.setdefault(
+            rule_name, {"violation": 0, "pass": 0, "error": 0, "unresolved": 0}
+        )
+        stats[outcome] += 1
+        if outcome == "error" or missed:
+            stats["unresolved"] += 1
+        if outcome == "error":
             return self.fail_closed
+        return outcome == "violation"
+
+    def get_rule_stats(self) -> dict[str, dict[str, int]]:
+        """Per-rule counts of ``violation`` / ``pass`` / ``error`` outcomes.
+
+        ``unresolved`` additionally counts the evaluations -- of any outcome --
+        in which the rule could not see everything it asked for: it errored, or
+        a ``state[...]`` lookup found no such key (which evaluates to ``None``
+        rather than erroring, so ``state['tier'] == 'free'`` is a quiet
+        ``pass`` when ``tier`` is absent).
+
+        Counts cover :meth:`check_state` and :meth:`check_message` calls since
+        the rule was registered (:meth:`evaluate_rules` is a dry run and is not
+        counted).
+        """
+        return {name: dict(stats) for name, stats in self._rule_stats.items()}
+
+    def vacuous_rules(self) -> list[str]:
+        """Rules that have been evaluated and have **never once** seen their data.
+
+        In every evaluation so far such a rule either errored or looked up a
+        key that was not there -- typically because it reads a key the state
+        never carries (a typo, or data the adapter does not populate), or names
+        ``message`` where only ``state`` is ever in scope (as under an
+        adapter). It has decided nothing on evidence since it was installed:
+        it has silently passed, or under ``fail_closed=True`` blocked
+        everything.
+
+        A rule that has not been evaluated at all is not listed: there is no
+        evidence either way. Check this after real traffic, or in a test after
+        driving a representative request through the agent.
+        """
+        return [
+            name
+            for name, stats in self._rule_stats.items()
+            if stats["unresolved"] > 0
+            and stats["unresolved"] == stats["violation"] + stats["pass"] + stats["error"]
+        ]
 
     def _eval_node(self, node: ast.AST, context: dict[str, Any], depth: int = 0) -> Any:
         if depth > 50:
@@ -466,6 +548,10 @@ class PolicyEnforcer:
             try:
                 return val[slice_val]
             except (KeyError, IndexError, TypeError):
+                # Deliberately not an error: `state['flag'] == True` should be
+                # a quiet "no" when the flag is absent. But it is noted, so a
+                # rule whose lookups have *never* resolved can be reported.
+                context[_MISSED_LOOKUP] = True
                 return None
         else:
             raise ValueError(f"Unsupported AST node: {node_type}")
