@@ -50,6 +50,73 @@ def _parse_condition(condition: str) -> ast.Expression:
     return tree
 
 
+#: Names a condition may reference. ``check_state`` binds ``state`` and
+#: ``check_message`` binds ``message``; nothing else is ever in scope.
+CONDITION_NAMES = frozenset({"state", "message"})
+
+_SUPPORTED_NODES: tuple[type[ast.AST], ...] = (
+    ast.Expression,
+    ast.Constant,
+    ast.Name,
+    ast.Load,
+    ast.List,
+    ast.Tuple,
+    ast.Set,
+    ast.Dict,
+    ast.Compare,
+    ast.BoolOp,
+    ast.And,
+    ast.Or,
+    ast.BinOp,
+    ast.Subscript,
+)
+
+
+def validate_condition(condition: str) -> None:
+    """Reject a condition the evaluator could never evaluate.
+
+    A rule whose condition always errors is *vacuous*: under the default
+    fail-open setting it never fires, and under ``fail_closed=True`` it fires
+    on everything. Neither is what its author meant, and both used to be
+    discovered only from a warning in the logs. Everything checked here is
+    decidable from the text alone, so it is checked once, at registration.
+
+    What this cannot see is the *data*: ``state["n"] > 5`` is well-formed but
+    still errors when ``n`` is absent. Use
+    :meth:`PolicyEnforcer.evaluate_rules` with a representative state for that.
+
+    Raises:
+        ValueError: on a syntax error, an oversized condition, an unsupported
+            construct (calls, attribute access, ``not``, slices, ...), an
+            unsupported operator, or a name other than ``state``/``message``.
+    """
+    try:
+        tree = _parse_condition(condition)
+    except SyntaxError as exc:
+        raise ValueError(f"Condition is not a valid expression: {exc.msg}") from exc
+    for node in ast.walk(tree):
+        if isinstance(node, _SUPPORTED_NODES):
+            if isinstance(node, ast.Name) and node.id not in CONDITION_NAMES:
+                raise ValueError(
+                    f"Unknown name {node.id!r} in condition; only "
+                    f"{sorted(CONDITION_NAMES)} are available"
+                )
+            if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+                raise ValueError("Slices are not supported in conditions")
+        elif isinstance(node, ast.cmpop):
+            if type(node) not in PolicyEnforcer._OPERATORS:
+                raise ValueError(f"Unsupported comparison in condition: {type(node).__name__}")
+        elif isinstance(node, ast.operator):
+            if type(node) not in PolicyEnforcer._BINOPS:
+                raise ValueError(f"Unsupported operator in condition: {type(node).__name__}")
+        else:
+            raise ValueError(
+                f"Unsupported construct in condition: {type(node).__name__} "
+                "(conditions allow literals, state[...]/message[...] lookups, "
+                "comparisons, and/or, and + - * /)"
+            )
+
+
 class PolicyEnforcer:
     """Enforces policies and rules on LLM agent behavior.
 
@@ -118,12 +185,12 @@ class PolicyEnforcer:
                 f"Condition length {len(condition)} exceeds maximum allowed length of 1024"
             )
 
-        # SECURITY: Bound CPU on pathological-but-shallow conditions (e.g. a flat
-        # 250-element literal) by rejecting conditions with too many AST nodes at
-        # registration time. ``_parse_condition`` raises ValueError when the node
-        # count exceeds ``MAX_CONDITION_NODES``; it also surfaces syntax errors so
-        # rules with broken syntax are rejected up front rather than silently.
-        _parse_condition(condition)
+        # SECURITY: Reject, up front, any condition the evaluator could never
+        # evaluate -- broken syntax, too many AST nodes (CPU bound), an
+        # unsupported construct such as a call or attribute access, or a name
+        # other than ``state``/``message``. Such a rule is vacuous: it would
+        # never fire (fail-open) or fire on everything (fail-closed).
+        validate_condition(condition)
 
         rule: PolicyRule = {
             "name": name,
@@ -218,6 +285,41 @@ class PolicyEnforcer:
                 self._handle_violation(rule)
 
         return violations
+
+    def evaluate_rules(
+        self,
+        *,
+        state: AgentState | None = None,
+        message: AgentMessage | None = None,
+    ) -> dict[str, str]:
+        """Dry-run every rule against an example, without side effects.
+
+        Returns ``{rule_name: outcome}`` where outcome is ``"violation"``,
+        ``"pass"`` or ``"error"`` (the condition could not be evaluated against
+        this example -- typically a missing key). Nothing is recorded and no
+        handler runs, so this is safe to call from a test or a startup check.
+
+        Use it to show a rule is not vacuous: a rule you expect to block should
+        report ``"violation"`` for at least one example and ``"pass"`` for at
+        least one other. A rule that reports ``"error"`` for a realistic
+        example is one that silently does nothing under the default
+        ``fail_closed=False``.
+        """
+        context: dict[str, Any] = {}
+        if state is not None:
+            context["state"] = state
+        if message is not None:
+            context["message"] = message
+        outcomes: dict[str, str] = {}
+        for rule_name, rule in self._rules.items():
+            try:
+                tree = _parse_condition(rule["condition"])
+                fired = bool(self._eval_node(tree.body, context))
+            except Exception:
+                outcomes[rule_name] = "error"
+            else:
+                outcomes[rule_name] = "violation" if fired else "pass"
+        return outcomes
 
     def get_violations(
         self,

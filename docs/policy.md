@@ -58,19 +58,25 @@ policy.check_message({"role": "user", "content": "my password is hunter2"})
 
 # state context: {"state": <the AgentState>}
 policy.add_rule(
-    name="empty_context_ok",
+    name="context_present",
     description="Fire when context has any keys",
-    condition="len(state['context']) > 0",  # NOTE: len() is NOT supported — see below
+    condition="state['context'] != {}",
     action="warn",
 )
 ```
 
 !!! warning
-    The two `len(...)` examples on this page are intentionally used to illustrate
-    a common mistake: **function calls are not part of the expression language.**
-    A condition that uses an unsupported construct raises during evaluation, is
-    caught, logged, and treated as "no violation" (returns `False`). Rewrite such
-    rules using only the supported nodes listed below.
+    **Function calls are not part of the expression language** — there is no
+    `len(...)` or `str(...)`. `add_rule` rejects a condition it could never
+    evaluate with a `ValueError`, so the mistake surfaces when the rule is
+    registered rather than as a rule that silently never fires:
+
+    ```python
+    policy.add_rule("long", "too long", condition="len(state['context']) > 0")
+    # ValueError: Unsupported construct in condition: Call (...)
+    policy.add_rule("typo", "typo", condition="stat['trust_score'] < 0.5")
+    # ValueError: Unknown name 'stat' in condition; only ['message', 'state'] are available
+    ```
 
 ---
 
@@ -104,8 +110,28 @@ Chained comparisons work as in Python (`0 < x < 10`). Subscript failures
 - **Unknown variables** — referencing a name not in the context raises
   `"Unknown variable: ..."`.
 
-Any unsupported node raises `ValueError("Unsupported AST node: ...")`, which is
-caught by `_evaluate_condition`, logged, and yields `False` (no violation).
+Every item above is detectable from the condition text alone, so `add_rule`
+(and `adapt validate`) rejects it with a `ValueError` at registration. What
+registration **cannot** see is your data: `state['n'] > 5` is well-formed but
+cannot be evaluated when `n` is missing. That case is still decided at run time
+by `fail_closed` — logged and treated as *no violation* by default, or as a
+violation with `PolicyEnforcer(fail_closed=True)`.
+
+### Checking a rule is not vacuous
+
+A rule that can never fire is worse than no rule, because it looks installed.
+`evaluate_rules` dry-runs every rule against an example — nothing is recorded
+and no handler runs — and reports `"violation"`, `"pass"` or `"error"` per rule:
+
+```python
+policy.evaluate_rules(state={"messages": [], "context": {}, "trust_score": 0.2})
+# {'low_trust': 'violation'}
+policy.evaluate_rules(state={"messages": [], "context": {}})
+# {'low_trust': 'error'}   <- trust_score missing: silently passes unless fail_closed
+```
+
+For each blocking rule, assert in your own tests that one realistic example
+gives `"violation"` and another gives `"pass"`.
 
 ### Depth limit
 
@@ -124,7 +150,7 @@ as no violation.
 "message['content'] == 'a' + 'b'"
 ```
 
-### Examples that are rejected (fire-as-False)
+### Examples that are rejected by `add_rule`
 
 ```python
 "len(message['content']) > 100"   # function call

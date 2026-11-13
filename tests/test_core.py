@@ -37,7 +37,7 @@ def test_policy_enforcer_add_rule():
     """Test adding a policy rule."""
     enforcer = PolicyEnforcer()
     enforcer.add_rule(
-        name="test_rule", description="Test rule", condition="test", action="warn", severity="low"
+        name="test_rule", description="Test rule", condition="True", action="warn", severity="low"
     )
 
     rule = enforcer.get_rule("test_rule")

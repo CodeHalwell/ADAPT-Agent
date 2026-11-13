@@ -271,3 +271,87 @@ def test_node_count_cap_allows_normal_condition():
         condition="state['trust_score'] < 0.5",
     )
     assert enforcer.get_rule("ok") is not None
+
+
+# -- registration-time validation: a rule that can never fire is rejected ------
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "stat['trust_score'] < 0.5",  # typo'd name
+        "len(state['messages']) > 5",  # function call
+        "state.trust_score < 0.5",  # attribute access
+        "not state['ok']",  # unary not
+        "state['messages'][-1] == 'x'",  # unary minus
+        "state['messages'][0:2] == []",  # slice
+        "state['n'] % 2 == 0",  # unsupported arithmetic operator
+        "state['n'] is None",  # unsupported comparison
+        "state['n'] >",  # syntax error
+    ],
+)
+def test_add_rule_rejects_conditions_that_could_never_evaluate(condition):
+    enforcer = PolicyEnforcer()
+    with pytest.raises(ValueError):
+        enforcer.add_rule(name="r", description="d", condition=condition, action="block")
+    assert enforcer.get_rule("r") is None
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "state['trust_score'] < 0.5",
+        "'password' in message['content'] or 'credentials' in message['content']",
+        "0 < state['n'] <= 10 and state['context'] != {}",
+        "state['a'] + state['b'] * 2 - 1 > state['c'] / 2",
+        "message['role'] in ['system', 'tool'] and message['role'] not in ('user',)",
+        "state['context'] == {'k': [1, 2], 's': {3}}",
+        "True",
+    ],
+)
+def test_add_rule_accepts_every_supported_construct(condition):
+    PolicyEnforcer().add_rule(name="r", description="d", condition=condition)
+
+
+def test_every_condition_accepted_at_registration_is_evaluable():
+    """validate_condition and _eval_node must agree on the supported grammar.
+
+    If the validator accepted a node the evaluator cannot handle, the rule
+    would register and then silently never fire -- the exact bug the validator
+    exists to prevent.
+    """
+    enforcer = PolicyEnforcer()
+    state = {"n": 3, "a": 1, "b": 2, "c": 4, "context": {"k": 1}, "messages": [{"content": "x"}]}
+    conditions = {
+        "cmp": "0 < state['n'] <= 10",
+        "bool": "state['n'] == 3 and state['context'] != {} or state['a'] == 9",
+        "arith": "state['a'] + state['b'] * 2 - 1 > state['c'] / 2",
+        "member": "state['n'] in [1, 2, 3] and state['n'] not in (7,) and state['n'] in {3}",
+        "nested": "state['messages'][0]['content'] == 'x'",
+        "dict": "state['context'] == {'k': 1}",
+    }
+    for name, condition in conditions.items():
+        enforcer.add_rule(name=name, description="d", condition=condition)
+    assert enforcer.evaluate_rules(state=state) == dict.fromkeys(conditions, "violation")
+
+
+def test_evaluate_rules_reports_violation_pass_and_error_without_side_effects():
+    enforcer = PolicyEnforcer()
+    handled = []
+    enforcer.register_handler("block", handled.append)
+    enforcer.add_rule(
+        name="low_trust", description="d", condition="state['trust_score'] < 0.5", action="block"
+    )
+    enforcer.add_rule(name="msg", description="d", condition="'x' in message['content']")
+
+    assert enforcer.evaluate_rules(state={"trust_score": 0.2}) == {
+        "low_trust": "violation",
+        "msg": "error",  # `message` is not in scope for a state-only example
+    }
+    assert enforcer.evaluate_rules(state={"trust_score": 0.9})["low_trust"] == "pass"
+    # A missing key is the run-time vacuity registration cannot see.
+    assert enforcer.evaluate_rules(state={})["low_trust"] == "error"
+    assert enforcer.evaluate_rules(message={"role": "user", "content": "x"})["msg"] == "violation"
+
+    assert enforcer.get_violations() == []
+    assert handled == []

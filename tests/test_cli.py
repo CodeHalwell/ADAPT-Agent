@@ -303,3 +303,23 @@ def test_main_monitor_with_missing_config_returns_one(tmp_path):
 def test_main_monitor_requires_agent_id():
     with pytest.raises(SystemExit):
         main(["monitor"])
+
+
+def test_validate_config_rejects_a_condition_that_could_never_evaluate():
+    from adapt_agent.cli import validate_config
+
+    errors = validate_config(
+        {"policy_rules": [{"name": "long", "condition": "len(message['content']) > 5000"}]}
+    )
+    assert len(errors) == 1
+    assert "policy_rules[0].condition cannot be evaluated" in errors[0]
+
+
+def test_bundled_example_config_is_valid():
+    import json
+    from pathlib import Path
+
+    from adapt_agent.cli import validate_config
+
+    example = Path(__file__).resolve().parent.parent / "examples" / "config.example.json"
+    assert validate_config(json.loads(example.read_text(encoding="utf-8"))) == []

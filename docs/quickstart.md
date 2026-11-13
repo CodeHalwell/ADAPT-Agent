@@ -96,9 +96,9 @@ policy.add_rule(
     severity="high",
 )
 policy.add_rule(
-    name="too_many_violations",
-    description="Flag states with prior violations",
-    condition="len(state['context']) > 100",
+    name="context_present",
+    description="Flag states that carry any context",
+    condition="state['context'] != {}",
     action="warn",
     severity="medium",
 )
@@ -174,9 +174,8 @@ except SecurityBlockedError as exc:
 !!! warning "Policy conditions cannot call functions"
     The safe expression language used by `PolicyEnforcer` does **not** support
     function calls (`str(...)`, `len(...)`) or attribute access. Use comparisons,
-    membership (`in`), boolean/arithmetic operators, and subscripts instead. The
-    `str(...)`/`len(...)` forms above are illustrative; an unsupported expression
-    is logged and treated as "no violation". See [Policy Enforcement](policy.md)
+    membership (`in`), boolean/arithmetic operators, and subscripts instead.
+    `add_rule` raises `ValueError` for a condition it could never evaluate. See [Policy Enforcement](policy.md)
     for exactly what is allowed.
 
 Continue to [Framework Adapters](adapters.md) for the complete LangGraph

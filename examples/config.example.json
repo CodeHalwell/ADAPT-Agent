@@ -8,9 +8,9 @@
       "severity": "high"
     },
     {
-      "name": "warn_on_long_message",
-      "description": "Warn when a message is unusually long.",
-      "condition": "len(message['content']) > 5000",
+      "name": "warn_on_system_message",
+      "description": "Warn when a message claims the system role.",
+      "condition": "message['role'] == 'system'",
       "action": "warn",
       "severity": "low"
     }

@@ -256,7 +256,8 @@ Two ways to protect yourself:
 Conditions are Python expressions evaluated by a **sandboxed AST evaluator**,
 not `eval`. The grammar is deliberately small: comparisons, boolean ops,
 membership tests, literals, and subscripting `message` / `state`. Notably
-**not** supported — each is treated as an unevaluable condition:
+**not** supported — `add_rule` raises `ValueError` for each, so the mistake
+surfaces at registration rather than as a rule that never fires:
 
 * function calls — `any(...)`, `len(...)`, `str(...)`
 * negative indexes — `state['messages'][-1]` (unary minus is not allowed)
