@@ -475,3 +475,22 @@ def test_dry_run_is_not_counted_in_rule_stats():
     assert enforcer.get_rule_stats() == {
         "r": {"violation": 0, "pass": 0, "error": 0, "unresolved": 0}
     }
+
+
+@pytest.mark.parametrize(
+    "condition, expected",
+    [
+        ("(0 or 2) == 2", "violation"),  # `or` yields the operand, not True
+        ("(1 and state['s']) == 'ab'", "violation"),  # so does `and`
+        ("(0 and 1) == 0", "violation"),
+        ("('' or state['none']) == None", "violation"),
+        ("0 < (0 or state['none'])", "error"),  # Python refuses 0 < None; so must we
+        ("state['z'] or state['n']", "violation"),
+        ("state['z'] and state['n']", "pass"),
+    ],
+)
+def test_and_or_have_python_semantics(condition, expected):
+    enforcer = PolicyEnforcer()
+    enforcer.add_rule("r", "d", condition)
+    state = {"s": "ab", "z": 0, "n": 2, "none": None}
+    assert enforcer.evaluate_rules(state=state)["r"] == expected

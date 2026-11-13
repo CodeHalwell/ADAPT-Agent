@@ -519,16 +519,23 @@ class PolicyEnforcer:
         elif node_type is ast.BoolOp:
             bool_node = cast(ast.BoolOp, node)
             bool_op_type = type(bool_node.op)
+            # Python semantics: `and`/`or` yield one of their *operands*, not a
+            # bool. Returning True/False here made `(0 or state['x']) < 1` mean
+            # something different in a rule than in Python -- and, worse, made
+            # a comparison Python refuses (`0 < None`) quietly succeed.
+            result: Any = None
             if bool_op_type is ast.And:
                 for value in bool_node.values:
-                    if not self._eval_node(value, context, depth + 1):
-                        return False
-                return True
+                    result = self._eval_node(value, context, depth + 1)
+                    if not result:
+                        return result
+                return result
             elif bool_op_type is ast.Or:
                 for value in bool_node.values:
-                    if self._eval_node(value, context, depth + 1):
-                        return True
-                return False
+                    result = self._eval_node(value, context, depth + 1)
+                    if result:
+                        return result
+                return result
             raise ValueError(f"Unsupported boolean operator: {bool_op_type}")
         elif node_type is ast.BinOp:
             bin_node = cast(ast.BinOp, node)
