@@ -108,9 +108,9 @@ def test_a_kill_is_only_credited_when_the_failing_test_fails_again(monkeypatch, 
         return False, "FAILED tests/test_perf.py::test_is_fast[big input] - AssertionError: slow"
 
     monkeypatch.setattr(module, "_run_suite", fake_run)
-    passed, _ = module._confirmed_run(tmp_path, 60)
+    status, _ = module._confirmed_run(tmp_path, 60)
 
-    assert passed, "an unreproducible failure was credited as a kill"
+    assert status == module.SURVIVED, "an unreproducible failure was credited as a kill"
     flaky = "tests/test_perf.py::test_is_fast[big input]"
     assert calls == [(None, ()), (flaky, ()), (None, (flaky,))]
 
@@ -119,7 +119,7 @@ def test_a_reproducible_failure_is_a_kill(monkeypatch, tmp_path):
     module = _load()
     line = "FAILED tests/test_guard.py::test_limit - assert False"
     monkeypatch.setattr(module, "_run_suite", lambda *a, **k: (False, line))
-    assert module._confirmed_run(tmp_path, 60) == (False, line)
+    assert module._confirmed_run(tmp_path, 60) == (module.KILLED, line)
 
 
 def test_a_timeout_or_collection_error_is_a_kill_without_confirmation(monkeypatch, tmp_path):
@@ -131,5 +131,43 @@ def test_a_timeout_or_collection_error_is_a_kill_without_confirmation(monkeypatc
         return False, "timed out after 60s"
 
     monkeypatch.setattr(module, "_run_suite", fake_run)
-    assert module._confirmed_run(tmp_path, 60) == (False, "timed out after 60s")
+    assert module._confirmed_run(tmp_path, 60) == (module.KILLED, "timed out after 60s")
     assert calls == [None]
+
+
+def test_running_out_of_attempts_is_not_rounded_up_to_a_kill(monkeypatch, tmp_path):
+    """Every suite run fails on a *different* test that then passes alone.
+
+    Nothing reproducible caught the mutant. Reporting that as a kill would let
+    the mutation job pass on flakes alone; it must be its own failing outcome.
+    """
+    module = _load()
+    suite_runs = []
+
+    def fake_run(workdir, timeout, *, only=None, deselect=()):
+        if only is not None:
+            return True, "1 passed"  # each "failure" passes in isolation
+        suite_runs.append(deselect)
+        return False, f"FAILED tests/test_perf.py::test_flaky_{len(suite_runs)} - slow"
+
+    monkeypatch.setattr(module, "_run_suite", fake_run)
+    status, detail = module._confirmed_run(tmp_path, 60, attempts=3)
+
+    assert status == module.UNCONFIRMED
+    assert len(suite_runs) == 3, "the final failure must be confirmed, not trusted"
+    assert "test_flaky_3" in detail
+
+    # ...and an UNCONFIRMED mutant fails the whole check.
+    monkeypatch.setattr(module, "stale_mutants", lambda: [])
+    monkeypatch.setattr(module, "_confirmed_run", lambda *a, **k: (module.UNCONFIRMED, detail))
+    monkeypatch.setattr(module, "_run_suite", lambda *a, **k: (True, "baseline passed"))
+    monkeypatch.setattr(module.shutil, "copytree", lambda src, dst, **k: _copy_one(dst, module))
+    assert module.main(["--only", module.MUTANTS[0].id, "-j", "1"]) == 1
+
+
+def _copy_one(dst, module):
+    """Stand-in for copying the repo: just the one file the first mutant edits."""
+    mutant = module.MUTANTS[0]
+    target = Path(dst) / mutant.path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text((REPO_ROOT / mutant.path).read_text(encoding="utf-8"), encoding="utf-8")

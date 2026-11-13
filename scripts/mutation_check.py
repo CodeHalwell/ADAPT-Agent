@@ -809,7 +809,10 @@ def _failing_test_id(detail: str) -> str | None:
     return None
 
 
-def _confirmed_run(workdir: Path, timeout: float, attempts: int = 3) -> tuple[bool, str]:
+KILLED, SURVIVED, STALE, UNCONFIRMED = "killed", "SURVIVED", "STALE", "UNCONFIRMED"
+
+
+def _confirmed_run(workdir: Path, timeout: float, attempts: int = 3) -> tuple[str, str]:
     """Run the suite against a mutated tree, crediting only reproducible kills.
 
     The suite stops at its first failure, and under several parallel workers
@@ -821,27 +824,30 @@ def _confirmed_run(workdir: Path, timeout: float, attempts: int = 3) -> tuple[bo
     same mutated tree. If it fails again the mutant is killed. If it passes it
     was a flake: the suite is run again without that test, so the mutant has to
     be caught by something that actually depends on it.
+
+    Returns ``(status, detail)``. ``UNCONFIRMED`` means every attempt failed on
+    a test that then passed alone: nothing reproducible caught the mutant, and
+    nothing showed it survives either. It is reported and fails the run --
+    never rounded up to a kill.
     """
     flaky: list[str] = []
-    passed, detail = _run_suite(workdir, timeout)
     for _ in range(attempts):
+        passed, detail = _run_suite(workdir, timeout, deselect=tuple(flaky))
         if passed:
-            return True, detail
+            return SURVIVED, detail
         test_id = _failing_test_id(detail)
         if test_id is None:
-            return False, detail  # a timeout or a collection error: noticed
-        still_fails = not _run_suite(workdir, timeout, only=test_id)[0]
-        if still_fails:
-            return False, detail
+            return KILLED, detail  # a timeout or a collection error: noticed
+        if not _run_suite(workdir, timeout, only=test_id)[0]:
+            return KILLED, detail
         flaky.append(test_id)
-        passed, detail = _run_suite(workdir, timeout, deselect=tuple(flaky))
-    return passed, detail
+    return UNCONFIRMED, f"{len(flaky)} failures, none reproducible: {', '.join(flaky)}"
 
 
 @dataclass
 class Outcome:
     mutant: Mutant
-    status: str  # "killed" | "SURVIVED" | "STALE"
+    status: str  # KILLED | SURVIVED | STALE | UNCONFIRMED
     detail: str
 
 
@@ -851,13 +857,13 @@ def _check(mutant: Mutant, workdirs: queue.Queue[Path], timeout: float) -> Outco
         target = workdir / mutant.path
         source = target.read_text(encoding="utf-8")
         if any(source.count(old) != 1 for old, _ in mutant.edits):
-            return Outcome(mutant, "STALE", "an anchor was not found exactly once")
+            return Outcome(mutant, STALE, "an anchor was not found exactly once")
         target.write_text(mutant.apply(source), encoding="utf-8")
         try:
-            passed, detail = _confirmed_run(workdir, timeout)
+            status, detail = _confirmed_run(workdir, timeout)
         finally:
             target.write_text(source, encoding="utf-8")
-        return Outcome(mutant, "SURVIVED" if passed else "killed", detail)
+        return Outcome(mutant, status, detail)
     finally:
         workdirs.put(workdir)
 
@@ -914,7 +920,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for outcome in outcomes:
         print(f"{outcome.status:9} {outcome.mutant.id:34} {outcome.detail[:110]}")
-    bad = [o for o in outcomes if o.status != "killed"]
+    bad = [o for o in outcomes if o.status != KILLED]
     historical = sum(1 for o in outcomes if o.mutant.history)
     print(
         f"\n{len(outcomes) - len(bad)}/{len(outcomes)} mutants killed "
