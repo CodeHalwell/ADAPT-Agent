@@ -2,6 +2,8 @@
 
 import re
 
+import pytest
+
 from adapt_agent.security import Firewall
 
 
@@ -252,3 +254,119 @@ def test_blocked_pattern_with_ignorecase_flag():
     firewall.add_blocked_pattern(r"secret", flags=re.IGNORECASE)
 
     assert firewall.check_input("SECRET value") is False
+
+
+# -- regression tests for historical fixes that scripts/mutation_check.py found
+# -- no test would have noticed being reverted ---------------------------------
+
+
+def test_event_snippet_redacts_a_secret_spanning_the_truncation_boundary():
+    """Sanitise the whole content, then truncate -- never the other way round.
+
+    Truncating first cuts the secret in half, the pattern no longer matches the
+    half that is left, and the stored snippet leaks it.
+    """
+    fw = Firewall()
+    fw.add_blocked_pattern(r"SECRET-\d{12}")
+    secret = "SECRET-123456789012"
+    content = "x" * 90 + secret  # the secret straddles the 100-character cut
+    assert fw.check_input(content) is False
+    snippet = fw.get_security_events()[-1]["metadata"]["content_snippet"]
+    assert "SECRET" not in snippet
+    assert "1234" not in snippet
+
+
+def test_event_snippet_escapes_newlines():
+    """A blocked payload cannot forge extra lines in an exported event log."""
+    fw = Firewall()
+    fw.add_blocked_pattern("attack")
+    assert fw.check_input("attack\nINFO forged entry\r\nINFO another") is False
+    snippet = fw.get_security_events()[-1]["metadata"]["content_snippet"]
+    assert "\n" not in snippet
+    assert "\r" not in snippet
+    assert "\\n" in snippet
+
+
+@pytest.mark.parametrize("text", ["\n" * 50, "ab\r\n" * 20, "a" * 19 + "\n\n", "plain" * 10])
+def test_truncate_escaped_never_exceeds_its_bound_or_splits_an_escape(text):
+    out = Firewall._truncate_escaped(text, 20)
+    assert len(out) <= 20
+    assert "\n" not in out and "\r" not in out
+    # Escaping doubles a control character into two; the cut must not land
+    # between them and leave a dangling backslash.
+    assert not out.endswith("\\")
+
+
+def test_whitelist_mode_cannot_waive_the_length_cap():
+    """The cap bounds the cost of every regex, the allowed patterns included."""
+    fw = Firewall(max_content_length=10, whitelist_mode=True)
+    fw.add_allowed_pattern(r".*")
+    assert fw.check_input("short") is True
+    assert fw.check_input("x" * 11) is False
+    assert "exceeds maximum" in fw.get_security_events()[-1]["description"]
+
+
+# -- dry_run / pattern hits: showing a pattern is not vacuous -------------------
+
+
+def _configured():
+    fw = Firewall(max_content_length=50)
+    fw.add_blocked_pattern(r"\b\d{16}\b")
+    fw.add_blocked_pattern(r"never-matches-anything-\d{99}")
+    fw.add_allowed_pattern(r"[a-z ]+")
+    return fw
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        ("card 4111111111111111", {"allowed": False, "reason": "blocked_pattern"}),
+        ("x" * 51, {"allowed": False, "reason": "length"}),
+        ("hello there", {"allowed": True, "reason": "allowed_pattern"}),
+        ("Hello, there!", {"allowed": True, "reason": "no_match"}),
+    ],
+)
+def test_dry_run_reports_the_decision_and_why(content, expected):
+    result = _configured().dry_run(content)
+    assert {k: result[k] for k in expected} == expected
+
+
+def test_dry_run_names_the_pattern_and_records_nothing():
+    fw = _configured()
+    result = fw.dry_run("card 4111111111111111")
+    assert result["pattern"] == r"\b\d{16}\b"
+    assert fw.get_security_events() == []
+    assert fw.get_stats()["total_blocked"] == 0
+    assert set(fw.get_pattern_hits().values()) == {0}
+
+
+def test_dry_run_reports_filter_blocks_and_filter_errors():
+    fw = Firewall()
+    fw.add_custom_filter(lambda c: "bad" in c)
+    assert fw.dry_run("bad thing")["reason"] == "custom_filter"
+
+    def boom(content):
+        raise RuntimeError("internal detail")
+
+    broken = Firewall()
+    broken.add_custom_filter(boom)
+    result = broken.dry_run("anything")
+    assert result == {"allowed": False, "reason": "custom_filter_error", "pattern": None}
+
+
+@pytest.mark.parametrize("whitelist_mode", [False, True])
+def test_dry_run_always_agrees_with_check_input(whitelist_mode):
+    """One decision function behind both, so they cannot disagree."""
+    fw = Firewall(max_content_length=30, whitelist_mode=whitelist_mode)
+    fw.add_blocked_pattern("secret")
+    fw.add_allowed_pattern(r".*safe.*")
+    fw.add_custom_filter(lambda c: c.startswith("!"))
+    for content in ["", "hi", "a secret", "safe secret", "!bang", "safe !", "s" * 31, "safe" * 9]:
+        assert fw.dry_run(content)["allowed"] is fw.check_input(content), content
+
+
+def test_pattern_hits_expose_a_pattern_that_never_matches():
+    fw = _configured()
+    for content in ["card 4111111111111111", "pin 0000000000000000", "nothing to see"]:
+        fw.check_input(content)
+    assert fw.get_pattern_hits() == {r"\b\d{16}\b": 2, r"never-matches-anything-\d{99}": 0}

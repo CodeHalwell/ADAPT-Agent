@@ -60,7 +60,6 @@ Configuration file schema (JSON)
 """
 
 import argparse
-import ast
 import json
 import os
 import re
@@ -69,6 +68,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from adapt_agent import __version__
+from adapt_agent.core.policy import validate_condition
 
 _VALID_ACTIONS = {"warn", "block", "modify"}
 _VALID_SEVERITIES = {"low", "medium", "high", "critical"}
@@ -385,10 +385,19 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         elif len(condition) > _MAX_CONDITION_LENGTH:
             errors.append(f"{label}.condition exceeds maximum length of {_MAX_CONDITION_LENGTH}")
         else:
+            # Same check ``PolicyEnforcer.add_rule`` applies, so a config that
+            # validates here is one whose rules will actually register.
             try:
-                ast.parse(condition, mode="eval")
-            except SyntaxError as exc:
-                errors.append(f"{label}.condition is not a valid expression: {exc.msg}")
+                validate_condition(condition)
+            except ValueError as exc:
+                detail = str(exc)
+                prefix = "Condition is not a valid expression: "
+                if detail.startswith(prefix):
+                    errors.append(
+                        f"{label}.condition is not a valid expression: {detail[len(prefix):]}"
+                    )
+                else:
+                    errors.append(f"{label}.condition cannot be evaluated: {detail}")
         action = rule.get("action", "warn")
         if action not in _VALID_ACTIONS:
             errors.append(

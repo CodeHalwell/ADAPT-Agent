@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `labeled`/`unlabeled` so that applying `spec-amendment` re-evaluates the
+    # held-out job; a re-run alone replays the original event, without the label.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   # Callable from release.yml, so a tagged release is gated on exactly the
   # same lint, test-matrix and build checks that guard main.
   workflow_call:
@@ -60,6 +63,68 @@ jobs:
         with:
           name: coverage-xml
           path: coverage.xml
+
+  # Coverage shows a line ran; this shows a test would notice if it were wrong.
+  # Re-introduces security bugs one at a time -- including every historical
+  # vulnerability in .jules/sentinel.md -- and fails if the suite stays green.
+  # It is what stops a change (human or automated) from weakening a security
+  # test while leaving coverage untouched.
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Mutation check (security modules)
+        run: python scripts/mutation_check.py
+
+  # A pull request is otherwise judged only by the tests it contains, and a
+  # failing check can be made to pass by fixing the code *or* by editing the
+  # check. This runs the BASE branch's tests against the pull request's code,
+  # and requires every base-branch mutant to still exist.
+  #
+  # Failing here is not necessarily a defect: it means the change alters
+  # behaviour an existing test pinned, i.e. it amends the specification. A
+  # maintainer reviews exactly those tests and applies the `spec-amendment`
+  # label, which skips this job.
+  #
+  # The script is run from the base checkout, not the pull request's: a check
+  # the change under review can rewrite is not held out. (This workflow file is
+  # itself read from the pull request -- CODEOWNERS covers .github/ for that.)
+  held-out:
+    if: >-
+      github.event_name == 'pull_request' &&
+      !contains(github.event.pull_request.labels.*.name, 'spec-amendment')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .base
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Base-branch tests against this change
+        run: |
+          if [ -f .base/scripts/heldout_check.py ]; then
+            python .base/scripts/heldout_check.py --base .base --head .
+          else
+            echo "Base branch predates the held-out check; nothing to hold out."
+          fi
 
   build:
     runs-on: ubuntu-latest

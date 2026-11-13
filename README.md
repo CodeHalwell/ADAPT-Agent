@@ -13,12 +13,12 @@ The library keeps its core install light and imports each agent framework **lazi
 
 ### Core
 - **`TrustManager`** — track and update trust scores for agents and sources.
-- **`PolicyEnforcer`** — define rules (name, description, condition, action, severity) and evaluate them against messages and agent state using a safe, sandboxed condition evaluator (no `eval`).
+- **`PolicyEnforcer`** — define rules (name, description, condition, action, severity) and evaluate them against messages and agent state using a safe, sandboxed condition evaluator (no `eval`). Fail-closed by default; rejects rules it could never evaluate, and reports rules that have never seen their data (`vacuous_rules()`).
 - **`MemorySystem`** — structured memory for agent context.
 - **`Middleware`** — a pre/post processing pipeline applied to inputs and outputs.
 
 ### Security
-- **`Firewall`** — input/output filtering with blocked/allowed regex patterns, custom filters, and a configurable maximum content length (DoS protection). Records security events.
+- **`Firewall`** — input/output filtering with blocked/allowed regex patterns, custom filters, and a configurable maximum content length (DoS protection). Records security events; `dry_run()` and `get_pattern_hits()` show whether a pattern actually matches anything.
 - **`TaintTracker`** — track tainted (untrusted) data through an agent, with `TaintLevel` and `TaintSource` classifications.
 
 ### Adversarial defense
@@ -159,8 +159,11 @@ policy.add_rule(
 message = {"role": "user", "content": "my password is hunter2"}
 violations = policy.check_message(message)        # -> ["no_secrets"]
 
-# Rules can also reference the agent `state` (e.g. for trust gating):
-policy.add_rule(
+# Rules can also reference the agent `state` (e.g. for trust gating). Keep them
+# on their own enforcer: `check_state` only has `state` in scope, and a rule it
+# cannot evaluate counts as a violation (the enforcer is fail-closed by default).
+state_policy = PolicyEnforcer()
+state_policy.add_rule(
     name="low_trust",
     description="Warn when trust score is too low",
     condition="state['trust_score'] < 0.5",
@@ -168,7 +171,7 @@ policy.add_rule(
     severity="medium",
 )
 state = {"messages": [], "context": {}, "trust_score": 0.2}
-policy.check_state(state)                          # -> ["low_trust"]
+state_policy.check_state(state)                    # -> ["low_trust"]
 
 # --- AdversarialDefense: prompt-injection / jailbreak detection ---
 defense = AdversarialDefense()

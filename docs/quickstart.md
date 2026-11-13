@@ -96,9 +96,9 @@ policy.add_rule(
     severity="high",
 )
 policy.add_rule(
-    name="too_many_violations",
-    description="Flag states with prior violations",
-    condition="len(state['context']) > 100",
+    name="system_role",
+    description="Flag messages that claim the system role",
+    condition="message['role'] == 'system'",
     action="warn",
     severity="medium",
 )
@@ -147,9 +147,9 @@ defense = AdversarialDefense(max_content_length=10_000)
 
 policy = PolicyEnforcer()
 policy.add_rule(
-    name="no_passwords",
-    description="Block leaked passwords",
-    condition="'password' in str(state['context'])" ,  # see note below
+    name="no_password_context",
+    description="Block runs whose context carries a password field",
+    condition="'password' in state['context']",  # key membership; see note below
     action="block",
     severity="high",
 )
@@ -174,9 +174,8 @@ except SecurityBlockedError as exc:
 !!! warning "Policy conditions cannot call functions"
     The safe expression language used by `PolicyEnforcer` does **not** support
     function calls (`str(...)`, `len(...)`) or attribute access. Use comparisons,
-    membership (`in`), boolean/arithmetic operators, and subscripts instead. The
-    `str(...)`/`len(...)` forms above are illustrative; an unsupported expression
-    is logged and treated as "no violation". See [Policy Enforcement](policy.md)
+    membership (`in`), boolean/arithmetic operators, and subscripts instead.
+    `add_rule` raises `ValueError` for a condition it could never evaluate. See [Policy Enforcement](policy.md)
     for exactly what is allowed.
 
 Continue to [Framework Adapters](adapters.md) for the complete LangGraph

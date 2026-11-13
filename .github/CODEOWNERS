@@ -1,0 +1,21 @@
+# Changes to the security controls, to the tests that pin them, and to the
+# machinery that checks those tests need a human review -- including changes
+# opened by automated agents (Sentinel, Bolt, Copilot, Dependabot).
+#
+# An agent asked to make a failing check pass can do it by fixing the code or
+# by loosening the check. Both produce a green PR; only review tells them
+# apart. To make this binding, enable "Require review from Code Owners" in the
+# branch protection rule for main -- without it this file only requests review.
+
+/adapt_agent/security/        @CodeHalwell
+/adapt_agent/adversarial/     @CodeHalwell
+/adapt_agent/core/            @CodeHalwell
+/adapt_agent/adapters/        @CodeHalwell
+/adapt_agent/integrations/    @CodeHalwell
+
+/tests/                       @CodeHalwell
+/scripts/mutation_check.py    @CodeHalwell
+/scripts/heldout_check.py     @CodeHalwell
+/.github/                     @CodeHalwell
+/docs/security.md             @CodeHalwell
+/SECURITY.md                  @CodeHalwell

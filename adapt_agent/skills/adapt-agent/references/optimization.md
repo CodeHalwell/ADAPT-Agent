@@ -116,7 +116,18 @@ returns a sensible pipeline. All share
 `max_evals`, `seed`, `judge`, `verbose`.
 
 Pass `val_dataset=` to score the winner on held-out data and catch overfitting
-to the training split.
+to the training split. It is a gate, not just a report: a winner that scores
+worse than the untuned agent on the held-out set is **not applied** —
+`result.validation_rejected` is `True`, `result.best_config` is empty, and the
+discarded values are in `result.rejected_config`. Check that flag before
+telling a user their agent was improved. `validation_gate=False` on the
+optimizer turns the gate off.
+
+If one `LLMJudge` both rewrites prompts and scores them, pass a second judge on
+a different model as `proposer_judge=` (on any optimizer or
+`make_default_optimizer`). Otherwise `result.recommendations` gains an
+`Independence:` entry: the reported gain may partly be the judge preferring its
+own writing.
 
 ## Proposers
 

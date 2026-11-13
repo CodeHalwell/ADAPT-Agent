@@ -7,6 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-13
+
+**Upgrading from 0.4.0:** this release changes defaults. Read the *Changed*
+section before upgrading -- in particular `PolicyEnforcer` is now fail-closed.
+
+### Changed
+
+- **`PolicyEnforcer` is fail-closed by default.** `fail_closed` now defaults to
+  `True`: a rule whose condition cannot be evaluated at run time -- it compares
+  against a key the state does not carry, or names `message` where only `state`
+  is in scope -- is a **violation**, where it used to be logged and ignored.
+  **This is a breaking change.** A `block` rule that reads a key your state
+  never supplies now refuses every request; an enforcer holding both `message`
+  and `state` rules now reports the out-of-scope ones on every call, so keep
+  the two on separate enforcers. Pass `PolicyEnforcer(fail_closed=False)` to
+  keep the old behaviour, and use `vacuous_rules()` to find the rules affected.
+- **`PolicyEnforcer.add_rule` rejects a condition it could never evaluate.**
+  A condition using a function call (`len(...)`), attribute access, `not`, a
+  slice, an unsupported operator, or a name other than `state`/`message` used
+  to register and then error on every evaluation -- which, under the default
+  `fail_closed=False`, meant the rule silently never fired while looking
+  installed. These are all decidable from the text, so they now raise
+  `ValueError` at registration. **This can break code that registers such a
+  rule**; the rule was not doing anything. `adapt validate` applies the same
+  check, and the bundled `examples/config.example.json` -- which shipped one
+  such rule -- is fixed.
+- **Optimizers no longer apply a configuration that regresses on held-out
+  data.** With a `val_dataset`, the training winner is applied only if it does
+  not score worse than the untuned agent on that set (beyond
+  `validation_tolerance`, default `1e-3`). A rejected run leaves the agent
+  untouched and returns `validation_rejected=True`, an empty `best_config`, and
+  the discarded values in `rejected_config`. Previously the held-out score was
+  reported and ignored. Costs one extra pass over `val_dataset`; opt out with
+  `validation_gate=False`. Applies to every optimizer, `PipelineOptimizer`
+  included, and so to `adapt optimize --val-data` and `adapt train`.
+
+- **A refused request no longer becomes the wrapped agent's state.** A request
+  blocked by a policy rule left its own payload as `get_state()`; one blocked on
+  output, or whose agent raised, left its input there as though it had been
+  served. State is now committed only when a request is served.
+- **The firewall's length cap is checked first in both modes.** With
+  `whitelist_mode=True` a matching allowed pattern used to return before the
+  cap, so the pattern ran over unbounded input and `.*` waived the DoS guard.
+- **`and` / `or` in policy conditions yield an operand, as in Python.** They
+  returned `True`/`False`, so `(0 or state['x']) == 2` was never true and a
+  comparison Python refuses (`0 < None`) quietly produced a verdict. Found by
+  the new property test against Python's own evaluator.
+
+### Added
+
+- `Firewall.dry_run(content)` (the decision and its reason, recording nothing)
+  and `Firewall.get_pattern_hits()` (blocks per pattern; a pattern still at
+  zero has never matched).
+- `PolicyEnforcer.get_rule_stats()` and `.vacuous_rules()`: per-rule outcome
+  counts, including lookups of absent keys -- which evaluate to `None` and so
+  pass silently under `==`.
+- `Optimizer(proposer_judge=...)` / `make_default_optimizer(proposer_judge=...)`
+  to separate the judge that rewrites prompts from the one that scores them. A
+  run whose rewriting judge is also its scoring judge now says so in
+  `OptimizationResult.recommendations`.
+- Property-based tests (`hypothesis`, a new dev dependency) against a reference
+  model of the pipeline in `tests/governance_model.py`: verdicts, sequences of
+  requests, sync vs async, adapter vs gate vs native hook, the policy language
+  vs Python, and every bounded store.
+- `scripts/heldout_check.py` and a `held-out` CI job: runs the base branch's
+  tests against a pull request's code; skipped by the `spec-amendment` label.
+- The mutation check grew to 78 mutants, adding the governed adapter and every
+  gate call in every framework integration. That exposed the OpenAI Agents hooks
+  as untested whenever the SDK is absent (as in CI); 
+  `tests/test_openai_hooks_stubbed.py` now drives them against a stub. Its first
+  run in CI found the same gap in the Claude Agent SDK hook, masked locally by
+  the SDK being installed; `tests/test_claude_hooks_stubbed.py` closes it.
+- `PolicyEnforcer.evaluate_rules(state=..., message=...)` dry-runs every rule
+  against an example and reports `"violation"`, `"pass"` or `"error"` per rule,
+  with no side effects -- for asserting in your own tests that a rule can fire.
+- `adapt_agent.core.policy.validate_condition`.
+- `OptimizationResult.validation_baseline_score`, `.validation_rejected` and
+  `.rejected_config` (appended; positional construction is unaffected).
+- `scripts/mutation_check.py` and a `mutation` CI job: re-introduces
+  security bugs one at a time -- every historical vulnerability in
+  `.jules/sentinel.md` among them -- and fails if the suite stays green. Its
+  first run found seven guarantees no test pinned (five of them previously
+  fixed vulnerabilities); regression tests for all seven are added.
+- `examples/09_verifying_your_guardrails.py`: `dry_run`, pattern hits, rule
+  rejection, `evaluate_rules`, the fail-closed default and `vacuous_rules`,
+  end to end and offline.
+- `.github/CODEOWNERS` covering the security modules, the tests, and CI.
+
+### Fixed
+
+- `examples/06_optimize_with_golden_dataset.py` exited cleanly but optimized
+  nothing (`improvement=+0.000`): its offline judge stub matched a prompt format
+  the library had since changed. It now works, uses separate scoring and
+  rewriting judges, and holds rows back for the validation gate.
+  `tests/test_examples_run.py` runs every top-level example and checks the
+  outcome each exists to show.
+- `docs/quickstart.md` showed a policy condition using `str(...)`, which is not
+  in the condition language; the CrewAI guide's offline judge stub had the same
+  stale prompt markers as example 06.
+- `docs/security.md` described the firewall as allow-first. It is block-first
+  by default: an allowed pattern never overrides a block unless
+  `whitelist_mode=True`, which the page did not mention. The page also now
+  states that the policy engine fails open by default, and gains a "What is not
+  covered" section.
+
 ## [0.4.0] - 2026-08-27
 
 ### Added
@@ -2091,7 +2196,8 @@ package that actually installs and is usable end to end.
   optimization, adversarial defense, evaluation, observability, patches, and the
   `adapt-agent` CLI (`info` command).
 
-[Unreleased]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/CodeHalwell/ADAPT-Agent/releases/tag/v0.3.2
 [0.3.1]: https://github.com/CodeHalwell/ADAPT-Agent/releases/tag/v0.3.1

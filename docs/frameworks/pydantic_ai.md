@@ -220,8 +220,8 @@ conditions reference the `state` variable:
 ```python
 from adapt_agent import PolicyEnforcer
 
-policy = PolicyEnforcer()                      # PolicyEnforcer(fail_closed=True) to treat
-policy.add_rule(                               # un-evaluable conditions as violations
+policy = PolicyEnforcer()                      # fail-closed by default: an un-evaluable
+policy.add_rule(                               # condition counts as a violation
     name="no_password_requests",
     description="Refuse requests that try to extract passwords.",
     condition="'password' in state['messages'][0]['content']",

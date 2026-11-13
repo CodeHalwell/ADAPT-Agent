@@ -177,7 +177,7 @@ Shares all of `evaluate`'s options, plus:
 | `--seed` | RNG seed for reproducible search (default 0). |
 | `--component NAME=module:attr` | Register a framework component to introspect for tunable knobs (repeatable). With components, `target`/`--runner` is the system entrypoint. |
 | `--runner module:attr` | Explicit runner callable driving the whole system. |
-| `--val-data FILE` | Held-out dataset; its score is reported as `validation`. |
+| `--val-data FILE` | Held-out dataset; its score is reported as `validation`, and a tuned config that scores worse on it than the untuned agent is not applied. |
 | `--save-config FILE` | Write the winning configuration to a JSON file. |
 | `--verbose` | Log each trial. |
 
@@ -241,9 +241,10 @@ The config root must be a JSON **object**. All top-level keys are optional.
 ```
 
 !!! note "Condition validation"
-    `validate` only checks that a condition *parses* as a Python expression and
-    is within the length limit. It does not check that the condition uses only
-    the supported safe nodes — that restriction is enforced at evaluation time by
-    the [`PolicyEnforcer`](policy.md). Keep conditions to comparisons, boolean
-    ops, arithmetic, subscripts, and literals (no function calls or attribute
-    access).
+    `validate` applies the same check as `PolicyEnforcer.add_rule`: the
+    condition must parse, be within the length limit, use only the supported
+    safe nodes (comparisons, boolean ops, arithmetic, subscripts, literals — no
+    function calls or attribute access), and reference only `state` or
+    `message`. A config that validates is one whose rules will register. It
+    cannot check that the keys a rule reads exist in your data; see
+    [Policy Enforcement](policy.md) for `evaluate_rules`.

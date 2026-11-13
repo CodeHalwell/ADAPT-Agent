@@ -244,9 +244,10 @@ policy.add_rule(
 )
 ```
 
-Recently added safety options you can opt into: `PolicyEnforcer(fail_closed=True)`
-(treat evaluation errors as a block), `Firewall(whitelist_mode=False)` (the
-default is block-first), and `Middleware(fail_closed=...)`.
+Safety defaults worth knowing: `PolicyEnforcer` is fail-closed (an evaluation
+error counts as a violation; `fail_closed=False` opts out), `Firewall` is
+block-first (`whitelist_mode=False`), and `Middleware(fail_closed=...)` is
+opt-in.
 
 ### AdversarialDefense
 
@@ -424,10 +425,11 @@ Built-in metrics include `exact_match`, `token_f1`, `contains`, `regex_match`,
 `OpenAIJudge(...)`, etc. **For offline, no-key runs, pass a deterministic stub**:
 
 ```python
-def judge_stub(prompt: str) -> str:
-    if "Rewrite" in prompt:
+def judge_stub(prompt: str, system: str | None = None) -> str:
+    if "CURRENT INSTRUCTION:" in prompt:
         return "Answer with ONLY the capital city name."     # prompt-rewrite path
-    response = prompt.split("RESPONSE:")[-1].split("REFERENCE")[0].strip()
+    # The answer being graded arrives inside a <response> fence.
+    response = prompt.split("<response>")[-1].split("</response>")[0].strip()
     score = 9 if response and " " not in response else 2
     return f'{{"score": {score}, "pass": {str(score >= 6).lower()}, "reasoning": "auto"}}'
 

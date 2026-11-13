@@ -19,7 +19,7 @@ from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from re import Pattern
-from typing import Any
+from typing import Any, cast
 
 from adapt_agent.core.types import AgentMessage, SecurityEvent
 
@@ -43,9 +43,12 @@ class Firewall:
     content that has already passed every block check.
 
     When ``whitelist_mode=True`` a full match against any allowed pattern
-    short-circuits to *allowed* **before** block checks run (the historical
-    behaviour). Use this only when the allowed patterns are themselves the
-    security boundary.
+    short-circuits to *allowed* **before** the blocked patterns and custom
+    filters run (the historical behaviour). Use this only when the allowed
+    patterns are themselves the security boundary.
+
+    The length cap is checked first in **both** modes: no allowed pattern can
+    waive it.
 
     .. warning::
        Neither mode makes allowed patterns *restrictive*. They exempt content,
@@ -81,6 +84,8 @@ class Firewall:
         self._custom_filters: list[Callable[[str], bool]] = []
         self._security_events: deque[SecurityEvent] = deque(maxlen=max_events)
         self._blocked_count = 0
+        # Bounded by the number of blocked patterns: keyed by pattern source.
+        self._pattern_hits: dict[str, int] = {}
         self.max_content_length = max_content_length
         self.max_events = max_events
         self.whitelist_mode = whitelist_mode
@@ -162,6 +167,94 @@ class Firewall:
         safe_snippet = Firewall._truncate_escaped(content, 12)
         return f"{safe_snippet}…(sha256:{digest})"
 
+    def _decide(self, content: str) -> tuple[bool, str, str | None]:
+        """Decide whether ``content`` is allowed, without recording anything.
+
+        The single source of the firewall's decision order, shared by the
+        enforcing path (:meth:`_check`) and the side-effect-free one
+        (:meth:`dry_run`) so the two cannot drift apart.
+
+        Returns:
+            ``(allowed, reason, detail)``. ``reason`` is one of ``"length"``,
+            ``"blocked_pattern"``, ``"custom_filter"``, ``"custom_filter_error"``
+            (all blocked), ``"allowed_pattern"`` or ``"no_match"`` (allowed).
+            ``detail`` is the matching pattern's source where there is one.
+        """
+        # SECURITY: DoS protection by limiting content length. Always first, in
+        # both modes: it is what bounds the cost of every regex below, the
+        # allowed patterns included. Checking it after the whitelist ran those
+        # patterns over unbounded input and let `.*` waive the cap entirely.
+        if self.max_content_length is not None and len(content) > self.max_content_length:
+            return False, "length", None
+
+        # In strict allowlist mode, a full allowed match short-circuits the
+        # remaining checks (blocked patterns and custom filters).
+        if self.whitelist_mode:
+            for pattern in self._allowed_patterns:
+                if pattern.fullmatch(content):
+                    return True, "allowed_pattern", pattern.pattern
+
+        # Check blocked patterns (block-first: these always win over allowed
+        # patterns in the default, non-whitelist mode).
+        for pattern in self._blocked_patterns:
+            if pattern.search(content):
+                return False, "blocked_pattern", pattern.pattern
+
+        # Check custom filters.
+        for filter_func in self._custom_filters:
+            try:
+                if filter_func(content):
+                    return False, "custom_filter", None
+            except Exception as e:  # noqa: BLE001 - fail closed on any filter error
+                # Log error and block on filter failure (fail-closed).
+                logger.error("Error in custom filter: %s", e)
+                return False, "custom_filter_error", None
+
+        # In the default (block-first) mode, an allowed fullmatch may whitelist
+        # content that has already passed every block check. It can never
+        # override a block.
+        if not self.whitelist_mode:
+            for pattern in self._allowed_patterns:
+                if pattern.fullmatch(content):
+                    return True, "allowed_pattern", pattern.pattern
+
+        return True, "no_match", None
+
+    def dry_run(self, content: str) -> dict[str, Any]:
+        """Report what the firewall *would* decide, recording nothing.
+
+        No security event is stored and no counter moves, so this is safe in a
+        test or a startup check. Use it to show a pattern is not vacuous -- a
+        blocked pattern you added should block at least one realistic example
+        and let at least one other through::
+
+            fw.dry_run("my card is 4111111111111111")
+            # {'allowed': False, 'reason': 'blocked_pattern', 'pattern': '\\b\\d{16}\\b'}
+
+        Custom filters *are* called (the decision depends on them), so a filter
+        with side effects of its own will still have them.
+
+        Returns:
+            ``{"allowed": bool, "reason": str, "pattern": str | None}`` with
+            ``reason`` as documented on :meth:`_decide`.
+        """
+        allowed, reason, detail = self._decide(content)
+        return {"allowed": allowed, "reason": reason, "pattern": detail}
+
+    def get_pattern_hits(self) -> dict[str, int]:
+        """How many times each blocked pattern has blocked content.
+
+        A blocked pattern still at ``0`` after real traffic has never matched
+        anything: it may be mistyped, anchored wrongly, or shadowed by an
+        earlier pattern that always matches first. The firewall cannot decide
+        that for you -- "never matched" is also what a good pattern looks like
+        on a quiet day -- but it can make it visible.
+        """
+        return {
+            pattern.pattern: self._pattern_hits.get(pattern.pattern, 0)
+            for pattern in self._blocked_patterns
+        }
+
     def _check(self, content: str, event_type: str) -> bool:
         """Core block-first check shared by check_input/check_output.
 
@@ -173,14 +266,11 @@ class Firewall:
         Returns:
             True if content is allowed, False if blocked.
         """
-        # In strict allowlist mode, a full allowed match short-circuits FIRST.
-        if self.whitelist_mode:
-            for pattern in self._allowed_patterns:
-                if pattern.fullmatch(content):
-                    return True
+        allowed, reason, detail = self._decide(content)
+        if allowed:
+            return True
 
-        # SECURITY: DoS protection by limiting content length (block-first).
-        if self.max_content_length is not None and len(content) > self.max_content_length:
+        if reason == "length":
             self._record_security_event(
                 event_type=event_type,
                 severity="high",
@@ -193,61 +283,38 @@ class Firewall:
                     "length": len(content),
                 },
             )
-            self._blocked_count += 1
-            return False
-
-        # Check blocked patterns (block-first: these always win over allowed
-        # patterns in the default, non-whitelist mode).
-        for pattern in self._blocked_patterns:
-            if pattern.search(content):
-                self._record_security_event(
-                    event_type=event_type,
-                    severity="high",
-                    description=f"Content matched blocked pattern: {pattern.pattern}",
-                    metadata={
-                        # SECURITY: Sanitize complete content before truncation to prevent partial secret leakage
-                        "content_snippet": self._truncate_escaped(self.sanitize(content), 100)
-                    },
-                )
-                self._blocked_count += 1
-                return False
-
-        # Check custom filters.
-        for filter_func in self._custom_filters:
-            try:
-                if filter_func(content):
-                    self._record_security_event(
-                        event_type=event_type,
-                        severity="medium",
-                        description="Content blocked by custom filter",
-                        metadata={"content_snippet": self._redact_snippet(content)},
-                    )
-                    self._blocked_count += 1
-                    return False
-            except Exception as e:  # noqa: BLE001 - fail closed on any filter error
-                # Log error and block on filter failure (fail-closed).
-                logger.error("Error in custom filter: %s", e)
-                self._record_security_event(
-                    event_type=event_type,
-                    severity="high",
-                    description="Content blocked due to custom filter error",
-                    metadata={
-                        "content_snippet": self._redact_snippet(content),
-                        "error": "An error occurred",
-                    },
-                )
-                self._blocked_count += 1
-                return False
-
-        # In the default (block-first) mode, an allowed fullmatch may whitelist
-        # content that has already passed every block check. It can never
-        # override a block.
-        if not self.whitelist_mode:
-            for pattern in self._allowed_patterns:
-                if pattern.fullmatch(content):
-                    return True
-
-        return True
+        elif reason == "blocked_pattern":
+            self._pattern_hits[cast(str, detail)] = self._pattern_hits.get(cast(str, detail), 0) + 1
+            self._record_security_event(
+                event_type=event_type,
+                severity="high",
+                description=f"Content matched blocked pattern: {detail}",
+                metadata={
+                    # SECURITY: Sanitize complete content before truncation to prevent partial secret leakage
+                    "content_snippet": self._truncate_escaped(self.sanitize(content), 100)
+                },
+            )
+        elif reason == "custom_filter":
+            self._record_security_event(
+                event_type=event_type,
+                severity="medium",
+                description="Content blocked by custom filter",
+                metadata={"content_snippet": self._redact_snippet(content)},
+            )
+        else:  # custom_filter_error
+            self._record_security_event(
+                event_type=event_type,
+                severity="high",
+                description="Content blocked due to custom filter error",
+                metadata={
+                    "content_snippet": self._redact_snippet(content),
+                    # SECURITY: never the exception text -- events are read by
+                    # people who should not see internals.
+                    "error": "An error occurred",
+                },
+            )
+        self._blocked_count += 1
+        return False
 
     def check_input(self, content: str) -> bool:
         """Check if input content should be blocked.

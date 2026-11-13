@@ -56,21 +56,29 @@ evaluates truthy), record the violation, and run any registered handler.
 policy.check_message({"role": "user", "content": "my password is hunter2"})
 # -> ['no_passwords']
 
-# state context: {"state": <the AgentState>}
+# state context: {"state": <the AgentState>} -- on its own enforcer; see
+# "One enforcer per scope" below.
+policy = PolicyEnforcer()
 policy.add_rule(
-    name="empty_context_ok",
+    name="context_present",
     description="Fire when context has any keys",
-    condition="len(state['context']) > 0",  # NOTE: len() is NOT supported — see below
+    condition="state['context'] != {}",
     action="warn",
 )
 ```
 
 !!! warning
-    The two `len(...)` examples on this page are intentionally used to illustrate
-    a common mistake: **function calls are not part of the expression language.**
-    A condition that uses an unsupported construct raises during evaluation, is
-    caught, logged, and treated as "no violation" (returns `False`). Rewrite such
-    rules using only the supported nodes listed below.
+    **Function calls are not part of the expression language** — there is no
+    `len(...)` or `str(...)`. `add_rule` rejects a condition it could never
+    evaluate with a `ValueError`, so the mistake surfaces when the rule is
+    registered rather than as a rule that silently never fires:
+
+    ```python
+    policy.add_rule("long", "too long", condition="len(state['context']) > 0")
+    # ValueError: Unsupported construct in condition: Call (...)
+    policy.add_rule("typo", "typo", condition="stat['trust_score'] < 0.5")
+    # ValueError: Unknown name 'stat' in condition; only ['message', 'state'] are available
+    ```
 
 ---
 
@@ -104,8 +112,87 @@ Chained comparisons work as in Python (`0 < x < 10`). Subscript failures
 - **Unknown variables** — referencing a name not in the context raises
   `"Unknown variable: ..."`.
 
-Any unsupported node raises `ValueError("Unsupported AST node: ...")`, which is
-caught by `_evaluate_condition`, logged, and yields `False` (no violation).
+Every item above is detectable from the condition text alone, so `add_rule`
+(and `adapt validate`) rejects it with a `ValueError` at registration. What
+registration **cannot** see is your data: `state['n'] > 5` is well-formed but
+cannot be evaluated when `n` is missing. That case is decided at run time by
+`fail_closed`:
+
+| | A rule that cannot be evaluated is… |
+| --- | --- |
+| `PolicyEnforcer()` — **default, fail-closed** | logged and treated as a **violation**. A `block` rule refuses the request. |
+| `PolicyEnforcer(fail_closed=False)` | logged and treated as *no violation*. The rule silently does nothing. |
+
+The default is fail-closed because a control that could not reach a verdict
+should not report that all is well. The cost is that it is loud: a `block` rule
+that reads a key your state never carries refuses **every** request until you
+supply the key or fix the rule. That is the intended signal — the alternative
+was a rule that looked installed and never fired.
+
+!!! warning "One enforcer per scope"
+    `check_state` puts only `state` in scope and `check_message` only
+    `message`. A rule naming the other one cannot be evaluated, so under the
+    default it is reported as violated on every call. Keep `message` rules and
+    `state` rules on **separate** `PolicyEnforcer` instances. A governed
+    adapter only ever calls `check_state`, so the enforcer you give it should
+    hold `state` rules only.
+
+!!! note "Changed in 0.5.0"
+    The default was `fail_closed=False`. Pass it explicitly to keep the old
+    behaviour while you check your rules with `vacuous_rules()` (below).
+
+### Checking a rule is not vacuous
+
+A rule that can never fire is worse than no rule, because it looks installed.
+`evaluate_rules` dry-runs every rule against an example — nothing is recorded
+and no handler runs — and reports `"violation"`, `"pass"` or `"error"` per rule:
+
+```python
+policy.evaluate_rules(state={"messages": [], "context": {}, "trust_score": 0.2})
+# {'low_trust': 'violation'}
+policy.evaluate_rules(state={"messages": [], "context": {}})
+# {'low_trust': 'error'}   <- trust_score missing: a violation by default (fail-closed)
+```
+
+For each blocking rule, assert in your own tests that one realistic example
+gives `"violation"` and another gives `"pass"`.
+
+### Finding a rule that has never seen its data
+
+`evaluate_rules` checks the examples you thought of. For the traffic you
+actually get, the enforcer counts outcomes per rule:
+
+```python
+policy.get_rule_stats()
+# {'low_trust': {'violation': 3, 'pass': 41, 'error': 0, 'unresolved': 0},
+#  'free_tier': {'violation': 0, 'pass': 44, 'error': 0, 'unresolved': 44}}
+
+policy.vacuous_rules()
+# ['free_tier']
+```
+
+`unresolved` counts the evaluations in which the rule could not see everything
+it asked for: it errored, **or** it looked up a key that was not there. The
+second case matters because it does not error. A failed `state[...]` lookup
+evaluates to `None`, so `state['tier'] == 'free'` is a quiet `"pass"` when
+`tier` is absent — which is the right answer for one request and the wrong one
+if `tier` is *never* there because of a typo, or because the adapter does not
+populate it.
+
+`vacuous_rules()` lists the rules for which **every** evaluation so far was
+unresolved. Check it after driving a representative request through your agent
+in a test, or periodically in production. A rule that has not been evaluated at
+all is not listed.
+
+[`examples/09_verifying_your_guardrails.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/09_verifying_your_guardrails.py)
+runs all of this end to end, offline.
+
+### `and` / `or`
+
+These behave as in Python: they yield one of their operands, not a bool. So
+`(state['override'] or state['default']) > 5` compares the value, and a
+comparison Python would refuse (`0 < None`) is an evaluation error here too
+rather than a silent verdict.
 
 ### Depth limit
 
@@ -124,7 +211,7 @@ as no violation.
 "message['content'] == 'a' + 'b'"
 ```
 
-### Examples that are rejected (fire-as-False)
+### Examples that are rejected by `add_rule`
 
 ```python
 "len(message['content']) > 100"   # function call

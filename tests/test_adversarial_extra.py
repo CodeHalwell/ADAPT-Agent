@@ -252,3 +252,25 @@ def test_stored_snippet_keeps_original_text():
     assert len(attacks) == 1
     # Snapshot preserves the original spacing (truncated for privacy only).
     assert attacks[0]["content"] == text[:100]
+
+
+# -- regression tests for historical fixes that scripts/mutation_check.py found
+# -- no test would have noticed being reverted ---------------------------------
+
+
+def test_recorded_attack_indicator_is_newline_sanitized():
+    defense = AdversarialDefense()
+    defense._record_attack("custom_pattern", "content", "matched\nINFO forged\rentry")
+    indicator = defense.get_detected_attacks()[-1]["indicator"]
+    assert "\n" not in indicator
+    assert "\r" not in indicator
+    assert "\\n" in indicator
+
+
+def test_analysis_result_input_snippet_is_newline_sanitized():
+    """The returned snippet is what a caller logs; it must stay on one line."""
+    defense = AdversarialDefense()
+    result = defense.analyze_input("hello\nINFO forged log entry\r\nmore")
+    assert "\n" not in result["input"]
+    assert "\r" not in result["input"]
+    assert "\\n" in result["input"]

@@ -50,6 +50,78 @@ def _parse_condition(condition: str) -> ast.Expression:
     return tree
 
 
+#: Names a condition may reference. ``check_state`` binds ``state`` and
+#: ``check_message`` binds ``message``; nothing else is ever in scope.
+CONDITION_NAMES = frozenset({"state", "message"})
+
+_SUPPORTED_NODES: tuple[type[ast.AST], ...] = (
+    ast.Expression,
+    ast.Constant,
+    ast.Name,
+    ast.Load,
+    ast.List,
+    ast.Tuple,
+    ast.Set,
+    ast.Dict,
+    ast.Compare,
+    ast.BoolOp,
+    ast.And,
+    ast.Or,
+    ast.BinOp,
+    ast.Subscript,
+)
+
+
+def validate_condition(condition: str) -> None:
+    """Reject a condition the evaluator could never evaluate.
+
+    A rule whose condition always errors is *vacuous*: under the default
+    fail-closed setting it fires on everything, and under ``fail_closed=False``
+    it never fires. Neither is what its author meant, and both used to be
+    discovered only from a warning in the logs. Everything checked here is
+    decidable from the text alone, so it is checked once, at registration.
+
+    What this cannot see is the *data*: ``state["n"] > 5`` is well-formed but
+    still errors when ``n`` is absent. Use
+    :meth:`PolicyEnforcer.evaluate_rules` with a representative state for that.
+
+    Raises:
+        ValueError: on a syntax error, an oversized condition, an unsupported
+            construct (calls, attribute access, ``not``, slices, ...), an
+            unsupported operator, or a name other than ``state``/``message``.
+    """
+    try:
+        tree = _parse_condition(condition)
+    except SyntaxError as exc:
+        raise ValueError(f"Condition is not a valid expression: {exc.msg}") from exc
+    for node in ast.walk(tree):
+        if isinstance(node, _SUPPORTED_NODES):
+            if isinstance(node, ast.Name) and node.id not in CONDITION_NAMES:
+                raise ValueError(
+                    f"Unknown name {node.id!r} in condition; only "
+                    f"{sorted(CONDITION_NAMES)} are available"
+                )
+            if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+                raise ValueError("Slices are not supported in conditions")
+        elif isinstance(node, ast.cmpop):
+            if type(node) not in PolicyEnforcer._OPERATORS:
+                raise ValueError(f"Unsupported comparison in condition: {type(node).__name__}")
+        elif isinstance(node, ast.operator):
+            if type(node) not in PolicyEnforcer._BINOPS:
+                raise ValueError(f"Unsupported operator in condition: {type(node).__name__}")
+        else:
+            raise ValueError(
+                f"Unsupported construct in condition: {type(node).__name__} "
+                "(conditions allow literals, state[...]/message[...] lookups, "
+                "comparisons, and/or, and + - * /)"
+            )
+
+
+#: Context key under which a failed ``state[...]`` lookup is noted during one
+#: rule's evaluation. An object, not a string, so no condition can name it.
+_MISSED_LOOKUP: Any = object()
+
+
 class PolicyEnforcer:
     """Enforces policies and rules on LLM agent behavior.
 
@@ -75,24 +147,37 @@ class PolicyEnforcer:
         ast.Div: operator.truediv,
     }
 
-    def __init__(self, max_violations: int = 1000, fail_closed: bool = False):
+    def __init__(self, max_violations: int = 1000, fail_closed: bool = True):
         """Initialize the PolicyEnforcer.
 
         Args:
             max_violations: Maximum number of violations to store in memory.
             fail_closed: How to treat a condition that cannot be evaluated
-                (unknown variable, unsupported node, arithmetic error, ...).
-                When ``False`` (default) such an error is logged and treated as
-                "no violation" (fail-open) — preserving historical behaviour.
-                When ``True`` the error is logged and treated as a VIOLATION so
-                that ``block`` rules still fire on malformed or edge-case input
-                (fail-closed). In either case the error is always logged.
+                at run time -- it compares against a key the state does not
+                carry, names ``message`` where only ``state`` is in scope, hits
+                an arithmetic error, ...
+                When ``True`` (default) the error is logged and treated as a
+                VIOLATION, so a ``block`` rule still fires on malformed or
+                unexpected input (fail-closed): a control that could not reach
+                a verdict does not report that all is well.
+                When ``False`` the error is logged and treated as "no
+                violation" (fail-open) -- the default before 0.5.0, and the one
+                under which a mistyped or mis-scoped rule silently does
+                nothing. In either case the error is always logged.
+
+                Because an out-of-scope name is an evaluation error, keep
+                ``message`` rules and ``state`` rules on **separate**
+                enforcers: under fail-closed, ``check_state`` reports every
+                ``message`` rule as violated, and vice versa.
         """
         self.max_violations = max_violations
         self.fail_closed = fail_closed
         self._rules: dict[str, PolicyRule] = {}
         # ⚡ Bolt: Replace O(N) list.pop(0) ring buffer with O(1) collections.deque
         self._violations: deque[dict[str, Any]] = deque(maxlen=max_violations)
+        # Per-rule outcome counts, so a rule that has only ever *errored* can be
+        # found. Bounded by the number of rules (entries die with their rule).
+        self._rule_stats: dict[str, dict[str, int]] = {}
         self._rule_handlers: dict[str, Callable] = {}
 
     def add_rule(
@@ -118,12 +203,12 @@ class PolicyEnforcer:
                 f"Condition length {len(condition)} exceeds maximum allowed length of 1024"
             )
 
-        # SECURITY: Bound CPU on pathological-but-shallow conditions (e.g. a flat
-        # 250-element literal) by rejecting conditions with too many AST nodes at
-        # registration time. ``_parse_condition`` raises ValueError when the node
-        # count exceeds ``MAX_CONDITION_NODES``; it also surfaces syntax errors so
-        # rules with broken syntax are rejected up front rather than silently.
-        _parse_condition(condition)
+        # SECURITY: Reject, up front, any condition the evaluator could never
+        # evaluate -- broken syntax, too many AST nodes (CPU bound), an
+        # unsupported construct such as a call or attribute access, or a name
+        # other than ``state``/``message``. Such a rule is vacuous: it would
+        # never fire (fail-open) or fire on everything (fail-closed).
+        validate_condition(condition)
 
         rule: PolicyRule = {
             "name": name,
@@ -133,6 +218,9 @@ class PolicyEnforcer:
             "severity": severity,
         }
         self._rules[name] = rule
+        # A re-registered rule is a new rule: old counts would describe the
+        # condition it replaced.
+        self._rule_stats[name] = {"violation": 0, "pass": 0, "error": 0, "unresolved": 0}
 
     def remove_rule(self, name: str) -> bool:
         """Remove a policy rule.
@@ -145,6 +233,7 @@ class PolicyEnforcer:
         """
         if name in self._rules:
             del self._rules[name]
+            self._rule_stats.pop(name, None)
             return True
         return False
 
@@ -190,8 +279,7 @@ class PolicyEnforcer:
         context = {"message": message}
 
         for rule_name, rule in self._rules.items():
-            # Simple condition checking (can be extended with more sophisticated evaluation)
-            if self._evaluate_condition(rule["condition"], context, rule_name):
+            if self._check_rule(rule_name, rule, context):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "message", message)
                 self._handle_violation(rule)
@@ -212,12 +300,48 @@ class PolicyEnforcer:
         context = {"state": state}
 
         for rule_name, rule in self._rules.items():
-            if self._evaluate_condition(rule["condition"], context, rule_name):
+            if self._check_rule(rule_name, rule, context):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "state", state)
                 self._handle_violation(rule)
 
         return violations
+
+    def evaluate_rules(
+        self,
+        *,
+        state: AgentState | None = None,
+        message: AgentMessage | None = None,
+    ) -> dict[str, str]:
+        """Dry-run every rule against an example, without side effects.
+
+        Returns ``{rule_name: outcome}`` where outcome is ``"violation"``,
+        ``"pass"`` or ``"error"`` (the condition could not be evaluated against
+        this example -- typically a missing key). Nothing is recorded and no
+        handler runs, so this is safe to call from a test or a startup check.
+
+        Use it to show a rule is not vacuous: a rule you expect to block should
+        report ``"violation"`` for at least one example and ``"pass"`` for at
+        least one other. A rule that reports ``"error"`` for a realistic
+        example is one that blocks that example under the default
+        fail-closed setting, and silently does nothing under
+        ``fail_closed=False``.
+        """
+        context: dict[str, Any] = {}
+        if state is not None:
+            context["state"] = state
+        if message is not None:
+            context["message"] = message
+        outcomes: dict[str, str] = {}
+        for rule_name, rule in self._rules.items():
+            try:
+                tree = _parse_condition(rule["condition"])
+                fired = bool(self._eval_node(tree.body, context))
+            except Exception:
+                outcomes[rule_name] = "error"
+            else:
+                outcomes[rule_name] = "violation" if fired else "pass"
+        return outcomes
 
     def get_violations(
         self,
@@ -265,7 +389,7 @@ class PolicyEnforcer:
         a condition that cannot be evaluated at all (unknown variable, unsupported
         node, arithmetic error, ...). An evaluation error is always logged as a
         warning; it is then treated as a violation when ``self.fail_closed`` is set
-        and as "no violation" otherwise (fail-open, the historical behaviour).
+        (the default) and as "no violation" otherwise (fail-open).
 
         Args:
             condition: Condition expression
@@ -276,9 +400,28 @@ class PolicyEnforcer:
             True if condition is met (violation), False otherwise. On an
             evaluation error returns ``self.fail_closed``.
         """
+        outcome = self._outcome(condition, context, rule_name)
+        if outcome == "error":
+            return self.fail_closed
+        return outcome == "violation"
+
+    def _outcome(
+        self,
+        condition: str,
+        context: dict[str, Any],
+        rule_name: str | None = None,
+    ) -> str:
+        """Evaluate a condition to ``"violation"``, ``"pass"`` or ``"error"``.
+
+        The three-way answer :meth:`_evaluate_condition` collapses to a bool.
+        Kept separate so the enforcer can count *errors* per rule: under
+        fail-open an error and a pass are the same ``False`` to the caller, and
+        a rule that only ever errors is indistinguishable from one that is
+        simply never violated.
+        """
         try:
             tree = _parse_condition(condition)
-            return bool(self._eval_node(tree.body, context))
+            return "violation" if self._eval_node(tree.body, context) else "pass"
         except Exception as e:
             label = f" for rule '{rule_name}'" if rule_name else ""
             logger.warning(
@@ -288,7 +431,59 @@ class PolicyEnforcer:
                 e,
                 "VIOLATION (fail_closed)" if self.fail_closed else "no violation (fail_open)",
             )
+            return "error"
+
+    def _check_rule(self, rule_name: str, rule: PolicyRule, context: dict[str, Any]) -> bool:
+        """Evaluate one rule for real: count the outcome, return "violated?"."""
+        context.pop(_MISSED_LOOKUP, None)
+        outcome = self._outcome(rule["condition"], context, rule_name)
+        missed = context.pop(_MISSED_LOOKUP, False)
+        stats = self._rule_stats.setdefault(
+            rule_name, {"violation": 0, "pass": 0, "error": 0, "unresolved": 0}
+        )
+        stats[outcome] += 1
+        if outcome == "error" or missed:
+            stats["unresolved"] += 1
+        if outcome == "error":
             return self.fail_closed
+        return outcome == "violation"
+
+    def get_rule_stats(self) -> dict[str, dict[str, int]]:
+        """Per-rule counts of ``violation`` / ``pass`` / ``error`` outcomes.
+
+        ``unresolved`` additionally counts the evaluations -- of any outcome --
+        in which the rule could not see everything it asked for: it errored, or
+        a ``state[...]`` lookup found no such key (which evaluates to ``None``
+        rather than erroring, so ``state['tier'] == 'free'`` is a quiet
+        ``pass`` when ``tier`` is absent).
+
+        Counts cover :meth:`check_state` and :meth:`check_message` calls since
+        the rule was registered (:meth:`evaluate_rules` is a dry run and is not
+        counted).
+        """
+        return {name: dict(stats) for name, stats in self._rule_stats.items()}
+
+    def vacuous_rules(self) -> list[str]:
+        """Rules that have been evaluated and have **never once** seen their data.
+
+        In every evaluation so far such a rule either errored or looked up a
+        key that was not there -- typically because it reads a key the state
+        never carries (a typo, or data the adapter does not populate), or names
+        ``message`` where only ``state`` is ever in scope (as under an
+        adapter). It has decided nothing on evidence since it was installed:
+        it has blocked everything it errored on, or under
+        ``fail_closed=False`` silently passed.
+
+        A rule that has not been evaluated at all is not listed: there is no
+        evidence either way. Check this after real traffic, or in a test after
+        driving a representative request through the agent.
+        """
+        return [
+            name
+            for name, stats in self._rule_stats.items()
+            if stats["unresolved"] > 0
+            and stats["unresolved"] == stats["violation"] + stats["pass"] + stats["error"]
+        ]
 
     def _eval_node(self, node: ast.AST, context: dict[str, Any], depth: int = 0) -> Any:
         if depth > 50:
@@ -335,16 +530,23 @@ class PolicyEnforcer:
         elif node_type is ast.BoolOp:
             bool_node = cast(ast.BoolOp, node)
             bool_op_type = type(bool_node.op)
+            # Python semantics: `and`/`or` yield one of their *operands*, not a
+            # bool. Returning True/False here made `(0 or state['x']) < 1` mean
+            # something different in a rule than in Python -- and, worse, made
+            # a comparison Python refuses (`0 < None`) quietly succeed.
+            result: Any = None
             if bool_op_type is ast.And:
                 for value in bool_node.values:
-                    if not self._eval_node(value, context, depth + 1):
-                        return False
-                return True
+                    result = self._eval_node(value, context, depth + 1)
+                    if not result:
+                        return result
+                return result
             elif bool_op_type is ast.Or:
                 for value in bool_node.values:
-                    if self._eval_node(value, context, depth + 1):
-                        return True
-                return False
+                    result = self._eval_node(value, context, depth + 1)
+                    if result:
+                        return result
+                return result
             raise ValueError(f"Unsupported boolean operator: {bool_op_type}")
         elif node_type is ast.BinOp:
             bin_node = cast(ast.BinOp, node)
@@ -364,6 +566,10 @@ class PolicyEnforcer:
             try:
                 return val[slice_val]
             except (KeyError, IndexError, TypeError):
+                # Deliberately not an error: `state['flag'] == True` should be
+                # a quiet "no" when the flag is absent. But it is noted, so a
+                # rule whose lookups have *never* resolved can be reported.
+                context[_MISSED_LOOKUP] = True
                 return None
         else:
             raise ValueError(f"Unsupported AST node: {node_type}")

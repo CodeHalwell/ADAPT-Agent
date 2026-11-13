@@ -170,8 +170,8 @@ firewall.add_blocked_pattern(r"(?i)ignore previous instructions")
 firewall.add_blocked_pattern(r"(?i)\bpassword\b")
 
 # Policy rules gate on agent *state*. Under an adapter only `state` is in
-# scope -- a rule written against `message` silently never fires.
-policy = PolicyEnforcer(fail_closed=True)
+# scope -- a rule written against `message` can never be evaluated.
+policy = PolicyEnforcer()  # fail-closed by default
 policy.add_rule(
     name="low_trust",
     description="Block callers whose trust score is too low",
@@ -184,7 +184,7 @@ guarded = LangGraphAdapter(firewall=firewall, policy_enforcer=policy).wrap_agent
 
 try:
     # `trust_score` must be present in the state, or the rule cannot be
-    # evaluated -- and with fail_closed=True that counts as a violation.
+    # evaluated -- and by default (fail-closed) that counts as a violation.
     result = guarded.execute(
         {"messages": [{"role": "user", "content": "Hello"}], "trust_score": 0.9}
     )
@@ -196,11 +196,11 @@ Two things worth getting right, because both fail silently:
 
 * **Use the firewall for content, policy rules for state.** An adapter's
   `execute()` evaluates policy conditions with `check_state()`, so only `state`
-  is in scope; a condition referencing `message` is unevaluable and, by
-  default, treated as *no violation* while the agent runs on.
-* **`fail_closed=True`** makes such a rule block instead of passing quietly —
-  but it cuts both ways: a rule referencing state the adapter does not populate
-  now blocks *everything*. An adapter's `extract_state()` yields `messages` and
+  is in scope; a condition referencing `message` is unevaluable.
+* **The enforcer is fail-closed by default**, so an unevaluable rule blocks
+  instead of passing quietly — which cuts both ways: a rule referencing state
+  the adapter does not populate blocks *everything*. (`fail_closed=False`
+  makes it pass silently instead; avoid that for security rules.) An adapter's `extract_state()` yields `messages` and
   `context`; anything else (like `trust_score`) has to be in the input you pass
   to `execute()`.
 

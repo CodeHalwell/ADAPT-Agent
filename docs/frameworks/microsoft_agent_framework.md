@@ -244,9 +244,9 @@ policy.add_rule(
 )
 ```
 
-Recorded violations are available via `policy.get_violations()`. New options:
-`PolicyEnforcer(fail_closed=True)` treats an *unevaluable* condition as a
-violation instead of passing it through.
+Recorded violations are available via `policy.get_violations()`. A condition
+that cannot be evaluated at run time counts as a violation by default;
+`PolicyEnforcer(fail_closed=False)` passes it through instead.
 
 ### 4.2 Adversarial defense
 

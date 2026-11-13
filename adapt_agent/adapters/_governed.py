@@ -527,8 +527,14 @@ class _GovernedAgent:
         # `block_on_violation` would turn the documented report-only rollout into
         # silence -- no auditing at all, rather than auditing without refusal.
         # Only the refusal itself is conditional.
-        self._last_state = adapter.extract_state(input_data)
-        blocking = adapter.gate.policy_violations(self._last_state)
+        #
+        # The state is evaluated but NOT committed to `_last_state` here. A
+        # refused request must leave the wrapped agent exactly as it found it:
+        # committing first meant `get_state()` returned the very payload policy
+        # had just blocked, and an output block left the request's input there
+        # as if it had been served. `_after` commits, on success only.
+        candidate_state = adapter.extract_state(input_data)
+        blocking = adapter.gate.policy_violations(candidate_state)
         if blocking and adapter.block_on_violation:
             raise SecurityBlockedError("Input blocked by policy", [f"policy:{v}" for v in blocking])
 

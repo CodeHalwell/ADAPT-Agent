@@ -1,9 +1,14 @@
 # Security Model
 
-ADAPT-Agent's security layer is built to **fail closed**, bound all in-memory
-state against denial-of-service, and compose multiple independent controls
-(defense in depth). This page documents the three core security components and
-the hardening guarantees each one provides.
+ADAPT-Agent's security layer bounds all in-memory state against
+denial-of-service and composes multiple independent controls (defense in
+depth). Every control **fails closed**: an error inside a control blocks. That
+includes the policy engine — a rule whose condition cannot be evaluated at run
+time counts as a violation unless you opt out with
+`PolicyEnforcer(fail_closed=False)` (see [Policy Enforcement](policy.md)). This
+page documents the three core security components, the hardening guarantees
+each one provides, and — just as important — [what they do not
+cover](#what-is-not-covered).
 
 The security primitives are exported from the top level and from
 `adapt_agent.security`:
@@ -28,37 +33,58 @@ fw = Firewall(max_content_length=10_000, max_events=1000)
 ### Decision order
 
 `check_input(content)` returns `True` if content is **allowed**, `False` if
-**blocked**. It evaluates controls in this order:
+**blocked**. The firewall is **block-first** by default
+(`whitelist_mode=False`), and evaluates controls in this order:
 
 1. **Length cap.** If `max_content_length` is set and exceeded, the input is
-   blocked immediately, a high-severity event is recorded, and a *sanitised,
-   truncated* snippet is stored. This is the DoS guard.
-2. **Allowed (whitelist) patterns** — checked with `pattern.fullmatch(content)`.
-   If any allowed pattern matches the **entire** content, it is allowed and no
-   further checks run.
-3. **Blocked patterns** — checked with `pattern.search(content)`. A match blocks
+   blocked immediately, a high-severity event is recorded, and a *redacted*
+   snippet (first 12 characters plus a hash) is stored. This is the DoS guard.
+2. **Blocked patterns** — checked with `pattern.search(content)`. A match blocks
    the input and records a high-severity event.
-4. **Custom filters** — each filter returns `True` to block. A filter that
+3. **Custom filters** — each filter returns `True` to block. A filter that
    *raises* is treated as a block (fail-closed), recording a high-severity event.
+4. **Allowed patterns** — checked with `pattern.fullmatch(content)`, last. By
+   this point the content has already passed every block check, so in the
+   default mode an allowed pattern changes no decision: it can never override a
+   block.
 
-`check_output(content)` delegates to the same logic as `check_input`.
+`check_output(content)` runs the same logic, recording `blocked_output` events.
 
-### fullmatch whitelist vs. search blocklist
+### `whitelist_mode=True`
+
+`Firewall(whitelist_mode=True)` moves the allowed-pattern check to the
+**front**, directly after the length cap: content that fully matches any
+allowed pattern is allowed immediately, and neither the blocked patterns nor the
+custom filters run. Use it only when the allowed patterns are themselves the
+security boundary, and keep them tight: an allowed pattern of `.*` in this mode
+disables pattern and filter screening. The length cap still applies — no allowed
+pattern can waive it.
+
+In neither mode are allowed patterns *restrictive*. They exempt content; they
+never reject it. Content matching no allowed pattern is still allowed once the
+block checks pass. To require input to match a shape, invert a custom filter:
+
+```python
+permitted = re.compile(r"[\w\s.,?!-]+")
+fw.add_custom_filter(lambda c: not permitted.fullmatch(c))
+```
+
+### fullmatch allowlist vs. search blocklist
 
 The asymmetry is deliberate and security-relevant:
 
-- Allowed patterns use **`fullmatch`** so a whitelist entry only short-circuits
-  when it describes the *whole* message. A whitelist that does not fully match
-  has no effect — it cannot accidentally allow a partial match.
+- Allowed patterns use **`fullmatch`** so an entry only applies when it
+  describes the *whole* message; it cannot exempt content on a partial match.
 - Blocked patterns use **`search`** so a forbidden substring anywhere in the
   content triggers a block.
 
 ```python
-fw.add_allowed_pattern(r"[A-Za-z0-9 ]+")          # fullmatch
+fw.add_allowed_pattern(r".*")                                # matches anything
 fw.add_blocked_pattern(r"(?i)ignore previous instructions")  # search
 
-fw.check_input("hello world")          # True
-fw.check_input("ignore previous instructions!")  # '!' breaks the whitelist; blocked
+fw.check_input("hello world")                    # True
+fw.check_input("ignore previous instructions!")  # False: block-first, the
+                                                 # allowed pattern cannot rescue it
 ```
 
 ### Custom filters fail closed
@@ -74,6 +100,26 @@ fw.add_custom_filter(block_long_digits)
 If `block_long_digits` raises for any reason, the firewall logs the error,
 records a high-severity event with a generic `"An error occurred"` message (it
 does **not** leak the exception text), and blocks the content.
+
+### Checking a pattern is not vacuous
+
+A blocked pattern that can never match protects nothing, and looks exactly like
+one that works. Two helpers make that visible:
+
+```python
+fw.dry_run("card 4111111111111111")
+# {'allowed': False, 'reason': 'blocked_pattern', 'pattern': '\\b\\d{16}\\b'}
+fw.dry_run("hello")
+# {'allowed': True, 'reason': 'no_match', 'pattern': None}
+
+fw.get_pattern_hits()
+# {'\\b\\d{16}\\b': 12, 'SECRET-[A-Z]{40}': 0}   <- never matched anything
+```
+
+`dry_run` uses the same decision function as `check_input` but records no event
+and moves no counter, so it is safe in a test: assert that each pattern you add
+blocks one realistic example and lets another through. `get_pattern_hits` counts
+real blocks per pattern; one still at zero after real traffic deserves a look.
 
 ### Sanitization / redaction
 
@@ -247,9 +293,69 @@ defense.get_detected_attacks(attack_type="prompt_injection", limit=10)
 | Guarantee | Where it lives |
 |-----------|----------------|
 | Fail-closed on filter errors | `Firewall.check_input` custom-filter `except` block |
-| Whitelist uses `fullmatch`, blocklist uses `search` | `Firewall.check_input` |
+| Block-first: allowed patterns never override a block (default mode) | `Firewall._check` |
+| Allowlist uses `fullmatch`, blocklist uses `search` | `Firewall._check` |
+| Unevaluable policy conditions rejected at registration | `PolicyEnforcer.add_rule` via `validate_condition` |
+| A rule that cannot be evaluated at run time is a violation (fail-closed default) | `PolicyEnforcer._check_rule` |
 | Content-length DoS cap | `Firewall.max_content_length`, `AdversarialDefense.max_content_length` |
 | Bounded event/attack/propagation stores | `max_events`, `max_attacks`, `max_propagations`, `max_tracked_items` |
 | Log-poisoning protection (escape + truncate) | `AdversarialDefense._record_attack`, `AgentObserver.log*` |
 | Snippets sanitised before storage | `Firewall._record_security_event` via `sanitize` |
 | Error text not leaked into events | `Firewall` custom-filter error path |
+| Length cap applies in both modes; no allowed pattern waives it | `Firewall._decide` |
+| A refused request leaves no state behind | `_GovernedAgent._before` / `_after` |
+
+---
+
+## What is not covered
+
+A guarantee is only as useful as its stated limits. The controls above are
+pattern- and rule-based screens around an agent; they are not a proof that the
+agent is safe. In particular:
+
+| Area | What is *not* guaranteed |
+|------|--------------------------|
+| **Detection is heuristic** | `AdversarialDefense` and firewall patterns match known shapes of attack. A novel, paraphrased, translated or encoded injection that matches no pattern passes. Treat a clean scan as "nothing recognised", never as "safe". |
+| **Only reachable text is scanned** | Governance scans the strings `extract_texts` can reach: dicts, lists, well-known text attributes, Pydantic models and dataclasses, to a depth of 12. Text inside an arbitrary object's private attributes, binary or encoded payloads, images, and anything nested deeper is not seen. |
+| **Only the governed boundary is scanned** | An adapter screens the input to and output from the agent it wraps. Tool calls, retrievals and sub-agent hops inside that agent are screened only where a native integration hook is installed for them. |
+| **Policy sees state, not content** | Under an adapter, rules are evaluated against `state` only. Registration rejects conditions that could never evaluate. A rule that reads a key your state does not carry with an ordering comparison (`<`, `>`) errors and, by default, blocks; with `==` or `in` the missing key is `None` and the rule quietly passes. `vacuous_rules()` finds both. |
+| **Allowed patterns do not restrict** | See above: they exempt, they never reject. In `whitelist_mode=True` a matching allowed pattern also skips the blocked patterns and custom filters. |
+| **Regex cost** | The length cap bounds input size, and obviously catastrophic patterns are rejected, but that check is a heuristic. A pathological user-supplied pattern can still be slow. |
+| **Trust and taint are bookkeeping** | `TrustManager` and `TaintTracker` record what you tell them. Nothing is enforced unless your code, or a policy rule, acts on the score or taint level. |
+| **Optimization is not a security control** | `adapt_agent.optimization` tunes for a score on your dataset. It does not check that a tuned prompt keeps safety instructions; review `best_config` before shipping it (see [Optimization](optimization.md)). |
+| **Process and host** | Single-process, in-memory state. No protection against a compromised dependency, model provider or host, and no cross-process rate limiting. |
+
+### A refused request leaves no trace
+
+When a request is refused — by the firewall, the adversarial defense, a
+blocking policy rule, output screening, or because the agent itself raised —
+the audit trail records it (a security event, a policy violation, an error
+span). Nothing else changes:
+
+* a request refused on input never reaches the agent or the middleware, and no
+  span is opened for it;
+* `get_state()` on the wrapped agent keeps describing the last request that was
+  actually **served** — never the payload that was just blocked;
+* a request refused on output closes its span as an error, not a success.
+
+### How the claims on this page are tested
+
+Four layers, each catching what the one before it cannot:
+
+1. **Example tests** — the ordinary suite.
+2. **Property tests against a reference model.** `tests/governance_model.py` is
+   a forty-line, dependency-free statement of what the pipeline does.
+   `tests/test_governance_properties.py` generates arbitrary requests and
+   sequences of requests (Hypothesis) and checks the real implementation never
+   disagrees with it. The same file checks that routes documented as equivalent
+   *are* — `execute` against `aexecute`, the adapter against the bare gate
+   against a native framework hook — and that the policy language means what
+   the same expression means in Python.
+3. **Mutation testing.** `scripts/mutation_check.py` re-introduces security bugs
+   one at a time — every historical vulnerability in `.jules/sentinel.md`, plus
+   each gate call in each framework integration — and fails if the suite still
+   passes with any of them in place. This is what shows the tests above would
+   *notice*.
+4. **A held-out check.** `scripts/heldout_check.py` runs the base branch's tests
+   against a pull request's code, so a guard and the test that pins it cannot be
+   loosened together unnoticed.

@@ -37,7 +37,7 @@ def test_policy_enforcer_add_rule():
     """Test adding a policy rule."""
     enforcer = PolicyEnforcer()
     enforcer.add_rule(
-        name="test_rule", description="Test rule", condition="test", action="warn", severity="low"
+        name="test_rule", description="Test rule", condition="True", action="warn", severity="low"
     )
 
     rule = enforcer.get_rule("test_rule")
@@ -66,11 +66,12 @@ def test_policy_enforcer_evaluate_condition():
     assert enforcer._evaluate_condition("item in {'a', 'b', 'c'}", context) is True
     assert enforcer._evaluate_condition("item in {'a': 1, 'b': 2}", context) is True
 
-    # Error handling (unsupported node)
-    assert enforcer._evaluate_condition("import os", context) is False
-
-    # Error handling (unknown variable)
-    assert enforcer._evaluate_condition("unknown_var == 1", context) is False
+    # Error handling: a condition that cannot be evaluated is a violation by
+    # default (fail-closed), and "no violation" only when that is asked for.
+    lenient = PolicyEnforcer(fail_closed=False)
+    for unevaluable in ("import os", "unknown_var == 1"):  # bad syntax, unknown name
+        assert enforcer._evaluate_condition(unevaluable, context) is True
+        assert lenient._evaluate_condition(unevaluable, context) is False
 
 
 def test_memory_system_short_term():
