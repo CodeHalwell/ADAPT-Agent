@@ -29,15 +29,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validation_gate=False`. Applies to every optimizer, `PipelineOptimizer`
   included, and so to `adapt optimize --val-data` and `adapt train`.
 
+- **A refused request no longer becomes the wrapped agent's state.** A request
+  blocked by a policy rule left its own payload as `get_state()`; one blocked on
+  output, or whose agent raised, left its input there as though it had been
+  served. State is now committed only when a request is served.
+- **The firewall's length cap is checked first in both modes.** With
+  `whitelist_mode=True` a matching allowed pattern used to return before the
+  cap, so the pattern ran over unbounded input and `.*` waived the DoS guard.
+- **`and` / `or` in policy conditions yield an operand, as in Python.** They
+  returned `True`/`False`, so `(0 or state['x']) == 2` was never true and a
+  comparison Python refuses (`0 < None`) quietly produced a verdict. Found by
+  the new property test against Python's own evaluator.
+
 ### Added
 
+- `Firewall.dry_run(content)` (the decision and its reason, recording nothing)
+  and `Firewall.get_pattern_hits()` (blocks per pattern; a pattern still at
+  zero has never matched).
+- `PolicyEnforcer.get_rule_stats()` and `.vacuous_rules()`: per-rule outcome
+  counts, including lookups of absent keys -- which evaluate to `None` and so
+  pass silently under `==`.
+- `Optimizer(proposer_judge=...)` / `make_default_optimizer(proposer_judge=...)`
+  to separate the judge that rewrites prompts from the one that scores them. A
+  run whose rewriting judge is also its scoring judge now says so in
+  `OptimizationResult.recommendations`.
+- Property-based tests (`hypothesis`, a new dev dependency) against a reference
+  model of the pipeline in `tests/governance_model.py`: verdicts, sequences of
+  requests, sync vs async, adapter vs gate vs native hook, the policy language
+  vs Python, and every bounded store.
+- `scripts/heldout_check.py` and a `held-out` CI job: runs the base branch's
+  tests against a pull request's code; skipped by the `spec-amendment` label.
+- The mutation check grew to 78 mutants, adding the governed adapter and every
+  gate call in every framework integration. That exposed the OpenAI Agents hooks
+  as untested whenever the SDK is absent (as in CI); 
+  `tests/test_openai_hooks_stubbed.py` now drives them against a stub.
 - `PolicyEnforcer.evaluate_rules(state=..., message=...)` dry-runs every rule
   against an example and reports `"violation"`, `"pass"` or `"error"` per rule,
   with no side effects -- for asserting in your own tests that a rule can fire.
 - `adapt_agent.core.policy.validate_condition`.
 - `OptimizationResult.validation_baseline_score`, `.validation_rejected` and
   `.rejected_config` (appended; positional construction is unaffected).
-- `scripts/mutation_check.py` and a `mutation` CI job: re-introduces 53
+- `scripts/mutation_check.py` and a `mutation` CI job: re-introduces
   security bugs one at a time -- every historical vulnerability in
   `.jules/sentinel.md` among them -- and fails if the suite stays green. Its
   first run found seven guarantees no test pinned (five of them previously

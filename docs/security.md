@@ -101,6 +101,26 @@ If `block_long_digits` raises for any reason, the firewall logs the error,
 records a high-severity event with a generic `"An error occurred"` message (it
 does **not** leak the exception text), and blocks the content.
 
+### Checking a pattern is not vacuous
+
+A blocked pattern that can never match protects nothing, and looks exactly like
+one that works. Two helpers make that visible:
+
+```python
+fw.dry_run("card 4111111111111111")
+# {'allowed': False, 'reason': 'blocked_pattern', 'pattern': '\\b\\d{16}\\b'}
+fw.dry_run("hello")
+# {'allowed': True, 'reason': 'no_match', 'pattern': None}
+
+fw.get_pattern_hits()
+# {'\\b\\d{16}\\b': 12, 'SECRET-[A-Z]{40}': 0}   <- never matched anything
+```
+
+`dry_run` uses the same decision function as `check_input` but records no event
+and moves no counter, so it is safe in a test: assert that each pattern you add
+blocks one realistic example and lets another through. `get_pattern_hits` counts
+real blocks per pattern; one still at zero after real traffic deserves a look.
+
 ### Sanitization / redaction
 
 `sanitize(content, replacement="[REDACTED]")` replaces every match of each
@@ -281,6 +301,8 @@ defense.get_detected_attacks(attack_type="prompt_injection", limit=10)
 | Log-poisoning protection (escape + truncate) | `AdversarialDefense._record_attack`, `AgentObserver.log*` |
 | Snippets sanitised before storage | `Firewall._record_security_event` via `sanitize` |
 | Error text not leaked into events | `Firewall` custom-filter error path |
+| Length cap applies in both modes; no allowed pattern waives it | `Firewall._decide` |
+| A refused request leaves no state behind | `_GovernedAgent._before` / `_after` |
 
 ---
 
@@ -302,11 +324,37 @@ agent is safe. In particular:
 | **Optimization is not a security control** | `adapt_agent.optimization` tunes for a score on your dataset. It does not check that a tuned prompt keeps safety instructions; review `best_config` before shipping it (see [Optimization](optimization.md)). |
 | **Process and host** | Single-process, in-memory state. No protection against a compromised dependency, model provider or host, and no cross-process rate limiting. |
 
+### A refused request leaves no trace
+
+When a request is refused — by the firewall, the adversarial defense, a
+blocking policy rule, output screening, or because the agent itself raised —
+the audit trail records it (a security event, a policy violation, an error
+span). Nothing else changes:
+
+* a request refused on input never reaches the agent or the middleware, and no
+  span is opened for it;
+* `get_state()` on the wrapped agent keeps describing the last request that was
+  actually **served** — never the payload that was just blocked;
+* a request refused on output closes its span as an error, not a success.
+
 ### How the claims on this page are tested
 
-The test suite is itself checked by **mutation testing**:
-`scripts/mutation_check.py` re-introduces security bugs one at a time —
-including each historical vulnerability recorded in `.jules/sentinel.md` — and
-fails if the suite still passes with any of them in place. CI runs it on every
-pull request, so a change that weakens a security test is caught even when
-coverage is unchanged.
+Four layers, each catching what the one before it cannot:
+
+1. **Example tests** — the ordinary suite.
+2. **Property tests against a reference model.** `tests/governance_model.py` is
+   a forty-line, dependency-free statement of what the pipeline does.
+   `tests/test_governance_properties.py` generates arbitrary requests and
+   sequences of requests (Hypothesis) and checks the real implementation never
+   disagrees with it. The same file checks that routes documented as equivalent
+   *are* — `execute` against `aexecute`, the adapter against the bare gate
+   against a native framework hook — and that the policy language means what
+   the same expression means in Python.
+3. **Mutation testing.** `scripts/mutation_check.py` re-introduces security bugs
+   one at a time — every historical vulnerability in `.jules/sentinel.md`, plus
+   each gate call in each framework integration — and fails if the suite still
+   passes with any of them in place. This is what shows the tests above would
+   *notice*.
+4. **A held-out check.** `scripts/heldout_check.py` runs the base branch's tests
+   against a pull request's code, so a guard and the test that pins it cannot be
+   loosened together unnoticed.

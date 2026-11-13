@@ -80,6 +80,30 @@ it. If you **refactor a guard**, its mutant will be reported as *stale*; update
 the mutant's `old`/`new` text to match the new code rather than deleting it.
 `tests/test_mutation_check.py` enforces both on every ordinary test run.
 
+### Property tests and the reference model
+
+`tests/governance_model.py` is a short, dependency-free model of the governance
+pipeline, and `tests/test_governance_properties.py` uses
+[Hypothesis](https://hypothesis.readthedocs.io/) to check the implementation
+against it on generated inputs. If you change what the pipeline *does*, change
+the model too — it is the specification, and it is meant to stay small enough
+to read in one sitting. When a property fails, Hypothesis prints a minimal
+counter-example; pin it with `@example(...)` once fixed.
+
+### Held-out check
+
+On a pull request CI also runs the **base branch's** tests against your code
+(`scripts/heldout_check.py`). It fails when your change alters behaviour that an
+existing test pinned — including when you updated that test to match. That is
+often exactly right; it means the change amends the specification, and a
+maintainer confirms it by applying the `spec-amendment` label. Say in the PR
+description which existing tests you changed and why. To run it locally:
+
+```bash
+git worktree add /tmp/base origin/main
+python scripts/heldout_check.py --base /tmp/base
+```
+
 ## Linting, formatting, and type checking
 
 Before opening a pull request, make sure the following all pass:

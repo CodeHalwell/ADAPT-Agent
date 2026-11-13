@@ -15,6 +15,7 @@
 
 /tests/                       @CodeHalwell
 /scripts/mutation_check.py    @CodeHalwell
+/scripts/heldout_check.py     @CodeHalwell
 /.github/                     @CodeHalwell
 /docs/security.md             @CodeHalwell
 /SECURITY.md                  @CodeHalwell

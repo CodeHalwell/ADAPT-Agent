@@ -133,6 +133,40 @@ policy.evaluate_rules(state={"messages": [], "context": {}})
 For each blocking rule, assert in your own tests that one realistic example
 gives `"violation"` and another gives `"pass"`.
 
+### Finding a rule that has never seen its data
+
+`evaluate_rules` checks the examples you thought of. For the traffic you
+actually get, the enforcer counts outcomes per rule:
+
+```python
+policy.get_rule_stats()
+# {'low_trust': {'violation': 3, 'pass': 41, 'error': 0, 'unresolved': 0},
+#  'free_tier': {'violation': 0, 'pass': 44, 'error': 0, 'unresolved': 44}}
+
+policy.vacuous_rules()
+# ['free_tier']
+```
+
+`unresolved` counts the evaluations in which the rule could not see everything
+it asked for: it errored, **or** it looked up a key that was not there. The
+second case matters because it does not error. A failed `state[...]` lookup
+evaluates to `None`, so `state['tier'] == 'free'` is a quiet `"pass"` when
+`tier` is absent — which is the right answer for one request and the wrong one
+if `tier` is *never* there because of a typo, or because the adapter does not
+populate it.
+
+`vacuous_rules()` lists the rules for which **every** evaluation so far was
+unresolved. Check it after driving a representative request through your agent
+in a test, or periodically in production. A rule that has not been evaluated at
+all is not listed.
+
+### `and` / `or`
+
+These behave as in Python: they yield one of their operands, not a bool. So
+`(state['override'] or state['default']) > 5` compares the value, and a
+comparison Python would refuse (`0 < None`) is an evaluation error here too
+rather than a silent verdict.
+
 ### Depth limit
 
 Evaluation is bounded to a recursion depth of **50**; deeper expressions raise

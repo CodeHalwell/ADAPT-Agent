@@ -123,6 +123,12 @@ discarded values are in `result.rejected_config`. Check that flag before
 telling a user their agent was improved. `validation_gate=False` on the
 optimizer turns the gate off.
 
+If one `LLMJudge` both rewrites prompts and scores them, pass a second judge on
+a different model as `proposer_judge=` (on any optimizer or
+`make_default_optimizer`). Otherwise `result.recommendations` gains an
+`Independence:` entry: the reported gain may partly be the judge preferring its
+own writing.
+
 ## Proposers
 
 Optimizers generate candidates through proposers, which you can mix:

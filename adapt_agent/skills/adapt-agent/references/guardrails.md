@@ -247,6 +247,10 @@ Two ways to protect yourself:
 
 * **`PolicyEnforcer(fail_closed=True)`** turns an unevaluable condition into a
   violation instead of a silent pass — strongly preferred for security rules.
+* **Ask the enforcer.** After driving a request through the agent,
+  `policy.vacuous_rules()` lists every rule that has never once seen the data
+  it reads (it errored, or looked up a key that was not there) — exactly the
+  rule above. Assert it is empty in a test.
 * **Screen content with the `Firewall`, not with policy rules.** The firewall
   scans the whole input and blocks through an adapter (verified); policy rules
   are for state-level gating like trust scores.

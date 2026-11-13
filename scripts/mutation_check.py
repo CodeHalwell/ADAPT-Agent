@@ -69,6 +69,47 @@ _MIDDLEWARE = "adapt_agent/core/middleware.py"
 _DEFENSE = "adapt_agent/adversarial/__init__.py"
 _OBSERVER = "adapt_agent/observability/__init__.py"
 _OPTIMIZERS = "adapt_agent/optimization/optimizers.py"
+_GOVERNED = "adapt_agent/adapters/_governed.py"
+
+#: Stands in for a gate call that has been "forgotten": accepts anything,
+#: finds no threats, raises nothing.
+_NO_OP = "(lambda *a, **k: [])("
+
+
+def _hook_mutants() -> tuple[Mutant, ...]:
+    """One mutant per place a native integration calls the governance gate.
+
+    Each framework hook is a few lines whose entire job is to make that call.
+    A hook that silently stops making it still imports, still registers, and
+    still returns the framework's expected shape -- it just governs nothing.
+    """
+    sites = (
+        ("agent-framework", "agent_framework", "resolved.review_input(", "input"),
+        ("agent-framework", "agent_framework", "resolved.review_output(", "output"),
+        ("claude-agent", "claude_agent", "resolved.scan_input(", "input"),
+        ("crewai", "crewai", "resolved.review_input(", "input"),
+        ("crewai", "crewai", "resolved.review_output(", "output"),
+        ("crewai-task", "crewai", "gate.scan_output(", "output"),
+        ("google-adk", "google_adk", "resolved.review_input(", "input"),
+        ("google-adk", "google_adk", "resolved.review_output(", "output"),
+        ("langgraph", "langgraph", "gate.review_input(", "input"),
+        ("langgraph", "langgraph", "gate.review_output(", "output"),
+        ("openai-guardrail", "openai_agents", "resolved.scan_input(", "input"),
+        ("openai-guardrail", "openai_agents", "resolved.scan_output(", "output"),
+        ("openai-hooks", "openai_agents", "resolved.review_input(", "input"),
+        ("openai-hooks", "openai_agents", "resolved.review_output(", "output"),
+        ("pydantic-ai", "pydantic_ai", "resolved.review_output(", "output"),
+    )
+    return tuple(
+        Mutant(
+            f"hook-{name}-{direction}",
+            f"adapt_agent/integrations/{module}.py",
+            call,
+            _NO_OP,
+            f"the {name} hook screens its {direction}",
+        )
+        for name, module, call, direction in sites
+    )
 
 
 @dataclass(frozen=True)
@@ -552,7 +593,80 @@ MUTANTS: tuple[Mutant, ...] = (
         "newlines are escaped in an event description",
         "2024-06-25 - [Log Poisoning Vulnerability in AgentObserver]",
     ),
+    # ----------------------------------------------------------- governed adapter
+    Mutant(
+        "gov-input-not-refused",
+        _GOVERNED,
+        "        if in_threats and adapter.block_on_violation:",
+        "        if False:",
+        "the adapter refuses an input its controls flagged",
+    ),
+    Mutant(
+        "gov-policy-not-refused",
+        _GOVERNED,
+        "        if blocking and adapter.block_on_violation:",
+        "        if False:",
+        "the adapter refuses an input a blocking rule matched",
+    ),
+    Mutant(
+        "gov-output-not-refused",
+        _GOVERNED,
+        "            if out_threats and adapter.block_on_violation:",
+        "            if False:",
+        "the adapter refuses an output its firewall flagged",
+    ),
+    Mutant(
+        "gov-refused-request-becomes-state",
+        _GOVERNED,
+        "        candidate_state = adapter.extract_state(input_data)",
+        "        candidate_state = self._last_state = adapter.extract_state(input_data)",
+        "a refused request never becomes the agent's state",
+    ),
+    Mutant(
+        "gov-output-block-recorded-as-success",
+        _GOVERNED,
+        """        except BaseException as exc:  # CancelledError derives from BaseException
+            self._trace_error(trace_id, exc)
+            raise""",
+        """        except BaseException:  # CancelledError derives from BaseException
+            if adapter.observer is not None:
+                adapter.observer.end_trace(trace_id, status="completed")
+            raise""",
+        "an output block closes its span as an error, not a success",
+    ),
+    Mutant(
+        "policy-boolop-returns-bool",
+        _POLICY,
+        """                    if result:
+                        return result
+                return result""",
+        """                    if result:
+                        return True
+                return False""",
+        "`or` yields its operand, as in Python",
+    ),
+    Mutant(
+        "policy-missed-lookup-untracked",
+        _POLICY,
+        "                context[_MISSED_LOOKUP] = True",
+        "                pass",
+        "a lookup of an absent key is counted as unresolved",
+    ),
     # ------------------------------------------------------------------ optimizer
+    Mutant(
+        "opt-proposer-judge-ignored",
+        _OPTIMIZERS,
+        "return self.proposer_judge if self.proposer_judge is not None else self.judge",
+        "return self.judge",
+        "a separate proposer judge does the rewriting",
+    ),
+    Mutant(
+        "opt-shared-judge-unflagged",
+        _OPTIMIZERS,
+        "if not any(same(rewriting, j) for j in scoring):",
+        "if True:",
+        "a judge that both writes and scores is reported",
+    ),
     Mutant(
         "opt-gate-never-rejects",
         _OPTIMIZERS,
@@ -574,6 +688,7 @@ MUTANTS: tuple[Mutant, ...] = (
         "if tuned.score < baseline.score - self.validation_tolerance:",
         "the gate never rejects on an incomplete held-out pass",
     ),
+    *_hook_mutants(),
 )
 
 
@@ -636,6 +751,9 @@ def _run_suite(workdir: Path, timeout: float) -> tuple[bool, str]:
     # be reported as a survivor.
     env["PYTHONPATH"] = str(workdir)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Selects the derandomized Hypothesis profile (tests/conftest.py): whether a
+    # mutant is caught must not depend on which examples happened to be drawn.
+    env["CI"] = "1"
     cmd = [
         sys.executable,
         "-m",

@@ -272,6 +272,29 @@ Things to know:
 * `Optimizer(..., validation_gate=False)` restores the old report-only
   behaviour.
 
+### Who marks the homework
+
+When an `LLMJudge` drives prompt rewriting *and* backs the metric that scores
+the result, the mark is not independent: a model tends to prefer text in its own
+style, and a rewrite can learn what the marker rewards rather than what the task
+needs. The held-out gate does not help here, because the same judge scores the
+held-out set too.
+
+```python
+scorer = LLMJudge("anthropic")          # marks the answers
+writer = LLMJudge("openai")             # critiques failures, rewrites prompts
+harness = EvaluationHarness(scorer.as_metric())
+
+optimizer = make_default_optimizer(harness, judge=scorer, proposer_judge=writer)
+```
+
+`proposer_judge` takes over critique and rewriting; `judge` and the harness keep
+scoring. If you do not pass one and the rewriting judge turns out to be the
+scoring judge — the same object, or two judges over the same completion
+function — the run says so in `result.recommendations` (an entry starting
+`Independence:`) and logs a warning. Scoring with a deterministic metric avoids
+the question entirely.
+
 The gate checks the score, not the content. It will not notice a rewritten
 prompt that lost a safety instruction if your held-out rows never probe for it —
 put such rows in the dataset, and read `best_config` before shipping it.
