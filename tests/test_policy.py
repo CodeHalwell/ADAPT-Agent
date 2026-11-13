@@ -1,5 +1,7 @@
 """Tests for the PolicyEnforcer."""
 
+import ast
+
 import pytest
 
 from adapt_agent.core import PolicyEnforcer
@@ -286,6 +288,9 @@ def test_node_count_cap_allows_normal_condition():
         "state['messages'][-1] == 'x'",  # unary minus
         "state['messages'][0:2] == []",  # slice
         "state['n'] % 2 == 0",  # unsupported arithmetic operator
+        "state['n'] ** 2 > 4",  # power: unbounded CPU and memory
+        "state['callback']() == 1",  # a call, even with only known names
+        "state['obj'].secret == 1",  # attribute access on a looked-up value
         "state['n'] is None",  # unsupported comparison
         "state['n'] >",  # syntax error
     ],
@@ -355,3 +360,23 @@ def test_evaluate_rules_reports_violation_pass_and_error_without_side_effects():
 
     assert enforcer.get_violations() == []
     assert handled == []
+
+
+@pytest.mark.parametrize(
+    "condition", ["2 ** 3 == 8", "state['f'](1) == 1", "state['o'].real == 1", "9 ** 9 ** 9 > 0"]
+)
+def test_evaluator_itself_refuses_calls_attributes_and_power(condition):
+    """Defence in depth behind add_rule: the evaluator never runs these.
+
+    Registration rejects them, but the evaluator is the actual sandbox -- a
+    rule injected past add_rule must still not be able to call, reach an
+    attribute, or burn CPU on an exponent tower.
+    """
+    enforcer = PolicyEnforcer(fail_closed=True)
+    state = {"f": lambda x: x, "o": 1}
+    # fail_closed turns "could not evaluate" into True, and a successful
+    # evaluation of any of these would also be truthy -- so assert on the node
+    # walk directly rather than on the boolean.
+    tree = ast.parse(condition, mode="eval")
+    with pytest.raises(ValueError):
+        enforcer._eval_node(tree.body, {"state": state})

@@ -61,6 +61,27 @@ jobs:
           name: coverage-xml
           path: coverage.xml
 
+  # Coverage shows a line ran; this shows a test would notice if it were wrong.
+  # Re-introduces security bugs one at a time -- including every historical
+  # vulnerability in .jules/sentinel.md -- and fails if the suite stays green.
+  # It is what stops a change (human or automated) from weakening a security
+  # test while leaving coverage untouched.
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Mutation check (security modules)
+        run: python scripts/mutation_check.py
+
   build:
     runs-on: ubuntu-latest
     steps:

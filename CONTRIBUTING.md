@@ -60,6 +60,26 @@ pytest --cov=adapt_agent --cov-report=term-missing
 
 Pull requests must keep total coverage at **85% or higher** and must pass CI.
 
+### Mutation check
+
+Coverage shows that a line ran under test, not that a test would notice if the
+line were wrong. For the security-critical modules CI therefore also runs:
+
+```bash
+python scripts/mutation_check.py          # ~2 minutes
+python scripts/mutation_check.py --list   # what it checks
+```
+
+It re-introduces one security bug at a time into a scratch copy of the repo —
+including every historical vulnerability recorded in `.jules/sentinel.md` — and
+fails if the test suite still passes with the bug in place.
+
+If you **fix a security bug**, add a mutant that puts it back (and cite the
+journal entry in `history=`). A fix is only finished when a test fails without
+it. If you **refactor a guard**, its mutant will be reported as *stale*; update
+the mutant's `old`/`new` text to match the new code rather than deleting it.
+`tests/test_mutation_check.py` enforces both on every ordinary test run.
+
 ## Linting, formatting, and type checking
 
 Before opening a pull request, make sure the following all pass:

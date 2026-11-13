@@ -2,6 +2,8 @@
 
 import re
 
+import pytest
+
 from adapt_agent.security import Firewall
 
 
@@ -252,3 +254,44 @@ def test_blocked_pattern_with_ignorecase_flag():
     firewall.add_blocked_pattern(r"secret", flags=re.IGNORECASE)
 
     assert firewall.check_input("SECRET value") is False
+
+
+# -- regression tests for historical fixes that scripts/mutation_check.py found
+# -- no test would have noticed being reverted ---------------------------------
+
+
+def test_event_snippet_redacts_a_secret_spanning_the_truncation_boundary():
+    """Sanitise the whole content, then truncate -- never the other way round.
+
+    Truncating first cuts the secret in half, the pattern no longer matches the
+    half that is left, and the stored snippet leaks it.
+    """
+    fw = Firewall()
+    fw.add_blocked_pattern(r"SECRET-\d{12}")
+    secret = "SECRET-123456789012"
+    content = "x" * 90 + secret  # the secret straddles the 100-character cut
+    assert fw.check_input(content) is False
+    snippet = fw.get_security_events()[-1]["metadata"]["content_snippet"]
+    assert "SECRET" not in snippet
+    assert "1234" not in snippet
+
+
+def test_event_snippet_escapes_newlines():
+    """A blocked payload cannot forge extra lines in an exported event log."""
+    fw = Firewall()
+    fw.add_blocked_pattern("attack")
+    assert fw.check_input("attack\nINFO forged entry\r\nINFO another") is False
+    snippet = fw.get_security_events()[-1]["metadata"]["content_snippet"]
+    assert "\n" not in snippet
+    assert "\r" not in snippet
+    assert "\\n" in snippet
+
+
+@pytest.mark.parametrize("text", ["\n" * 50, "ab\r\n" * 20, "a" * 19 + "\n\n", "plain" * 10])
+def test_truncate_escaped_never_exceeds_its_bound_or_splits_an_escape(text):
+    out = Firewall._truncate_escaped(text, 20)
+    assert len(out) <= 20
+    assert "\n" not in out and "\r" not in out
+    # Escaping doubles a control character into two; the cut must not land
+    # between them and leave a dangling backslash.
+    assert not out.endswith("\\")
