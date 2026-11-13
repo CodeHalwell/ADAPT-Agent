@@ -105,8 +105,9 @@ def context_state(context: Any) -> dict[str, Any]:
 
     A policy rule typically gates on session data -- ``state['trust_score']`` --
     which lives on the framework's context, not in the model request. Without
-    this the key is simply absent, and a fail-open enforcer reads that as "no
-    violation": the rule never fires and nothing says so.
+    this the key is simply absent: a fail-closed enforcer (the default) then
+    refuses every request, and a fail-open one reads it as "no violation" -- the
+    rule never fires and nothing says so.
     """
     # ADK: `Context.state`; some versions expose it via the session instead.
     state = getattr(context, "state", None)

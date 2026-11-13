@@ -2,10 +2,10 @@
 
 ADAPT-Agent's security layer bounds all in-memory state against
 denial-of-service and composes multiple independent controls (defense in
-depth). The firewall **fails closed**: an error inside a control blocks. The
-policy engine is the one exception — a condition that cannot be evaluated at
-run time is treated as *no violation* unless you construct
-`PolicyEnforcer(fail_closed=True)` (see [Policy Enforcement](policy.md)). This
+depth). Every control **fails closed**: an error inside a control blocks. That
+includes the policy engine — a rule whose condition cannot be evaluated at run
+time counts as a violation unless you opt out with
+`PolicyEnforcer(fail_closed=False)` (see [Policy Enforcement](policy.md)). This
 page documents the three core security components, the hardening guarantees
 each one provides, and — just as important — [what they do not
 cover](#what-is-not-covered).
@@ -296,6 +296,7 @@ defense.get_detected_attacks(attack_type="prompt_injection", limit=10)
 | Block-first: allowed patterns never override a block (default mode) | `Firewall._check` |
 | Allowlist uses `fullmatch`, blocklist uses `search` | `Firewall._check` |
 | Unevaluable policy conditions rejected at registration | `PolicyEnforcer.add_rule` via `validate_condition` |
+| A rule that cannot be evaluated at run time is a violation (fail-closed default) | `PolicyEnforcer._check_rule` |
 | Content-length DoS cap | `Firewall.max_content_length`, `AdversarialDefense.max_content_length` |
 | Bounded event/attack/propagation stores | `max_events`, `max_attacks`, `max_propagations`, `max_tracked_items` |
 | Log-poisoning protection (escape + truncate) | `AdversarialDefense._record_attack`, `AgentObserver.log*` |
@@ -317,7 +318,7 @@ agent is safe. In particular:
 | **Detection is heuristic** | `AdversarialDefense` and firewall patterns match known shapes of attack. A novel, paraphrased, translated or encoded injection that matches no pattern passes. Treat a clean scan as "nothing recognised", never as "safe". |
 | **Only reachable text is scanned** | Governance scans the strings `extract_texts` can reach: dicts, lists, well-known text attributes, Pydantic models and dataclasses, to a depth of 12. Text inside an arbitrary object's private attributes, binary or encoded payloads, images, and anything nested deeper is not seen. |
 | **Only the governed boundary is scanned** | An adapter screens the input to and output from the agent it wraps. Tool calls, retrievals and sub-agent hops inside that agent are screened only where a native integration hook is installed for them. |
-| **Policy sees state, not content** | Under an adapter, rules are evaluated against `state` only. Registration rejects conditions that could never evaluate, but a rule that references a key your state does not carry still errors at run time — and passes silently unless `fail_closed=True`. |
+| **Policy sees state, not content** | Under an adapter, rules are evaluated against `state` only. Registration rejects conditions that could never evaluate. A rule that reads a key your state does not carry with an ordering comparison (`<`, `>`) errors and, by default, blocks; with `==` or `in` the missing key is `None` and the rule quietly passes. `vacuous_rules()` finds both. |
 | **Allowed patterns do not restrict** | See above: they exempt, they never reject. In `whitelist_mode=True` a matching allowed pattern also skips the blocked patterns and custom filters. |
 | **Regex cost** | The length cap bounds input size, and obviously catastrophic patterns are rejected, but that check is a heuristic. A pathological user-supplied pattern can still be slow. |
 | **Trust and taint are bookkeeping** | `TrustManager` and `TaintTracker` record what you tell them. Nothing is enforced unless your code, or a policy rule, acts on the score or taint level. |

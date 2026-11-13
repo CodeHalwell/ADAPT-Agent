@@ -228,13 +228,16 @@ available depends on how the rule is evaluated:
 | `policy.check_state(state)` — you call it | `state` |
 | **A governed adapter's `execute()`** | `state` **only** |
 
-This matters because it fails *silently*. An adapter only ever calls
-`check_state()`, so a rule written against `message` hits an unknown variable
-and — with the default `fail_closed=False` — is logged and treated as **no
-violation**. The agent then runs unguarded while the rule looks installed:
+This matters because a rule in the wrong scope never does what it says. An
+adapter only ever calls `check_state()`, so a rule written against `message`
+cannot be evaluated. By default (fail-closed) that counts as a violation, so a
+`block` rule refuses **every** request; with `fail_closed=False` it is logged
+and treated as **no violation**, and the agent runs unguarded while the rule
+looks installed:
 
 ```python
-# WRONG under an adapter: `message` is not in scope, so this never fires.
+# WRONG under an adapter: `message` is not in scope, so this can never be
+# evaluated -- it blocks everything (default) or nothing (fail_closed=False).
 policy.add_rule(name="no_secrets", description="…",
                 condition="'password' in message['content']", action="block", severity="high")
 
@@ -245,8 +248,9 @@ policy.add_rule(name="low_trust", description="Block low-trust callers",
 
 Two ways to protect yourself:
 
-* **`PolicyEnforcer(fail_closed=True)`** turns an unevaluable condition into a
-  violation instead of a silent pass — strongly preferred for security rules.
+* **Keep the default.** `PolicyEnforcer()` is fail-closed: an unevaluable
+  condition is a violation, not a silent pass. Only pass `fail_closed=False`
+  for rules whose failure you are content to ignore.
 * **Ask the enforcer.** After driving a request through the agent,
   `policy.vacuous_rules()` lists every rule that has never once seen the data
   it reads (it errored, or looked up a key that was not there) — exactly the
@@ -366,7 +370,7 @@ automatically. All stores are bounded (`max_logs`, `max_traces`, `max_metrics`,
 Note the division of labour: **content** patterns live under `firewall`, and
 `policy_rules` gate on **state**. A rule conditioned on `message[...]` would be
 unevaluable once this config is fed to an adapter (see "Scope" above) — and
-with the `fail_closed=True` recipe below, that means every request is refused.
+with the default fail-closed enforcer below, that means every request is refused.
 
 ```bash
 adapt-agent validate config.json --json     # conditions parse, regexes compile, enums valid
@@ -401,8 +405,8 @@ for pattern in fw_config.get("blocked_patterns", []):
 for pattern in fw_config.get("allowed_patterns", []):
     firewall.add_allowed_pattern(pattern)
 
-# fail_closed so a rule that cannot be evaluated blocks rather than passing.
-policy = PolicyEnforcer(fail_closed=True)
+# Fail-closed by default: a rule that cannot be evaluated blocks rather than passing.
+policy = PolicyEnforcer()
 for rule in config.get("policy_rules", []):
     policy.add_rule(**rule)   # see "Scope" above: adapters evaluate `state`
 

@@ -158,19 +158,21 @@ def test_evaluate_condition_subscript_missing_key_returns_none():
 
 
 def test_evaluate_condition_unsupported_node_returns_false():
-    enforcer = PolicyEnforcer()
+    enforcer = PolicyEnforcer(fail_closed=False)
     # Lambda is an unsupported AST node -> exception caught -> False
     assert enforcer._evaluate_condition("(lambda: 1)() == 1", {}) is False
+    # ...and never *evaluated*: by default the same error is a violation.
+    assert PolicyEnforcer()._evaluate_condition("(lambda: 1)() == 1", {}) is True
 
 
 def test_evaluate_condition_unsupported_operator_returns_false():
-    enforcer = PolicyEnforcer()
+    enforcer = PolicyEnforcer(fail_closed=False)
     # Modulo is not in _BINOPS -> ValueError -> caught -> False
     assert enforcer._evaluate_condition("5 % 2 == 1", {}) is False
 
 
 def test_evaluate_condition_depth_limit_returns_false():
-    enforcer = PolicyEnforcer()
+    enforcer = PolicyEnforcer(fail_closed=False)
     # Deeply nested arithmetic to exceed depth limit (>50)
     deep = "+".join(["1"] * 60) + " == 60"
     assert enforcer._evaluate_condition(deep, {}) is False
@@ -196,9 +198,24 @@ def test_max_violations_bounding():
 # --- A14: fail-open vs fail-closed on evaluation errors -----------------------
 
 
-def test_evaluation_error_default_fails_open_but_logs(caplog):
-    """Default behaviour: an evaluation error is logged and is NOT a violation."""
-    enforcer = PolicyEnforcer()  # fail_closed defaults to False
+def test_the_default_is_fail_closed(caplog):
+    """Default behaviour: a rule that cannot be evaluated is a violation, logged.
+
+    A security control that cannot reach a verdict must not report "fine".
+    """
+    enforcer = PolicyEnforcer()
+    assert enforcer.fail_closed is True
+    with caplog.at_level("WARNING"):
+        assert enforcer._evaluate_condition("missing_var == 1", {}, rule_name="r") is True
+    assert any("missing_var" in rec.getMessage() for rec in caplog.records)
+
+    enforcer.add_rule("needs_field", "d", "state['trust_score'] < 0.5", action="block")
+    assert enforcer.check_state({"messages": [], "context": {}}) == ["needs_field"]
+
+
+def test_evaluation_error_fails_open_when_asked_but_logs(caplog):
+    """fail_closed=False: an evaluation error is logged and is NOT a violation."""
+    enforcer = PolicyEnforcer(fail_closed=False)
     assert enforcer.fail_closed is False
     # ``missing_var`` is not in the context -> unknown variable -> eval error.
     with caplog.at_level("WARNING"):
@@ -236,8 +253,8 @@ def test_fail_closed_block_rule_fires_on_malformed_input():
 
 
 def test_fail_open_block_rule_does_not_fire_on_malformed_input():
-    """The same malformed input is silently allowed under the default fail-open."""
-    enforcer = PolicyEnforcer()  # fail-open
+    """The same malformed input is silently allowed when fail-open is asked for."""
+    enforcer = PolicyEnforcer(fail_closed=False)
     enforcer.add_rule(
         name="needs_field",
         description="d",
@@ -413,7 +430,12 @@ def test_vacuous_rules_finds_a_rule_that_has_never_been_evaluable():
     enforcer.remove_rule("never_checked")
 
     for trust in (0.9, 0.2, 0.7):
-        assert "no_secrets" not in enforcer.check_state({"trust_score": trust})
+        # `needs_tier` is not returned either: `state['tier'] == 'free'` does
+        # not error when `tier` is absent, it is quietly False. `no_secrets`
+        # does error (no `message` in scope), so fail-closed reports it.
+        violations = enforcer.check_state({"trust_score": trust})
+        assert "needs_tier" not in violations
+        assert "no_secrets" in violations
 
     assert enforcer.vacuous_rules() == ["no_secrets", "needs_tier"]
 

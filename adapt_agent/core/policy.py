@@ -76,8 +76,8 @@ def validate_condition(condition: str) -> None:
     """Reject a condition the evaluator could never evaluate.
 
     A rule whose condition always errors is *vacuous*: under the default
-    fail-open setting it never fires, and under ``fail_closed=True`` it fires
-    on everything. Neither is what its author meant, and both used to be
+    fail-closed setting it fires on everything, and under ``fail_closed=False``
+    it never fires. Neither is what its author meant, and both used to be
     discovered only from a warning in the logs. Everything checked here is
     decidable from the text alone, so it is checked once, at registration.
 
@@ -147,18 +147,28 @@ class PolicyEnforcer:
         ast.Div: operator.truediv,
     }
 
-    def __init__(self, max_violations: int = 1000, fail_closed: bool = False):
+    def __init__(self, max_violations: int = 1000, fail_closed: bool = True):
         """Initialize the PolicyEnforcer.
 
         Args:
             max_violations: Maximum number of violations to store in memory.
             fail_closed: How to treat a condition that cannot be evaluated
-                (unknown variable, unsupported node, arithmetic error, ...).
-                When ``False`` (default) such an error is logged and treated as
-                "no violation" (fail-open) — preserving historical behaviour.
-                When ``True`` the error is logged and treated as a VIOLATION so
-                that ``block`` rules still fire on malformed or edge-case input
-                (fail-closed). In either case the error is always logged.
+                at run time -- it compares against a key the state does not
+                carry, names ``message`` where only ``state`` is in scope, hits
+                an arithmetic error, ...
+                When ``True`` (default) the error is logged and treated as a
+                VIOLATION, so a ``block`` rule still fires on malformed or
+                unexpected input (fail-closed): a control that could not reach
+                a verdict does not report that all is well.
+                When ``False`` the error is logged and treated as "no
+                violation" (fail-open) -- the default up to 0.4.0, and the one
+                under which a mistyped or mis-scoped rule silently does
+                nothing. In either case the error is always logged.
+
+                Because an out-of-scope name is an evaluation error, keep
+                ``message`` rules and ``state`` rules on **separate**
+                enforcers: under fail-closed, ``check_state`` reports every
+                ``message`` rule as violated, and vice versa.
         """
         self.max_violations = max_violations
         self.fail_closed = fail_closed
@@ -313,7 +323,8 @@ class PolicyEnforcer:
         Use it to show a rule is not vacuous: a rule you expect to block should
         report ``"violation"`` for at least one example and ``"pass"`` for at
         least one other. A rule that reports ``"error"`` for a realistic
-        example is one that silently does nothing under the default
+        example is one that blocks that example under the default
+        fail-closed setting, and silently does nothing under
         ``fail_closed=False``.
         """
         context: dict[str, Any] = {}
@@ -378,7 +389,7 @@ class PolicyEnforcer:
         a condition that cannot be evaluated at all (unknown variable, unsupported
         node, arithmetic error, ...). An evaluation error is always logged as a
         warning; it is then treated as a violation when ``self.fail_closed`` is set
-        and as "no violation" otherwise (fail-open, the historical behaviour).
+        (the default) and as "no violation" otherwise (fail-open).
 
         Args:
             condition: Condition expression
@@ -460,8 +471,8 @@ class PolicyEnforcer:
         never carries (a typo, or data the adapter does not populate), or names
         ``message`` where only ``state`` is ever in scope (as under an
         adapter). It has decided nothing on evidence since it was installed:
-        it has silently passed, or under ``fail_closed=True`` blocked
-        everything.
+        it has blocked everything it errored on, or under
+        ``fail_closed=False`` silently passed.
 
         A rule that has not been evaluated at all is not listed: there is no
         evidence either way. Check this after real traffic, or in a test after

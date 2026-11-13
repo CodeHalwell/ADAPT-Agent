@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`PolicyEnforcer` is fail-closed by default.** `fail_closed` now defaults to
+  `True`: a rule whose condition cannot be evaluated at run time -- it compares
+  against a key the state does not carry, or names `message` where only `state`
+  is in scope -- is a **violation**, where it used to be logged and ignored.
+  **This is a breaking change.** A `block` rule that reads a key your state
+  never supplies now refuses every request; an enforcer holding both `message`
+  and `state` rules now reports the out-of-scope ones on every call, so keep
+  the two on separate enforcers. Pass `PolicyEnforcer(fail_closed=False)` to
+  keep the old behaviour, and use `vacuous_rules()` to find the rules affected.
 - **`PolicyEnforcer.add_rule` rejects a condition it could never evaluate.**
   A condition using a function call (`len(...)`), attribute access, `not`, a
   slice, an unsupported operator, or a name other than `state`/`message` used

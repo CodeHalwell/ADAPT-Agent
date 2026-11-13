@@ -372,6 +372,13 @@ MUTANTS: tuple[Mutant, ...] = (
         "fail_closed=True turns an unevaluable rule into a violation",
     ),
     Mutant(
+        "policy-default-fail-open",
+        _POLICY,
+        "def __init__(self, max_violations: int = 1000, fail_closed: bool = True):",
+        "def __init__(self, max_violations: int = 1000, fail_closed: bool = False):",
+        "an unevaluable rule is a violation unless fail-open is asked for",
+    ),
+    Mutant(
         "policy-depth-guard",
         _POLICY,
         "if depth > 50:",

@@ -274,8 +274,8 @@ policy.add_rule(
 > shorthand only applies when you call `PolicyEnforcer.check_message(...)`
 > directly; the adapter calls `check_state(...)`, which exposes `state`.
 
-`PolicyEnforcer(fail_closed=True)` flips the default from fail-open (a condition
-that cannot be evaluated is treated as no violation) to fail-closed.
+The enforcer is fail-closed by default: a condition that cannot be evaluated is
+treated as a violation. `PolicyEnforcer(fail_closed=False)` restores fail-open.
 
 ### AdversarialDefense
 

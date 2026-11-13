@@ -68,11 +68,18 @@ def firewall_blocks(controls: Controls, value: Any) -> bool:
 
 
 def policy_blocks(controls: Controls, payload: dict[str, Any]) -> bool:
-    """Whether the one policy rule fires. An absent score is *not* a violation."""
-    score = payload.get("trust_score")
-    if controls.trust_floor is None or isinstance(score, bool):
+    """Whether the one policy rule fires.
+
+    Fail-closed: a rule that cannot reach a verdict -- here, because the request
+    carries no usable ``trust_score`` to compare -- counts as a violation. A
+    control that could not check must not report that all is well.
+    """
+    if controls.trust_floor is None:
         return False
-    return isinstance(score, (int, float)) and score < controls.trust_floor
+    score = payload.get("trust_score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return True
+    return score < controls.trust_floor
 
 
 def verdict(controls: Controls, payload: dict[str, Any], result: Any) -> str:

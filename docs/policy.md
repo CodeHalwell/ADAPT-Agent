@@ -56,7 +56,9 @@ evaluates truthy), record the violation, and run any registered handler.
 policy.check_message({"role": "user", "content": "my password is hunter2"})
 # -> ['no_passwords']
 
-# state context: {"state": <the AgentState>}
+# state context: {"state": <the AgentState>} -- on its own enforcer; see
+# "One enforcer per scope" below.
+policy = PolicyEnforcer()
 policy.add_rule(
     name="context_present",
     description="Fire when context has any keys",
@@ -113,9 +115,31 @@ Chained comparisons work as in Python (`0 < x < 10`). Subscript failures
 Every item above is detectable from the condition text alone, so `add_rule`
 (and `adapt validate`) rejects it with a `ValueError` at registration. What
 registration **cannot** see is your data: `state['n'] > 5` is well-formed but
-cannot be evaluated when `n` is missing. That case is still decided at run time
-by `fail_closed` — logged and treated as *no violation* by default, or as a
-violation with `PolicyEnforcer(fail_closed=True)`.
+cannot be evaluated when `n` is missing. That case is decided at run time by
+`fail_closed`:
+
+| | A rule that cannot be evaluated is… |
+| --- | --- |
+| `PolicyEnforcer()` — **default, fail-closed** | logged and treated as a **violation**. A `block` rule refuses the request. |
+| `PolicyEnforcer(fail_closed=False)` | logged and treated as *no violation*. The rule silently does nothing. |
+
+The default is fail-closed because a control that could not reach a verdict
+should not report that all is well. The cost is that it is loud: a `block` rule
+that reads a key your state never carries refuses **every** request until you
+supply the key or fix the rule. That is the intended signal — the alternative
+was a rule that looked installed and never fired.
+
+!!! warning "One enforcer per scope"
+    `check_state` puts only `state` in scope and `check_message` only
+    `message`. A rule naming the other one cannot be evaluated, so under the
+    default it is reported as violated on every call. Keep `message` rules and
+    `state` rules on **separate** `PolicyEnforcer` instances. A governed
+    adapter only ever calls `check_state`, so the enforcer you give it should
+    hold `state` rules only.
+
+!!! note "Changed after 0.4.0"
+    The default was `fail_closed=False`. Pass it explicitly to keep the old
+    behaviour while you check your rules with `vacuous_rules()` (below).
 
 ### Checking a rule is not vacuous
 
@@ -127,7 +151,7 @@ and no handler runs — and reports `"violation"`, `"pass"` or `"error"` per rul
 policy.evaluate_rules(state={"messages": [], "context": {}, "trust_score": 0.2})
 # {'low_trust': 'violation'}
 policy.evaluate_rules(state={"messages": [], "context": {}})
-# {'low_trust': 'error'}   <- trust_score missing: silently passes unless fail_closed
+# {'low_trust': 'error'}   <- trust_score missing: a violation by default (fail-closed)
 ```
 
 For each blocking rule, assert in your own tests that one realistic example

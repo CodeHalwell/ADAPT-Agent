@@ -96,9 +96,9 @@ policy.add_rule(
     severity="high",
 )
 policy.add_rule(
-    name="context_present",
-    description="Flag states that carry any context",
-    condition="state['context'] != {}",
+    name="system_role",
+    description="Flag messages that claim the system role",
+    condition="message['role'] == 'system'",
     action="warn",
     severity="medium",
 )

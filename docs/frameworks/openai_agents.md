@@ -233,8 +233,9 @@ policy.add_rule(
   `[-1]`).
 - Only `action="block"` blocks (and only raises when `block_on_violation=True`).
   `action="warn"` records a violation you can read with `policy.get_violations()`.
-- `PolicyEnforcer(fail_closed=True)` treats an *unevaluable* condition (unknown
-  variable, unsupported node) as a violation instead of ignoring it.
+- An *unevaluable* condition (it reads a key the state does not carry, or names
+  `message` where only `state` is in scope) is a violation by default;
+  `PolicyEnforcer(fail_closed=False)` ignores it instead.
 
 ### AdversarialDefense
 

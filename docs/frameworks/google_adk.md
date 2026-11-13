@@ -262,8 +262,8 @@ policy.add_rule(
 
 The language supports comparisons, `in`, boolean ops, and subscripting
 (`state['messages'][0]['content']`); it does **not** support function calls or
-comprehensions. New options: `PolicyEnforcer(fail_closed=True)` treats an
-*un-evaluable* condition as a violation (default is fail-open).
+comprehensions. A condition that cannot be evaluated at run time counts as a
+violation by default; `PolicyEnforcer(fail_closed=False)` opts out.
 
 ### AdversarialDefense
 

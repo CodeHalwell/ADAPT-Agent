@@ -244,9 +244,10 @@ policy.add_rule(
 )
 ```
 
-Recently added safety options you can opt into: `PolicyEnforcer(fail_closed=True)`
-(treat evaluation errors as a block), `Firewall(whitelist_mode=False)` (the
-default is block-first), and `Middleware(fail_closed=...)`.
+Safety defaults worth knowing: `PolicyEnforcer` is fail-closed (an evaluation
+error counts as a violation; `fail_closed=False` opts out), `Firewall` is
+block-first (`whitelist_mode=False`), and `Middleware(fail_closed=...)` is
+opt-in.
 
 ### AdversarialDefense
 
