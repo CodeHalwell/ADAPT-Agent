@@ -111,3 +111,37 @@ def test_the_real_mutant_list_can_be_read_including_generated_ids():
     ids = _load().mutant_ids(REPO_ROOT / "scripts" / "mutation_check.py")
     assert "fw-length-cap" in ids
     assert "hook-langgraph-input" in ids  # built by a helper, not a literal
+
+
+def test_the_change_cannot_deselect_a_held_out_test_through_pytest_config(tmp_path):
+    """Which tests run is held out too, not only what they say.
+
+    The change loosens the guard, leaves the base test file untouched, and
+    instead tells pytest to skip it -- once through ``addopts`` and once
+    through a root ``conftest.py``. A second, passing test keeps the run from
+    being empty.
+    """
+    module = _load()
+    passing = "def test_unrelated():\n    assert True\n"
+    base = _repo(tmp_path / "base", limit=10, test_limit=10)
+    (base / "tests" / "test_other.py").write_text(passing)
+    (base / "pyproject.toml").write_text("[tool.pytest.ini_options]\ntestpaths = ['tests']\n")
+
+    via_addopts = _repo(tmp_path / "addopts", limit=1000, test_limit=10)
+    (via_addopts / "tests" / "test_other.py").write_text(passing)
+    (via_addopts / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n"
+        "addopts = '--deselect=tests/test_guard.py::test_limit_is_enforced'\n"
+    )
+
+    via_conftest = _repo(tmp_path / "conftest", limit=1000, test_limit=10)
+    (via_conftest / "tests" / "test_other.py").write_text(passing)
+    (via_conftest / "conftest.py").write_text(
+        "def pytest_collection_modifyitems(items):\n"
+        "    items[:] = [i for i in items if 'test_limit' not in i.name]\n"
+    )
+
+    for head in (via_addopts, via_conftest):
+        passed, failing, summary = module.run_base_tests(base, head, timeout=120)
+        assert not passed, summary
+        assert failing == ["tests/test_guard.py::test_limit_is_enforced"]

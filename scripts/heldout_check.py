@@ -74,6 +74,21 @@ print("\\n".join(m.id for m in module.MUTANTS))
 """
 
 
+#: Files at the repository root that decide *which* tests pytest collects or
+#: how it runs them. ``pyproject.toml`` is among them, so the scratch tree is
+#: run from source (``PYTHONPATH``) and never installed from it.
+_PYTEST_CONTROL_FILES = (
+    "pyproject.toml",
+    "pytest.ini",
+    ".pytest.ini",
+    "pytest.toml",
+    ".pytest.toml",
+    "tox.ini",
+    "setup.cfg",
+    "conftest.py",
+)
+
+
 def mutant_ids(script: Path) -> set[str] | None:
     """The mutant ids a ``mutation_check.py`` declares, or ``None`` if absent.
 
@@ -120,11 +135,24 @@ def run_base_tests(base: Path, head: Path, timeout: float) -> tuple[bool, list[s
         shutil.rmtree(work / "tests", ignore_errors=True)
         shutil.copytree(base / "tests", work / "tests", ignore=_IGNORED)
 
+        # Which tests run is part of what is held out, not just their text. The
+        # head's pytest configuration could otherwise deselect a base test
+        # (`addopts = "--deselect ..."`) and pass without touching it. So every
+        # file pytest reads its settings or root-level hooks from is taken from
+        # the base branch, and removed when the base branch has none.
+        for name in _PYTEST_CONTROL_FILES:
+            (work / name).unlink(missing_ok=True)
+            if (base / name).is_file():
+                shutil.copy2(base / name, work / name)
+
         env = dict(os.environ)
         env["PYTHONPATH"] = str(work)  # the scratch copy, not an installed package
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["CI"] = "1"  # derandomized property tests: same examples every run
-        cmd = [sys.executable, "-m", "pytest", "-q", "--no-cov", "-p", "no:cacheprovider"]
+        # `tests` is named explicitly rather than left to `testpaths`, and
+        # PYTEST_ADDOPTS is dropped so the environment cannot narrow the run.
+        env.pop("PYTEST_ADDOPTS", None)
+        cmd = [sys.executable, "-m", "pytest", "tests", "-q", "--no-cov", "-p", "no:cacheprovider"]
         try:
             proc = subprocess.run(
                 cmd, cwd=work, env=env, capture_output=True, text=True, timeout=timeout
