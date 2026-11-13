@@ -137,7 +137,7 @@ was a rule that looked installed and never fired.
     adapter only ever calls `check_state`, so the enforcer you give it should
     hold `state` rules only.
 
-!!! note "Changed after 0.4.0"
+!!! note "Changed in 0.5.0"
     The default was `fail_closed=False`. Pass it explicitly to keep the old
     behaviour while you check your rules with `vacuous_rules()` (below).
 
@@ -183,6 +183,9 @@ populate it.
 unresolved. Check it after driving a representative request through your agent
 in a test, or periodically in production. A rule that has not been evaluated at
 all is not listed.
+
+[`examples/09_verifying_your_guardrails.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/09_verifying_your_guardrails.py)
+runs all of this end to end, offline.
 
 ### `and` / `or`
 

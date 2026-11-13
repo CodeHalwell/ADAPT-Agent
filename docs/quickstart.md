@@ -147,9 +147,9 @@ defense = AdversarialDefense(max_content_length=10_000)
 
 policy = PolicyEnforcer()
 policy.add_rule(
-    name="no_passwords",
-    description="Block leaked passwords",
-    condition="'password' in str(state['context'])" ,  # see note below
+    name="no_password_context",
+    description="Block runs whose context carries a password field",
+    condition="'password' in state['context']",  # key membership; see note below
     action="block",
     severity="high",
 )

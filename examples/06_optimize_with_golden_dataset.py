@@ -7,13 +7,15 @@ This shows the full ADAPT-Agent optimization loop end to end:
     "orchestrator + two specialists" system whose behaviour depends on a tunable
     prompt. Real systems plug in a LangGraph graph, a CrewAI ``Crew``, a Pydantic
     AI ``Agent``, etc.; the optimizer treats them all the same.
-3.  An **LLM-as-judge** used both as a scoring metric *and* to rewrite prompts
-    from observed failures. The judge is provider-agnostic; here we back it with
-    a deterministic offline stub so the example runs with **no API key and no
-    network**. Swap in ``ClaudeJudge(model=...)`` / ``OpenAIJudge(...)`` /
-    ``GeminiJudge(...)`` for the real thing.
-4.  A **CoordinateAscentOptimizer** that searches for a better prompt and applies
-    the winning configuration back onto the live agent.
+3.  **Two LLM judges** -- one scores answers, a different one critiques
+    failures and rewrites the prompt -- so the model that writes a candidate is
+    not the one that marks it. Judges are provider-agnostic; here both are
+    deterministic offline stubs so the example runs with **no API key and no
+    network**. Swap in ``LLMJudge("anthropic")`` / ``LLMJudge("openai")`` (two
+    different providers) for the real thing.
+4.  A **CoordinateAscentOptimizer** that searches for a better prompt against
+    the training rows, and applies the winner to the live agent only if it does
+    not score worse than the untuned agent on **held-out** rows.
 
 Run it with:
 
@@ -37,7 +39,14 @@ from adapt_agent.optimization import (
 # live objects whose knobs it may tune. Here the shared "prompt" is the knob.
 SHARED = {"capital_prompt": "Answer the question."}
 
-_CAPITALS = {"France": "Paris", "Japan": "Tokyo", "Italy": "Rome", "Egypt": "Cairo"}
+_CAPITALS = {
+    "France": "Paris",
+    "Japan": "Tokyo",
+    "Italy": "Rome",
+    "Egypt": "Cairo",
+    "Spain": "Madrid",
+    "Kenya": "Nairobi",
+}
 
 
 def specialist_lookup(country: str) -> str:
@@ -53,31 +62,47 @@ def orchestrator(question: str) -> str:
     return specialist_lookup(country)
 
 
-def deterministic_judge_stub(prompt: str) -> str:
-    """Offline stand-in for a real LLM judge (no network).
+def _response_of(prompt: str) -> str:
+    """The text inside the judge prompt's ``<response>`` fence."""
+    return prompt.split("<response>")[-1].split("</response>")[0].strip()
 
-    * For *grading* prompts it returns a JSON score.
-    * For *prompt-rewrite* prompts it returns an improved instruction.
-    Real usage: ``LLMJudge(ClaudeJudge(...))`` or any provider.
+
+def scoring_judge_stub(prompt: str, system: str | None = None) -> str:
+    """Offline stand-in for the judge that *scores* answers (no network).
+
+    Grades higher when the response is a single clean word.
+    Real usage: ``LLMJudge("anthropic")`` or any provider.
     """
-    if "Rewrite the instruction" in prompt:
-        return "Answer with ONLY the capital city name, nothing else."
-    # Grade higher when the response is a single clean word.
-    response = prompt.split("RESPONSE:")[-1].split("REFERENCE")[0].strip()
+    response = _response_of(prompt)
     score = 9 if response and " " not in response else 2
     return f'{{"score": {score}, "pass": {str(score >= 6).lower()}, "reasoning": "auto"}}'
 
 
+def writing_judge_stub(prompt: str, system: str | None = None) -> str:
+    """Offline stand-in for the judge that *critiques and rewrites* prompts.
+
+    A different model from the scoring judge in real use -- see step 3 below.
+    """
+    if "CURRENT INSTRUCTION" in prompt:
+        return "Answer with ONLY the capital city name, nothing else."
+    return "The answer hedges instead of naming the city."
+
+
 def main() -> None:
-    # 1. Golden dataset.
+    # 1. Golden dataset, with some rows held back. The optimizer only ever
+    #    searches against `train`; `holdout` is what tells you whether the
+    #    result generalises rather than having memorised the training rows.
     data = GoldenDataset.from_list(
         [
             {"input": "What is the capital of France?", "expected": "Paris"},
             {"input": "What is the capital of Japan?", "expected": "Tokyo"},
             {"input": "What is the capital of Italy?", "expected": "Rome"},
             {"input": "What is the capital of Egypt?", "expected": "Cairo"},
+            {"input": "What is the capital of Spain?", "expected": "Madrid"},
+            {"input": "What is the capital of Kenya?", "expected": "Nairobi"},
         ]
     )
+    train, holdout = data.split(0.67, seed=0)
 
     # 2. Wrap the agent. The tunable prompt is declared as a Parameter bound to
     #    the live SHARED dict, so mutating it changes what the specialist does.
@@ -94,22 +119,35 @@ def main() -> None:
     )
     print("Tunable parameters:", [p.name for p in agent.parameters])
 
-    # 3. Judge: used as a metric AND to rewrite prompts. Provider-agnostic.
-    judge = LLMJudge(deterministic_judge_stub)
+    # 3. Two judges, deliberately. One *scores* answers; a different one
+    #    *critiques failures and rewrites the prompt*. If a single model does
+    #    both, it is marking its own homework -- it tends to prefer text in its
+    #    own style -- and the reported gain is not independent. (Pass only
+    #    `judge=` and the run says so in `result.recommendations`.)
+    scorer = LLMJudge(scoring_judge_stub)
+    writer = LLMJudge(writing_judge_stub)
     harness = EvaluationHarness(
-        metrics=[exact_match(), judge.as_metric("judge")],
+        metrics=[exact_match(), scorer.as_metric("judge")],
         primary_metric="exact_match",
     )
 
-    print("\nBaseline:", harness.evaluate(agent, data))
+    print("\nBaseline:", harness.evaluate(agent, train))
     print("Baseline answer for France:", orchestrator("What is the capital of France?"))
 
-    # 4. Optimize. The LLM judge proposes prompt rewrites from failures.
-    optimizer = CoordinateAscentOptimizer(harness, judge=judge, seed=0, verbose=False)
-    result = optimizer.optimize(agent, data)
+    # 4. Optimize. The writing judge proposes prompt rewrites from failures;
+    #    the winner is applied only if it does not score worse than the untuned
+    #    agent on the held-out rows (the validation gate).
+    optimizer = CoordinateAscentOptimizer(
+        harness, judge=scorer, proposer_judge=writer, seed=0, verbose=False
+    )
+    result = optimizer.optimize(agent, train, val_dataset=holdout)
 
     print("\nResult:", result)
     print("Best config:", result.best_config)
+    print(
+        f"Held-out score: {result.validation_baseline_score} -> {result.validation_score}"
+        f" (rejected by the gate: {result.validation_rejected})"
+    )
     print("Final prompt applied in place:", SHARED["capital_prompt"])
     print("Answer for France now:", orchestrator("What is the capital of France?"))
 

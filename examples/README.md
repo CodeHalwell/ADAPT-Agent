@@ -10,7 +10,9 @@ python examples/03_langgraph_guarded_agent.py
 python examples/04_observability.py
 python examples/05_multi_framework_adapters.py
 python examples/06_optimize_with_golden_dataset.py
+python examples/07_train_from_yaml.py
 python examples/08_agent_evals.py
+python examples/09_verifying_your_guardrails.py
 ```
 
 None of these examples require any optional dependencies (including
@@ -73,12 +75,21 @@ prompt-injection input is blocked identically across all of them.
 ### `06_optimize_with_golden_dataset.py`
 Runs the full **optimization** loop end to end with **no API key and no
 network**: a `GoldenDataset`, an `OptimizableAgent` wrapping a tiny
-orchestrator + specialist system whose behaviour depends on a tunable prompt, an
-`LLMJudge` (backed by a deterministic offline stub) used both as a scoring metric
-and to rewrite the prompt from failures, and a `CoordinateAscentOptimizer` that
-improves the baseline and applies the winning configuration back onto the live
-agent. Swap the stub for `ClaudeJudge` / `OpenAIJudge` / `GeminiJudge` for real
-optimization.
+orchestrator + specialist system whose behaviour depends on a tunable prompt,
+**two** `LLMJudge`s (deterministic offline stubs) -- one scores answers, a
+different one rewrites the prompt from failures (`proposer_judge=`), so the
+model that writes a candidate is not the one that marks it -- and a
+`CoordinateAscentOptimizer` that searches against the training rows and applies
+the winner to the live agent only if it holds up on **held-out** rows
+(`val_dataset=`, the validation gate). Swap the stubs for two different real
+providers for real optimization.
+
+### `07_train_from_yaml.py`
+Runs the same kind of optimization from a **declarative training config**
+instead of hand-written optimizer code. The script builds the config in-process
+(the structure you would normally put in a `train.yaml`; see
+[`train.example.yaml`](train.example.yaml)) and runs it offline. This is what
+`adapt-agent train train.yaml` does from the command line.
 
 ### `08_agent_evals.py`
 Runs **one-call evals** (`evaluate_agent`) against agents shaped like each of
@@ -90,6 +101,16 @@ graded against per-row criteria by a deterministic offline judge stub.
 Framework-native results (an `AgentRunResult`, a LangGraph state dict, an ADK
 event stream) are unwrapped to final response text automatically. See
 [docs/evals.md](../docs/evals.md).
+
+### `09_verifying_your_guardrails.py`
+Shows how to check that a guardrail actually does something. `Firewall.dry_run`
+reports a decision and its reason without recording anything, and
+`get_pattern_hits` exposes a blocked pattern that has never matched.
+`PolicyEnforcer.add_rule` rejects a rule it could never evaluate;
+`evaluate_rules` dry-runs rules against example states; the enforcer's
+**fail-closed** default is contrasted with `fail_closed=False`; and
+`vacuous_rules` finds rules that have never seen the data they read. It ends by
+showing that a refused request does not become the wrapped agent's state.
 
 ## Per-framework example ladders
 

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-13
+
+**Upgrading from 0.4.0:** this release changes defaults. Read the *Changed*
+section before upgrading -- in particular `PolicyEnforcer` is now fail-closed.
+
 ### Changed
 
 - **`PolicyEnforcer` is fail-closed by default.** `fail_closed` now defaults to
@@ -85,10 +90,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.jules/sentinel.md` among them -- and fails if the suite stays green. Its
   first run found seven guarantees no test pinned (five of them previously
   fixed vulnerabilities); regression tests for all seven are added.
+- `examples/09_verifying_your_guardrails.py`: `dry_run`, pattern hits, rule
+  rejection, `evaluate_rules`, the fail-closed default and `vacuous_rules`,
+  end to end and offline.
 - `.github/CODEOWNERS` covering the security modules, the tests, and CI.
 
 ### Fixed
 
+- `examples/06_optimize_with_golden_dataset.py` exited cleanly but optimized
+  nothing (`improvement=+0.000`): its offline judge stub matched a prompt format
+  the library had since changed. It now works, uses separate scoring and
+  rewriting judges, and holds rows back for the validation gate.
+  `tests/test_examples_run.py` runs every top-level example and checks the
+  outcome each exists to show.
+- `docs/quickstart.md` showed a policy condition using `str(...)`, which is not
+  in the condition language; the CrewAI guide's offline judge stub had the same
+  stale prompt markers as example 06.
 - `docs/security.md` described the firewall as allow-first. It is block-first
   by default: an allowed pattern never overrides a block unless
   `whitelist_mode=True`, which the page did not mention. The page also now
@@ -2179,7 +2196,8 @@ package that actually installs and is usable end to end.
   optimization, adversarial defense, evaluation, observability, patches, and the
   `adapt-agent` CLI (`info` command).
 
-[Unreleased]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/CodeHalwell/ADAPT-Agent/releases/tag/v0.3.2
 [0.3.1]: https://github.com/CodeHalwell/ADAPT-Agent/releases/tag/v0.3.1

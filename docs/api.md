@@ -37,15 +37,27 @@ Key methods:
 
 ### PolicyEnforcer
 
-`PolicyEnforcer(max_violations=1000)`
+`PolicyEnforcer(max_violations=1000, fail_closed=True)`
 
 Evaluates declarative rules written in a safe, restricted expression language
 against messages and state. See [Policy Enforcement](policy.md).
 
+`fail_closed` decides what a rule that **cannot be evaluated** at run time
+means: a violation (`True`, the default since 0.5.0) or no violation (`False`).
+
 Key methods:
 
 - `add_rule(name, description, condition, action="warn", severity="medium")` —
-  raises `ValueError` if `condition` exceeds 1024 chars.
+  raises `ValueError` if `condition` exceeds 1024 chars, or could never be
+  evaluated (a function call, attribute access, an unsupported operator, or a
+  name other than `state` / `message`).
+- `evaluate_rules(*, state=None, message=None) -> dict[str, str]` — dry-run
+  every rule against an example; `"violation"`, `"pass"` or `"error"` per rule,
+  with no side effects.
+- `get_rule_stats() -> dict[str, dict[str, int]]` — per-rule counts of
+  `violation` / `pass` / `error` / `unresolved` outcomes.
+- `vacuous_rules() -> list[str]` — rules that have been evaluated and have never
+  once seen the data they read.
 - `remove_rule(name) -> bool`, `get_rule(name) -> PolicyRule | None`,
   `list_rules() -> list[PolicyRule]`
 - `register_handler(action, handler)`
@@ -92,10 +104,12 @@ Key methods:
 
 ### Firewall
 
-`Firewall(max_content_length=None, max_events=1000)`
+`Firewall(max_content_length=None, max_events=1000, whitelist_mode=False)`
 
-Input/output screening with a `fullmatch` whitelist, a `search` blocklist,
-fail-closed custom filters, a length cap, and bounded events. See
+Input/output screening with a `search` blocklist, fail-closed custom filters, a
+length cap that no allowed pattern can waive, a `fullmatch` allowlist, and
+bounded events. Block-first by default; `whitelist_mode=True` lets a matching
+allowed pattern skip the blocklist and filters. See
 [Security Model](security.md).
 
 Key methods:
@@ -106,6 +120,10 @@ Key methods:
   (True = allowed)
 - `check_message(message) -> bool`
 - `sanitize(content, replacement="[REDACTED]") -> str`
+- `dry_run(content) -> dict` — `{"allowed", "reason", "pattern"}`: the decision
+  `check_input` would make, recording nothing.
+- `get_pattern_hits() -> dict[str, int]` — how many times each blocked pattern
+  has blocked content.
 - `get_security_events(severity=None, limit=None) -> list[SecurityEvent]`
 - `get_stats() -> dict`
 
@@ -221,6 +239,26 @@ Key methods:
 - `get_traces(agent_id=None, status=None, limit=None) -> list[dict]`
 - `get_logs(level=None, agent_id=None, limit=None) -> list[dict]`
 - `get_metric_stats(metric_name) -> dict[str, float]`
+
+### Optimizers
+
+`GridSearchOptimizer`, `RandomSearchOptimizer`, `CoordinateAscentOptimizer`,
+`BootstrapFewShotOptimizer`, `EvolutionaryOptimizer`, `PipelineOptimizer` and
+`make_default_optimizer(harness, ...)`. See
+[Optimization & Evaluation](optimization.md).
+
+Shared constructor options (keyword-only): `max_evals=50`, `seed=0`,
+`min_improvement=1e-3`, `judge=None`, `verbose=False`, and since 0.5.0:
+
+- `validation_gate=True`, `validation_tolerance=1e-3` — with a `val_dataset`,
+  do not apply a configuration that scores worse than the untuned agent on it.
+- `proposer_judge=None` — a separate judge for critique and prompt rewriting, so
+  the model that writes a candidate is not the one that scores it.
+
+`optimize(agent, dataset, *, val_dataset=None, ...) -> OptimizationResult`
+
+`OptimizationResult` fields added in 0.5.0: `validation_baseline_score`,
+`validation_rejected`, `rejected_config`.
 
 ### AgentOptimizer
 

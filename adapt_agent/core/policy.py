@@ -161,7 +161,7 @@ class PolicyEnforcer:
                 unexpected input (fail-closed): a control that could not reach
                 a verdict does not report that all is well.
                 When ``False`` the error is logged and treated as "no
-                violation" (fail-open) -- the default up to 0.4.0, and the one
+                violation" (fail-open) -- the default before 0.5.0, and the one
                 under which a mistyped or mis-scoped rule silently does
                 nothing. In either case the error is always logged.
 
