@@ -251,10 +251,17 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "fw-description-newlines",
         _FIREWALL,
-        '"description": description[:10000].replace("\\n", "\\\\n").replace("\\r", "\\\\r"),',
+        '"description": self._truncate_escaped(description, _MAX_DESCRIPTION_LENGTH),',
         '"description": description,',
         "newlines are escaped in an event's description",
         "2024-11-09 - Log Poisoning in Firewall Security Events",
+    ),
+    Mutant(
+        "fw-description-unbounded",
+        _FIREWALL,
+        '"description": self._truncate_escaped(description, _MAX_DESCRIPTION_LENGTH),',
+        '"description": description[:10000].replace("\\n", "\\\\n").replace("\\r", "\\\\r"),',
+        "an escaped description stays within its length bound",
     ),
     Mutant(
         "fw-truncate-overflow",

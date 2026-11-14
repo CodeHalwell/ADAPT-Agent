@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tests/test_mutation_check.py` was failing on `main`: the firewall
   description fix in #252 added a vulnerability journal entry without the
   mutant that re-opens it. The mutant and a regression test are added.
+- A firewall security event's `description` is now bounded *after* escaping.
+  The fix in #252 sliced to 10,000 characters and escaped afterwards, so a
+  description full of newlines could be stored at nearly twice that. It now
+  goes through `Firewall._truncate_escaped`, like the event's snippet does.
 - `docs/optimization.md` named a method `save()` that does not exist; it is
   `OptimizationResult.to_config()`.
 
