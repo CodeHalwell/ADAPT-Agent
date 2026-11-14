@@ -439,7 +439,7 @@ class Firewall:
         event: SecurityEvent = {
             "event_type": event_type,
             "severity": severity,
-            "description": description,
+            "description": description[:10000].replace("\n", "\\n").replace("\r", "\\r"),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata,
         }

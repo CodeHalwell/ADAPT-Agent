@@ -111,3 +111,7 @@
 **Vulnerability:** The `indicator` field in `AdversarialDefense._record_attack` stored matched attack snippets without sanitizing control characters, leading to potential log poisoning.
 **Learning:** Even extracted indicators from matched patterns are user input snippets and must be strictly sanitized.
 **Prevention:** Always explicitly sanitize all returned user input snippets (e.g., escaping `\n` to `\\n` and `\r` to `\\r` after truncation) before storing them in security event logs or analysis results.
+## 2024-11-09 - Log Poisoning in Firewall Security Events
+**Vulnerability:** The `description` field in `Firewall._record_security_event` stored descriptions without sanitizing control characters, leading to potential log poisoning.
+**Learning:** Even statically generated or concatenated strings used as event descriptions should be sanitized if they include parts of user input or dynamic content.
+**Prevention:** Always explicitly sanitize event descriptions (e.g., escaping `\n` to `\\n` and `\r` to `\\r` after truncation) before storing them in security event logs.
