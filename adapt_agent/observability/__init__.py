@@ -38,7 +38,7 @@ class AgentObserver:
         self._traces: dict[str, dict[str, Any]] = {}
         # ⚡ Bolt: Use deque for O(1) eviction instead of O(N) list.pop(0)
         self._logs: deque[dict[str, Any]] = deque(maxlen=max_logs)
-        self._metrics: dict[str, list[float]] = {}
+        self._metrics: dict[str, deque[float]] = {}
 
     def start_trace(
         self,
@@ -161,17 +161,14 @@ class AgentObserver:
             value: Metric value
         """
         if metric_name not in self._metrics:
-            self._metrics[metric_name] = []
+            # ⚡ Bolt: Use deque for O(1) eviction instead of O(N) list.pop(0)
+            self._metrics[metric_name] = deque(maxlen=self.max_metrics)
             # SECURITY: Prevent memory exhaustion from unbounded dictionary
             if len(self._metrics) > self.max_metric_names:
                 oldest_metric = next(iter(self._metrics))
                 del self._metrics[oldest_metric]
 
         self._metrics[metric_name].append(value)
-
-        # SECURITY: Prevent unbounded memory growth
-        if len(self._metrics[metric_name]) > self.max_metrics:
-            self._metrics[metric_name].pop(0)
 
     def get_traces(
         self,
