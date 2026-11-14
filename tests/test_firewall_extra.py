@@ -370,3 +370,18 @@ def test_pattern_hits_expose_a_pattern_that_never_matches():
     for content in ["card 4111111111111111", "pin 0000000000000000", "nothing to see"]:
         fw.check_input(content)
     assert fw.get_pattern_hits() == {r"\b\d{16}\b": 2, r"never-matches-anything-\d{99}": 0}
+
+
+def test_event_description_escapes_newlines():
+    """The description embeds the matching pattern, which a caller supplies.
+
+    A pattern containing a line break must not turn one security event into
+    several lines of an exported log.
+    """
+    fw = Firewall()
+    fw.add_blocked_pattern("attack\nINFO forged entry\r")
+    assert fw.check_input("an attack\nINFO forged entry\r here") is False
+    description = fw.get_security_events()[-1]["description"]
+    assert "\n" not in description
+    assert "\r" not in description
+    assert "\\n" in description
