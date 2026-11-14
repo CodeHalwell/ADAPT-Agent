@@ -315,7 +315,7 @@ adapt_agent/
 - [docs/releasing.md](docs/releasing.md) — how a version tag publishes to PyPI.
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community guidelines.
 - [docs/](docs/) — extended documentation.
-- [examples/](examples/) — runnable examples.
+- [examples/](examples/) — fifteen runnable, offline examples covering every part of the library, indexed by capability in [examples/README.md](examples/README.md). Start with [14_end_to_end_support_desk.py](examples/14_end_to_end_support_desk.py) to see it all working together.
 
 ## Development
 

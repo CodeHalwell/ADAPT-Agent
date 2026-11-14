@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Examples for the parts of the library that had none**, all offline and
+  dependency-free: `10_trust_taint_and_memory.py`,
+  `11_middleware_async_and_rollout.py`, `12_native_framework_hooks.py`,
+  `13_optimizer_strategies.py`, `14_end_to_end_support_desk.py` (everything
+  together in one application) and `15_cli_tour.py`. `examples/README.md` is now
+  indexed by task and by capability.
+- `tests/test_examples_run.py` checks the outcome each new example exists to
+  demonstrate, so an example cannot drift into showing nothing.
+
+### Changed
+
+- `examples/02_adversarial_defense.py` now shows what `AdversarialDefense`
+  catches (including zero-width characters, HTML comments, invisible CSS and
+  forged role tags), what it does not (encodings, look-alike letters, other
+  languages), and a false positive.
+
+### Fixed
+
+- `tests/test_mutation_check.py` was failing on `main`: the firewall
+  description fix in #252 added a vulnerability journal entry without the
+  mutant that re-opens it. The mutant and a regression test are added.
+- `docs/optimization.md` named a method `save()` that does not exist; it is
+  `OptimizationResult.to_config()`.
+
 ## [0.5.0] - 2026-11-13
 
 **Upgrading from 0.4.0:** this release changes defaults. Read the *Changed*

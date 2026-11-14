@@ -257,7 +257,7 @@ if result.validation_rejected:
 | `validation_score` | Held-out score of the configuration that is **applied**. |
 | `validation_baseline_score` | Held-out score of the untuned agent. |
 | `validation_rejected` | The training winner regressed on held-out data and was discarded; `best_config` is empty. |
-| `rejected_config` | The discarded configuration. Never applied, never exported by `save()`. |
+| `rejected_config` | The discarded configuration. Never applied, never exported by `to_config()`. |
 
 Things to know:
 
