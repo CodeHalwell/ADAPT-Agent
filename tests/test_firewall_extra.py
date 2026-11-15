@@ -370,3 +370,50 @@ def test_pattern_hits_expose_a_pattern_that_never_matches():
     for content in ["card 4111111111111111", "pin 0000000000000000", "nothing to see"]:
         fw.check_input(content)
     assert fw.get_pattern_hits() == {r"\b\d{16}\b": 2, r"never-matches-anything-\d{99}": 0}
+
+
+def test_event_description_escapes_newlines():
+    """The description embeds the matching pattern, which a caller supplies.
+
+    A pattern containing a line break must not turn one security event into
+    several lines of an exported log.
+    """
+    fw = Firewall()
+    fw.add_blocked_pattern("attack\nINFO forged entry\r")
+    assert fw.check_input("an attack\nINFO forged entry\r here") is False
+    description = fw.get_security_events()[-1]["description"]
+    assert "\n" not in description
+    assert "\r" not in description
+    assert "\\n" in description
+
+
+def test_event_description_is_bounded_after_escaping():
+    """Truncating and then escaping bounds the input, not what is stored.
+
+    Each newline becomes two characters, so a description sliced to 10,000 and
+    escaped afterwards could be kept at nearly twice that -- the mistake
+    ``_truncate_escaped`` exists to avoid.
+    """
+    from adapt_agent.security.firewall import _MAX_DESCRIPTION_LENGTH
+
+    fw = Firewall()
+    pattern = "\n" * 9000 + "x"
+    fw.add_blocked_pattern(pattern)
+    assert fw.check_input(pattern) is False
+
+    description = fw.get_security_events()[-1]["description"]
+    assert len(description) <= _MAX_DESCRIPTION_LENGTH
+    assert "\n" not in description
+    # The cut never lands between the two characters of an escape.
+    assert not description.endswith("\\")
+
+
+def test_an_ordinary_event_description_is_stored_unchanged():
+    fw = Firewall(max_content_length=5)
+    fw.add_blocked_pattern("secret")
+    fw.check_input("a secret")
+    fw.check_input("x" * 6)
+    assert [e["description"] for e in fw.get_security_events()] == [
+        "Content length 8 exceeds maximum allowed 5",
+        "Content length 6 exceeds maximum allowed 5",
+    ]

@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 # Best-effort guard against the most common catastrophic-backtracking shapes,
 # e.g. nested quantifiers like ``(a+)+``, ``(a*)*`` or ``(a+)*``. This is a
 # heuristic, not a complete ReDoS analysis.
+#: Upper bound on a stored security event's description, after escaping.
+_MAX_DESCRIPTION_LENGTH = 10_000
+
 _CATASTROPHIC_RE = re.compile(r"\([^)(]*[+*]\)[+*]")
 
 
@@ -439,7 +442,10 @@ class Firewall:
         event: SecurityEvent = {
             "event_type": event_type,
             "severity": severity,
-            "description": description[:10000].replace("\n", "\\n").replace("\r", "\\r"),
+            # Escaped *and* bounded. Slicing first and escaping afterwards
+            # bounds the input, not the result: every newline doubles, so a
+            # 10,000-character description could be stored at nearly 20,000.
+            "description": self._truncate_escaped(description, _MAX_DESCRIPTION_LENGTH),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata,
         }
