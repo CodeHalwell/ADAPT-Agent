@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-15
+
 ### Added
 
 - **Examples for the parts of the library that had none**, all offline and
@@ -24,9 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catches (including zero-width characters, HTML comments, invisible CSS and
   forged role tags), what it does not (encodings, look-alike letters, other
   languages), and a false positive.
+- `AgentObserver.record_metric` keeps its bounded history in a
+  `collections.deque`, so dropping the oldest point no longer shifts the whole
+  list (#254).
 
 ### Fixed
 
+- A firewall security event's `description` has its newlines and carriage
+  returns escaped, so a blocked pattern containing them cannot forge extra
+  lines in a log built from the event (#252).
 - `tests/test_mutation_check.py` was failing on `main`: the firewall
   description fix in #252 added a vulnerability journal entry without the
   mutant that re-opens it. The mutant and a regression test are added.
@@ -2226,7 +2234,8 @@ package that actually installs and is usable end to end.
   optimization, adversarial defense, evaluation, observability, patches, and the
   `adapt-agent` CLI (`info` command).
 
-[Unreleased]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/CodeHalwell/ADAPT-Agent/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/CodeHalwell/ADAPT-Agent/releases/tag/v0.3.2
