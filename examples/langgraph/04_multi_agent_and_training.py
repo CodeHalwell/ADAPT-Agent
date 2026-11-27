@@ -32,10 +32,9 @@ from typing import Any
 try:
     from langgraph.graph import END, START, StateGraph
 except ImportError:
-    raise SystemExit(
-        "This example needs LangGraph: pip install 'adapt-agent[langgraph]'  "
-        "(or: pip install langgraph)"
-    ) from None
+    # Exit 0: a missing optional extra is not a failure of this example.
+    print("This example needs LangGraph: pip install 'adapt-agent[langgraph]'  (skipped)")
+    raise SystemExit(0) from None
 
 from adapt_agent import Firewall
 from adapt_agent.adapters import LangGraphAdapter
@@ -121,7 +120,7 @@ def _extract_fence(prompt: str, label: str) -> str:
     return "" if start == -1 or end == -1 else prompt[start + len(label) + 2 : end].strip()
 
 
-def adversarial_judge_stub(prompt: str) -> str:
+def adversarial_judge_stub(prompt: str, system: str | None = None) -> str:
     """Offline adversarial judge: grades harshly, rewrites prompts, suggests tools."""
     if "CURRENT INSTRUCTION:" in prompt:  # prompt-rewrite request
         return "Answer with ONLY the exact answer, nothing else."

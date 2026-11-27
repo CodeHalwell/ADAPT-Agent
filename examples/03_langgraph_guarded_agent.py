@@ -97,7 +97,11 @@ def main() -> None:
     #     guarded.execute({"messages": [{"role": "user", "content": "hi"}]})
     #
     # No other code changes are required - the adapter only needs an object
-    # with a callable `invoke(state)` method.
+    # with a callable `invoke(state)` method. A `langchain.agents.create_agent`
+    # agent is a compiled graph too; to govern each model and tool call inside
+    # it, add `middleware=[governance_middleware(...)]` from
+    # `adapt_agent.integrations.langgraph` (see
+    # examples/langgraph/05_tool_governance_middleware.py).
     # ------------------------------------------------------------------
 
 
