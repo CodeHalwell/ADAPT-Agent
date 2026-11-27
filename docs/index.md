@@ -44,11 +44,13 @@ custom firewall filter raises an exception, the `Firewall` does **not** silently
 allow the content through; it records a high-severity event and returns "blocked":
 
 ```python
-# In Firewall.check_input — a raising custom filter blocks the input.
-except Exception as e:
-    logger.error(f"Error in custom filter: {e}")
-    self._blocked_count += 1
-    return False  # fail-closed
+from adapt_agent import Firewall
+
+firewall = Firewall()
+firewall.add_custom_filter(lambda text: 1 / 0)  # a filter that crashes
+
+firewall.check_input("hello")                        # False: blocked, not waved through
+firewall.get_security_events()[-1]["description"]    # "Content blocked due to custom filter error"
 ```
 
 The same instinct drives the adapter's `block_on_violation=True` default, the

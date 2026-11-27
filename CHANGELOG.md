@@ -60,6 +60,11 @@ the old behaviour is still available, the option is named.
   `AdapterError` instead of bypassing it.
 - **`Firewall(normalize=True)` is opt-in and off by default**, so existing
   deployments' patterns match what they did. Turn it on for new ones.
+- **A shared `gate=` combined with a control raises `ValueError`.** A binding
+  factory given `gate=` together with `firewall=`, `defense=`,
+  `policy_enforcer=` or `tool_policy=` used to keep the gate and drop the
+  control without a word, so a tool policy could be configured and never
+  consulted. Put the control on the `GovernanceGate`, or drop `gate=`.
 
 **Observability**
 
@@ -189,9 +194,9 @@ the old behaviour is still available, the option is named.
   `UNSCANNABLE` in `adapt_agent.core.governance`; `GovernedAdapter(tool_policy=,
   max_payload_chars=)`.
 
-**Per-framework bindings.** Each takes `tool_policy=` and `observer=` beside the
-shared `gate=` / `firewall=` / `defense=` / `policy_enforcer=` /
-`block_on_violation=` / `agent_id=`.
+**Per-framework bindings.** Each takes `tool_policy=` and `observer=`, and
+either a shared `gate=` or the individual `firewall=` / `defense=` /
+`policy_enforcer=` controls, with `block_on_violation=` and `agent_id=`.
 
 - **LangGraph / LangChain v1**: `governance_middleware()` (a `create_agent`
   middleware: model input and output in `wrap_model_call`, tool calls and results
@@ -319,6 +324,16 @@ shared `gate=` / `firewall=` / `defense=` / `policy_enforcer=` /
   suite against the real framework, a non-blocking job at the declared floor
   versions, a weekly schedule and a concurrency group; packaging metadata tests.
 
+**Documentation**
+
+- Every page was checked against the code: each Python snippet parses and its
+  `adapt_agent` imports resolve, relative links and anchors resolve, every extra
+  named exists, and the docs site builds in strict mode.
+  `tests/test_docs_consistency.py` keeps it that way, including a short list of
+  retired names that must not reappear. `docs/integrations.md` and
+  `docs/frameworks/index.md` are rewritten around tool-call governance, with
+  each framework's stated gaps.
+
 ### Changed
 
 - **Optimisers.** The grid no longer leaves knobs untried when the full product
@@ -427,6 +442,12 @@ shared `gate=` / `firewall=` / `defense=` / `policy_enforcer=` /
   `CrewAIAdapter(hooks=True)`, which drains the stream). A task `guardrail` cannot
   be checkpointed, and restoring `governance_callbacks` needs
   `CREWAI_DESERIALIZE_CALLBACKS=1`.
+  `governance_hooks()` needs CrewAI's interception layer
+  (`crewai.hooks.InterceptionPoint`; verified on 1.15), which older releases
+  the `crewai` extra still admits do not have. There it raises a
+  `RuntimeError` naming the alternative (`governance_callbacks()` and
+  `governance_guardrail()`), and `tool_inspection_supported()` reports which
+  applies.
 - **OpenAI Agents SDK**: tools OpenAI runs server-side (hosted search, file
   search, code interpreter, image generation, hosted shell) have no client-side
   seam, and `ComputerTool` and `LocalShellTool` are governed by name only. SDK

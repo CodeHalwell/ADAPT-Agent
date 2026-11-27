@@ -36,12 +36,7 @@ DOC_FILES: list[Path] = sorted(
 #: Known failures in files another change is rewriting, keyed by
 #: ``(check, relative path)``. Each is ``xfail(strict=False)`` so the suite
 #: stays green until that rewrite lands -- then delete the entry.
-KNOWN_FAILURES: dict[tuple[str, str], str] = {
-    ("compile", "docs/index.md"): "an excerpt of Firewall.check_input that starts at `except`",
-    ("retired", "docs/integrations.md"): "shows create_react_agent hooks, chat_client.create_agent "
-    "and gemini-2.0-flash as current; being rewritten",
-    ("retired", "docs/api.md"): "still documents validation_tolerance=1e-3; being rewritten",
-}
+KNOWN_FAILURES: dict[tuple[str, str], str] = {}
 
 _FENCE = re.compile(r"^([ \t]*)(`{3,})[ \t]*([\w+-]*)[^\n]*\n(.*?)^\1\2[ \t]*$", re.M | re.S)
 _LINK = re.compile(r"(?<!!)\[[^\]\n]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")

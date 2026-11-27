@@ -296,7 +296,18 @@ class CrewAIGovernance:
     def _hook_table(self) -> list[tuple[Any, Callable[[Any], Any]]]:
         if self._points is None:
             hooks = optional_import("crewai.hooks", "crewai", "CrewAI governance hooks")
-            point = hooks.InterceptionPoint
+            point = getattr(hooks, "InterceptionPoint", None)
+            if point is None:
+                # An older CrewAI has a `crewai.hooks` module without the
+                # interception layer. Failing here with a bare AttributeError
+                # would say nothing about the cause or the way out.
+                raise RuntimeError(
+                    "governance_hooks() needs CrewAI's interception layer "
+                    "(crewai.hooks.InterceptionPoint), which the installed CrewAI does "
+                    "not have. Upgrade CrewAI, or on this release use "
+                    "governance_callbacks() and governance_guardrail(), which do not "
+                    "need it. tool_inspection_supported() reports which applies."
+                )
             table: list[tuple[Any, Callable[[Any], Any]]] = []
             g = self._guard
             if self._screen["boundaries"]:

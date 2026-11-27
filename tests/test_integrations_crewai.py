@@ -278,3 +278,21 @@ def test_a_wrapped_governance_block_is_surfaced_with_its_threats():
         _surface(outer)
     assert excinfo.value.threats == ["tool:denied:x"]
     _surface(RuntimeError("unrelated"))  # nothing to unwrap: returns, caller re-raises
+
+
+def test_hooks_on_a_crewai_without_the_interception_layer_fail_with_the_way_out(monkeypatch):
+    import sys
+    import types
+
+    from adapt_agent.integrations import crewai as binding
+
+    old_hooks = types.ModuleType("crewai.hooks")  # the module exists, the layer does not
+    monkeypatch.setitem(sys.modules, "crewai", types.ModuleType("crewai"))
+    monkeypatch.setitem(sys.modules, "crewai.hooks", old_hooks)
+
+    assert binding.tool_inspection_supported() is False
+    governance = binding.governance_hooks()
+    with pytest.raises(RuntimeError, match="InterceptionPoint") as exc:
+        governance.install()
+    assert "governance_callbacks()" in str(exc.value)
+    assert governance.installed is False
