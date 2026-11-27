@@ -65,16 +65,35 @@ Every check maps `(output, expected)` to a score in `[0, 1]`; most are binary.
 
 | Name | Passes when ... |
 | --- | --- |
-| `exact_match` | output equals expected (normalised: case / whitespace / punctuation) |
-| `contains` | expected appears as a substring of the output |
-| `regex_match` | output matches the expected regex (or a fixed `pattern=`) |
-| `numeric_close` | the first number in the output is within `tolerance` of expected's (`relative=True` for a relative bound) |
-| `token_f1` | token-overlap F1 (SQuAD-style, continuous) |
+| `exact_match` | output equals expected after normalisation: NFKC, case-folding, whitespace, and *edge* punctuation (`"Paris."` = `"paris"`, but `-5` ≠ `5`) |
+| `contains` | expected appears in the output **on word boundaries** (`"no"` is not found in `"know"`) |
+| `regex_match` | output matches the expected regex (or a fixed `pattern=`); row-supplied patterns are screened for catastrophic backtracking |
+| `numeric_close` | the answer number in the output is within `tolerance` of expected's (`relative=True` for a relative bound); see below for which number |
+| `token_f1` | token-overlap F1 (SQuAD-style, continuous; Japanese/Chinese/Thai tokenised per character) |
 | `jaccard` | token-set Jaccard similarity (continuous) |
-| `json_subset` | every key/value in the expected dict appears in the output dict |
+| `json_subset` | fraction of expected keys matched, **recursively** (nested dicts as subsets; `True` ≠ `1`); fenced or embedded JSON is parsed |
 | `levenshtein_ratio` | normalised edit-distance similarity (continuous) |
 | `checks` | per-row dispatch -- see below |
 | `judge` / `llm_judge` | the LLM judge grades the row (needs `judge=`) |
+| `tool_called`, `tool_call_args_match`, `tool_sequence`, `no_forbidden_tools`, `tool_call_budget` | trajectory checks on the tool calls the agent made -- see [Trajectory evals](#trajectory-tool-call-evals) |
+
+### Metric semantics (changed in 0.6)
+
+These defaults changed because the old ones scored wrong answers as right.
+Each old behaviour is still one option away.
+
+| Metric | Now | Before (still available) |
+| --- | --- | --- |
+| `exact_match` | punctuation stripped only from token edges; NFKC + case-folding | every symbol erased, so `-5` = `5`, `<=` = `>=`, `C++` = `C`, `$100` = `100%` (`exact_match(punctuation="all")`) |
+| `contains` | word-boundary match | substring (`contains(word_boundary=False)`; also the default with `normalize=False`) |
+| `numeric_close` | `which="auto"`: the number after the last answer marker (`answer`, `result`, `total`, `=`), else the last number; reads `.5`, `1e3`, `1,000`, `3,14`, Unicode digits | the first number (`numeric_close(which="first")`); `"any"` passes if any number matches |
+| `regex_match` | a row with no pattern (`expected` empty/`None`) is an **error**, not a pass; row patterns over 512 characters or with nested quantifiers/alternation under a quantifier (`(a+)+`, `(a\|aa)+`) are refused | the empty pattern matched everything (1.0); `(a+)+$` could hang the run |
+| `json_subset` | recursive subset, strict bool/int, fenced/embedded JSON parsed | flat equality per key (`json_subset(strict_types=False)` for loose types) |
+| any metric | a NaN / infinite score is an **error for that row** (`report.n_metric_errors`, `result.metric_errors`) | NaN was clamped to **1.0** |
+
+A metric that raises (or returns a non-finite value) on a row scores that row
+with its declared `on_error` fallback (`0.0` by default) and is recorded in
+`ExampleResult.metric_errors`; it is never silently a pass.
 
 Pass them by name, as factories with options, or mix with your own callables:
 
@@ -136,7 +155,9 @@ from adapt_agent.optimization.judges import ClaudeJudge
 report = evaluate_agent(my_agent, data, judge="claude")
 
 # Or configure the judge yourself:
-judge = LLMJudge(ClaudeJudge(model="claude-opus-4-8"), pass_threshold=0.7)
+judge = ClaudeJudge(model="claude-opus-5-5", pass_threshold=0.7)   # a ClaudeJudge *is* an LLMJudge
+# ...or wrap any provider / completion callable:
+judge = LLMJudge(my_completion_fn, pass_threshold=0.7)
 report = evaluate_agent(
     my_agent, data,
     judge=judge,
@@ -324,7 +345,18 @@ is `module:attribute` (append `()` to call a factory). Judge routing matches
 `{"check": "judge"}` spend judge calls -- add `--metric judge` to also grade
 every row with the `--judge` provider. The identical flags work on
 `adapt-agent optimize`, so the eval that gates your agent is the same eval
-that trains it -- see [Optimization & Evaluation](optimization.md).
+that trains it -- see [Optimization & Evaluation](optimization.md), and
+[Gating CI](#gating-ci) below for the exit codes.
+
+!!! warning "Targets and configs are code"
+    `module:attribute` **imports** the module, which runs its top-level code,
+    and a trailing `()` **calls** the object; the current working directory is
+    on the import path. A training config's `target:` entries are the same.
+    Treat a config file like a script: only run ones you would execute. The
+    `judge:` section of a training config accepts a fixed list of keys and
+    refuses others -- in particular `base_url` and `api_key` -- so a config
+    cannot redirect graded outputs to another host or carry a credential; set
+    API keys in the provider's environment variable.
 
 ## Running examples concurrently
 
@@ -402,3 +434,223 @@ table instead of one blended number that hides which column moved. That
 `pack: 0.0` is a column the agent never gets right; averaged in, it reads as a
 mild dip. A deterministic field check is also cheaper and more correct than
 asking a judge whether two labels agree.
+
+## Trajectory (tool-call) evals
+
+A correct answer reached without calling the weather tool is a guess; a
+correct answer reached via `delete_db` is a failure. Trajectory metrics score
+**what the agent did** -- the tool calls, in order, with their arguments -- and
+compose with the text metrics in one run.
+
+A row declares its expected trajectory next to `input` / `expected`, the same
+place a per-row `check` lives:
+
+```jsonl
+{"id": "w1", "input": "Weather in Paris?", "expected": "sunny",
+ "expected_tools": [{"name": "get_weather", "args": {"city": "Paris"}}],
+ "forbidden_tools": ["delete_*"], "max_tool_calls": 3}
+{"id": "w2", "input": "Compare Paris and Rome", "check": {"name": "tool_sequence", "mode": "any_order"},
+ "expected_tools": ["get_weather", "get_weather"]}
+```
+
+| Metric | Scores 1.0 when ... |
+| --- | --- |
+| `tool_called(name=None, min_times=1)` | `name` was called (`min_times`); without `name`, the fraction of the row's `expected_tools` that were called |
+| `tool_call_args_match(check="exact_match")` | the fraction of expected calls made with **at least** the expected arguments (a subset; extra arguments are fine). String values use the `check` text metric, so case and edge punctuation do not matter; others compare by equality (`True` ≠ `1`). Use `{"$check": "contains", "value": "paris"}` (any built-in) for a looser match. Each real call satisfies one expectation. |
+| `tool_sequence(mode="in_order", check_args=False)` | `"exact"`: exactly the expected calls in order; `"in_order"`: expected calls appear in order, others may be interleaved; `"any_order"`: all expected calls appear (as a multiset); `"no_extra"`: all appear and nothing else was called. `check_args=True` also requires the arguments. |
+| `no_forbidden_tools(forbidden=None)` | no call matched a forbidden name or glob (`"delete_*"`) |
+| `tool_call_budget(max_calls=None, max_steps=None)` | the run made at most `max_calls` tool calls / `max_steps` model turns (or the row's `max_tool_calls` / `max_steps`) |
+
+Expectations come from the factory arguments when given, else from the row. A
+row that declares nothing a metric needs is an **error** for that row (recorded
+in `result.metric_errors`), never a silent pass -- apply trajectory metrics
+per row with `checks` when only some rows have expectations.
+
+```python
+from adapt_agent.evaluation import (
+    evaluate_agent, no_forbidden_tools, tool_call_args_match, tool_sequence,
+)
+
+report = evaluate_agent(
+    my_agent, "golden.jsonl",
+    metrics=["exact_match", tool_sequence(mode="in_order"), tool_call_args_match(),
+             no_forbidden_tools()],
+)
+report.aggregate   # {"exact_match": 0.9, "tool_sequence": 0.8, "tool_call_args_match": 0.75, ...}
+```
+
+**Where the trajectory comes from.** The harness keeps each row's *raw* result
+(before `output_extractor` flattens it to text) and
+`extract_trajectory(result)` recovers the calls, duck-typed like the text
+extractor:
+
+| Framework | Read from |
+| --- | --- |
+| LangGraph / LangChain | state `messages`: `AIMessage.tool_calls`, results from `ToolMessage` |
+| Pydantic AI | `AgentRunResult.all_messages()`: `ToolCallPart` / `ToolReturnPart` |
+| OpenAI Agents SDK | `RunResult.new_items`: `ToolCallItem` / `ToolCallOutputItem` (steps from `raw_responses`) |
+| Google ADK | event stream: `content.parts[*].function_call` / `function_response` |
+| Microsoft Agent Framework | `AgentResponse.messages[*].contents` of type `function_call` / `function_result` |
+| Claude Agent SDK | message stream: `ToolUseBlock` in `AssistantMessage`, `ToolResultBlock` in replies |
+| OpenAI chat completions | assistant `tool_calls` (`function.name` / `function.arguments`), `role: "tool"` replies |
+| Your own agent | return `{"output": ..., "tool_calls": [{"name": ..., "arguments": {...}, "result": ...}], "steps": 3}` |
+
+Arguments given as a JSON string are parsed; results are paired to calls by
+call id. A step is one model response; when a result does not expose its step
+count, `max_steps` refuses to score rather than guess (budget tool calls with
+`max_tool_calls` instead). For a framework not listed, return the dict form or
+pass a `Trajectory` yourself.
+
+## Multi-turn evals
+
+A row may be a **scripted conversation**: a list of user turns, each with its
+own expectation. The harness feeds the turns in order, carries the history, and
+scores every turn.
+
+```jsonl
+{"id": "c1", "turns": [
+  {"input": "My order is 1234.", "score": false},
+  {"input": "Where is it?", "expected": "1234", "check": "contains"},
+  {"input": "Cancel it.", "expected_tools": ["cancel_order"], "check": "tool_called"}
+]}
+```
+
+* Each turn has an `input`, optionally `expected`, and any per-turn metadata
+  (`check`, `criteria`, `expected_tools`, ...). `"score": false` runs a setup
+  turn without scoring it. Turns can also be plain strings.
+* How history reaches the agent is `conversation_input=` on `evaluate_agent` /
+  `EvaluationHarness`: `"messages"` (default) passes the conversation so far as
+  `[{"role": "user"|"assistant", "content": ...}]` ending with the new user turn
+  (the assistant content is each previous output's extracted text); `"text"`
+  passes only the new turn, for an agent that keeps its own memory (use a fresh
+  agent per row); or a callable `(history, turn_input) -> payload`.
+* The row's score for each metric is the **mean over its scored turns**;
+  `result.turns` holds per-turn inputs, outputs, scores and latency.
+* If the agent raises on turn *k*, the row is an error (`"turn k: ..."`) and
+  later turns are not run.
+
+The user side is scripted, not simulated: an LLM playing the user is out of
+scope. Malformed `turns` fail when the dataset loads, before any agent call.
+
+## Latency, tokens and cost
+
+Every row records its latency (`result.latency`); the report adds
+`latency_p50` / `latency_p95` (nearest-rank, over every row run) beside
+`avg_latency`. Token usage and cost are recorded when the result exposes them
+-- `usage` (attribute, key or Pydantic AI's `usage`), the OpenAI Agents SDK's
+`context_wrapper.usage`, Microsoft's `usage_details`, LangChain
+`usage_metadata`, ADK `usage_metadata`, or Claude's `ResultMessage`
+(`total_cost_usd`) -- normalised to `input_tokens`, `output_tokens`,
+`total_tokens`, `cost_usd` on `result.usage`, and summed on `report.usage`.
+When a judge's provider exposes `last_usage`, its tokens are added as
+`judge_input_tokens` etc. -- on the serial path only, since with concurrent
+rows the provider's last call may belong to another row.
+
+## What counts as "transient"
+
+A row whose call failed with a *transient infrastructure fault* -- a 429, a
+5xx, a provider timeout that outlived its retries -- is excluded from the
+score (so a throttled run is not ranked below an unthrottled one), counted in
+`n_transient_errors`, and makes `is_complete` false.
+
+**An exception raised by the agent under test is only eligible when something
+shows it came from infrastructure**: a link in its cause chain was raised by a
+provider SDK or HTTP client package (`openai`, `anthropic`, `google`, `httpx`,
+`requests`, ...; see `evaluation.INFRASTRUCTURE_MODULES`), carries an HTTP
+status attribute, or names an HTTP status in its message (`"Error code: 429"`,
+`"503 Service Unavailable"`). Anything else -- an agent's own
+`ToolTimeout("step budget exceeded")`, a bare `TimeoutError` from your tool --
+is a **failure of that row**: scored 0, kept in the denominator, reported as an
+error. (Before 0.6 such a row was dropped, so an agent failing two rows of
+three on its own timeouts printed `1.0000`.) A judge or metric call keeps the
+generous classification, since its provider is the harness's own
+infrastructure. Pass `retry=RetryPolicy(is_transient=...)` to decide yourself;
+a custom classifier is honoured as given.
+
+`report.completeness()` says how much of the dataset a score covers:
+
+```python
+{"rows_total": 3, "rows_scored": 3, "rows_errored": 2,
+ "rows_dropped_transient": 0, "rows_metric_errors": 0}
+```
+
+`rows_scored` is the denominator of `score` and *includes* errored rows (they
+score 0). The CLI prints this line for every run, and labels any aggregate
+computed over a subset `PARTIAL` next to the number.
+
+## Gating CI
+
+`adapt evaluate` exits non-zero when a gate fails, so it can be a CI step:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | ran; every gate passed |
+| `1` | could not run: bad arguments, the target / dataset / judge failed to load, an empty dataset |
+| `2` | command-line usage error (from argparse) |
+| `3` | `--fail-under` missed |
+| `4` | `--fail-on-error`: a row errored (agent raised, or a metric failed) -- **and always** when every row errored |
+| `5` | `--fail-on-incomplete`: rows were dropped as transient -- **and always** when every row was |
+| `6` | `--fail-on-regression`: worse than `--baseline` |
+
+When several gates fail the most severe code wins (4, then 5, 3, 6), and every
+failure is printed.
+
+```yaml
+# .github/workflows/evals.yml
+- name: Agent evals
+  run: |
+    adapt evaluate "myapp.agents:build()" --data evals/golden.jsonl \
+      --metric checks --extract-output --concurrency 8 \
+      --fail-under 0.9 --fail-under tool_sequence=1.0 \
+      --fail-on-error --fail-on-incomplete \
+      --baseline evals/baseline.json --fail-on-regression \
+      --output eval-results.json --junit eval-junit.xml
+- uses: actions/upload-artifact@v4
+  if: always()
+  with: {name: eval-results, path: "eval-results.json\neval-junit.xml"}
+```
+
+* `--fail-under 0.9` gates **every** metric; `--fail-under exact_match=0.9`
+  gates one (and overrides a bare value for it). An unknown metric name is an
+  error, so a typo cannot disable a gate.
+* `--fail-on-incomplete` is what makes the gate honest under throttling: a
+  score over a subset can pass a threshold the full dataset would miss.
+* `--concurrency N` runs N rows at once in a thread pool (the harness's
+  `evaluate(concurrency=)`); results are identical, in row order.
+
+## Exporting results and comparing runs
+
+```bash
+adapt evaluate ... --output results.json     # full per-row results
+adapt evaluate ... --junit junit.xml         # one testcase per row x metric
+adapt evaluate ... --baseline results.json --fail-on-regression --regression-tolerance 0.02
+```
+
+The same functions are importable:
+
+```python
+from adapt_agent.evaluation import compare_runs, load_results, to_json, to_junit
+
+to_json(report, "results.json")                   # summary + completeness + every row
+to_junit(report, "junit.xml", thresholds={"exact_match": 1.0, "judge": 0.6})
+diff = compare_runs(report, load_results("baseline.json"), tolerance=0.02)
+diff.metrics            # {"exact_match": {"baseline": 0.92, "current": 0.88, "delta": -0.04}}
+diff.regressed_rows     # [{"key": "id:w7", "metric": "exact_match", "baseline": 1.0, "current": 0.0}]
+diff.has_regression, diff.warnings
+```
+
+* The JSON document holds `summary` (the report's `to_dict()` plus
+  completeness, latency percentiles, usage) and one record per stored row:
+  inputs, expected, output (each truncated to 4,000 characters), every score,
+  error and error type, metric errors, latency, usage, and per-turn detail.
+  `--json` on stdout prints the same summary with the rows and the gate
+  results.
+* JUnit: a case fails below its threshold (`--fail-under` values; default the
+  harness's `failure_threshold`, 1.0) with expected / actual / input in the
+  body; an agent exception is an `<error>`; a transient row is `<skipped>`.
+  The document is capped (5 MB by default): past the cap failure bodies are
+  dropped, never cases, so the counts stay exact.
+* Rows are matched across runs by their dataset **`id`** -- give rows one.
+  Without it they are matched by position, which a `warnings` entry flags,
+  because inserting a row shifts every match. A partial run on either side is
+  flagged too.

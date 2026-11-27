@@ -29,7 +29,7 @@ dataset:
 
 judge:
   provider: anthropic          # anthropic/claude, openai, gemini, mistral, ...
-  model: claude-opus-4-8
+  model: claude-opus-5-5
   adversarial: true            # grade as a harsh critic/adversary (reward-hack resistant)
   scale: 10
   pass_threshold: 0.6

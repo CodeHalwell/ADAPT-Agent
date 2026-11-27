@@ -83,7 +83,48 @@ class Example:
         meta = record.pop("metadata", None)
         metadata: dict[str, Any] = dict(meta) if isinstance(meta, dict) else {}
         metadata.update(record)
+        if "turns" in metadata:
+            # Validated at load, not at run: a malformed conversation should
+            # fail before the first agent call is paid for.
+            metadata["turns"] = _normalise_turns(metadata["turns"])
         return cls(inputs=inputs, expected=expected, metadata=metadata)
+
+    @property
+    def turns(self) -> list[dict[str, Any]] | None:
+        """The scripted user turns of a multi-turn row, or ``None`` for a single turn.
+
+        Each turn is a mapping with ``input`` and, optionally, ``expected``,
+        ``score`` (``False`` for a setup turn that is run but not scored) and any
+        per-turn metadata (``check``, ``criteria``, ``expected_tools``, ...).
+        """
+        turns = self.metadata.get("turns") if isinstance(self.metadata, dict) else None
+        return turns if isinstance(turns, list) else None
+
+    @property
+    def is_conversation(self) -> bool:
+        """Whether this row is a multi-turn conversation (see :attr:`turns`)."""
+        return self.turns is not None
+
+
+def _normalise_turns(raw: Any) -> list[dict[str, Any]]:
+    """Validate a ``turns`` list and give every turn ``input`` / ``expected`` keys."""
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("'turns' must be a non-empty list of turn mappings")
+    turns: list[dict[str, Any]] = []
+    for position, turn in enumerate(raw):
+        if isinstance(turn, str):
+            turns.append({"input": turn, "expected": None})
+            continue
+        if not isinstance(turn, dict):
+            raise ValueError(f"turns[{position}] must be a mapping or a string, got {turn!r}")
+        turn = dict(turn)
+        if not any(key in turn for key in _INPUT_KEYS):
+            raise ValueError(f"turns[{position}] has no input (one of {list(_INPUT_KEYS)})")
+        normalised = {"input": _pop_first(turn, _INPUT_KEYS)}
+        normalised["expected"] = _pop_first(turn, _EXPECTED_KEYS)
+        normalised.update(turn)
+        turns.append(normalised)
+    return turns
 
 
 def _pop_first(record: dict[str, Any], keys: tuple[str, ...]) -> Any:

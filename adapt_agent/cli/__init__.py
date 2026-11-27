@@ -32,7 +32,13 @@ Commands
     ``AgentRunResult``, LangGraph state, ADK events, ...) to final response
     text before scoring, and ``--metric checks`` to let each dataset row
     declare its own check via ``metadata`` (text match, numeric tolerance,
-    LLM-judge, ...).
+    LLM-judge, tool-call trajectory, ...). As a CI gate: ``--fail-under``,
+    ``--fail-on-error``, ``--fail-on-incomplete`` and ``--baseline`` /
+    ``--fail-on-regression`` exit 3 / 4 / 5 / 6 (1 = could not run);
+    ``--output`` and ``--junit`` export per-row results.
+
+    ``<target>`` (and ``--component`` / ``--runner``) are imported and, with
+    ``()``, called: they are code, so only point them at modules you trust.
 
 ``adapt-agent optimize <target> --data <file> [--optimizer S] [--judge PROVIDER] ...``
     Optimize an agent against a golden dataset (prompts, few-shot, models,
@@ -70,9 +76,42 @@ from typing import Any, Optional
 from adapt_agent import __version__
 from adapt_agent.core.policy import validate_condition
 
-_VALID_ACTIONS = {"warn", "block", "modify"}
-_VALID_SEVERITIES = {"low", "medium", "high", "critical"}
+# The policy engine owns these sets; a local copy is only the fallback for a
+# build where it does not export them yet, so the two cannot drift silently.
+try:
+    from adapt_agent.core.policy import (  # type: ignore[attr-defined,unused-ignore]
+        VALID_ACTIONS as _POLICY_ACTIONS,
+    )
+except ImportError:
+    _POLICY_ACTIONS = frozenset({"warn", "block", "modify", "require_approval"})
+try:
+    from adapt_agent.core.policy import (  # type: ignore[attr-defined,unused-ignore]
+        VALID_SEVERITIES as _POLICY_SEVERITIES,
+    )
+except ImportError:
+    _POLICY_SEVERITIES = frozenset({"low", "medium", "high", "critical"})
+
+_VALID_ACTIONS = set(_POLICY_ACTIONS) | {"require_approval"}
+_VALID_SEVERITIES = set(_POLICY_SEVERITIES)
+#: Pauses a call for a human; only a tool call can be paused (see core.policy).
+_APPROVAL_ACTION = "require_approval"
 _MAX_CONDITION_LENGTH = 1024
+
+# -- exit codes for `evaluate` (documented in docs/cli.md) -----------------------
+#: The evaluation ran and every gate passed.
+EXIT_OK = 0
+#: Could not run: bad arguments, target/dataset/judge failed to load, an empty
+#: dataset. Also every other command's generic failure code.
+EXIT_COULD_NOT_RUN = 1
+#: A score gate failed (``--fail-under``).
+EXIT_THRESHOLD = 3
+#: Rows errored (``--fail-on-error``), or *every* row errored (always enforced).
+EXIT_ERRORS = 4
+#: Rows were dropped as transient (``--fail-on-incomplete``), or every row was
+#: (always enforced: a score over zero rows is not a score).
+EXIT_INCOMPLETE = 5
+#: The run regressed against ``--baseline`` (``--fail-on-regression``).
+EXIT_REGRESSION = 6
 
 #: Console-script names this CLI is published under (see ``[project.scripts]``).
 #: Used only to echo the invoked name back in ``--help`` output.
@@ -95,6 +134,12 @@ _BUILTIN_METRIC_NAMES = (
     "json_subset",
     "levenshtein_ratio",
     "checks",
+    # trajectory (tool-call) metrics; rows declare expected_tools etc.
+    "tool_called",
+    "tool_call_args_match",
+    "tool_sequence",
+    "no_forbidden_tools",
+    "tool_call_budget",
 )
 _OPTIMIZER_CHOICES = (
     "default",
@@ -108,6 +153,59 @@ _OPTIMIZER_CHOICES = (
 
 def _builtin_metric_names() -> list[str]:
     return list(_BUILTIN_METRIC_NAMES)
+
+
+def _add_gating_arguments(sub: Any) -> None:
+    """The CI-gating and export flags of ``evaluate`` (see docs/cli.md for exit codes)."""
+    gate = sub.add_argument_group(
+        "CI gating (exit codes: 3 score, 4 errors, 5 incomplete, 6 regression)"
+    )
+    gate.add_argument(
+        "--fail-under",
+        action="append",
+        default=[],
+        metavar="[METRIC=]SCORE",
+        help="Exit 3 if a metric's aggregate is below SCORE. 'exact_match=0.9' gates one "
+        "metric; a bare '0.9' gates every metric. Repeatable.",
+    )
+    gate.add_argument(
+        "--fail-on-error",
+        action="store_true",
+        help="Exit 4 if any row errored (the agent raised, or a metric failed).",
+    )
+    gate.add_argument(
+        "--fail-on-incomplete",
+        action="store_true",
+        help="Exit 5 if any row was dropped as a transient infrastructure fault, so the "
+        "score covers only part of the dataset.",
+    )
+    gate.add_argument(
+        "--baseline",
+        metavar="RESULTS.json",
+        help="Compare with a previous run's --output file: per-metric deltas and the rows "
+        "that regressed or improved.",
+    )
+    gate.add_argument(
+        "--fail-on-regression",
+        action="store_true",
+        help="With --baseline: exit 6 if any metric's aggregate or any row's score dropped "
+        "by more than --regression-tolerance.",
+    )
+    gate.add_argument(
+        "--regression-tolerance",
+        type=float,
+        default=0.0,
+        metavar="DELTA",
+        help="Score drop tolerated before --fail-on-regression fires (default 0).",
+    )
+    out = sub.add_argument_group("result export")
+    out.add_argument("--output", metavar="PATH", help="Write full per-row results as JSON to PATH.")
+    out.add_argument(
+        "--junit",
+        metavar="PATH",
+        help="Write JUnit XML to PATH: one testcase per row x metric; a case fails below its "
+        "--fail-under threshold (default: the harness failure threshold, 1.0).",
+    )
 
 
 def _prog_name() -> str:
@@ -156,6 +254,11 @@ def main(args: list[str] | None = None) -> int:
     train_parser.add_argument("config_file", help="Path to a YAML or JSON training config")
     train_parser.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON output"
+    )
+    train_parser.add_argument(
+        "--save-config",
+        help="Write the winning configuration to this file (.json flat, .yaml/.yml nested). "
+        "Values that cannot round-trip (live tools, callables) are listed, not written.",
     )
 
     install_parser = subparsers.add_parser(
@@ -263,6 +366,15 @@ def main(args: list[str] | None = None) -> int:
             "state, ADK events, ...) to final response text before scoring.",
         )
         sub.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+        sub.add_argument(
+            "--concurrency",
+            type=int,
+            default=1,
+            metavar="N",
+            help="Run N rows at once (thread pool; default 1 = serial).",
+        )
+        if name == "evaluate":
+            _add_gating_arguments(sub)
         if name == "optimize":
             sub.add_argument(
                 "--optimizer",
@@ -274,7 +386,10 @@ def main(args: list[str] | None = None) -> int:
             sub.add_argument("--seed", type=int, default=0, help="RNG seed for reproducibility.")
             sub.add_argument("--val-data", help="Optional held-out dataset for validation.")
             sub.add_argument(
-                "--save-config", help="Write the winning configuration to this JSON file."
+                "--save-config",
+                help="Write the winning configuration to this file (.json flat, .yaml/.yml "
+                "nested). Values that cannot round-trip (live tools, callables) are listed, "
+                "not written.",
             )
             sub.add_argument("--verbose", action="store_true", help="Log each trial.")
 
@@ -403,6 +518,18 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             errors.append(
                 f"{label}.action '{action}' is invalid (expected one of {sorted(_VALID_ACTIONS)})"
             )
+        elif (
+            action == _APPROVAL_ACTION
+            and isinstance(condition, str)
+            and "tool" not in _condition_names(condition)
+        ):
+            # A framework can pause a *tool call* for a human, but not a message
+            # that has already arrived -- so the engine only honours this action
+            # on tool-scoped rules, and elsewhere it would silently not pause.
+            errors.append(
+                f"{label}.action 'require_approval' needs a tool-scoped rule: the condition "
+                "must reference 'tool' (e.g. \"tool['name'] == 'delete_db'\")"
+            )
         severity = rule.get("severity", "medium")
         if severity not in _VALID_SEVERITIES:
             errors.append(
@@ -441,6 +568,17 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             errors.append("adversarial.attack_patterns must contain only strings")
 
     return errors
+
+
+def _condition_names(condition: str) -> set[str]:
+    """Bare names a condition references; empty if it does not parse."""
+    import ast
+
+    try:
+        tree = ast.parse(condition, mode="eval")
+    except SyntaxError:
+        return set()
+    return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
 
 
 def _cmd_validate(config_file: str, as_json: bool = False) -> int:
@@ -840,31 +978,272 @@ def _fail(exc: Exception, as_json: bool) -> int:
     return 1
 
 
+def _parse_fail_under(specs: list[str], metric_names: list[str]) -> dict[str, float]:
+    """Parse ``--fail-under`` values into ``{metric: threshold}``.
+
+    A bare number applies to every metric; ``NAME=SCORE`` to one, and wins over
+    a bare number for that metric whatever the order on the command line.
+
+    Raises:
+        ValueError: On a malformed value, a score outside ``[0, 1]``, or a
+            metric that is not part of this evaluation -- a gate on a misspelt
+            metric would otherwise never fire.
+    """
+    every: float | None = None
+    named: dict[str, float] = {}
+    for spec in specs:
+        name, sep, raw = spec.rpartition("=")
+        try:
+            value = float(raw)
+        except ValueError:
+            raise ValueError(f"--fail-under expects [METRIC=]SCORE, got {spec!r}") from None
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"--fail-under score must be within [0, 1], got {spec!r}")
+        if not sep:
+            every = value
+            continue
+        name = name.strip()
+        if name not in metric_names:
+            raise ValueError(
+                f"--fail-under names metric {name!r}, which this evaluation does not compute "
+                f"(metrics: {metric_names})"
+            )
+        named[name] = value
+    thresholds = dict.fromkeys(metric_names, every) if every is not None else {}
+    thresholds.update(named)
+    return thresholds
+
+
+def _score_note(report: Any, metric: str) -> str:
+    """How many rows stand behind a metric's aggregate, said next to the number."""
+    total = report.n_evaluated
+    samples = report.metric_samples.get(metric, 0)
+    if total and samples < total:
+        return f"(PARTIAL: over {samples} of {total} rows; {total - samples} dropped as transient)"
+    return f"(over {samples}/{total} rows)"
+
+
+def _evaluate_gates(
+    args: Any, report: Any, thresholds: dict[str, float], comparison: Any
+) -> list[tuple[int, str]]:
+    """Every failed gate as ``(exit code, message)``, most severe first."""
+    failed: list[tuple[int, str]] = []
+    total = report.n_evaluated
+    if total and report.n_agent_errors == total:
+        failed.append((EXIT_ERRORS, f"every row errored ({total}/{total}); nothing was measured"))
+    elif args.fail_on_error and (report.n_agent_errors or report.n_metric_errors):
+        failed.append(
+            (
+                EXIT_ERRORS,
+                f"{report.n_agent_errors} row(s) errored and {report.n_metric_errors} row(s) "
+                "had a metric fail (--fail-on-error)",
+            )
+        )
+    if total and report.n_transient_errors == total:
+        failed.append((EXIT_INCOMPLETE, "every row was dropped as transient; no score exists"))
+    elif args.fail_on_incomplete and (not report.is_complete or report.partial_metrics):
+        failed.append(
+            (
+                EXIT_INCOMPLETE,
+                f"{report.n_transient_errors} row(s) dropped as transient; partial metrics: "
+                f"{report.partial_metrics} (--fail-on-incomplete)",
+            )
+        )
+    for metric, cutoff in sorted(thresholds.items()):
+        value = report.aggregate.get(metric, 0.0)
+        if value < cutoff:
+            failed.append((EXIT_THRESHOLD, f"{metric} = {value:.4f} < {cutoff:.4f} (--fail-under)"))
+    if comparison is not None and args.fail_on_regression and comparison.has_regression:
+        failed.append(
+            (
+                EXIT_REGRESSION,
+                f"regressed against baseline: metrics {comparison.regressed_metrics}, "
+                f"{len(comparison.regressed_rows)} row score(s) dropped (--fail-on-regression)",
+            )
+        )
+    order = [EXIT_ERRORS, EXIT_INCOMPLETE, EXIT_THRESHOLD, EXIT_REGRESSION]
+    return sorted(failed, key=lambda item: order.index(item[0]))
+
+
 def _cmd_evaluate(args: Any) -> int:
-    """Evaluate an agent against a golden dataset."""
-    from adapt_agent.optimization import EvaluationHarness
+    """Evaluate an agent against a golden dataset, then apply the CI gates."""
+    from adapt_agent.optimization import EvaluationHarness, reporting
 
     try:
+        if args.fail_on_regression and not args.baseline:
+            raise ValueError("--fail-on-regression needs --baseline RESULTS.json")
+        if args.concurrency < 1:
+            raise ValueError("--concurrency must be at least 1")
         target = _build_target(args)
         dataset = _load_dataset(args.data)
+        if not dataset:
+            raise ValueError(f"dataset {args.data!r} has no rows; nothing to evaluate")
         judge = _build_judge(args.judge, args.judge_model)
         metrics, primary = _build_metrics(args.metric, judge, args.primary)
+        thresholds = _parse_fail_under(args.fail_under, [m.name for m in metrics])
+        baseline = reporting.load_results(args.baseline) if args.baseline else None
         harness = EvaluationHarness(
             metrics, primary_metric=primary, output_extractor=_output_extractor(args)
         )
-        report = harness.evaluate(target, dataset)
+        report = harness.evaluate(target, dataset, concurrency=args.concurrency)
+        comparison = (
+            reporting.compare_runs(report, baseline, tolerance=args.regression_tolerance)
+            if baseline is not None
+            else None
+        )
+        if args.output:
+            reporting.to_json(
+                report, args.output, metadata={"target": args.target, "data": args.data}
+            )
+        if args.junit:
+            reporting.to_junit(report, args.junit, thresholds=thresholds or None)
     except Exception as exc:
         return _fail(exc, args.json)
 
+    failed = _evaluate_gates(args, report, thresholds, comparison)
+    exit_code = failed[0][0] if failed else EXIT_OK
+
     if args.json:
-        print(json.dumps(report.to_dict(), indent=2, default=str))
-    else:
-        print(f"Evaluated '{args.target}' over {report.n} example(s):")
-        print(f"  primary metric: {report.primary_metric} = {report.score:.4f}")
-        for metric_name, value in sorted(report.aggregate.items()):
-            print(f"    - {metric_name}: {value:.4f}")
-        print(f"  errors: {report.n_errors}   avg latency: {report.avg_latency:.4f}s")
-    return 0
+        payload = reporting.results_document(report)["summary"]
+        payload["rows"] = reporting.results_document(report)["rows"]
+        payload["gates"] = {
+            "passed": not failed,
+            "exit_code": exit_code,
+            "failures": [message for _, message in failed],
+            "thresholds": thresholds,
+        }
+        if comparison is not None:
+            payload["baseline"] = comparison.to_dict()
+        print(json.dumps(payload, indent=2, default=str))
+        return exit_code
+
+    done = report.completeness()
+    print(f"Evaluated '{args.target}' over {report.n_evaluated} example(s):")
+    print(
+        f"  rows: {done['rows_total']} total, {done['rows_scored']} scored "
+        f"({done['rows_errored']} errored, scored 0), "
+        f"{done['rows_dropped_transient']} dropped as transient, "
+        f"{done['rows_metric_errors']} with a metric error"
+    )
+    print(
+        f"  primary metric: {report.primary_metric} = {report.score:.4f}  "
+        f"{_score_note(report, report.primary_metric)}"
+    )
+    for metric_name, value in sorted(report.aggregate.items()):
+        print(f"    - {metric_name}: {value:.4f}  {_score_note(report, metric_name)}")
+    print(
+        f"  errors: {report.n_errors}   avg latency: {report.avg_latency:.4f}s   "
+        f"p50: {report.latency_p50:.4f}s   p95: {report.latency_p95:.4f}s"
+    )
+    if report.usage:
+        usage = ", ".join(f"{k}={v:g}" for k, v in sorted(report.usage.items()))
+        print(f"  usage: {usage}")
+    first_errors = [r for r in report.results if r.error is not None][:3]
+    for row in first_errors:
+        kind = "transient" if row.transient else (row.error_type or "error")
+        print(f"    ! row {row.index} [{kind}]: {row.error}")
+    metric_failures = [r for r in report.results if r.metric_errors][:3]
+    for row in metric_failures:
+        for metric_name, message in sorted(row.metric_errors.items()):
+            print(f"    ! row {row.index} metric {metric_name} failed: {message}")
+    if comparison is not None:
+        print(f"  vs baseline {args.baseline}:")
+        for metric_name, delta in sorted(comparison.metrics.items()):
+            print(
+                f"    - {metric_name}: {delta['baseline']:.4f} -> {delta['current']:.4f} "
+                f"({delta['delta']:+.4f})"
+            )
+        print(
+            f"    rows regressed: {len(comparison.regressed_rows)}, improved: "
+            f"{len(comparison.improved_rows)}, new: {len(comparison.new_rows)}, missing: "
+            f"{len(comparison.missing_rows)}"
+        )
+        for warning in comparison.warnings:
+            print(f"    note: {warning}")
+    if args.output:
+        print(f"  results written to: {args.output}")
+    if args.junit:
+        print(f"  JUnit written to: {args.junit}")
+    if failed:
+        for code, message in failed:
+            print(f"  GATE FAILED (exit {code}): {message}")
+    elif thresholds or args.fail_on_error or args.fail_on_incomplete or args.fail_on_regression:
+        print("  gates: all passed")
+    return exit_code
+
+
+def _save_tuned_config(result: Any, path: str) -> list[str]:
+    """Write ``result.best_config`` where ``load_tuned_config`` can read it back.
+
+    ``.yaml`` / ``.yml`` go through :meth:`OptimizationResult.to_config` (nested
+    by component, provenance as a comment header). ``.json`` keeps the flat
+    ``{"component.knob": value}`` shape this command has always written --
+    which ``load_tuned_config`` also reads -- but only for values that survive
+    the round trip. A live tool list or callable cannot: writing its ``str()``
+    produced ``"<function search at 0x...>"``, which reloads as a string and
+    breaks the agent when applied. Such values are left out and named under
+    ``_provenance.unexportable`` (ignored on reload).
+
+    Returns:
+        The names of the parameters that were not written.
+    """
+
+    lower = path.lower()
+    if lower.endswith((".yaml", ".yml")):
+        result.to_config(path)
+        exported = set(_flatten_nested(result.to_config()))
+        return sorted(name for name in result.best_config if name not in exported)
+
+    flat: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+    for name, value in result.best_config.items():
+        if isinstance(value, dict) or not _round_trips(value):
+            # A mapping at the top level reads back as a component section,
+            # i.e. under different names; ambiguous beats wrong.
+            skipped[name] = _describe_value(value)
+        else:
+            flat[name] = value
+    document: dict[str, Any] = dict(flat)
+    document["_provenance"] = {
+        "baseline_score": result.baseline_score,
+        "best_score": result.best_score,
+        "n_evals": result.n_evals,
+        "unexportable": skipped,
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=2)
+        handle.write("\n")
+    return sorted(skipped)
+
+
+def _flatten_nested(nested: dict[str, Any]) -> dict[str, Any]:
+    flat: dict[str, Any] = {}
+    for key, value in nested.items():
+        if isinstance(value, dict):
+            for knob, inner in value.items():
+                flat[f"{key}.{knob}"] = inner
+        else:
+            flat[key] = value
+    return flat
+
+
+def _round_trips(value: Any) -> bool:
+    """Whether ``value`` survives JSON encoding unchanged (no ``default=str``)."""
+    try:
+        text = json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    return bool(json.loads(text) == value)
+
+
+def _describe_value(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_describe_value(v) for v in value) + "]"
+    module = getattr(value, "__module__", None)
+    name = getattr(value, "__qualname__", None) or getattr(value, "__name__", None)
+    if name:
+        return f"{module}:{name}" if module else str(name)
+    return f"<{type(value).__name__}>"
 
 
 def _cmd_optimize(args: Any) -> int:
@@ -878,7 +1257,10 @@ def _cmd_optimize(args: Any) -> int:
         judge = _build_judge(args.judge, args.judge_model)
         metrics, primary = _build_metrics(args.metric, judge, args.primary)
         harness = EvaluationHarness(
-            metrics, primary_metric=primary, output_extractor=_output_extractor(args)
+            metrics,
+            primary_metric=primary,
+            output_extractor=_output_extractor(args),
+            concurrency=max(1, args.concurrency),
         )
         optimizer = _build_optimizer(
             args.optimizer, harness, judge, args.max_evals, args.seed, args.verbose
@@ -887,15 +1269,18 @@ def _cmd_optimize(args: Any) -> int:
     except Exception as exc:
         return _fail(exc, args.json)
 
+    skipped: list[str] = []
     if args.save_config:
         try:
-            with open(args.save_config, "w", encoding="utf-8") as handle:
-                json.dump(result.best_config, handle, indent=2, default=str)
+            skipped = _save_tuned_config(result, args.save_config)
         except OSError as exc:
             return _fail(exc, args.json)
 
     if args.json:
-        print(json.dumps(result.to_dict(), indent=2, default=str))
+        payload = result.to_dict()
+        if args.save_config:
+            payload["saved_config"] = {"path": args.save_config, "not_saved": skipped}
+        print(json.dumps(payload, indent=2, default=str))
     else:
         print(f"Optimized '{args.target}' with strategy '{args.optimizer}':")
         print(f"  baseline   : {result.baseline_score:.4f}")
@@ -914,7 +1299,16 @@ def _cmd_optimize(args: Any) -> int:
             print("  no improving configuration found (agent left unchanged).")
         if args.save_config:
             print(f"  saved best config to: {args.save_config}")
+            _print_skipped(skipped)
     return 0
+
+
+def _print_skipped(skipped: list[str]) -> None:
+    if skipped:
+        print(
+            "  not saved (cannot round-trip through a config file; named in the file "
+            f"for review instead): {', '.join(skipped)}"
+        )
 
 
 def _cmd_train(args: Any) -> int:
@@ -935,9 +1329,19 @@ def _cmd_train(args: Any) -> int:
     except Exception as exc:
         return _fail(exc, args.json)
 
+    skipped: list[str] = []
+    save_path = getattr(args, "save_config", None)
+    if save_path:
+        try:
+            skipped = _save_tuned_config(result, save_path)
+        except OSError as exc:
+            return _fail(exc, args.json)
+
     if args.json:
         payload = result.to_dict()
         payload["recommendations"] = list(result.recommendations)
+        if save_path:
+            payload["saved_config"] = {"path": save_path, "not_saved": skipped}
         print(json.dumps(payload, indent=2, default=str))
     else:
         print(f"Trained from '{args.config_file}':")
@@ -959,6 +1363,9 @@ def _cmd_train(args: Any) -> int:
             print("  judge recommendations (advisory):")
             for tip in result.recommendations:
                 print(f"    - {tip}")
+        if save_path:
+            print(f"  saved best config to: {save_path}")
+            _print_skipped(skipped)
     return 0
 
 

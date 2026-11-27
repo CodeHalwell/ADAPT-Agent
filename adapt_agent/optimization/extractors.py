@@ -534,7 +534,10 @@ def _is_declared_model(value: Any) -> bool:
     """
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return True
-    return hasattr(value, "model_fields") or hasattr(value, "__fields__")  # pydantic v2 / v1
+    # Asked of the *class*: reading `model_fields` off an instance is deprecated
+    # in Pydantic 2.11 and warns on every call, once per scored row.
+    cls = type(value)
+    return hasattr(cls, "model_fields") or hasattr(cls, "__fields__")  # pydantic v2 / v1
 
 
 def _declared_model_to_dict(value: Any) -> dict[str, Any] | None:
@@ -633,11 +636,536 @@ def _extract_sequence(value: Sequence[Any], depth: int) -> Any:
     return value
 
 
+# -- trajectories: what the agent *did* ----------------------------------------
+
+
+@dataclasses.dataclass
+class ToolCall:
+    """One tool invocation recovered from an agent run.
+
+    Args:
+        name: The tool's name as the framework reported it.
+        arguments: The arguments the model supplied, as a mapping. A JSON
+            string is parsed; anything unparseable is kept under ``"_raw"``.
+        result: The tool's return value, when the run recorded it.
+        id: The framework's call id, used to pair calls with their results.
+    """
+
+    name: str
+    arguments: dict[str, Any] = dataclasses.field(default_factory=dict)
+    result: Any = None
+    id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"name": self.name, "arguments": self.arguments}
+        if self.result is not None:
+            out["result"] = self.result
+        if self.id is not None:
+            out["id"] = self.id
+        return out
+
+
+@dataclasses.dataclass
+class Trajectory:
+    """The tool calls an agent made, in order, and how many model turns it took.
+
+    ``steps`` counts model responses (one per LLM round trip) when the result
+    exposes them, and is ``None`` when it cannot be told -- a step budget then
+    refuses to score rather than guess.
+    """
+
+    tool_calls: list[ToolCall] = dataclasses.field(default_factory=list)
+    steps: int | None = None
+
+    @property
+    def tool_names(self) -> list[str]:
+        return [call.name for call in self.tool_calls]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"tool_calls": [c.to_dict() for c in self.tool_calls], "steps": self.steps}
+
+
+class _TrajectoryBuilder:
+    """Accumulates calls (deduplicated by id) and pairs results onto them."""
+
+    def __init__(self) -> None:
+        self.calls: list[ToolCall] = []
+        self.by_id: dict[str, ToolCall] = {}
+        self.pending_results: dict[str, Any] = {}
+        self.steps = 0
+        self.saw_steps = False
+        self.explicit_steps: int | None = None
+
+    def call(self, name: Any, arguments: Any, call_id: Any = None) -> None:
+        if not isinstance(name, str) or not name:
+            return
+        cid = str(call_id) if call_id not in (None, "") else None
+        if cid is not None and cid in self.by_id:
+            return  # the same call surfaced twice (e.g. a streamed event)
+        call = ToolCall(name=name, arguments=_coerce_arguments(arguments), id=cid)
+        if cid is not None:
+            self.by_id[cid] = call
+            if cid in self.pending_results:
+                call.result = self.pending_results.pop(cid)
+        self.calls.append(call)
+
+    def result(self, call_id: Any, value: Any, name: Any = None) -> None:
+        cid = str(call_id) if call_id not in (None, "") else None
+        if cid is not None:
+            target = self.by_id.get(cid)
+            if target is None:
+                self.pending_results[cid] = value
+                return
+            target.result = value
+            return
+        # No id: attach to the latest call of that name still lacking a result.
+        for call in reversed(self.calls):
+            if call.result is None and (name is None or call.name == name):
+                call.result = value
+                return
+
+    def model_turn(self) -> None:
+        self.steps += 1
+        self.saw_steps = True
+
+    def build(self) -> Trajectory:
+        steps = self.explicit_steps if self.explicit_steps is not None else None
+        if steps is None and self.saw_steps:
+            steps = self.steps
+        return Trajectory(tool_calls=self.calls, steps=steps)
+
+
+def _coerce_arguments(arguments: Any) -> dict[str, Any]:
+    if arguments is None:
+        return {}
+    if isinstance(arguments, Mapping):
+        return dict(arguments)
+    if isinstance(arguments, str):
+        text = arguments.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return {"_raw": arguments}
+        return dict(parsed) if isinstance(parsed, Mapping) else {"_raw": parsed}
+    dumped = _model_to_dict(arguments)
+    if dumped is not None:
+        return dumped
+    return {"_raw": arguments}
+
+
+def _get(value: Any, name: str) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    try:
+        return getattr(value, name, None)
+    except Exception:
+        return None
+
+
+def extract_trajectory(value: Any) -> Trajectory:
+    """Recover the tool calls an agent made from a framework-native run result.
+
+    Duck-typed like :func:`extract_output_text` -- no framework is imported.
+    Recognised shapes:
+
+    * LangGraph / LangChain: a state (or message list) whose ``AIMessage`` s
+      carry ``tool_calls``; ``ToolMessage`` s supply the results.
+    * Pydantic AI: ``AgentRunResult.all_messages()`` -- ``ToolCallPart`` and
+      ``ToolReturnPart``.
+    * OpenAI Agents SDK: ``RunResult.new_items`` -- ``ToolCallItem`` and
+      ``ToolCallOutputItem``.
+    * Google ADK: events whose ``content.parts`` carry ``function_call`` /
+      ``function_response``.
+    * Microsoft Agent Framework: ``AgentResponse.messages[*].contents`` of type
+      ``function_call`` / ``function_result``.
+    * Claude Agent SDK: a message stream of ``AssistantMessage`` s holding
+      ``ToolUseBlock`` s, with ``ToolResultBlock`` s in the replies.
+    * OpenAI chat-completions messages (``tool_calls`` with ``function``) and
+      Anthropic-style ``tool_use`` / ``tool_result`` content blocks.
+    * A plain mapping for a custom agent: ``{"output": ..., "tool_calls":
+      [{"name": ..., "arguments": {...}, "result": ...}], "steps": 3}``.
+
+    Anything unrecognised yields an empty trajectory -- never an error -- so a
+    trajectory metric scores the *absence* of calls, which it reports.
+    """
+    builder = _TrajectoryBuilder()
+    # `seen` holds the objects themselves, not just their ids: walking creates
+    # temporary lists, and a freed temporary's id can be reused by the next one.
+    _walk_trajectory(value, builder, _MAX_DEPTH + 4, {})
+    return builder.build()
+
+
+def _walk_trajectory(value: Any, b: _TrajectoryBuilder, depth: int, seen: dict[int, Any]) -> None:
+    if value is None or isinstance(value, (str, bytes, int, float, bool)) or depth <= 0:
+        return
+    if isinstance(value, Trajectory):
+        for call in value.tool_calls:
+            b.call(call.name, call.arguments, call.id)
+            if call.result is not None:
+                b.result(call.id, call.result, call.name)
+        if value.steps is not None:
+            b.explicit_steps = (b.explicit_steps or 0) + value.steps
+        return
+    if id(value) in seen:
+        return
+    seen[id(value)] = value
+    nxt = depth - 1
+
+    if isinstance(value, Mapping):
+        _walk_mapping(value, b, nxt, seen)
+        return
+    if isinstance(value, Sequence):
+        for item in value:
+            _walk_trajectory(item, b, nxt, seen)
+        return
+
+    # Pydantic AI AgentRunResult: the message history is behind a method.
+    all_messages = _get(value, "all_messages")
+    if callable(all_messages) and (hasattr(value, "output") or hasattr(value, "data")):
+        try:
+            history = all_messages()
+        except Exception:
+            history = None
+        if isinstance(history, Sequence):
+            _walk_trajectory(list(history), b, nxt, seen)
+            return
+
+    # OpenAI Agents SDK RunResult.
+    new_items = _get(value, "new_items")
+    if isinstance(new_items, Sequence) and not isinstance(new_items, (str, bytes)):
+        raw_responses = _get(value, "raw_responses")
+        if isinstance(raw_responses, Sequence):
+            b.explicit_steps = (b.explicit_steps or 0) + len(raw_responses)
+        for item in new_items:
+            _walk_openai_agents_item(item, b)
+        return
+
+    # One element of a message/event/part stream.
+    if _walk_element(value, b, nxt, seen):
+        return
+
+    # Envelopes: a result object carrying the run under a conventional name.
+    for name in ("messages", "events", "result", "output", "final_output"):
+        inner = _get(value, name)
+        if inner is not None and not isinstance(inner, (str, bytes)) and not callable(inner):
+            _walk_trajectory(inner, b, nxt, seen)
+            return
+
+
+def _walk_mapping(
+    value: Mapping[Any, Any], b: _TrajectoryBuilder, depth: int, seen: dict[int, Any]
+) -> None:
+    # Custom-agent form and OpenAI chat-completions assistant messages.
+    tool_calls = value.get("tool_calls")
+    if isinstance(tool_calls, Sequence) and not isinstance(tool_calls, (str, bytes)):
+        if value.get("role") in ("assistant", "ai", "model"):
+            b.model_turn()
+        for entry in tool_calls:
+            _record_call_entry(entry, b)
+        steps = value.get("steps")
+        if isinstance(steps, int) and not isinstance(steps, bool):
+            b.explicit_steps = (b.explicit_steps or 0) + steps
+        messages = value.get("messages")
+        if isinstance(messages, Sequence) and not isinstance(messages, (str, bytes)):
+            _walk_trajectory(messages, b, depth, seen)
+        return
+    kind = value.get("type")
+    if kind in ("tool_use", "server_tool_use"):
+        b.call(value.get("name"), value.get("input"), value.get("id"))
+        return
+    if kind == "tool_result":
+        b.result(value.get("tool_use_id"), value.get("content"))
+        return
+    if kind == "function_call":
+        b.call(value.get("name"), value.get("arguments"), value.get("call_id") or value.get("id"))
+        return
+    if kind == "function_call_output":
+        b.result(value.get("call_id"), value.get("output"))
+        return
+    role = value.get("role")
+    if role == "tool" or "tool_call_id" in value:
+        b.result(value.get("tool_call_id"), value.get("content"), value.get("name"))
+        return
+    if role in ("assistant", "ai", "model"):
+        b.model_turn()
+    for key in ("messages", "events", "content", "result", "output"):
+        inner = value.get(key)
+        if inner is not None and not isinstance(inner, (str, bytes)):
+            _walk_trajectory(inner, b, depth, seen)
+            return
+
+
+def _record_call_entry(entry: Any, b: _TrajectoryBuilder) -> None:
+    """One entry of a ``tool_calls`` list, in whichever dialect it is written."""
+    if isinstance(entry, ToolCall):
+        b.call(entry.name, entry.arguments, entry.id)
+        if entry.result is not None:
+            b.result(entry.id, entry.result, entry.name)
+        return
+    function = _get(entry, "function")
+    if function is not None:  # OpenAI chat-completions
+        b.call(_get(function, "name"), _get(function, "arguments"), _get(entry, "id"))
+        return
+    args = None
+    for key in ("arguments", "args", "input", "parameters"):
+        args = _get(entry, key)
+        if args is not None:
+            break
+    call_id = _get(entry, "id") or _get(entry, "call_id") or _get(entry, "tool_call_id")
+    b.call(_get(entry, "name") or _get(entry, "tool_name"), args, call_id)
+    for key in ("result", "output", "response"):
+        result = _get(entry, key)
+        if result is not None:
+            b.result(call_id, result, _get(entry, "name"))
+            break
+
+
+def _walk_openai_agents_item(item: Any, b: _TrajectoryBuilder) -> None:
+    raw = _get(item, "raw_item")
+    item_type = type(item).__name__
+    if item_type == "ToolCallOutputItem" or _get(raw, "type") == "function_call_output":
+        output = _get(item, "output")
+        b.result(_get(raw, "call_id"), output if output is not None else _get(raw, "output"))
+        return
+    if item_type == "ToolCallItem" or _get(raw, "type") == "function_call":
+        name = _get(raw, "name") or _get(raw, "type")
+        args = _get(raw, "arguments")
+        if args is None:
+            args = _get(raw, "action") or _get(raw, "query")
+        b.call(name, args, _get(raw, "call_id") or _get(raw, "id"))
+
+
+def _walk_element(value: Any, b: _TrajectoryBuilder, depth: int, seen: dict[int, Any]) -> bool:
+    """Handle one message, event, part or block. ``True`` when it was one."""
+    # Pydantic AI message parts.
+    part_kind = _get(value, "part_kind")
+    if part_kind in ("tool-call", "builtin-tool-call"):
+        args_as_dict = _get(value, "args_as_dict")
+        try:
+            args = args_as_dict() if callable(args_as_dict) else _get(value, "args")
+        except Exception:
+            args = _get(value, "args")
+        b.call(_get(value, "tool_name"), args, _get(value, "tool_call_id"))
+        return True
+    if part_kind in ("tool-return", "builtin-tool-return"):
+        b.result(_get(value, "tool_call_id"), _get(value, "content"), _get(value, "tool_name"))
+        return True
+    # Pydantic AI messages: ModelResponse / ModelRequest with `parts`.
+    msg_kind = _get(value, "kind")
+    if msg_kind in ("response", "request") and isinstance(_get(value, "parts"), Sequence):
+        if msg_kind == "response":
+            b.model_turn()
+        _walk_trajectory(list(_get(value, "parts")), b, depth, seen)
+        return True
+
+    # Google GenAI Part (ADK events): function_call / function_response.
+    function_call = _get(value, "function_call")
+    function_response = _get(value, "function_response")
+    if function_call is not None or function_response is not None:
+        if function_call is not None:
+            b.call(
+                _get(function_call, "name"), _get(function_call, "args"), _get(function_call, "id")
+            )
+        if function_response is not None:
+            b.result(
+                _get(function_response, "id"),
+                _get(function_response, "response"),
+                _get(function_response, "name"),
+            )
+        return True
+
+    # Microsoft Agent Framework Content.
+    content_type = _get(value, "type")
+    if content_type == "function_call" and hasattr(value, "call_id"):
+        b.call(_get(value, "name"), _get(value, "arguments"), _get(value, "call_id"))
+        return True
+    if content_type == "function_result" and hasattr(value, "call_id"):
+        b.result(_get(value, "call_id"), _get(value, "result"))
+        return True
+
+    # Claude Agent SDK / Anthropic blocks.
+    if hasattr(value, "tool_use_id") and not hasattr(value, "tool_calls"):
+        b.result(_get(value, "tool_use_id"), _get(value, "content"))
+        return True
+    if hasattr(value, "input") and hasattr(value, "name") and hasattr(value, "id"):
+        if not hasattr(value, "content"):
+            b.call(_get(value, "name"), _get(value, "input"), _get(value, "id"))
+            return True
+
+    # LangChain messages: AIMessage.tool_calls / ToolMessage.
+    lc_type = _get(value, "type")
+    tool_calls = _get(value, "tool_calls")
+    if isinstance(tool_calls, Sequence) and not isinstance(tool_calls, (str, bytes)):
+        if lc_type == "ai" or _get(value, "role") == "assistant":
+            b.model_turn()
+        for entry in tool_calls:
+            _record_call_entry(entry, b)
+        return True
+    if hasattr(value, "tool_call_id") and lc_type == "tool":
+        b.result(_get(value, "tool_call_id"), _get(value, "content"), _get(value, "name"))
+        return True
+    if lc_type == "ai":
+        b.model_turn()
+        return True
+
+    # MAF Message (role + contents) and ChatResponse/AgentResponse.
+    contents = _get(value, "contents")
+    if isinstance(contents, Sequence) and not isinstance(contents, (str, bytes)):
+        role = _get(value, "role")
+        if str(getattr(role, "value", role)) == "assistant":
+            b.model_turn()
+        _walk_trajectory(list(contents), b, depth, seen)
+        return True
+
+    # ADK Event (author + content.parts) and GenAI Content.
+    content = _get(value, "content")
+    if content is not None and isinstance(_get(content, "parts"), Sequence):
+        if _get(content, "role") == "model" and not _get(value, "partial"):
+            b.model_turn()
+        _walk_trajectory(list(_get(content, "parts") or ()), b, depth, seen)
+        return True
+    parts = _get(value, "parts")
+    if (
+        isinstance(parts, Sequence)
+        and not isinstance(parts, (str, bytes))
+        and hasattr(value, "role")
+    ):
+        if _get(value, "role") == "model":
+            b.model_turn()
+        _walk_trajectory(list(parts), b, depth, seen)
+        return True
+
+    # Claude Agent SDK AssistantMessage / UserMessage: `content` block lists.
+    if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+        if type(value).__name__ == "AssistantMessage" or _get(value, "role") == "assistant":
+            b.model_turn()
+        _walk_trajectory(list(content), b, depth, seen)
+        return True
+    return False
+
+
+# -- usage: tokens and cost ----------------------------------------------------
+
+_USAGE_FIELDS: dict[str, tuple[str, ...]] = {
+    "input_tokens": ("input_tokens", "prompt_tokens", "input_token_count", "prompt_token_count"),
+    "output_tokens": (
+        "output_tokens",
+        "completion_tokens",
+        "output_token_count",
+        "candidates_token_count",
+    ),
+    "total_tokens": ("total_tokens", "total_token_count"),
+    "cost_usd": ("cost_usd", "total_cost_usd"),
+}
+
+
+def _usage_numbers(source: Any) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if source is None:
+        return out
+    for key, names in _USAGE_FIELDS.items():
+        for name in names:
+            raw = _get(source, name)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                continue
+            out[key] = float(raw)
+            break
+    return out
+
+
+def _merge_usage(total: dict[str, float], part: dict[str, float]) -> None:
+    for key, value in part.items():
+        total[key] = total.get(key, 0.0) + value
+
+
+def extract_usage(value: Any) -> dict[str, float] | None:
+    """Token usage (and cost, when reported) from a run result, or ``None``.
+
+    Duck-typed. Reads, in order: ``usage`` (attribute, mapping key, or a
+    zero-argument method -- Pydantic AI's ``usage()``),
+    ``context_wrapper.usage`` (OpenAI Agents SDK), ``usage_details``
+    (Microsoft Agent Framework), and ``total_cost_usd`` (Claude Agent SDK's
+    ``ResultMessage``). A message or event *stream* is summed over its
+    elements' ``usage`` / ``usage_metadata`` (LangChain messages, ADK events),
+    unless it contains a run summary (a Claude ``ResultMessage``), which is
+    used alone so per-message usage is not double counted.
+
+    Keys, when present: ``input_tokens``, ``output_tokens``, ``total_tokens``,
+    ``cost_usd``.
+    """
+    try:
+        return _extract_usage(value, 3)
+    except Exception:  # usage is advisory; never let it fail a row
+        return None
+
+
+def _extract_usage(value: Any, depth: int) -> dict[str, float] | None:
+    if value is None or isinstance(value, (str, bytes, int, float, bool)) or depth <= 0:
+        return None
+    if isinstance(value, Mapping):
+        if _is_graph_state(value):
+            return _extract_usage(value.get(_MESSAGES_KEY), depth - 1)
+        usage = value.get("usage")
+        nums = _usage_numbers(usage) if usage is not None else {}
+        if "cost_usd" not in nums:
+            nums.update({k: v for k, v in _usage_numbers(value).items() if k == "cost_usd"})
+        if nums:
+            return nums
+        inner = value.get("result")
+        return _extract_usage(inner, depth - 1) if inner is not None else None
+    if isinstance(value, Sequence):
+        summaries = [item for item in value if _get(item, "total_cost_usd") is not None]
+        if summaries:
+            return _element_usage(summaries[-1]) or None
+        total: dict[str, float] = {}
+        for item in value:
+            _merge_usage(total, _element_usage(item))
+        return total or None
+    nums = _element_usage(value)
+    if nums:
+        return nums
+    for name in ("messages", "events"):
+        inner = _get(value, name)
+        if isinstance(inner, Sequence) and not isinstance(inner, (str, bytes)):
+            return _extract_usage(inner, depth - 1)
+    return None
+
+
+def _element_usage(value: Any) -> dict[str, float]:
+    usage = _get(value, "usage")
+    nums = _usage_numbers(usage)
+    if not nums and callable(usage):
+        # Older Pydantic AI exposes `usage()` as a method; newer releases make
+        # it a value that is still callable (and warns when called), so the
+        # value is read first and the call is the fallback.
+        try:
+            nums = _usage_numbers(usage())
+        except Exception:
+            nums = {}
+    if not nums:
+        wrapper = _get(value, "context_wrapper")
+        nums = _usage_numbers(_get(wrapper, "usage")) if wrapper is not None else {}
+    if not nums:
+        nums = _usage_numbers(_get(value, "usage_details"))
+    if not nums:
+        nums = _usage_numbers(_get(value, "usage_metadata"))
+    cost = _get(value, "total_cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        nums["cost_usd"] = float(cost)
+    return nums
+
+
 __all__ = [
     "ExtractorFn",
     "ExtractorPredicate",
+    "ToolCall",
+    "Trajectory",
     "available_extractors",
     "extract_output_payload",
     "extract_output_text",
+    "extract_trajectory",
+    "extract_usage",
     "register_extractor",
 ]

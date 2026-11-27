@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -24,6 +26,7 @@ from itertools import islice
 from typing import Any, cast
 
 from adapt_agent.optimization.dataset import Example, GoldenDataset
+from adapt_agent.optimization.extractors import extract_output_text, extract_usage
 from adapt_agent.optimization.metrics import Metric, MetricFn, coerce_metric
 from adapt_agent.optimization.retry import (
     DEFAULT_RETRY_POLICY,
@@ -31,9 +34,132 @@ from adapt_agent.optimization.retry import (
     collecting_declared_fallbacks,
     consume_declared_fallback,
     consume_retries_exhausted,
+    is_transient_error,
 )
+from adapt_agent.optimization.trajectory import scoring_raw_output
 
 logger = logging.getLogger(__name__)
+
+
+# -- what may excuse an agent failure as "transient" ---------------------------
+#
+# The retry classifier is deliberately generous: a false positive costs one
+# retry. That is the right trade for the *judge*, whose provider is the harness's
+# own infrastructure. It is the wrong one for the agent under test. An agent's
+# own `ToolTimeout("step budget exceeded")` matches the "timeout" type-name
+# fragment, and a transient row is *removed from the denominator* -- so an agent
+# failing two rows of three on its own timeouts scored 1.0000. A failure of the
+# system under test is a measurement, not noise.
+#
+# So at the agent boundary an exception is only eligible to be transient when
+# something in its cause chain shows it came from infrastructure: it was raised
+# by a provider SDK or HTTP client package, or it carries an HTTP status (an
+# attribute, or a status in status context in its message, "Error code: 429").
+# A caller who configured their own `RetryPolicy(is_transient=...)` has made the
+# call themselves, and it is honoured as given.
+
+#: Top-level packages whose exceptions are infrastructure, not agent logic.
+INFRASTRUCTURE_MODULES = frozenset(
+    {
+        "aiohttp",
+        "anthropic",
+        "azure",
+        "boto3",
+        "botocore",
+        "cohere",
+        "google",
+        "groq",
+        "grpc",
+        "h11",
+        "h2",
+        "httpcore",
+        "httpx",
+        "huggingface_hub",
+        "litellm",
+        "mistralai",
+        "ollama",
+        "openai",
+        "requests",
+        "together",
+        "urllib3",
+        "vertexai",
+        "websockets",
+    }
+)
+
+_HTTP_STATUS_IN_TEXT = re.compile(
+    r"\b(?:error code|status code|status|http(?:\s*error)?)\b\W{0,3}(?:408|409|425|429|5\d\d)\b"
+    r"|\b(?:408|409|425|429|5\d\d)\b\W{0,3}(?:too many requests|request timeout|conflict|"
+    r"too early|internal server error|bad gateway|service unavailable|gateway timeout|overloaded)",
+    re.IGNORECASE,
+)
+
+
+def _cause_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None and not current.__suppress_context__:
+            pending.append(current.__context__)
+    return chain
+
+
+def _carries_http_status(exc: BaseException) -> bool:
+    for source in (exc, getattr(exc, "response", None)):
+        if source is None:
+            continue
+        for attr in ("status_code", "status", "http_status"):
+            value = getattr(source, attr, None)
+            if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+                return True
+    return False
+
+
+def is_infrastructure_error(exc: BaseException) -> bool:
+    """Whether ``exc`` shows it came from a provider or the network, not agent logic.
+
+    True when any link of the cause chain was raised by a package in
+    :data:`INFRASTRUCTURE_MODULES`, carries an HTTP status attribute, or names an
+    HTTP status in status context in its message (``"Error code: 429"``,
+    ``"503 Service Unavailable"``). The harness uses this to decide whether an
+    exception raised *by the agent under test* may be excused as transient.
+    """
+    for link in _cause_chain(exc):
+        if _carries_http_status(link):
+            return True
+        root = (type(link).__module__ or "").split(".", 1)[0]
+        if root in INFRASTRUCTURE_MODULES:
+            return True
+        try:
+            message = str(link)
+        except Exception:
+            continue
+        if _HTTP_STATUS_IN_TEXT.search(message):
+            return True
+    return False
+
+
+def _row_id(example: Example) -> str | None:
+    meta = example.metadata if isinstance(example.metadata, dict) else {}
+    value = meta.get("id")
+    return None if value is None else str(value)
+
+
+def _percentile(values: list[float], q: float) -> float:
+    """Nearest-rank percentile; ``0.0`` for no values."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    rank = max(1, math.ceil(q / 100.0 * len(ordered)))
+    return ordered[min(rank, len(ordered)) - 1]
 
 
 # Framework-native "run" methods, sync entrypoints first so frameworks that
@@ -161,6 +287,26 @@ class ExampleResult:
     transient: bool = False
     #: How many times the agent was called for this example (1 = no retry).
     attempts: int = 1
+    # Appended after 0.5, never inserted: positional construction is supported.
+    #: Metrics that failed *permanently* on this row (raised, or returned a
+    #: non-finite score), name -> message. Their score on the row is their
+    #: declared fallback (``0.0`` by default), and the row counts towards
+    #: :attr:`EvaluationReport.n_metric_errors`.
+    metric_errors: dict[str, str] = field(default_factory=dict)
+    #: Class name of the exception the agent raised, when it raised.
+    error_type: str | None = None
+    #: Token usage / cost the run reported (see
+    #: :func:`~adapt_agent.optimization.extractors.extract_usage`), plus the
+    #: judge's when it exposes ``last_usage``; ``None`` when nothing reported it.
+    usage: dict[str, float] | None = None
+    #: Per-turn records of a multi-turn row (``None`` for a single-turn row):
+    #: ``{"index", "input", "output", "expected", "scores", "latency",
+    #: "scored", "error"}``. The row's :attr:`scores` are the mean over its
+    #: scored turns.
+    turns: list[dict[str, Any]] | None = None
+    #: The dataset row's ``id`` (from its metadata), when it has one. Used to
+    #: match rows across runs in a baseline comparison.
+    row_id: str | None = None
 
     @property
     def primary_ok(self) -> bool:
@@ -224,6 +370,35 @@ class EvaluationReport:
     metric_samples: dict[str, int] = field(default_factory=dict)
     #: Rows where each metric failed transiently and lost its sample.
     transient_by_metric: dict[str, int] = field(default_factory=dict)
+    #: Median and 95th-percentile per-row latency (seconds), over every row run.
+    latency_p50: float = 0.0
+    latency_p95: float = 0.0
+    #: Summed token usage / cost across rows that reported any (see
+    #: :attr:`ExampleResult.usage`); empty when nothing reported usage.
+    usage: dict[str, float] = field(default_factory=dict)
+    #: Rows on which at least one metric failed permanently.
+    n_metric_errors: int = 0
+
+    @property
+    def n_agent_errors(self) -> int:
+        """Rows where the agent itself failed (scored 0, still in the denominator)."""
+        return max(0, self.n_errors - self.n_transient_errors)
+
+    def completeness(self) -> dict[str, int]:
+        """How much of the dataset the headline score actually covers.
+
+        ``rows_total`` were run; ``rows_dropped_transient`` were excluded from
+        the score as infrastructure faults; ``rows_scored`` is the denominator
+        of :attr:`score` and *includes* ``rows_errored`` -- rows the agent
+        failed, which score 0. ``rows_metric_errors`` had a metric fail on them.
+        """
+        return {
+            "rows_total": self.n_evaluated,
+            "rows_scored": self.n_scored,
+            "rows_errored": self.n_agent_errors,
+            "rows_dropped_transient": self.n_transient_errors,
+            "rows_metric_errors": self.n_metric_errors,
+        }
 
     @property
     def score(self) -> float:
@@ -406,7 +581,19 @@ class EvaluationHarness:
         output_extractor: Callable[[Any], Any] | None = None,
         concurrency: int = 1,
         retry: RetryPolicy | None = None,
+        conversation_input: str | Callable[[list[dict[str, Any]], Any], Any] = "messages",
     ):
+        if not callable(conversation_input) and conversation_input not in ("messages", "text"):
+            raise ValueError(
+                "conversation_input must be 'messages', 'text', or a callable "
+                f"(history, turn_input) -> payload, got {conversation_input!r}"
+            )
+        #: How a multi-turn row's history reaches the agent on each turn:
+        #: ``"messages"`` (default) passes the whole conversation so far as a
+        #: ``[{"role": "user"|"assistant", "content": ...}]`` list ending with
+        #: the new user turn; ``"text"`` passes only the new turn's input (for an
+        #: agent that keeps its own memory); a callable builds the payload.
+        self.conversation_input = conversation_input
         self.metrics: list[Metric] = self._normalize_metrics(metrics)
         if not self.metrics:
             raise ValueError("EvaluationHarness requires at least one metric")
@@ -424,6 +611,17 @@ class EvaluationHarness:
         self.output_extractor = output_extractor
         self.concurrency = max(1, concurrency)
         self.retry = DEFAULT_RETRY_POLICY if retry is None else retry
+        self._attribute_judge_usage = True
+        self._last_judge_usage: dict[int, Any] = {}
+
+    def _reset_judge_usage(self, concurrency: int) -> None:
+        # Judge usage is attributed per row only when rows are scored one at a
+        # time; see `_judge_usage`.
+        self._attribute_judge_usage = concurrency <= 1
+        self._last_judge_usage = {
+            id(m): getattr(getattr(getattr(m, "judge", None), "complete", None), "last_usage", None)
+            for m in self.metrics
+        }
 
     @staticmethod
     def _normalize_metrics(metrics: Any) -> list[Metric]:
@@ -468,6 +666,7 @@ class EvaluationHarness:
         """
         runner = resolve_runner(agent)
         concurrency = self.concurrency if concurrency is None else concurrency
+        self._reset_judge_usage(concurrency)
         if concurrency <= 1:
             return self._build_report(
                 self._run_one(runner, index, example) for index, example in enumerate(dataset)
@@ -528,6 +727,7 @@ class EvaluationHarness:
         """
         runner = aresolve_runner(agent)
         concurrency = self.concurrency if concurrency is None else concurrency
+        self._reset_judge_usage(concurrency)
         accumulator = _Accumulator(self)
         examples = enumerate(dataset)
 
@@ -554,54 +754,62 @@ class EvaluationHarness:
 
     # -- per-example execution -------------------------------------------------
 
-    def _run_one(self, runner: Callable[[Any], Any], index: int, example: Example) -> ExampleResult:
-        start = time.perf_counter()
-        policy = self.retry
-        attempt = 1
-        while True:
-            try:
-                output = runner(example.inputs)
-            except Exception as exc:  # non-fatal: retry if transient, else record
-                if policy.should_retry(exc, attempt):
-                    delay = policy.delay_for(exc, attempt)
-                    logger.info(
-                        "Transient error on example %d (attempt %d/%d), retrying in %.2fs: %s",
-                        index,
-                        attempt,
-                        policy.attempts,
-                        delay,
-                        exc,
-                    )
-                    # A thread-pool worker, or the caller's own thread on the
-                    # serial path: blocking here is what we want, and it is the
-                    # backpressure that lets the provider recover.
-                    time.sleep(delay)
-                    attempt += 1
-                    continue
-                return self._error_result(
-                    index, example, time.perf_counter() - start, exc, attempts=attempt
-                )
-            return self._score_one(
-                index, example, output, time.perf_counter() - start, attempts=attempt
-            )
+    def _agent_failure_is_transient(self, exc: BaseException) -> bool:
+        """Whether an exception raised by the *agent under test* may be excused.
 
-    async def _arun_one(
-        self, runner: Callable[[Any], Awaitable[Any]], index: int, example: Example
-    ) -> ExampleResult:
-        start = time.perf_counter()
+        See :func:`is_infrastructure_error`: the policy's classifier must call
+        it transient **and** the exception must show it came from a provider
+        or the network. A caller-supplied classifier is trusted as given.
+        """
+        if not self.retry.should_retry(exc, 0):
+            return False
+        if self.retry.is_transient is not is_transient_error:
+            return True
+        return is_infrastructure_error(exc)
+
+    def _should_retry_agent(self, exc: BaseException, attempt: int) -> bool:
+        return self.retry.should_retry(exc, attempt) and self._agent_failure_is_transient(exc)
+
+    def _call_with_retry(
+        self, runner: Callable[[Any], Any], payload: Any, index: int
+    ) -> tuple[Any, int, Exception | None]:
+        """Run the agent once, retrying excusable failures. ``(output, attempts, error)``."""
         policy = self.retry
         attempt = 1
         while True:
             try:
-                output = await runner(example.inputs)
-                break
+                return runner(payload), attempt, None
+            except Exception as exc:  # non-fatal: retry if transient, else record
+                if not self._should_retry_agent(exc, attempt):
+                    return None, attempt, exc
+                delay = policy.delay_for(exc, attempt)
+                logger.info(
+                    "Transient error on example %d (attempt %d/%d), retrying in %.2fs: %s",
+                    index,
+                    attempt,
+                    policy.attempts,
+                    delay,
+                    exc,
+                )
+                # A thread-pool worker, or the caller's own thread on the
+                # serial path: blocking here is what we want, and it is the
+                # backpressure that lets the provider recover.
+                time.sleep(delay)
+                attempt += 1
+
+    async def _acall_with_retry(
+        self, runner: Callable[[Any], Awaitable[Any]], payload: Any, index: int
+    ) -> tuple[Any, int, Exception | None]:
+        policy = self.retry
+        attempt = 1
+        while True:
+            try:
+                return await runner(payload), attempt, None
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # non-fatal: retry if transient, else record
-                if not policy.should_retry(exc, attempt):
-                    return self._error_result(
-                        index, example, time.perf_counter() - start, exc, attempts=attempt
-                    )
+                if not self._should_retry_agent(exc, attempt):
+                    return None, attempt, exc
                 delay = policy.delay_for(exc, attempt)
                 logger.info(
                     "Transient error on example %d (attempt %d/%d), retrying in %.2fs: %s",
@@ -615,18 +823,39 @@ class EvaluationHarness:
                 # the caller's loop with every other in-flight example.
                 await asyncio.sleep(delay)
                 attempt += 1
+
+    def _run_one(self, runner: Callable[[Any], Any], index: int, example: Example) -> ExampleResult:
+        if example.is_conversation:
+            return self._run_conversation(runner, index, example)
+        start = time.perf_counter()
+        output, attempts, exc = self._call_with_retry(runner, example.inputs, index)
+        if exc is not None:
+            return self._error_result(
+                index, example, time.perf_counter() - start, exc, attempts=attempts
+            )
+        return self._score_one(index, example, output, time.perf_counter() - start, attempts)
+
+    async def _arun_one(
+        self, runner: Callable[[Any], Awaitable[Any]], index: int, example: Example
+    ) -> ExampleResult:
+        if example.is_conversation:
+            return await self._arun_conversation(runner, index, example)
+        start = time.perf_counter()
+        output, attempts, exc = await self._acall_with_retry(runner, example.inputs, index)
         latency = time.perf_counter() - start
+        if exc is not None:
+            return self._error_result(index, example, latency, exc, attempts=attempts)
         # Scoring goes to a worker thread. Metrics are synchronous by contract,
         # and an LLM judge's provider call is a *network* round trip: run inline
         # here, the agent calls overlap but their judging serialises on the loop
         # and stalls every other task. `asyncio.to_thread` propagates
         # `contextvars`, so a judge still sees the caller's tracing context.
-        return await asyncio.to_thread(self._score_one, index, example, output, latency, attempt)
+        return await asyncio.to_thread(self._score_one, index, example, output, latency, attempts)
 
     def _error_result(
         self, index: int, example: Example, latency: float, exc: Exception, *, attempts: int = 1
     ) -> ExampleResult:
-        transient = self.retry.should_retry(exc, 0)
+        transient = self._agent_failure_is_transient(exc)
         if transient:
             logger.warning(
                 "Example %d failed transiently after %d attempt(s); excluded from the "
@@ -652,26 +881,16 @@ class EvaluationHarness:
             # something the accumulator has to infer from `transient`.
             transient_metrics=tuple(m.name for m in self.metrics) if transient else (),
             attempts=attempts,
+            error_type=type(exc).__name__,
+            row_id=_row_id(example),
         )
 
     def _score_one(
         self, index: int, example: Example, output: Any, latency: float, attempts: int = 1
     ) -> ExampleResult:
         """Apply the output extractor and every metric. Shared by both paths."""
-        if self.output_extractor is not None:
-            try:
-                output = self.output_extractor(output)
-            except Exception as exc:  # non-fatal: score the raw output instead
-                logger.warning("Output extractor raised on example %d: %s", index, exc)
-
-        scores: dict[str, float] = {}
-        transient_metrics: list[str] = []
-        for metric in self.metrics:
-            score, metric_transient = self._score_with_metric(metric, output, example, index)
-            scores[metric.name] = score
-            if metric_transient:
-                transient_metrics.append(metric.name)
-
+        scored = self._score_output(index, example, output)
+        transient_metrics = scored["transient_metrics"]
         # Only the *primary* makes the whole row unusable: it is the number the
         # optimizer compares, so a gap there means the row cannot be ranked. A
         # throttled secondary loses its own sample and nothing else -- marking
@@ -682,7 +901,228 @@ class EvaluationHarness:
         return ExampleResult(
             index=index,
             inputs=example.inputs if self.capture_output else None,
-            output=output if self.capture_output else None,
+            output=scored["output"] if self.capture_output else None,
+            expected=example.expected,
+            scores=scored["scores"],
+            latency=latency,
+            error="transient metric failure" if transient else None,
+            transient=transient,
+            transient_metrics=tuple(transient_metrics),
+            attempts=attempts,
+            metric_errors=scored["metric_errors"],
+            usage=scored["usage"],
+            row_id=_row_id(example),
+        )
+
+    def _score_output(self, index: int, example: Example, raw: Any) -> dict[str, Any]:
+        """Extract, then score one output with every metric.
+
+        The *raw* result is kept for the duration of scoring so trajectory
+        metrics can read the tool calls the extractor is about to flatten away,
+        and so usage can be read off the framework's own result object.
+        """
+        usage = extract_usage(raw)
+        output = raw
+        if self.output_extractor is not None:
+            try:
+                output = self.output_extractor(raw)
+            except Exception as exc:  # non-fatal: score the raw output instead
+                logger.warning("Output extractor raised on example %d: %s", index, exc)
+
+        scores: dict[str, float] = {}
+        transient_metrics: list[str] = []
+        metric_errors: dict[str, str] = {}
+        with scoring_raw_output(raw):
+            for metric in self.metrics:
+                score, metric_transient, error = self._score_with_metric(
+                    metric, output, example, index
+                )
+                scores[metric.name] = score
+                if metric_transient:
+                    transient_metrics.append(metric.name)
+                if error is not None:
+                    metric_errors[metric.name] = error
+                judge_usage = self._judge_usage(metric)
+                if judge_usage:
+                    usage = dict(usage or {})
+                    for key, value in judge_usage.items():
+                        usage[f"judge_{key}"] = usage.get(f"judge_{key}", 0.0) + value
+        return {
+            "output": output,
+            "scores": scores,
+            "transient_metrics": transient_metrics,
+            "metric_errors": metric_errors,
+            "usage": usage,
+        }
+
+    def _judge_usage(self, metric: Metric) -> dict[str, float] | None:
+        """The judge's ``last_usage`` for the call this metric just made, if any.
+
+        Read only on the serial path: ``last_usage`` is the provider's *latest*
+        call, and with rows scored concurrently it may belong to another row.
+        Compared by identity with the previous reading, so a metric that did not
+        call its provider on this row is not billed for the last one that did.
+        """
+        if not self._attribute_judge_usage:
+            return None
+        judge = getattr(metric, "judge", None)
+        provider = getattr(judge, "complete", None) if judge is not None else None
+        last = getattr(provider, "last_usage", None) if provider is not None else None
+        if last is None:
+            return None
+        key = id(metric)
+        if self._last_judge_usage.get(key) is last:
+            return None
+        self._last_judge_usage[key] = last
+        from adapt_agent.optimization.extractors import _usage_numbers
+
+        return _usage_numbers(last) or None
+
+    # -- multi-turn rows -------------------------------------------------------
+
+    def _turn_payload(self, history: list[dict[str, Any]], turn_input: Any) -> Any:
+        mode = self.conversation_input
+        if callable(mode):
+            return mode(list(history), turn_input)
+        if mode == "text":
+            return turn_input
+        return [*history, {"role": "user", "content": turn_input}]
+
+    @staticmethod
+    def _turn_example(example: Example, position: int, turn: dict[str, Any]) -> Example:
+        meta = {k: v for k, v in example.metadata.items() if k != "turns"}
+        extra = {k: v for k, v in turn.items() if k not in ("input", "expected", "score")}
+        meta.update(extra)
+        meta["turn_index"] = position
+        return Example(inputs=turn["input"], expected=turn.get("expected"), metadata=meta)
+
+    def _run_conversation(
+        self, runner: Callable[[Any], Any], index: int, example: Example
+    ) -> ExampleResult:
+        """Feed a scripted conversation turn by turn, scoring each turn."""
+        start = time.perf_counter()
+        history: list[dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
+        total_attempts = 0
+        for position, turn in enumerate(example.turns or []):
+            turn_start = time.perf_counter()
+            output, attempts, exc = self._call_with_retry(
+                runner, self._turn_payload(history, turn["input"]), index
+            )
+            total_attempts += attempts
+            if exc is not None:
+                return self._conversation_error(
+                    index, example, time.perf_counter() - start, exc, total_attempts, records
+                )
+            records.append(
+                self._score_turn(index, example, position, turn, output, turn_start, history)
+            )
+        return self._conversation_result(
+            index, example, time.perf_counter() - start, total_attempts, records
+        )
+
+    async def _arun_conversation(
+        self, runner: Callable[[Any], Awaitable[Any]], index: int, example: Example
+    ) -> ExampleResult:
+        start = time.perf_counter()
+        history: list[dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
+        total_attempts = 0
+        for position, turn in enumerate(example.turns or []):
+            turn_start = time.perf_counter()
+            output, attempts, exc = await self._acall_with_retry(
+                runner, self._turn_payload(history, turn["input"]), index
+            )
+            total_attempts += attempts
+            if exc is not None:
+                return self._conversation_error(
+                    index, example, time.perf_counter() - start, exc, total_attempts, records
+                )
+            records.append(
+                await asyncio.to_thread(
+                    self._score_turn, index, example, position, turn, output, turn_start, history
+                )
+            )
+        return self._conversation_result(
+            index, example, time.perf_counter() - start, total_attempts, records
+        )
+
+    def _score_turn(
+        self,
+        index: int,
+        example: Example,
+        position: int,
+        turn: dict[str, Any],
+        output: Any,
+        turn_start: float,
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        latency = time.perf_counter() - turn_start
+        scored_flag = turn.get("score", True) is not False
+        text = extract_output_text(output)
+        history.append({"role": "user", "content": turn["input"]})
+        history.append(
+            {"role": "assistant", "content": text if isinstance(text, str) else str(text)}
+        )
+        record: dict[str, Any] = {
+            "index": position,
+            "input": turn["input"],
+            "expected": turn.get("expected"),
+            "latency": latency,
+            "scored": scored_flag,
+        }
+        if not scored_flag:
+            record.update(
+                output=text if self.capture_output else None,
+                scores={},
+                transient_metrics=[],
+                metric_errors={},
+                usage=extract_usage(output),
+            )
+            return record
+        scored = self._score_output(index, self._turn_example(example, position, turn), output)
+        record.update(
+            output=scored["output"] if self.capture_output else None,
+            scores=scored["scores"],
+            transient_metrics=scored["transient_metrics"],
+            metric_errors=scored["metric_errors"],
+            usage=scored["usage"],
+        )
+        return record
+
+    def _conversation_result(
+        self,
+        index: int,
+        example: Example,
+        latency: float,
+        attempts: int,
+        records: list[dict[str, Any]],
+    ) -> ExampleResult:
+        scored_turns = [r for r in records if r["scored"]]
+        if not scored_turns:
+            raise ValueError(f"example {index}: every turn has score: false; nothing to score")
+        transient_metrics = sorted({m for r in scored_turns for m in r["transient_metrics"]})
+        scores: dict[str, float] = {}
+        for metric in self.metrics:
+            samples = [
+                r["scores"][metric.name]
+                for r in scored_turns
+                if metric.name not in r["transient_metrics"]
+            ]
+            scores[metric.name] = sum(samples) / len(samples) if samples else 0.0
+        metric_errors: dict[str, str] = {}
+        for r in scored_turns:
+            for name, message in r["metric_errors"].items():
+                metric_errors.setdefault(name, f"turn {r['index']}: {message}")
+        usage: dict[str, float] = {}
+        for r in records:
+            for key, value in (r.get("usage") or {}).items():
+                usage[key] = usage.get(key, 0.0) + value
+        transient = self.primary_metric in transient_metrics
+        return ExampleResult(
+            index=index,
+            inputs=example.inputs if self.capture_output else None,
+            output=records[-1]["output"] if self.capture_output and records else None,
             expected=example.expected,
             scores=scores,
             latency=latency,
@@ -690,11 +1130,29 @@ class EvaluationHarness:
             transient=transient,
             transient_metrics=tuple(transient_metrics),
             attempts=attempts,
+            metric_errors=metric_errors,
+            usage=usage or None,
+            turns=[{k: v for k, v in r.items() if k != "transient_metrics"} for r in records],
+            row_id=_row_id(example),
         )
+
+    def _conversation_error(
+        self,
+        index: int,
+        example: Example,
+        latency: float,
+        exc: Exception,
+        attempts: int,
+        records: list[dict[str, Any]],
+    ) -> ExampleResult:
+        result = self._error_result(index, example, latency, exc, attempts=attempts)
+        result.error = f"turn {len(records)}: {exc}"
+        result.turns = [{k: v for k, v in r.items() if k != "transient_metrics"} for r in records]
+        return result
 
     def _score_with_metric(
         self, metric: Metric, output: Any, example: Example, index: int
-    ) -> tuple[float, bool]:
+    ) -> tuple[float, bool, str | None]:
         """Apply one metric, retrying it on transient failures.
 
         A metric is free to be a network call -- an LLM judge is the documented
@@ -705,7 +1163,8 @@ class EvaluationHarness:
         provider-backed metric that is not :class:`LLMJudge` still gets its
         retries rather than one attempt.
 
-        Returns ``(score, transient)``. A transient failure that outlives its
+        Returns ``(score, transient, error)``; ``error`` describes a permanent
+        failure (which the row records in :attr:`ExampleResult.metric_errors`). A transient failure that outlives its
         retries scores ``0.0`` *and* flags the row, so the caller can drop it
         from the aggregate instead of counting it against the agent.
 
@@ -742,7 +1201,7 @@ class EvaluationHarness:
                 # the call and answers for the next failure of the same
                 # exception object.
                 with collecting_declared_fallbacks():
-                    return metric(output, example.expected, example), False
+                    return metric(output, example.expected, example), False, None
             except Exception as exc:
                 # Both notes this attempt may carry come off here, once,
                 # whatever happens next -- because five paths leave this block
@@ -774,7 +1233,7 @@ class EvaluationHarness:
                             index,
                             exc,
                         )
-                        return _permanent(carried), False
+                        return _permanent(carried), False, f"{type(exc).__name__}: {exc}"
                     logger.warning(
                         "Metric %s failed transiently on example %d (its own retries "
                         "were already spent); excluded from the score: %s",
@@ -782,7 +1241,7 @@ class EvaluationHarness:
                         index,
                         exc,
                     )
-                    return 0.0, True
+                    return 0.0, True, None
                 if policy.should_retry(exc, attempt):
                     delay = policy.delay_for(exc, attempt)
                     logger.info(
@@ -810,9 +1269,9 @@ class EvaluationHarness:
                         attempt,
                         exc,
                     )
-                    return 0.0, True
+                    return 0.0, True, None
                 logger.warning("Metric %s raised on example %d: %s", metric.name, index, exc)
-                return _permanent(carried), False
+                return _permanent(carried), False, f"{type(exc).__name__}: {exc}"
 
     def _build_report(self, results_iter: Any) -> EvaluationReport:
         """Aggregate a stream of per-example results into a report."""
@@ -843,10 +1302,18 @@ class _Accumulator:
         self._n_evaluated = 0
         self._transient_by_metric: dict[str, int] = {}
         self._total_latency = 0.0
+        self._latencies: list[float] = []
+        self._usage: dict[str, float] = {}
+        self._n_metric_errors = 0
 
     def add(self, result: ExampleResult) -> None:
         self._n_evaluated += 1
         self._total_latency += result.latency
+        self._latencies.append(result.latency)
+        if result.metric_errors:
+            self._n_metric_errors += 1
+        for key, value in (result.usage or {}).items():
+            self._usage[key] = self._usage.get(key, 0.0) + value
         if result.error is not None:
             self._n_errors += 1
         if result.transient:
@@ -896,6 +1363,10 @@ class _Accumulator:
             transient_by_metric=dict(self._transient_by_metric),
             total_latency=self._total_latency,
             failure_threshold=self._harness.failure_threshold,
+            latency_p50=_percentile(self._latencies, 50),
+            latency_p95=_percentile(self._latencies, 95),
+            usage=dict(self._usage),
+            n_metric_errors=self._n_metric_errors,
         )
 
 

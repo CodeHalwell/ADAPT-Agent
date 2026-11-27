@@ -36,7 +36,7 @@ Example (YAML)::
       format: jsonl
     judge:
       provider: anthropic
-      model: claude-opus-4-8
+      model: claude-opus-5-5
       adversarial: true                    # the judge IS the adversary
     metrics: [exact_match, token_f1]
     optimizer:
@@ -55,6 +55,14 @@ Example (YAML)::
         component: manager
         attr_path: chat_client.temperature
         bounds: [0.0, 1.5]                 # clamped to the provider max if needed
+
+Trust boundary: **a training config is code.** ``target`` entries are
+``module:attribute`` references that are imported -- running the module's
+top-level code -- and a trailing ``()`` calls the object; the current working
+directory is importable. Only load configs you would run as a script. The
+``judge`` section forwards a fixed set of keys (:data:`JUDGE_KEYS`) and refuses
+anything else, so a config cannot point the judge at another endpoint
+(``base_url``) or carry an ``api_key``; set credentials in the environment.
 
 Then::
 
@@ -75,9 +83,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from adapt_agent.optimization import providers as _providers
 from adapt_agent.optimization.dataset import GoldenDataset
 from adapt_agent.optimization.evaluation import EvaluationHarness
-from adapt_agent.optimization.metrics import BUILTIN_METRICS, Metric, get_metric
+from adapt_agent.optimization.metrics import (
+    Metric,
+    _resolve_check,
+    available_metric_names,
+    get_metric,
+    metric_factory,
+)
 from adapt_agent.optimization.optimizers import (
     BootstrapFewShotOptimizer,
     CoordinateAscentOptimizer,
@@ -95,6 +110,37 @@ logger = logging.getLogger(__name__)
 
 #: Hard ceiling for any sampling temperature when the provider's max is unknown.
 _DEFAULT_MAX_TEMPERATURE = 2.0
+
+#: The Claude model used in examples and when an ``anthropic`` judge names none.
+#: Owned by :mod:`adapt_agent.optimization.providers`; the literal is only the
+#: fallback for a build that does not define the constant.
+DEFAULT_ANTHROPIC_MODEL: str = getattr(_providers, "DEFAULT_ANTHROPIC_MODEL", "claude-opus-5-5")
+
+#: Keys a ``judge:`` section may carry. Everything else is refused: unknown keys
+#: used to be forwarded to the provider constructor, so a config could set
+#: ``base_url`` (sending every graded output to another host) or embed an
+#: ``api_key`` in a file that gets committed.
+JUDGE_KEYS = frozenset(
+    {
+        # JudgeSpec fields
+        "provider",
+        "model",
+        "adversarial",
+        "scale",
+        "pass_threshold",
+        "score_is_normalized",
+        "criteria",
+        "metric_name",
+        # LLMJudge options
+        "rubric",
+        "max_failures",
+        "on_error",
+        # provider sampling options
+        "temperature",
+        "max_tokens",
+        "system",
+    }
+)
 
 _OPTIMIZER_TYPES: dict[str, Any] = {
     "default": "default",  # special-cased -> make_default_optimizer
@@ -182,7 +228,9 @@ class TrainingConfig:
     target: TargetSpec
     dataset: DatasetSpec
     judge: JudgeSpec | None = None
-    metrics: list[str] = field(default_factory=lambda: ["exact_match"])
+    #: Metric names, or ``{"name": ..., **options}`` mappings (e.g.
+    #: ``{"name": "field_match", "field": "lane"}``; ``"as"`` renames it).
+    metrics: list[Any] = field(default_factory=lambda: ["exact_match"])
     primary_metric: str | None = None
     optimizer: OptimizerSpec = field(default_factory=OptimizerSpec)
     parameters: list[ParameterSpec] = field(default_factory=list)
@@ -273,6 +321,14 @@ def parse_training_config(raw: dict[str, Any]) -> TrainingConfig:
     if isinstance(judge_raw, dict):
         if not judge_raw.get("provider"):
             raise TrainingConfigError("judge requires a 'provider'")
+        unknown = sorted(str(k) for k in judge_raw if k not in JUDGE_KEYS)
+        if unknown:
+            raise TrainingConfigError(
+                f"judge: unsupported key(s) {unknown}. Allowed: {sorted(JUDGE_KEYS)}. "
+                "Endpoints and credentials (base_url, api_key, ...) cannot be set from a "
+                "config file: put the key in the provider's environment variable, or build "
+                "the judge in code and pass it to the harness."
+            )
         known = {
             "provider",
             "model",
@@ -301,8 +357,7 @@ def parse_training_config(raw: dict[str, Any]) -> TrainingConfig:
     if not isinstance(metrics, list):
         raise TrainingConfigError("'metrics' must be a list of metric names")
     for m in metrics:
-        if m not in BUILTIN_METRICS:
-            raise TrainingConfigError(f"Unknown metric {m!r}. Available: {sorted(BUILTIN_METRICS)}")
+        _validate_metric_spec(m)
 
     opt_raw = raw.get("optimizer") or {}
     if not isinstance(opt_raw, dict):
@@ -345,6 +400,45 @@ def parse_training_config(raw: dict[str, Any]) -> TrainingConfig:
         optimizer=optimizer,
         parameters=parameters,
     )
+
+
+def _validate_metric_spec(spec: Any) -> None:
+    """Check one ``metrics:`` entry: a name, or a ``{"name": ..., **options}`` mapping.
+
+    Built at parse time, so a metric that needs arguments -- ``field_match``
+    needs a ``field`` -- fails with a config error naming the fix, not a raw
+    ``TypeError`` from deep inside harness construction.
+    """
+    if isinstance(spec, dict):
+        name = spec.get("name")
+        if not isinstance(name, str) or metric_factory(name) is None:
+            raise TrainingConfigError(
+                f"metric mapping {spec!r} needs a 'name' from {available_metric_names()}"
+            )
+        try:
+            _resolve_check(spec, None, {})
+        except (TypeError, ValueError, KeyError) as exc:
+            raise TrainingConfigError(
+                f"metric {name!r} cannot be built from {spec!r}: {exc}"
+            ) from exc
+        return
+    if not isinstance(spec, str) or metric_factory(spec) is None:
+        raise TrainingConfigError(f"Unknown metric {spec!r}. Available: {available_metric_names()}")
+    try:
+        get_metric(spec)
+    except TypeError as exc:
+        raise TrainingConfigError(
+            f"metric {spec!r} needs options and cannot be named alone; write it as a "
+            f'mapping, e.g. {{"name": "{spec}", "field": "lane"}}'
+        ) from exc
+
+
+def _build_metric(spec: Any) -> Metric:
+    if isinstance(spec, dict):
+        metric = _resolve_check(spec, None, {})
+        reported = spec.get("as")
+        return metric.renamed(reported) if isinstance(reported, str) else metric
+    return get_metric(spec)
 
 
 def _parse_parameter_spec(raw: Any) -> ParameterSpec:
@@ -486,14 +580,14 @@ def build_judge(spec: JudgeSpec | None) -> Any:
 
 
 def build_harness(config: TrainingConfig, judge: Any) -> EvaluationHarness:
-    metrics: list[Metric] = [get_metric(name) for name in config.metrics]
+    metrics: list[Metric] = [_build_metric(spec) for spec in config.metrics]
     judge_metric_name: str | None = None
     if judge is not None and config.judge is not None:
         judge_metric_name = config.judge.metric_name
         metrics.append(judge.as_metric(judge_metric_name, criteria=config.judge.criteria))
     primary = config.primary_metric
     if primary is None:
-        primary = judge_metric_name if judge_metric_name is not None else config.metrics[0]
+        primary = judge_metric_name if judge_metric_name is not None else metrics[0].name
     names = [m.name for m in metrics]
     if primary not in names:
         raise TrainingConfigError(
@@ -690,6 +784,8 @@ __all__ = [
     "OptimizerSpec",
     "ParameterSpec",
     "TrainingConfigError",
+    "JUDGE_KEYS",
+    "DEFAULT_ANTHROPIC_MODEL",
     "load_training_config",
     "parse_training_config",
     "build_dataset",

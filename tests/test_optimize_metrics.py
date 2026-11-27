@@ -535,3 +535,160 @@ def test_checks_without_example_uses_default():
     # Metric.__call__ passes example=None when a harness lacks example context.
     m = checks()
     assert m("Paris", "Paris") == 1.0
+
+
+# -- metric semantics that protect meaning -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("-5", "5"),
+        ("<=", ">="),
+        ("C++", "C"),
+        ("x != y", "x == y"),
+        ("$100", "100%"),
+        ("3.14", "3 14"),
+    ],
+)
+def test_exact_match_keeps_meaningful_symbols(output, expected):
+    assert exact_match()(output, expected) == 0.0
+
+
+def test_exact_match_legacy_punctuation_rule_is_still_reachable():
+    assert exact_match(punctuation="all")("-5", "5") == 1.0
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("Paris.", "paris"),
+        ('"Paris"', "Paris"),
+        ("Hello, world!", "hello world"),
+        ("café", "café"),  # NFC vs NFD
+        ("STRASSE", "straße"),  # case folding
+        ("ｆｕｌｌ", "full"),  # full-width
+    ],
+)
+def test_exact_match_normalises_what_does_not_change_meaning(output, expected):
+    assert exact_match()(output, expected) == 1.0
+
+
+def test_normalize_text_rejects_an_unknown_punctuation_mode():
+    with pytest.raises(ValueError):
+        normalize_text("x", strip_punct="sometimes")
+
+
+@pytest.mark.parametrize(
+    ("output", "expected", "score"),
+    [
+        ("I know", "no", 0.0),
+        ("10 apples", "1", 0.0),
+        ("unsafe", "safe", 0.0),
+        ("The answer is no.", "no", 1.0),
+        ("東京は日本の首都です", "東京", 1.0),
+    ],
+)
+def test_contains_matches_on_word_boundaries(output, expected, score):
+    assert contains()(output, expected) == score
+
+
+def test_contains_plain_substring_is_still_reachable():
+    assert contains(word_boundary=False)("I know", "no") == 1.0
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("Step 1: the answer is 42", 42),
+        (".5", 0.5),
+        ("1e3", 1000),
+        ("3,14", 3.14),
+        ("1,000", 1000),
+        ("1.000,5", 1000.5),
+        ("2024-01-05: 7", 7),
+        ("٤٢", 42),  # Arabic-Indic digits
+        ("４２", 42),  # full-width digits
+    ],
+)
+def test_numeric_close_reads_numbers_as_written(output, expected):
+    assert numeric_close()(output, expected) == 1.0
+
+
+def test_numeric_close_which_options():
+    assert numeric_close(which="first")("Step 1: 42", 42) == 0.0
+    assert numeric_close(which="last")("42 then 7", 42) == 0.0
+    assert numeric_close(which="any")("42 then 7", 42) == 1.0
+    assert numeric_close()("x", float("nan")) == 0.0
+    with pytest.raises(ValueError):
+        numeric_close(which="median")
+
+
+def test_regex_match_row_without_pattern_is_an_error_not_a_pass():
+    with pytest.raises(ValueError, match="no pattern"):
+        regex_match()("anything", None)
+    with pytest.raises(ValueError, match="no pattern"):
+        regex_match()("anything", "")
+
+
+@pytest.mark.parametrize("pattern", ["(a+)+$", "(a*)*b", "(a|aa)+$", "((ab)*c)+", "x" * 600])
+def test_regex_match_refuses_catastrophic_row_patterns(pattern):
+    import time
+
+    start = time.perf_counter()
+    with pytest.raises(ValueError):
+        regex_match()("a" * 40 + "!", pattern)
+    assert time.perf_counter() - start < 1.0
+
+
+def test_regex_match_accepts_ordinary_row_patterns_and_trusts_code_patterns():
+    assert regex_match()("order 1234 shipped", r"\d{4}") == 1.0
+    assert regex_match()("abab", "(ab){2}") == 1.0
+    # A pattern written in code is the author's and is not screened.
+    assert regex_match(pattern="(ab|cd)+")("abcd", None) == 1.0
+
+
+def test_token_f1_on_unsegmented_japanese():
+    assert token_f1()("東京は日本の首都です", "日本の首都は東京です") == 1.0
+    assert 0.0 < token_f1()("東京です", "大阪です") < 1.0
+
+
+@pytest.mark.parametrize(
+    ("output", "expected", "score"),
+    [
+        ('```json\n{"a": 1}\n```', {"a": 1}, 1.0),
+        ('Result: {"a": 1} as requested', {"a": 1}, 1.0),
+        ({"a": {"b": 1, "c": 2}}, {"a": {"b": 1}}, 1.0),
+        ({"a": {"b": 2}}, {"a": {"b": 1}}, 0.0),
+        ({"a": 1}, {"a": True}, 0.0),
+        ({"a": [1, 2, 3]}, {"a": [1, 2]}, 0.0),
+        ({"a": [{"x": 1, "y": 2}]}, {"a": [{"x": 1}]}, 1.0),
+    ],
+)
+def test_json_subset_is_recursive_and_type_strict(output, expected, score):
+    assert json_subset()(output, expected) == score
+
+
+def test_json_subset_loose_types_option():
+    assert json_subset(strict_types=False)({"a": 1}, {"a": True}) == 1.0
+
+
+def test_nan_is_never_a_perfect_score():
+    assert M._clamp(float("nan")) == 0.0
+    nan_metric = Metric("nan", lambda o, e: float("nan"))
+    with pytest.raises(M.NonFiniteScoreError):
+        nan_metric("a", "b")
+    with pytest.raises(M.NonFiniteScoreError):
+        Metric("inf", lambda o, e: float("inf"))("a", "b")
+
+
+def test_a_nan_metric_makes_the_row_an_error_in_the_harness():
+    from adapt_agent.optimization.dataset import GoldenDataset
+    from adapt_agent.optimization.evaluation import EvaluationHarness
+
+    harness = EvaluationHarness([Metric("nan", lambda o, e: float("nan"))])
+    data = GoldenDataset.from_list([{"input": "q", "expected": "a"}] * 3)
+    report = harness.evaluate(lambda x: "wrong", data)
+    assert report.score == 0.0
+    assert report.n_metric_errors == 3
+    assert "non-finite" in report.results[0].metric_errors["nan"]

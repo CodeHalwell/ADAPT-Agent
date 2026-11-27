@@ -50,9 +50,13 @@ from adapt_agent.optimization.evaluation import (
     resolve_runner,
 )
 from adapt_agent.optimization.extractors import (
+    ToolCall,
+    Trajectory,
     available_extractors,
     extract_output_payload,
     extract_output_text,
+    extract_trajectory,
+    extract_usage,
     register_extractor,
 )
 from adapt_agent.optimization.judge import CompletionFn, JudgeVerdict, LLMJudge
@@ -110,6 +114,14 @@ from adapt_agent.optimization.providers import (
     get_provider,
     register_provider,
 )
+from adapt_agent.optimization.reporting import (
+    RunComparison,
+    compare_runs,
+    load_results,
+    results_document,
+    to_json,
+    to_junit,
+)
 from adapt_agent.optimization.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
@@ -123,6 +135,13 @@ from adapt_agent.optimization.runners import (
     openai_agents_runner,
 )
 from adapt_agent.optimization.target import OptimizableAgent, wrap
+from adapt_agent.optimization.trajectory import (
+    no_forbidden_tools,
+    tool_call_args_match,
+    tool_call_budget,
+    tool_called,
+    tool_sequence,
+)
 
 __all__ = [
     # legacy runtime metrics
@@ -183,6 +202,23 @@ __all__ = [
     "adk_runner",
     "openai_agents_runner",
     "claude_agent_runner",
+    # trajectory (tool-call) evals
+    "ToolCall",
+    "Trajectory",
+    "extract_trajectory",
+    "extract_usage",
+    "tool_called",
+    "tool_call_args_match",
+    "tool_sequence",
+    "no_forbidden_tools",
+    "tool_call_budget",
+    # result export / run comparison
+    "RunComparison",
+    "compare_runs",
+    "load_results",
+    "results_document",
+    "to_json",
+    "to_junit",
     # target
     "OptimizableAgent",
     "wrap",
