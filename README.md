@@ -26,6 +26,53 @@ The library keeps its core install light and imports each agent framework **lazi
 ### Adversarial defense
 - **`AdversarialDefense`** — detect prompt injection and jailbreak attempts, plus user-supplied custom attack patterns. `analyze_input(text)` returns a dict with `is_safe`, `threats_detected`, and a truncated input snapshot.
 
+### Tool-call governance
+Agents act through tools, so the gate can also judge individual tool calls and
+their results, not only the prompt and the final answer. `GovernanceGate`
+exposes the contract that framework bindings are built on:
+
+- **`gate.check_tool_call(tool_name, arguments, *, state=None)`** decides whether a
+  call may run, and **`gate.check_tool_result(tool_name, result)`** whether what a
+  tool returned (a web page, an email, an MCP reply) may reach the model — the
+  indirect-injection seam. Both return a `ToolDecision` and never raise;
+  `review_tool_call` / `review_tool_result` are the same checks but raise
+  `SecurityBlockedError` on a block.
+- **`ToolDecision.action`** is `"allow"`, `"block"` or `"ask"` (needs a human).
+  `.reason` is a one-line, content-free message that is safe to show the model, and
+  `.resolve(approvals_supported=False)` turns an `"ask"` into a `"block"` when the
+  framework cannot pause for approval, so a missing approval path fails closed.
+- **`ToolPolicy(allow=None, deny=(), require_approval=())`** — shell-style glob
+  lists over tool names (`"mcp__*"`, `"read_*"`). Deny beats allow-list beats
+  approval; a tool outside a configured allow-list is refused.
+- **Tool-scoped policy rules** — a `PolicyEnforcer` rule whose condition names
+  `tool` is evaluated only for tool calls, and may combine `tool['arguments']`
+  with agent `state`. Besides `block`, a rule can use the new
+  **`require_approval`** action.
+- Tool arguments and results are also screened by the firewall and adversarial
+  defense.
+
+```python
+from adapt_agent.core import GovernanceGate, PolicyEnforcer, ToolPolicy
+
+policy = PolicyEnforcer()
+policy.add_rule(
+    name="approve_large_refunds",
+    description="A human signs off refunds over 500",
+    condition="tool['name'] == 'refund' and tool['arguments']['amount'] > 500",
+    action="require_approval",
+)
+gate = GovernanceGate(
+    policy_enforcer=policy,
+    tool_policy=ToolPolicy(allow=["search", "refund"], deny=["delete_*"]),
+)
+
+gate.check_tool_call("delete_user", {"id": 7}).blocked              # True (denied)
+gate.check_tool_call("refund", {"amount": 900}).needs_approval      # True
+gate.check_tool_call("search", {"q": "opening hours"}).allowed      # True
+```
+
+<!-- LEAD: framework binding table goes here -->
+
 ### Observability
 - **`AgentObserver`** — tracing (`start_trace`/`end_trace`) and structured logging for agent executions.
 
@@ -84,7 +131,7 @@ Adapters integrate ADAPT-Agent's controls with third-party agent frameworks. Imp
 | Framework                  | Class                             | Extra                                   | Wrap target                       |
 | -------------------------- | --------------------------------- | --------------------------------------- | --------------------------------- |
 | LangGraph                  | `LangGraphAdapter`                | `adapt-agent[langgraph]`                | compiled graph (`.invoke`)        |
-| Microsoft Agent Framework  | `MicrosoftAgentFrameworkAdapter`  | `adapt-agent[microsoft-agent-framework]`| `ChatAgent` (`.run`)              |
+| Microsoft Agent Framework  | `MicrosoftAgentFrameworkAdapter`  | `adapt-agent[microsoft-agent-framework]`| `Agent` (`.run`)                  |
 | Google ADK                 | `GoogleADKAdapter`                | `adapt-agent[google-adk]`               | callable driving a `Runner`       |
 | Pydantic AI                | `PydanticAIAdapter`               | `adapt-agent[pydantic-ai]`              | `Agent` (`.run_sync` / `.run`)    |
 | CrewAI                     | `CrewAIAdapter`                   | `adapt-agent[crewai]`                   | `Crew` (`.kickoff`)               |
@@ -120,17 +167,24 @@ pip install adapt-agent[crewai]
 pip install adapt-agent[openai-agents]
 pip install adapt-agent[claude-agent]
 
+# Optional OpenTelemetry bridge for AgentObserver
+pip install adapt-agent[otel]
+
 # Development tooling (pytest, ruff, black, mypy, build)
 pip install adapt-agent[dev]
 
 # Documentation tooling (mkdocs, mkdocs-material)
 pip install adapt-agent[docs]
 
-# Every framework adapter at once
+# Every framework adapter EXCEPT CrewAI (see the note below)
 pip install adapt-agent[all]
 ```
 
+With uv the same extras work, e.g. `uv add "adapt-agent[microsoft-agent-framework]"`.
+
 > **Note:** Each framework extra installs that framework so its adapter can run; `adapt_agent` itself imports a framework only when you wrap an agent from it, so you never need a framework you don't use.
+>
+> **Install one framework per environment.** The frameworks constrain each other's dependencies: CrewAI pins `openai<3`, which holds the OpenAI Agents SDK at 0.20 and Pydantic AI at 2.31 when installed alongside it, and a resolver left to itself will instead settle on a very old CrewAI. For that reason `[all]` leaves CrewAI out; install `adapt-agent[crewai]` in its own virtual environment. The `microsoft-agent-framework` extra installs `agent-framework-core`, which is all the library needs, rather than the `agent-framework` meta-package.
 
 ## Quick Start
 
@@ -298,9 +352,11 @@ adapt_agent/
 │   ├── openai_agents/              # OpenAIAgentsAdapter
 │   └── claude_agent/               # ClaudeAgentSDKAdapter
 ├── security/          # Firewall, TaintTracker
+├── integrations/      # Native per-framework hooks (middleware, plugins, guardrails)
+│   └── _common.py     # build_gate and helpers shared by every integration
 ├── adversarial/       # AdversarialDefense
-├── optimization/      # AgentOptimizer
-├── evaluation/        # AgentEvaluator
+├── optimization/      # Optimizers, LLMJudge, providers, introspection, evals
+├── evaluation/        # GoldenDataset, EvaluationHarness (re-exported)
 ├── observability/     # AgentObserver
 ├── patches/           # PatchManager
 ├── skills/            # Bundled agent skills (SKILL.md) + install registry

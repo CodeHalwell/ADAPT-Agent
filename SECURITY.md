@@ -8,16 +8,18 @@ researchers and users who responsibly disclose issues.
 
 ## Supported versions
 
-Security fixes are provided for the following versions:
+Security fixes are provided for the **latest minor release line** only; every
+earlier line is unsupported.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.2.x   | :white_check_mark: |
-| 0.1.x   | :x:                |
-| < 0.1   | :x:                |
+| 0.5.x   | :white_check_mark: |
+| < 0.5   | :x:                |
 
-We strongly recommend always running the latest released version. Once a newer
-minor release is published, the previous minor series typically stops receiving
+The row above names the current line (the minor of `adapt_agent.__version__`);
+it moves forward with each new minor release, and a test fails if it is left
+behind. We strongly recommend always running the latest released version. Once a
+newer minor release is published, the previous minor series stops receiving
 security updates.
 
 ## Reporting a vulnerability

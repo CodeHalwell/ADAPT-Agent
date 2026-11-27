@@ -10,9 +10,25 @@ on:
   # Callable from release.yml, so a tagged release is gated on exactly the
   # same lint, test-matrix and build checks that guard main.
   workflow_call:
+  # Weekly, so a framework release that breaks the library is noticed without
+  # needing a commit. Only the `frameworks` jobs can change outcome on an
+  # unchanged tree; the rest simply re-confirm main.
+  schedule:
+    - cron: "17 5 * * 1"
 
 permissions:
   contents: read
+
+# Supersede stale runs on a pull request: `labeled`/`unlabeled` (needed for the
+# `spec-amendment` label) plus a bot applying several labels would otherwise
+# queue a full run per event. Cancellation is for pull requests ONLY. Pushes,
+# the schedule and -- critically -- the `workflow_call` from release.yml are
+# never cancelled mid-run: a cancelled release gate fails the release. In a
+# called workflow `github.workflow` is the *caller's* name ("Release"), so a
+# release run never shares a group with this file's own run on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -63,6 +79,88 @@ jobs:
         with:
           name: coverage-xml
           path: coverage.xml
+
+  # Every other job installs only `.[dev]`, so framework tests there run against
+  # stubs. This job installs the real framework -- one per environment, because
+  # the frameworks constrain each other's dependencies (notably CrewAI's
+  # `openai<3`) -- and runs the whole suite, so the `tests/test_real_*.py` files
+  # (which `importorskip` their framework) actually execute and everything else
+  # is checked to still pass with a framework present.
+  frameworks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        extra:
+          - langgraph
+          - pydantic-ai
+          - crewai
+          - openai-agents
+          - claude-agent
+          - google-adk
+          - microsoft-agent-framework
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies (latest ${{ matrix.extra }})
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,${{ matrix.extra }}]"
+          pip list
+      - name: Run tests against the real framework
+        run: pytest -q -o addopts=""
+
+  # The same, but with each framework held at the minimum its extra declares,
+  # so a floor in pyproject.toml is tested rather than merely asserted.
+  # `floor` pins the direct requirements to exact versions (the lowest release
+  # each `>=` floor admits); transitive dependencies are left to the resolver.
+  # UNPROVEN: written without being able to run Actions, so a resolver conflict
+  # among transitive dependencies is possible. It is non-blocking until it has
+  # been seen green once; then remove `continue-on-error` so the floors bind.
+  frameworks-floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - extra: langgraph
+            floor: "langgraph==1.0.0 langchain==1.0.0"
+          - extra: pydantic-ai
+            floor: "pydantic-ai==2.0.0"
+          - extra: crewai
+            floor: "crewai==1.0.0"
+          - extra: openai-agents
+            floor: "openai-agents==0.20.0"
+          - extra: claude-agent
+            # 0.2.82 is the oldest 0.2.x release on the index.
+            floor: "claude-agent-sdk==0.2.82"
+          - extra: google-adk
+            floor: "google-adk==2.0.0"
+          - extra: microsoft-agent-framework
+            floor: "agent-framework-core==1.0.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies (floor of ${{ matrix.extra }})
+        env:
+          FLOOR: ${{ matrix.floor }}
+        run: |
+          python -m pip install --upgrade pip
+          printf '%s\n' $FLOOR > floor-constraints.txt
+          cat floor-constraints.txt
+          pip install -c floor-constraints.txt -e ".[dev,${{ matrix.extra }}]"
+          pip list
+      - name: Run tests against the floor version
+        run: pytest -q -o addopts=""
 
   # Coverage shows a line ran; this shows a test would notice if it were wrong.
   # Re-introduces security bugs one at a time -- including every historical

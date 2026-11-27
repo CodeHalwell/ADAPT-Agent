@@ -11,7 +11,7 @@ installed.
 | Framework | Class | Extra | Wrap target |
 |-----------|-------|-------|-------------|
 | LangGraph | `LangGraphAdapter` | `adapt-agent[langgraph]` | compiled graph (`.invoke`) |
-| Microsoft Agent Framework | `MicrosoftAgentFrameworkAdapter` | `adapt-agent[microsoft-agent-framework]` | `ChatAgent` (`.run`) |
+| Microsoft Agent Framework | `MicrosoftAgentFrameworkAdapter` | `adapt-agent[microsoft-agent-framework]` | `Agent` (`.run`) |
 | Google ADK | `GoogleADKAdapter` | `adapt-agent[google-adk]` | callable driving a `Runner` |
 | Pydantic AI | `PydanticAIAdapter` | `adapt-agent[pydantic-ai]` | `Agent` (`.run_sync` / `.run`) |
 | CrewAI | `CrewAIAdapter` | `adapt-agent[crewai]` | `Crew` (`.kickoff`) |
@@ -77,6 +77,11 @@ adapter = PydanticAIAdapter(
 
 ### Per-framework wrap targets
 
+The Microsoft Agent Framework extra installs `agent-framework-core`, which is all
+the adapter needs. Install one framework extra per environment: the frameworks
+constrain each other's dependencies (CrewAI pins `openai<3`, which holds the OpenAI
+Agents SDK and Pydantic AI back), which is why `adapt-agent[all]` leaves CrewAI out.
+
 The only thing that differs between frameworks is the object you pass to
 `wrap_agent` and how the input is shaped:
 
@@ -84,8 +89,8 @@ The only thing that differs between frameworks is the object you pass to
 # LangGraph — wrap a compiled graph; the payload dict is passed to .invoke()
 LangGraphAdapter().wrap_agent(compiled_graph)
 
-# Microsoft Agent Framework — wrap a ChatAgent; .run() is awaited
-MicrosoftAgentFrameworkAdapter().wrap_agent(chat_agent)
+# Microsoft Agent Framework — wrap an Agent (e.g. client.as_agent(...)); .run() is awaited
+MicrosoftAgentFrameworkAdapter().wrap_agent(maf_agent)
 
 # Pydantic AI — wrap an Agent; .run_sync()/.run() receive a prompt string
 PydanticAIAdapter().wrap_agent(pydantic_agent)

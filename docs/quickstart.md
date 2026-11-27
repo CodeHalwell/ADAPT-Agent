@@ -9,7 +9,13 @@ snippet runs against the real ADAPT-Agent API.
 pip install adapt-agent
 # For the LangGraph adapter walkthrough at the end:
 pip install "adapt-agent[langgraph]"
+# Optional OpenTelemetry bridge for the observer:
+pip install "adapt-agent[otel]"
 ```
+
+Install one framework extra per environment (`langgraph`, `pydantic-ai`, `crewai`,
+`openai-agents`, `claude-agent`, `google-adk`, `microsoft-agent-framework`); they
+constrain each other's dependencies. See [Framework Adapters](adapters.md).
 
 ## 2. Screen inputs with the Firewall
 

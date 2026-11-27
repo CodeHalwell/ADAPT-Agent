@@ -28,6 +28,30 @@ pip install -e ".[dev]"
 If you are working on a specific framework adapter, install its extra as well, for
 example `pip install -e ".[dev,langgraph]"`.
 
+### Testing against a real framework
+
+A plain `.[dev]` install has no agent framework, so framework tests there run
+against stubs, which cannot notice when a framework release changes its API. To run
+the suite against the real thing, install **one** framework extra per virtualenv:
+
+```bash
+python -m venv .venv-crewai && source .venv-crewai/bin/activate
+pip install -e ".[dev,crewai]"
+pytest -o addopts=""
+```
+
+Use a separate environment per framework (`langgraph`, `pydantic-ai`, `crewai`,
+`openai-agents`, `claude-agent`, `google-adk`, `microsoft-agent-framework`). They
+constrain each other's dependencies: CrewAI pins `openai<3`, which holds the OpenAI
+Agents SDK and Pydantic AI back, and a resolver given both quietly picks an old
+CrewAI. That is also why `adapt-agent[all]` leaves CrewAI out. Tests that need a
+framework (`tests/test_real_<framework>.py`) call `pytest.importorskip`, so they
+skip in the dev-only environment and run in the matching one. CI runs the same
+matrix (the `frameworks` job, weekly as well as on every change, so an upstream
+release that breaks us is noticed) plus a `frameworks-floor` job that installs each
+framework at the minimum its extra declares. If you change a floor in
+`pyproject.toml`, that job is what validates it.
+
 ### Pre-commit hooks
 
 We use [pre-commit](https://pre-commit.com/) to run formatting and linting before
@@ -93,8 +117,9 @@ counter-example; pin it with `@example(...)` once fixed.
 ### Held-out check
 
 On a pull request CI also runs the **base branch's** tests against your code
-(`scripts/heldout_check.py`). It fails when your change alters behaviour that an
-existing test pinned — including when you updated that test to match. That is
+(`scripts/heldout_check.py`), and requires every base-branch mutant to still
+exist, so a mutant cannot be deleted to make a change pass. It fails when your
+change alters behaviour that an existing test pinned — including when you updated that test to match. That is
 often exactly right; it means the change amends the specification, and a
 maintainer confirms it by applying the `spec-amendment` label. Say in the PR
 description which existing tests you changed and why. To run it locally:
