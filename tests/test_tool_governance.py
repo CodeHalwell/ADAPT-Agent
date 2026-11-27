@@ -407,3 +407,14 @@ def test_context_state_ignores_a_to_dict_that_fails_or_returns_something_else() 
     for state in (Raises(), NotADict()):
         context = type("Context", (), {"state": state, "session": None, "context": None})()
         assert context_state(context) == {}
+
+
+def test_the_tool_governance_api_is_exported_from_the_package_root() -> None:
+    import adapt_agent
+    from adapt_agent import core
+
+    for name in ("GovernanceGate", "ToolPolicy", "ToolDecision"):
+        assert getattr(adapt_agent, name) is getattr(core, name)
+        assert name in adapt_agent.__all__ and name in core.__all__
+    for name in ("walk_texts", "TextExtraction", "UNSCANNABLE"):
+        assert hasattr(core, name) and name in core.__all__
