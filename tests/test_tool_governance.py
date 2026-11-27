@@ -315,3 +315,59 @@ def test_build_gate_relabelling_a_shared_gate_keeps_its_tool_policy() -> None:
     assert relabelled is not shared
     assert relabelled.tool_policy is policy and relabelled.agent_id == "specialist"
     assert relabelled.check_tool_call("x").blocked
+
+
+# -- observer helpers shared by the framework bindings -------------------------
+
+
+def test_traced_hands_the_exception_to_an_observer_that_takes_it() -> None:
+    from adapt_agent.integrations._common import traced
+    from adapt_agent.observability import AgentObserver
+
+    observer = AgentObserver()
+    with pytest.raises(SecurityBlockedError):
+        with traced(observer, "ops", "run"):
+            raise SecurityBlockedError("blocked", ["firewall"])
+    (trace,) = observer.get_traces()
+    assert trace["status"] == "error"
+    assert trace["threats"] == ["firewall"]
+    assert trace["error_type"] == "SecurityBlockedError"
+
+
+def test_traced_still_works_with_an_observer_written_to_the_original_contract() -> None:
+    from adapt_agent.integrations._common import traced
+
+    calls: list[tuple] = []
+
+    class LegacyObserver:
+        def start_trace(self, trace_id: str, agent_id: str, operation: str) -> None:
+            calls.append(("start", agent_id, operation))
+
+        def end_trace(self, trace_id: str, status: str = "completed", result: str = "") -> None:
+            calls.append(("end", status, result))
+
+    with pytest.raises(ValueError):
+        with traced(LegacyObserver(), "ops", "run"):
+            raise ValueError("boom")
+    assert calls == [("start", "ops", "run"), ("end", "error", "boom")]
+
+
+def test_record_helpers_reach_the_observer_and_tolerate_one_without_them() -> None:
+    from adapt_agent.integrations._common import record_refusal, record_tool_decision
+    from adapt_agent.observability import AgentObserver
+
+    observer = AgentObserver()
+    decision = GovernanceGate(
+        tool_policy=ToolPolicy(deny=["shell"]), agent_id="ops"
+    ).check_tool_call("shell")
+    record_tool_decision(observer, "ops", decision, phase="call")
+    record_refusal(observer, "ops", "run", ["firewall"], stage="input")
+    (recorded,) = observer.get_tool_decisions()
+    assert recorded["tool_name"] == "shell" and recorded["decision"] == "block"
+    (refusal,) = observer.get_refusals()
+    assert refusal["threats"] == ["firewall"] and refusal["stage"] == "input"
+
+    record_tool_decision(None, "ops", decision, phase="call")
+    record_refusal(None, "ops", "run", ["firewall"], stage="input")
+    record_tool_decision(object(), "ops", decision, phase="call")
+    record_refusal(object(), "ops", "run", ["firewall"], stage="input")

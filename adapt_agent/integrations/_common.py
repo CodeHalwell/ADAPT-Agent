@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import uuid
 from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any
@@ -83,9 +84,65 @@ def traced(observer: Any, agent_id: str, operation: str) -> Iterator[None]:
     except BaseException as exc:
         # BaseException, not Exception: `asyncio.CancelledError` derives from it,
         # so a cancelled request would otherwise leave the span open forever.
-        observer.end_trace(trace_id, status="error", result=str(exc))
+        _end_trace_error(observer, trace_id, exc)
         raise
     observer.end_trace(trace_id, status="completed")
+
+
+def _end_trace_error(observer: Any, trace_id: str, exc: BaseException) -> None:
+    """Close a span as failed, handing the exception over when the observer takes it.
+
+    :class:`~adapt_agent.observability.AgentObserver` reads the threat labels
+    and the exception class from ``error=``, which is what makes a blocked run
+    distinguishable from a crashed one in a trace. A third-party observer
+    written against the original two-argument contract is still supported: it
+    is called without the keyword rather than failing inside an ``except``.
+    """
+    if _accepts_keyword(observer.end_trace, "error"):
+        observer.end_trace(trace_id, status="error", result=str(exc), error=exc)
+    else:
+        observer.end_trace(trace_id, status="error", result=str(exc))
+
+
+def _accepts_keyword(func: Any, name: str) -> bool:
+    """Whether ``func`` can be called with keyword ``name``; ``False`` if unknowable."""
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD
+        or (p.name == name and p.kind is not inspect.Parameter.POSITIONAL_ONLY)
+        for p in parameters
+    )
+
+
+def record_tool_decision(observer: Any, agent_id: str, decision: Any, *, phase: str) -> None:
+    """Report a tool-call verdict to the observer, if it can record one.
+
+    ``phase`` is ``"call"`` (before the tool runs) or ``"result"`` (before its
+    result returns to the model). A no-op for ``observer=None`` and for an
+    observer without ``record_tool_decision``, so a binding can call this
+    unconditionally.
+    """
+    record = getattr(observer, "record_tool_decision", None)
+    if callable(record):
+        record(agent_id, decision, phase=phase)
+
+
+def record_refusal(
+    observer: Any, agent_id: str, operation: str, threats: list[str], *, stage: str
+) -> None:
+    """Report a refusal that happened before any span was opened.
+
+    Without this an input block leaves no trace at all in the observer: the
+    request was refused before the run began, so there is no span to mark as
+    failed. A no-op for ``observer=None`` and for an observer without
+    ``record_refusal``.
+    """
+    record = getattr(observer, "record_refusal", None)
+    if callable(record):
+        record(agent_id, operation, list(threats), stage=stage)
 
 
 def optional_import(module: str, extra: str, needed_for: str) -> Any:
@@ -163,4 +220,12 @@ def as_state(messages: Any, /, **extra: Any) -> dict[str, Any]:
     return state
 
 
-__all__ = ["as_state", "build_gate", "context_state", "optional_import", "traced"]
+__all__ = [
+    "as_state",
+    "build_gate",
+    "context_state",
+    "optional_import",
+    "record_refusal",
+    "record_tool_decision",
+    "traced",
+]
