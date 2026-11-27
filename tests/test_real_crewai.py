@@ -832,6 +832,10 @@ def test_a_checkpoint_restored_in_a_new_process_is_governed_or_refuses_loudly(tm
 EXAMPLES = sorted((REPO_ROOT / "examples" / "crewai").glob("0*.py"))
 
 
+# The examples are written for the release line the binding targets (the one
+# with ``crewai.hooks``). They are not exercised on an older CrewAI, where the
+# optimisation examples take minutes rather than seconds.
+@needs_hooks
 @pytest.mark.parametrize("script", EXAMPLES, ids=lambda p: p.name)
 def test_every_crewai_example_runs_against_the_installed_crewai(script):
     env = dict(os.environ)

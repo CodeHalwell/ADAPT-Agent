@@ -57,6 +57,18 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (  # noqa: E4
 from opentelemetry.trace import StatusCode  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _otel_sdk_enabled(monkeypatch):
+    """Keep the SDK switched on for these tests whatever the process says.
+
+    ``OTEL_SDK_DISABLED`` is read when a ``TracerProvider`` is built and turns
+    it into a no-op. Other test modules set it for the whole process (it is
+    CrewAI's telemetry opt-out), which would make every span assertion here
+    fail for a reason that has nothing to do with the bridge.
+    """
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+
+
 @pytest.fixture
 def otel():
     exporter = InMemorySpanExporter()

@@ -161,6 +161,64 @@ def _content_payload(value: Any, depth: int = 0) -> list[Any]:
     return [value]
 
 
+#: Content kinds that are a *request to run a tool*, not something the agent
+#: said. Their arguments are judged at the tool seam, which can refuse the one
+#: call and let the run continue.
+_TOOL_REQUEST_KINDS = frozenset(
+    {"function_call", "function_approval_request", "function_approval_response"}
+)
+
+
+def _output_payload(result: Any, depth: int = 0) -> list[Any]:
+    """The screenable content of a model or agent response, minus tool requests.
+
+    Output screening judges what the agent *says*. A function call in the
+    response is the model asking for a tool; the function layer screens its
+    arguments and applies ``on_tool_violation``. Screening the same arguments
+    here as output would abort the run before that refusal could be returned
+    to the model, which is the difference between the two modes.
+
+    Everything else is kept -- text, reasoning, tool results already in the
+    transcript, a structured ``value`` -- and anything unrecognised is passed
+    through whole for the gate's own extraction, so nothing is dropped by
+    omission.
+    """
+    if depth > _MAX_CONTENT_DEPTH or result is None:
+        return []
+    if isinstance(result, (str, bytes, int, float, bool, Mapping)):
+        return [result]
+    if isinstance(result, (list, tuple)):
+        out: list[Any] = []
+        for item in result:
+            out.extend(_output_payload(item, depth + 1))
+        return out
+    messages = getattr(result, "messages", None)
+    if isinstance(messages, (list, tuple)):  # an AgentResponse / ChatResponse
+        out = _output_payload(list(messages), depth + 1)
+        value = getattr(result, "value", None)  # structured output, when present
+        if value is not None and not isinstance(value, str):
+            out.append(value)
+        return out
+    contents = getattr(result, "contents", None)
+    if isinstance(contents, (list, tuple)):  # a Message
+        return _output_payload(list(contents), depth + 1)
+    kind = getattr(result, "type", None)
+    if isinstance(kind, str):  # a Content
+        if kind in _TOOL_REQUEST_KINDS:
+            return []
+        return _content_payload(result, depth)
+    return [result]
+
+
+def _review_output(gate: GovernanceGate) -> Callable[[Any], Any]:
+    """``gate.review_output`` over :func:`_output_payload` of its argument."""
+
+    def review(result: Any) -> Any:
+        return gate.review_output(_output_payload(result))
+
+    return review
+
+
 def _arguments_dict(arguments: Any) -> Any:
     """Return tool arguments as a plain mapping where possible.
 
@@ -535,7 +593,7 @@ def governance_chat_middleware(
         if streaming:
             _screen_stream_output(
                 context,
-                model_gate.review_output,
+                _review_output(model_gate),
                 buffer_streams=buffer_streams,
                 span=span,
             )
@@ -544,7 +602,7 @@ def governance_chat_middleware(
             # The response's *text*. Function-call arguments in it are the tool
             # layer's to judge -- screening them here aborted the run before a
             # refusal could be returned to the model.
-            model_gate.review_output(getattr(context, "result", None))
+            model_gate.review_output(_output_payload(getattr(context, "result", None)))
         except BaseException as exc:
             span.end("error", str(exc))
             raise
@@ -707,7 +765,7 @@ def _agent_middleware(
         if streaming:
             _screen_stream_output(
                 context,
-                resolved.review_output,
+                _review_output(resolved),
                 buffer_streams=buffer_streams,
                 span=span,
             )
@@ -715,7 +773,7 @@ def _agent_middleware(
         # Inside the span, not after it. A blocked result is exactly the event
         # an observer exists to surface.
         try:
-            resolved.review_output(getattr(context, "result", None))
+            resolved.review_output(_output_payload(getattr(context, "result", None)))
         except BaseException as exc:
             span.end("error", str(exc))
             raise

@@ -414,3 +414,38 @@ def test_every_framework_example_exits_cleanly(name):
     assert result.returncode == 0, result.stderr[-2000:]
     assert result.stdout.strip()
     assert "Traceback" not in result.stderr
+
+
+# -- output screening judges what the agent says, not its tool requests ---------
+
+
+def test_output_payload_drops_tool_requests_and_keeps_everything_said() -> None:
+    from types import SimpleNamespace as NS
+
+    from adapt_agent.integrations.agent_framework import _output_payload
+
+    call = NS(type="function_call", name="shell", arguments={"cmd": "rm -rf /"})
+    approval = NS(type="function_approval_request", function_call=call)
+    text = NS(type="text", text="all done")
+    reasoning = NS(type="text_reasoning", text="thinking it over")
+    tool_result = NS(type="function_result", result="42 rows")
+    response = NS(
+        messages=[
+            NS(role="assistant", contents=[reasoning, call, approval]),
+            NS(role="tool", contents=[tool_result]),
+            NS(role="assistant", contents=[text]),
+        ],
+        value={"summary": "structured answer"},
+    )
+    payload = _output_payload(response)
+    assert payload == ["thinking it over", "42 rows", "all done", {"summary": "structured answer"}]
+    assert "rm -rf /" not in repr(payload)
+
+
+def test_output_payload_passes_unrecognised_values_through_whole() -> None:
+    from adapt_agent.integrations.agent_framework import _output_payload
+
+    marker = object()
+    assert _output_payload("plain text") == ["plain text"]
+    assert _output_payload(None) == []
+    assert _output_payload([marker, "x"]) == [marker, "x"]
