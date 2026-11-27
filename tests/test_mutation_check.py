@@ -165,6 +165,67 @@ def test_running_out_of_attempts_is_not_rounded_up_to_a_kill(monkeypatch, tmp_pa
     assert module.main(["--only", module.MUTANTS[0].id, "-j", "1"]) == 1
 
 
+def test_a_targeted_mutant_runs_only_its_tests(monkeypatch, tmp_path):
+    """Every suite run of a targeted mutant -- retries included -- uses its files."""
+    module = _load()
+    calls = []
+
+    def fake_run(workdir, timeout, *, only=None, deselect=(), tests=()):
+        calls.append((only, deselect, tests))
+        if only is not None:
+            return True, "1 passed"
+        if deselect:
+            return True, "all passed"
+        return False, "FAILED tests/test_guard.py::test_flaky - slow"
+
+    monkeypatch.setattr(module, "_run_suite", fake_run)
+    selection = ("tests/test_guard.py",)
+    status, _ = module._confirmed_run(tmp_path, 60, tests=selection)
+
+    assert status == module.SURVIVED
+    flaky = "tests/test_guard.py::test_flaky"
+    assert calls == [(None, (), selection), (flaky, (), ()), (None, (flaky,), selection)]
+
+
+def test_a_run_that_collects_nothing_is_not_a_kill(tmp_path):
+    """pytest exits non-zero when it collects no tests; that is not a failure."""
+    module = _load()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_empty.py").write_text("X = 1\n", encoding="utf-8")
+    passed, detail = module._run_suite(tmp_path, 120, tests=("tests/test_empty.py",))
+    assert not passed and detail.startswith(module._SELECTION_ERROR)
+
+
+def test_an_empty_selection_is_reported_not_credited(monkeypatch, tmp_path):
+    module = _load()
+    detail = f"{module._SELECTION_ERROR}: no tests ran"
+    monkeypatch.setattr(module, "_run_suite", lambda *a, **k: (False, detail))
+    assert module._confirmed_run(tmp_path, 60, tests=("tests/x.py",)) == (module.STALE, detail)
+
+
+def test_stale_mutants_flags_a_missing_or_self_test_selection(monkeypatch):
+    module = _load()
+    real = module.MUTANTS[0]
+    ghost = module.Mutant(
+        "ghost", real.path, real.old, real.new, real.why, tests=("tests/test_no_such_file.py",)
+    )
+    selfish = module.Mutant(
+        "selfish", real.path, real.old, real.new, real.why, tests=(module._SELF_TEST,)
+    )
+    monkeypatch.setattr(module, "MUTANTS", (real, ghost, selfish))
+    problems = module.stale_mutants()
+    assert any(p.startswith("ghost:") and "does not exist" in p for p in problems)
+    assert any(p.startswith("selfish:") for p in problems)
+
+
+def test_every_targeted_mutant_names_test_files():
+    """A selection is a list of test *files*: a node id would skip its siblings."""
+    for mutant in _load().MUTANTS:
+        for test in mutant.tests:
+            assert test.startswith("tests/test_") and test.endswith(".py"), (mutant.id, test)
+        assert len(set(mutant.tests)) == len(mutant.tests), mutant.id
+
+
 def _copy_one(dst, module):
     """Stand-in for copying the repo: just the one file the first mutant edits."""
     mutant = module.MUTANTS[0]
