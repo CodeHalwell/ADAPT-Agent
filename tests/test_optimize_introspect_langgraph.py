@@ -260,3 +260,137 @@ def test_a_real_compiled_graph_yields_tunable_parameters() -> None:
     # Writable, not merely discoverable: the write must reach the node object.
     params["chat.system_prompt"].write("Be terse.")
     assert graph.nodes["chat"].bound.func.system_prompt == "Be terse."
+
+
+# -- prebuilt agents: the prompt, model and tools live in closures --------------
+#
+# ``create_react_agent`` and ``create_agent`` are the most common LangGraph
+# agents and, being closures over their configuration, introspected to nothing.
+
+
+def _recording_model():
+    """An offline chat model that records the messages and tool names it is given."""
+    pytest.importorskip("langchain_core")
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+
+    class Recording(BaseChatModel):
+        model_name: str = "fake-model"
+        temperature: float = 0.5
+        seen: list = []
+        tools_offered: list = []
+
+        @property
+        def _llm_type(self) -> str:
+            return "recording"
+
+        def bind_tools(self, tools, **kwargs):
+            self.tools_offered.append([getattr(t, "name", str(t)) for t in tools])
+            return self
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            self.seen.append([m.content for m in messages])
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="done"))])
+
+    model = Recording()
+    model.seen, model.tools_offered = [], []
+    return model
+
+
+def _two_tools():
+    pytest.importorskip("langchain_core")
+    from langchain_core.tools import tool
+
+    @tool
+    def fetch(url: str) -> str:
+        """Fetch a url."""
+        return url
+
+    @tool
+    def delete_db(name: str) -> str:
+        """Delete a database."""
+        return name
+
+    return [fetch, delete_db]
+
+
+def _prebuilt_agent(kind: str, model):
+    import warnings
+
+    tools = _two_tools()
+    if kind == "react":
+        prebuilt = pytest.importorskip("langgraph.prebuilt")
+        with warnings.catch_warnings():  # create_react_agent is deprecated upstream
+            warnings.simplefilter("ignore")
+            return prebuilt.create_react_agent(model, tools, prompt="You are terse.")
+    agents = pytest.importorskip("langchain.agents")
+    return agents.create_agent(model, tools, system_prompt="You are terse.")
+
+
+@pytest.mark.parametrize("kind", ["react", "create_agent"])
+def test_a_prebuilt_agent_prompt_and_model_are_tunable_and_reach_the_model(kind: str) -> None:
+    import asyncio
+
+    model = _recording_model()
+    graph = _prebuilt_agent(kind, model)
+    assert detect(graph) == "langgraph"
+
+    params = {p.name.split(".", 1)[1]: p for p in introspect(graph)}
+    prompt = params["system_prompt"]
+    assert prompt.kind is ParameterKind.PROMPT
+    assert prompt.read() == "You are terse."
+    assert params["model"].read() == "fake-model"
+    assert params["temperature"].bounds == (0.0, 2.0)
+
+    prompt.write("Be verbose.")
+    params["temperature"].write(0.1)
+    params["model"].write("other-model")
+    graph.invoke({"messages": [("user", "hi")]})
+    assert model.seen[-1] == ["Be verbose.", "hi"]
+    assert (model.temperature, model.model_name) == (0.1, "other-model")
+
+    # The async entry point closes over the same cells, so it sees the write too.
+    asyncio.run(graph.ainvoke({"messages": [("user", "again")]}))
+    assert model.seen[-1] == ["Be verbose.", "again"]
+
+
+@pytest.mark.parametrize("kind", ["react", "create_agent"])
+def test_a_failed_prebuilt_prompt_write_raises_and_changes_nothing(kind: str) -> None:
+    model = _recording_model()
+    graph = _prebuilt_agent(kind, model)
+    prompt = next(p for p in introspect(graph) if p.name.endswith("system_prompt"))
+    assert prompt.setter is not None
+    with pytest.raises(TypeError):
+        prompt.setter(None)
+    graph.invoke({"messages": [("user", "hi")]})
+    assert model.seen[-1] == ["You are terse.", "hi"]
+
+
+def test_create_agent_tool_list_can_be_narrowed_and_the_model_sees_it() -> None:
+    model = _recording_model()
+    graph = _prebuilt_agent("create_agent", model)
+    tools = next(p for p in introspect(graph) if p.kind is ParameterKind.TOOL)
+    assert tools.optimizable
+    assert [t.name for t in tools.read()] == ["fetch", "delete_db"]
+
+    tools.write(tools.candidates[1])  # drop `fetch`
+    graph.invoke({"messages": [("user", "hi")]})
+    assert model.tools_offered[-1] == ["delete_db"]
+
+    tools.write(tools.candidates[0])
+    graph.invoke({"messages": [("user", "hi")]})
+    assert model.tools_offered[-1] == ["fetch", "delete_db"]
+
+    assert tools.setter is not None
+    with pytest.raises(ValueError):
+        tools.setter(["not a tool"])
+    assert [t.name for t in tools.read()] == ["fetch", "delete_db"]
+
+
+def test_create_react_agent_tools_are_reported_but_not_writable() -> None:
+    """Its tool schemas are baked into the bound model, so narrowing would half-apply."""
+    graph = _prebuilt_agent("react", _recording_model())
+    tools = next(p for p in introspect(graph) if p.kind is ParameterKind.TOOL)
+    assert [t.name for t in tools.read()] == ["fetch", "delete_db"]
+    assert not tools.optimizable

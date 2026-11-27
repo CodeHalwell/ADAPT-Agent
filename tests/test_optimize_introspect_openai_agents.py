@@ -7,6 +7,8 @@ round-trip, and that the predicate rejects unrelated objects.
 """
 
 # Importing the module triggers self-registration with the introspection registry.
+import pytest
+
 import adapt_agent.optimization.introspection.openai_agents as module
 from adapt_agent.optimization.introspection import detect, introspect
 from adapt_agent.optimization.parameters import ParameterKind
@@ -265,3 +267,66 @@ def test_handoff_wrapper_shared_by_two_agents_bound_once():
     params = introspect(root)
     names = [p.name for p in params]
     assert names.count("shared_agent_handoff.tool_description") == 1
+
+
+# -- real SDK objects ------------------------------------------------------------
+
+
+def _scripted_agents():
+    pytest.importorskip("agents")
+    testing = pytest.importorskip("agents.testing")
+    import agents
+
+    agents.set_tracing_disabled(True)
+    return agents, testing
+
+
+def test_a_real_agents_tuned_instructions_reach_the_model_on_the_next_run():
+    agents, testing = _scripted_agents()
+    model = testing.ScriptedModel(
+        [[testing.assistant_message("ok")], [testing.assistant_message("ok")]]
+    )
+    agent = agents.Agent(name="Solo", instructions="Be terse.", model=model)
+    prompt = next(p for p in introspect(agent) if p.name == "solo.instructions")
+
+    agents.Runner.run_sync(agent, "hi")
+    assert model.calls[-1].system_instructions == "Be terse."
+
+    prompt.write("Be verbose.")
+    agents.Runner.run_sync(agent, "hi")
+    assert model.calls[-1].system_instructions == "Be verbose."
+
+
+def test_agents_behind_a_handoff_wrapper_and_an_agent_tool_are_introspected():
+    """``handoff()`` and ``as_tool()`` keep their agent on private attributes."""
+    agents, testing = _scripted_agents()
+    model = testing.ScriptedModel([[testing.assistant_message("ok")]])
+    child = agents.Agent(name="Child", instructions="child inst", model=model)
+    helper = agents.Agent(name="Helper", instructions="helper inst", model=model)
+    root = agents.Agent(
+        name="Root",
+        instructions="root inst",
+        model=model,
+        handoffs=[agents.handoff(child)],
+        tools=[helper.as_tool("helper", "Does helping.")],
+    )
+    by_name = {p.name: p for p in introspect(root)}
+    assert by_name["child.instructions"].read() == "child inst"
+    assert by_name["helper.instructions"].read() == "helper inst"
+    assert "child_handoff.tool_description" in by_name
+
+    by_name["child.instructions"].write("tuned")
+    assert child.instructions == "tuned"
+
+
+def test_a_collected_handoff_agent_is_skipped_not_an_error():
+    agents, testing = _scripted_agents()
+    model = testing.ScriptedModel([[testing.assistant_message("ok")]])
+    wrapper = agents.handoff(agents.Agent(name="Gone", instructions="x", model=model))
+    # The wrapper holds only a weak reference; with the agent collected it reads None.
+    root = agents.Agent(name="Root", instructions="r", model=model, handoffs=[wrapper])
+    import gc
+
+    gc.collect()
+    names = {p.name for p in introspect(root)}
+    assert "root.instructions" in names

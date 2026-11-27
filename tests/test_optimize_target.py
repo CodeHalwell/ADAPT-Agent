@@ -674,3 +674,24 @@ def test_wrap_callable_path_forwards_replace():
         wrap(lambda x: x, parameters=[p, other])
     replaced = wrap(lambda x: x, parameters=[p, other], replace=True)
     assert replaced.search_space["agent.knob"] is other
+
+
+def test_from_agent_runs_a_real_adk_llm_agent_without_a_runner():
+    """``LlmAgent`` inherits an unrelated ``run`` from ADK's ``BaseNode``."""
+    pytest.importorskip("google.adk")
+    pytest.importorskip("google.genai")
+    from google.adk.agents import LlmAgent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    class _Llm(BaseLlm):
+        async def generate_content_async(self, llm_request, stream=False):
+            text = llm_request.contents[-1].parts[0].text
+            yield LlmResponse(
+                content=types.Content(role="model", parts=[types.Part(text=f"adk: {text}")])
+            )
+
+    agent = LlmAgent(name="root", model=_Llm(model="fake"), instruction="Be terse.")
+    target = OptimizableAgent.from_agent(agent)
+    assert target.run("hello") == "adk: hello"

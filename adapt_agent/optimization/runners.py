@@ -21,7 +21,7 @@ This module closes all three:
   ``Callable[[input], text]``: input adaptation (auto-detected for LangGraph),
   sync/async resolution, then output extraction via
   :func:`~adapt_agent.optimization.extractors.extract_output_text`. An object
-  with no run method of its own is *delegated* by detected framework: an OpenAI
+  drivable only through framework machinery is *delegated* by detected framework (checked before any run method is probed): an OpenAI
   Agents ``Agent`` to :func:`openai_agents_runner`, a Claude Agent SDK options
   object to :func:`claude_agent_runner`, a bare Google ADK agent to
   :func:`adk_runner` -- so every supported framework is drivable through the one
@@ -69,7 +69,7 @@ def framework_runner(
 
     Args:
         agent: A framework agent (LangGraph compiled graph, Microsoft Agent
-            Framework ``ChatAgent``, Pydantic AI ``Agent``, CrewAI ``Crew``,
+            Framework ``Agent``, Pydantic AI ``Agent``, CrewAI ``Crew``,
             ...), a governed adapter, or any callable. For Google ADK prefer
             :func:`adk_runner`, which handles sessions and message packing.
         input_adapter: ``"auto"`` (default) applies :func:`langgraph_inputs`
@@ -92,15 +92,13 @@ def framework_runner(
             installed (the message names the extra to install).
     """
     adapter = _resolve_input_adapter(agent, input_adapter)
-    try:
-        runner = resolve_runner(agent)
-    except TypeError:
-        # Not directly runnable. Some frameworks are *by design* driven by
-        # separate machinery -- delegate by detected framework rather than
-        # bouncing the user to a hand-written lambda.
-        delegated = _delegated_runner(agent, output_extractor)
-        if delegated is None:
-            raise
+    # Framework detection comes *before* the generic run-method probe. Some
+    # frameworks' agent objects carry a method that merely shares a probed name
+    # without being the entry point: a Google ADK 2.x ``LlmAgent`` inherits
+    # ``BaseNode.run(*, ctx, node_input)``, which the probe would grab and then
+    # fail on with a confusing ``TypeError`` at the first call.
+    delegated = _delegated_runner(agent, output_extractor)
+    if delegated is not None:
         if adapter is None:
             return delegated
 
@@ -108,6 +106,7 @@ def framework_runner(
             return delegated(adapter(input_data))
 
         return _adapted
+    runner = resolve_runner(agent)
 
     def _run(input_data: Any) -> Any:
         if adapter is not None:
@@ -316,14 +315,10 @@ def _delegated_runner(
     """Build a runner for an object that is only drivable via framework machinery.
 
     Returns ``None`` when the object is not detected as one of the delegatable
-    frameworks, so the caller can surface the original resolution error.
+    frameworks, so the caller falls through to the generic run-method probe
+    (which raises its own ``TypeError`` for an unrunnable object).
     """
-    from adapt_agent.optimization.introspection import detect
-
-    try:
-        detected = detect(agent)
-    except Exception:
-        return None
+    detected = delegated_framework(agent)
     if detected == "openai_agents":
         return openai_agents_runner(agent, output_extractor=output_extractor)
     if detected == "claude_agent":
@@ -331,6 +326,21 @@ def _delegated_runner(
     if detected == "google_adk":
         return adk_runner(agent, output_extractor=output_extractor)
     return None
+
+
+def delegated_framework(agent: Any) -> str | None:
+    """The detected framework when ``agent`` must be driven by framework machinery.
+
+    ``"openai_agents"``, ``"claude_agent"`` or ``"google_adk"``; ``None`` for
+    everything else (including objects whose detection raises).
+    """
+    from adapt_agent.optimization.introspection import detect
+
+    try:
+        detected = detect(agent)
+    except Exception:
+        return None
+    return detected if detected in ("openai_agents", "claude_agent", "google_adk") else None
 
 
 def _load_openai_agents_runner() -> Any:
@@ -437,6 +447,7 @@ __all__ = [
     "AUTO",
     "adk_runner",
     "claude_agent_runner",
+    "delegated_framework",
     "framework_runner",
     "langgraph_inputs",
     "openai_agents_runner",

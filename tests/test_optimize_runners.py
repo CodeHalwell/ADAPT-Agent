@@ -489,3 +489,44 @@ def test_framework_runner_delegates_bare_adk_agent_to_adk_runner():
 def test_framework_runner_still_raises_for_unrunnable_unknown_objects():
     with pytest.raises(TypeError, match="Cannot evaluate object"):
         framework_runner(object())
+
+
+# -- a real Google ADK agent ----------------------------------------------------
+#
+# ADK 2.x ``LlmAgent`` inherits ``BaseNode.run(*, ctx, node_input)``. The generic
+# run-method probe used to grab it and fail on the first call, so the delegation
+# to ``adk_runner`` was never reached. The stub test above fakes an agent with no
+# ``run`` at all, so it could not see this.
+
+
+def _real_adk_agent():
+    pytest.importorskip("google.adk")
+    pytest.importorskip("google.genai")
+    from google.adk.agents import LlmAgent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    class _Llm(BaseLlm):
+        async def generate_content_async(self, llm_request, stream=False):
+            text = llm_request.contents[-1].parts[0].text
+            yield LlmResponse(
+                content=types.Content(role="model", parts=[types.Part(text=f"adk: {text}")])
+            )
+
+    return LlmAgent(name="root", model=_Llm(model="fake"), instruction="Be terse.")
+
+
+def test_framework_runner_drives_a_real_adk_llm_agent():
+    agent = _real_adk_agent()
+    run = framework_runner(agent)
+    assert run("hello") == "adk: hello"
+    assert run("again") == "adk: again"
+
+
+def test_framework_runner_drives_a_real_adk_workflow():
+    pytest.importorskip("google.adk")
+    from google.adk.workflow import Workflow
+
+    flow = Workflow(name="flow", edges=[("START", _real_adk_agent())])
+    assert framework_runner(flow)("hello") == "adk: hello"

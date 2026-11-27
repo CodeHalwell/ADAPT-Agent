@@ -195,7 +195,7 @@ def _bind_tool_like(obj: Any, attr: str, component: str, kind: ParameterKind) ->
 
 
 def _introspect(obj: Any) -> list[Parameter]:
-    """Walk a Microsoft ``ChatAgent`` and return its tunable parameters (best-effort)."""
+    """Walk a Microsoft Agent Framework ``Agent`` (formerly ``ChatAgent``) (best-effort)."""
     params: list[Parameter] = []
     try:
         component = _slug(getattr(obj, "name", None)) or "agent"

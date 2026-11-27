@@ -4,6 +4,8 @@ These tests use plain fake classes mimicking CrewAI's ``Crew``/``Agent``/``Task`
 attribute shape; the real ``crewai`` package is never imported.
 """
 
+import pytest
+
 from adapt_agent.optimization.introspection import detect, introspect
 from adapt_agent.optimization.parameters import ParameterKind
 
@@ -279,3 +281,80 @@ def test_task_name_colliding_with_positional_fallback_is_disambiguated() -> None
     by_name = {p.name: p for p in params}
     assert by_name["task_1.description"].read() == "Named"
     assert by_name["task_1_1.description"].read() == "Nameless"
+
+
+# -- a real Crew: a written value reaches the model on the next kickoff ----------
+
+
+def _real_crew(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    """A real ``Crew`` backed by an offline ``BaseLLM`` that records its messages.
+
+    ``crewai.LLM`` is a provider-routing factory that needs a real ``model``; a
+    ``BaseLLM`` subclass is the supported way to supply a double.
+    """
+    crewai = pytest.importorskip("crewai")
+    monkeypatch.setenv("CREWAI_DISABLE_TELEMETRY", "true")
+    monkeypatch.setenv("OTEL_SDK_DISABLED", "true")
+    monkeypatch.setenv("CREWAI_TRACING_ENABLED", "false")
+
+    class RecordingLLM(crewai.BaseLLM):  # type: ignore[misc]
+        seen: list = []
+
+        def __init__(self) -> None:
+            super().__init__(model="offline-script")
+            self.seen = []
+
+        def call(self, messages, tools=None, callbacks=None, available_functions=None, **kwargs):  # type: ignore[no-untyped-def]
+            self.seen.append(str(messages))
+            return "Paris."
+
+        def supports_function_calling(self) -> bool:
+            return False
+
+        def supports_stop_words(self) -> bool:
+            return False
+
+        def get_context_window_size(self) -> int:
+            return 8000
+
+    llm = RecordingLLM()
+    agent = crewai.Agent(
+        role="Geographer",
+        goal="Answer {topic}",
+        backstory="Careful.",
+        llm=llm,
+        allow_delegation=False,
+        verbose=False,
+    )
+    task = crewai.Task(
+        description="Tell me about {topic}", expected_output="A sentence", agent=agent
+    )
+    return crewai.Crew(agents=[agent], tasks=[task], verbose=False), llm
+
+
+def test_a_real_crew_is_introspected_and_written_prompts_reach_the_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crew, llm = _real_crew(monkeypatch)
+    assert detect(crew) == "crewai"
+    params = {p.name: p for p in introspect(crew)}
+    assert params["geographer.goal"].read() == "Answer {topic}"
+    assert params["task_0.description"].read() == "Tell me about {topic}"
+    assert params["geographer.model"].read() == "offline-script"
+
+    crew.kickoff(inputs={"topic": "France"})
+    assert "Answer France" in llm.seen[-1]
+    # CrewAI renders the live field in place; the knob must still read the template,
+    # and must write through the stash the next kickoff renders from.
+    assert params["geographer.goal"].read() == "Answer {topic}"
+
+    assert params["geographer.goal"].setter is not None
+    with pytest.raises(TypeError):
+        params["geographer.goal"].setter(None)
+
+    params["geographer.goal"].write("Reply tersely about {topic}")
+    params["task_0.description"].write("Name the capital of {topic}")
+    crew.kickoff(inputs={"topic": "France"})
+    assert "Reply tersely about France" in llm.seen[-1]
+    assert "Name the capital of France" in llm.seen[-1]
+    assert "Answer France" not in llm.seen[-1]

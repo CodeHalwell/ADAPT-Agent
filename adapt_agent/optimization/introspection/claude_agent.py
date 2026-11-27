@@ -3,7 +3,10 @@
 The Claude Agent SDK is driven by a ``query(prompt=..., options=...)`` call,
 where ``options`` is a ``ClaudeAgentOptions`` object holding the agent's
 configuration: its ``system_prompt``, ``model``, ``allowed_tools`` /
-``disallowed_tools``, ``max_turns`` budget, and ``permission_mode``. This module
+``disallowed_tools``, ``max_turns`` budget, ``effort`` and ``permission_mode``.
+Security-relevant settings are never searched: ``permission_mode`` and
+``disallowed_tools`` are reported read-only, and ``allowed_tools`` can only be
+narrowed. This module
 turns such an options object into a flat list of tunable
 :class:`~adapt_agent.optimization.parameters.Parameter` objects without ever
 importing ``claude_agent_sdk``: everything is discovered by duck-typing with
@@ -48,9 +51,78 @@ from adapt_agent.optimization.parameters import Parameter, ParameterKind
 #: more advanced, Claude setup.
 _FOREIGN_ATTRS = ("handoffs", "sub_agents", "kickoff", "instructions")
 
-#: The discrete set of Claude Agent SDK ``permission_mode`` values. Exposing
-#: these as candidates makes the knob a real (searchable) routing parameter.
-_PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions"]
+#: Effort levels used when the installed SDK's own type cannot be read (the
+#: object being introspected is then a stand-in for one).
+_FALLBACK_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
+
+
+def _effort_levels() -> list[str]:
+    """The ``effort`` values the installed SDK accepts, read from its own type.
+
+    Reading the ``EffortLevel`` literal keeps the search space equal to what the
+    SDK will actually take, whatever release is installed, instead of a list
+    that rots as levels are added.
+    """
+    try:
+        import typing
+
+        from claude_agent_sdk.types import EffortLevel
+
+        levels = [level for level in typing.get_args(EffortLevel) if isinstance(level, str)]
+    except Exception:
+        levels = []
+    return levels or list(_FALLBACK_EFFORT_LEVELS)
+
+
+def _read_only(
+    obj: Any, attr: str, name: str, kind: ParameterKind, component: str, note: str
+) -> Parameter | None:
+    """Bind ``obj.<attr>`` for reporting only: no setter, never searched.
+
+    Used for settings whose only possible *changes* are security decisions. The
+    value shows up in reports and snapshots, but no optimizer can write it.
+    """
+    if not hasattr(obj, attr):
+        return None
+    return Parameter(
+        name=name,
+        kind=kind,
+        value=getattr(obj, attr, None),
+        getter=lambda: getattr(obj, attr, None),
+        component=component,
+        mutable=False,
+        metadata={"source": f"attr:{attr}", "read_only_reason": note},
+    )
+
+
+def _tighten_only(param: Parameter | None) -> Parameter | None:
+    """Restrict a tool-list parameter so a write can only *remove* entries.
+
+    ``allowed_tools`` is the list of tools the agent may use without asking, so
+    adding a tool widens what runs unattended. An optimizer scored on task
+    quality has every reason to prefer more tools; letting it grow the list
+    would trade safety for score without anyone deciding to. The setter
+    therefore accepts only subsets of the list as introspected, and raises on
+    anything else.
+    """
+    if param is None or param.setter is None:
+        return param
+    baseline = frozenset(param.read() or ())
+    write = param.setter
+
+    def _setter(value: Any) -> None:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"{param.name} must be a list of tool names")
+        added = set(value) - baseline
+        if added:
+            raise ValueError(
+                f"{param.name} may only be narrowed: {sorted(added)!r} would grant "
+                "tools the agent was configured without"
+            )
+        write(list(value))
+
+    param.setter = _setter
+    return param
 
 
 def _predicate(obj: Any) -> bool:
@@ -94,7 +166,8 @@ def _definition_params(definition: Any, component: str) -> list[Parameter]:
     knobs -- the prompt steers what the subagent does, the description steers
     when the orchestrator delegates to it -- and ``tools``/``skills`` get the
     same drop-one ablation candidates as every other tool list so subagent tool
-    selection is a real search space.
+    selection is a real search space (``tools`` can only be narrowed, like
+    ``allowed_tools``).
     """
     is_mapping = isinstance(definition, dict)
 
@@ -126,8 +199,9 @@ def _definition_params(definition: Any, component: str) -> list[Parameter]:
             param = _bind(
                 field, f"{component}.{field}", kind, tool_subset_candidates(current) or None
             )
-            if param is not None:
-                params.append(param)
+            tightened = _tighten_only(param) if field == "tools" else param
+            if tightened is not None:
+                params.append(tightened)
     return params
 
 
@@ -195,22 +269,31 @@ def _introspect(obj: Any) -> list[Parameter]:
             tool_subset_candidates(allowed) if isinstance(allowed, (list, tuple)) else None
         )
 
+        # ``effort`` replaced the flat thinking budget: current SDKs document
+        # ``max_thinking_tokens`` as deprecated and treat it as an on/off
+        # switch, so a numeric search over it explores nothing. It is still
+        # offered on releases that have no ``effort`` field.
+        has_effort = hasattr(obj, "effort")
+
         candidates = [
             bind_attr(obj, "model", f"{component}.model", ParameterKind.MODEL, component=component),
-            bind_attr(
-                obj,
-                "allowed_tools",
-                f"{component}.allowed_tools",
-                ParameterKind.TOOL,
-                component=component,
-                candidates=allowed_candidates or None,
+            _tighten_only(
+                bind_attr(
+                    obj,
+                    "allowed_tools",
+                    f"{component}.allowed_tools",
+                    ParameterKind.TOOL,
+                    component=component,
+                    candidates=allowed_candidates or None,
+                )
             ),
-            bind_attr(
+            _read_only(
                 obj,
                 "disallowed_tools",
                 f"{component}.disallowed_tools",
                 ParameterKind.TOOL,
-                component=component,
+                component,
+                "the deny list is a security control; shrinking it is a policy decision",
             ),
             bind_attr(
                 obj,
@@ -220,25 +303,41 @@ def _introspect(obj: Any) -> list[Parameter]:
                 component=component,
                 bounds=(1, 100),
             ),
-            # The extended-thinking budget (present on SDK versions that carry
-            # it as a flat option). The floor matches the API's minimum budget.
             bind_attr(
                 obj,
-                "max_thinking_tokens",
-                f"{component}.max_thinking_tokens",
+                "effort",
+                f"{component}.effort",
                 ParameterKind.HYPERPARAM,
                 component=component,
-                bounds=(1024, 32000),
+                candidates=_effort_levels() if has_effort else None,
             ),
-            # ``permission_mode`` is a small discrete enum; giving it explicit
-            # candidates turns it from a dead knob into a searchable one.
-            bind_attr(
+            (
+                None
+                if has_effort
+                else bind_attr(
+                    obj,
+                    "max_thinking_tokens",
+                    f"{component}.max_thinking_tokens",
+                    ParameterKind.HYPERPARAM,
+                    component=component,
+                    bounds=(1024, 32000),
+                )
+            ),
+            # ``permission_mode`` decides which tool calls run without a human.
+            # The SDK documents its values but gives no ordering from which
+            # "tighter" and "looser" can be read with confidence (``plan``,
+            # ``dontAsk`` and ``auto`` are not points on one scale), and
+            # ``bypassPermissions`` switches checking off entirely. A score-driven
+            # search must not choose among them, so the mode is reported, never
+            # written.
+            _read_only(
                 obj,
                 "permission_mode",
                 f"{component}.permission_mode",
                 ParameterKind.ROUTING,
-                component=component,
-                candidates=list(_PERMISSION_MODES),
+                component,
+                "permission modes cannot be ordered from the SDK's documentation; "
+                "choosing one is a security decision, not a tunable",
             ),
         ]
         params.extend(p for p in candidates if p is not None)

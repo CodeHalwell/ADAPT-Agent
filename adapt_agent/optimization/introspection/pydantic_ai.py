@@ -2,9 +2,11 @@
 
 `Pydantic AI <https://ai.pydantic.dev>`_ centres on an ``Agent`` that exposes a
 callable ``run_sync`` and holds its configuration on attributes: the system
-prompts in a private ``_system_prompts`` tuple, a ``model`` (a string identifier
+prompts in a private ``_system_prompts`` tuple (or, for ``instructions=``, a
+private ``_instructions`` list), a ``model`` (a string identifier
 or a model object), an optional ``model_settings`` dict (temperature / top_p /
-max_tokens), and a function-tool registry (``_function_tools`` or ``tools``).
+max_tokens), and a function-tool registry (``_function_toolset.tools`` on current releases;
+``_function_tools`` / ``tools`` on older ones).
 
 This module turns such an object into a flat list of tunable
 :class:`~adapt_agent.optimization.parameters.Parameter` objects bound to live
@@ -14,6 +16,7 @@ getters/setters. It duck-types every attribute access and never imports
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from adapt_agent.optimization.introspection import (
@@ -31,7 +34,7 @@ def _predicate(obj: Any) -> bool:
     A match needs a callable ``run_sync`` and a ``model`` attribute, plus either
     the private ``_system_prompts`` tuple or a public ``system_prompt``. We
     explicitly reject objects that carry multi-agent / handoff markers (or a
-    ``chat_client``, which a Microsoft Agent Framework ``ChatAgent`` carries) so
+    ``chat_client``, which a Microsoft Agent Framework ``Agent`` (formerly ``ChatAgent``) carries) so
     we do not steal objects belonging to other frameworks' introspectors.
     """
     try:
@@ -62,6 +65,33 @@ def _component_name(obj: Any) -> str:
 _PROMPT_FIELDS = (("_system_prompts", tuple), ("_instructions", list))
 
 
+def _is_sourced(item: Any) -> bool:
+    """Whether ``item`` is a ``SourcedInstruction``-style wrapper (newer releases).
+
+    Recent releases keep each entry of ``_instructions`` as a dataclass whose
+    ``instruction`` field holds the text or callable, alongside the identity the
+    framework addresses the instruction by. Older releases (and
+    ``_system_prompts`` on every release) hold the text itself.
+    """
+    return (
+        not isinstance(item, str)
+        and dataclasses.is_dataclass(item)
+        and not isinstance(item, type)
+        and hasattr(item, "instruction")
+    )
+
+
+def _text_of(item: Any) -> str | None:
+    """The static text of one prompt entry, or ``None`` for a callable / part.
+
+    Looking through the wrapper is what makes an ``instructions=`` agent
+    readable at all: testing ``isinstance(item, str)`` on the wrapper matched
+    nothing, so the knob bound a getter that always read ``""``.
+    """
+    inner = item.instruction if _is_sourced(item) else item
+    return inner if isinstance(inner, str) else None
+
+
 def _string_elements(value: Any) -> list[str]:
     """The string members of a prompt sequence, in order.
 
@@ -75,7 +105,7 @@ def _string_elements(value: Any) -> list[str]:
     """
     if not isinstance(value, (list, tuple)):
         return []
-    return [item for item in value if isinstance(item, str)]
+    return [text for text in map(_text_of, value) if text is not None]
 
 
 def _is_populated(value: Any) -> bool:
@@ -100,13 +130,36 @@ def _first_static_run(value: Any) -> tuple[int, int]:
     """
     if not isinstance(value, (list, tuple)):
         return (0, 0)
-    start = next((i for i, item in enumerate(value) if isinstance(item, str)), None)
+    start = next((i for i, item in enumerate(value) if _text_of(item) is not None), None)
     if start is None:
         return (0, 0)
     end = start
-    while end < len(value) and isinstance(value[end], str):
+    while end < len(value) and _text_of(value[end]) is not None:
         end += 1
     return (start, end)
+
+
+def _with_text(template: Any, value: str) -> Any:
+    """A copy of ``template`` carrying ``value``, keeping the entry's own type.
+
+    A wrapped entry is rebuilt with ``dataclasses.replace`` so the framework's
+    bookkeeping (source, ordering policy, ...) survives; a plain entry is just
+    the new string. Writing a bare ``str`` into a list of wrappers is what made
+    the agent's next run die with ``'str' object has no attribute 'instruction'``.
+    """
+    if _is_sourced(template):
+        return dataclasses.replace(template, instruction=value)
+    return value
+
+
+def _new_entry(current: list[Any], value: str) -> Any:
+    """An entry introducing ``value`` where the field held no static text yet."""
+    template = next((item for item in current if _is_sourced(item)), None)
+    if template is None:
+        return value
+    # A fresh, unnamed literal: reusing the template's id/name would make two
+    # entries claim the same address, and its `dynamic` flag describes a callable.
+    return dataclasses.replace(template, instruction=value, name=None, id=None, dynamic=False)
 
 
 def _sequence_prompt_param(obj: Any, attr: str, wrap: Any, component: str) -> Parameter:
@@ -119,9 +172,15 @@ def _sequence_prompt_param(obj: Any, attr: str, wrap: Any, component: str) -> Pa
     collapsing every string into one would reorder the sequence and drop
     whatever sat past the callable. See :func:`_first_static_run`.
 
-    ``"\n"`` is the separator Pydantic AI itself puts between consecutive
-    static instructions, so reading a run and writing it back unchanged leaves
-    the rendered prompt byte-identical.
+    The run is joined with the separator the framework renders it with
+    (``"\n\n"`` between wrapped instructions, ``"\n"`` between the plain
+    strings older releases keep), so a run of several entries reads as the text
+    the model sees. Writing it back collapses the run to one entry carrying
+    that text; the rendered prompt is unchanged for the separators above.
+
+    The write is built completely, applied, and read back; if the text did not
+    land the previous sequence is restored and the error raised, so a failed
+    write never leaves the agent holding something its next run cannot render.
     """
 
     def _getter() -> Any:
@@ -129,20 +188,28 @@ def _sequence_prompt_param(obj: Any, attr: str, wrap: Any, component: str) -> Pa
         if prompts is None:
             return None
         start, end = _first_static_run(prompts)
-        return "\n".join(prompts[start:end])
+        run = prompts[start:end]
+        sep = "\n\n" if any(_is_sourced(item) for item in run) else "\n"
+        return sep.join(text for text in map(_text_of, run) if text is not None)
 
     def _setter(value: Any) -> None:
-        current = list(getattr(obj, attr, None) or ())
+        if not isinstance(value, str):
+            raise TypeError(f"a prompt must be a str, got {type(value).__name__}")
+        original = getattr(obj, attr, None)
+        current = list(original or ())
         start, end = _first_static_run(current)
         if start == end:  # no static text yet: the new prompt goes in front
             # ...unless there is no prompt either. Writing back the empty value
             # a callable-only field reads must leave that field untouched, or
             # the round trip an optimizer performs on every sweep grows an
             # empty instruction each time.
-            replaced = [value, *current] if value else list(current)
+            replaced = [_new_entry(current, value), *current] if value else list(current)
         else:
-            replaced = [*current[:start], value, *current[end:]]
+            replaced = [*current[:start], _with_text(current[start], value), *current[end:]]
         setattr(obj, attr, wrap(replaced))
+        if _getter() != value and not (start == end and not value):
+            setattr(obj, attr, original)
+            raise RuntimeError(f"writing {attr} did not change the prompt the agent reads")
 
     return Parameter(
         name="agent.system_prompt",
@@ -284,13 +351,57 @@ def _model_settings_params(obj: Any, component: str) -> list[Parameter]:
     return [p for p in params if p is not None]
 
 
+def _registry_param(obj: Any, registry: dict[Any, Any], component: str) -> Parameter:
+    """Bind the ``name -> tool`` dict a current-release agent keeps its tools in.
+
+    The registry is a dict the agent rebuilds its per-run toolset from, so the
+    knob reads its values as a list (the shape ``tool_subset_candidates`` and
+    the optimizer work with) and a write rewrites the dict *in place* -- other
+    references to it, including the toolset that owns it, keep seeing the
+    change. Every entry must be a named tool; the new mapping is built before
+    the old one is touched so a bad value raises with the registry intact.
+    """
+
+    def _getter() -> Any:
+        return list(registry.values())
+
+    def _setter(value: Any) -> None:
+        if not isinstance(value, (list, tuple)):
+            raise TypeError(f"tools must be a list, got {type(value).__name__}")
+        rebuilt: dict[Any, Any] = {}
+        for tool in value:
+            name = getattr(tool, "name", None)
+            if not isinstance(name, str) or not name:
+                raise TypeError(f"{tool!r} is not a named tool")
+            rebuilt[name] = tool
+        registry.clear()
+        registry.update(rebuilt)
+
+    current = _getter()
+    return Parameter(
+        name="agent.tools",
+        kind=ParameterKind.TOOL,
+        value=current,
+        candidates=tool_subset_candidates(current),
+        getter=_getter,
+        setter=_setter,
+        component=component,
+        metadata={"source": "attr:_function_toolset.tools"},
+    )
+
+
 def _tool_param(obj: Any, component: str) -> Parameter | None:
     """Expose a TOOL parameter bound to the agent's function-tool registry.
 
-    When the registry is a list/tuple of two or more tools the parameter is made
-    *optimizable* via drop-one ablation ``candidates`` so the optimizer can search
-    tool subsets.
+    Current releases keep the registry in ``agent._function_toolset.tools`` (a
+    dict); older ones used ``_function_tools`` or ``tools`` directly. When the
+    registry holds two or more tools the parameter is made *optimizable* via
+    drop-one ablation ``candidates`` so the optimizer can search tool subsets.
     """
+    toolset = getattr(obj, "_function_toolset", None)
+    registry = getattr(toolset, "tools", None)
+    if isinstance(registry, dict):
+        return _registry_param(obj, registry, component)
     for attr in ("_function_tools", "tools"):
         if hasattr(obj, attr):
             current = getattr(obj, attr, None)
