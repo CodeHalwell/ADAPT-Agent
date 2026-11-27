@@ -371,3 +371,39 @@ def test_record_helpers_reach_the_observer_and_tolerate_one_without_them() -> No
     record_refusal(None, "ops", "run", ["firewall"], stage="input")
     record_tool_decision(object(), "ops", decision, phase="call")
     record_refusal(object(), "ops", "run", ["firewall"], stage="input")
+
+
+def test_context_state_reads_a_state_object_that_is_not_a_mapping() -> None:
+    from adapt_agent.integrations._common import context_state
+
+    class State:  # shaped like google.adk's State: to_dict(), not a Mapping
+        def to_dict(self) -> dict:
+            return {"trust_score": 0.9}
+
+    class Context:
+        state = State()
+
+    class SessionContext:
+        state = None
+
+        class session:  # noqa: N801 - attribute stand-in
+            state = State()
+
+    assert context_state(Context()) == {"trust_score": 0.9}
+    assert context_state(SessionContext()) == {"trust_score": 0.9}
+
+
+def test_context_state_ignores_a_to_dict_that_fails_or_returns_something_else() -> None:
+    from adapt_agent.integrations._common import context_state
+
+    class Raises:
+        def to_dict(self) -> dict:
+            raise RuntimeError("no")
+
+    class NotADict:
+        def to_dict(self) -> list:
+            return [1]
+
+    for state in (Raises(), NotADict()):
+        context = type("Context", (), {"state": state, "session": None, "context": None})()
+        assert context_state(context) == {}

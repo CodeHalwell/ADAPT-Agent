@@ -384,6 +384,24 @@ def main(args: list[str] | None = None) -> int:
             )
             sub.add_argument("--max-evals", type=int, default=60, help="Evaluation budget.")
             sub.add_argument("--seed", type=int, default=0, help="RNG seed for reproducibility.")
+            sub.add_argument(
+                "--alpha",
+                type=float,
+                help="Significance level a gain must meet to count as an improvement "
+                "(default: 0.05).",
+            )
+            sub.add_argument(
+                "--repeats",
+                type=int,
+                help="Measure each comparison this many times. Default: once, or three "
+                "times when the agent is detected to be non-deterministic.",
+            )
+            sub.add_argument(
+                "--holdout-fraction",
+                type=float,
+                help="Share of the dataset held out to confirm a gain when --val-data is "
+                "not given (default: 0.25).",
+            )
             sub.add_argument("--val-data", help="Optional held-out dataset for validation.")
             sub.add_argument(
                 "--save-config",
@@ -942,9 +960,27 @@ def _build_target(args: Any) -> Any:
 
 
 def _build_optimizer(
-    name: str, harness: Any, judge: Any, max_evals: int, seed: int, verbose: bool
+    name: str,
+    harness: Any,
+    judge: Any,
+    max_evals: int,
+    seed: int,
+    verbose: bool,
+    *,
+    alpha: float | None = None,
+    repeats: int | None = None,
+    holdout_fraction: float | None = None,
 ) -> Any:
     """Instantiate the requested optimizer strategy."""
+    acceptance: dict[str, Any] = {
+        key: value
+        for key, value in (
+            ("alpha", alpha),
+            ("repeats", repeats),
+            ("holdout_fraction", holdout_fraction),
+        )
+        if value is not None
+    }
     from adapt_agent.optimization import (
         BootstrapFewShotOptimizer,
         CoordinateAscentOptimizer,
@@ -956,7 +992,7 @@ def _build_optimizer(
 
     if name == "default":
         return make_default_optimizer(
-            harness, judge=judge, max_evals=max_evals, seed=seed, verbose=verbose
+            harness, judge=judge, max_evals=max_evals, seed=seed, verbose=verbose, **acceptance
         )
     classes = {
         "coordinate_ascent": CoordinateAscentOptimizer,
@@ -965,7 +1001,9 @@ def _build_optimizer(
         "random": RandomSearchOptimizer,
         "evolutionary": EvolutionaryOptimizer,
     }
-    return classes[name](harness, max_evals=max_evals, seed=seed, judge=judge, verbose=verbose)
+    return classes[name](
+        harness, max_evals=max_evals, seed=seed, judge=judge, verbose=verbose, **acceptance
+    )
 
 
 def _fail(exc: Exception, as_json: bool) -> int:
@@ -1263,7 +1301,15 @@ def _cmd_optimize(args: Any) -> int:
             concurrency=max(1, args.concurrency),
         )
         optimizer = _build_optimizer(
-            args.optimizer, harness, judge, args.max_evals, args.seed, args.verbose
+            args.optimizer,
+            harness,
+            judge,
+            args.max_evals,
+            args.seed,
+            args.verbose,
+            alpha=args.alpha,
+            repeats=args.repeats,
+            holdout_fraction=args.holdout_fraction,
         )
         result = optimizer.optimize(target, dataset, val_dataset=val_dataset)
     except Exception as exc:
@@ -1287,6 +1333,7 @@ def _cmd_optimize(args: Any) -> int:
         print(f"  best       : {result.best_score:.4f}  (improvement {result.improvement:+.4f})")
         if result.validation_score is not None:
             print(f"  validation : {result.validation_score:.4f}")
+        print(f"  significant: {_significance_line(result)}")
         print(f"  evaluations: {result.n_evals}")
         if result.best_config:
             print("  best config:")
@@ -1301,6 +1348,30 @@ def _cmd_optimize(args: Any) -> int:
             print(f"  saved best config to: {args.save_config}")
             _print_skipped(skipped)
     return 0
+
+
+def _significance_line(result: Any) -> str:
+    """One line saying whether the measured gain is statistically supported.
+
+    A higher score on a handful of rows is not evidence of a better agent, so
+    the verdict is printed next to the numbers rather than left for the reader
+    to infer from them.
+    """
+    verdict = "yes" if getattr(result, "significant", False) else "no"
+    details = []
+    p_value = getattr(result, "p_value", None)
+    if p_value is not None:
+        details.append(f"p={p_value:.3f}")
+    n_rows = getattr(result, "n_rows", None)
+    if n_rows is not None:
+        details.append(f"{n_rows} rows")
+    repeats = getattr(result, "repeats", None)
+    if repeats and repeats > 1:
+        details.append(f"{repeats} repeats")
+    reason = getattr(result, "rejected_reason", None)
+    if reason and verdict == "no":
+        details.append(str(reason))
+    return f"{verdict} ({', '.join(details)})" if details else verdict
 
 
 def _print_skipped(skipped: list[str]) -> None:
@@ -1349,6 +1420,7 @@ def _cmd_train(args: Any) -> int:
         print(f"  best       : {result.best_score:.4f}  (improvement {result.improvement:+.4f})")
         if result.validation_score is not None:
             print(f"  validation : {result.validation_score:.4f}")
+        print(f"  significant: {_significance_line(result)}")
         print(f"  evaluations: {result.n_evals}")
         if result.best_config:
             print("  best config:")

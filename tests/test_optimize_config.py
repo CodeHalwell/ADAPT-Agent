@@ -342,3 +342,56 @@ def test_min_improvement_threaded_into_default_optimizer():
 def _cleanup_mini_app():
     yield
     sys.modules.pop("mini_app", None)
+
+
+# -- significance settings in the training config -------------------------------
+
+
+def test_optimizer_acceptance_settings_are_parsed_and_passed_on() -> None:
+    from adapt_agent.optimization.config import OptimizerSpec, _optional_bool, _optional_number
+
+    raw = {"alpha": 0.1, "repeats": 3, "holdout_fraction": "0.3", "allow_small_sample": False}
+    spec = OptimizerSpec(
+        alpha=_optional_number(raw, "alpha", float),
+        repeats=_optional_number(raw, "repeats", int),
+        holdout_fraction=_optional_number(raw, "holdout_fraction", float),
+        allow_small_sample=_optional_bool(raw, "allow_small_sample"),
+        detect_nondeterminism=_optional_bool(raw, "detect_nondeterminism"),
+    )
+    assert spec.acceptance_kwargs() == {
+        "alpha": 0.1,
+        "repeats": 3,
+        "holdout_fraction": 0.3,
+        "allow_small_sample": False,
+    }
+    assert OptimizerSpec().acceptance_kwargs() == {}
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("alpha", "high"), ("repeats", True), ("allow_small_sample", "yes")],
+)
+def test_malformed_acceptance_settings_are_config_errors(key: str, value: object) -> None:
+    from adapt_agent.optimization.config import (
+        TrainingConfigError,
+        _optional_bool,
+        _optional_number,
+    )
+
+    with pytest.raises(TrainingConfigError, match=f"optimizer.{key}"):
+        if key == "allow_small_sample":
+            _optional_bool({key: value}, key)
+        else:
+            _optional_number({key: value}, key, float)
+
+
+def test_the_default_pipeline_refuses_a_setting_it_cannot_honour() -> None:
+    from adapt_agent.optimization.config import (
+        OptimizerSpec,
+        TrainingConfigError,
+        _pipeline_acceptance_kwargs,
+    )
+
+    assert _pipeline_acceptance_kwargs(OptimizerSpec(alpha=0.1)) == {"alpha": 0.1}
+    with pytest.raises(TrainingConfigError, match="detect_nondeterminism"):
+        _pipeline_acceptance_kwargs(OptimizerSpec(detect_nondeterminism=False))

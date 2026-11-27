@@ -170,13 +170,13 @@ def context_state(context: Any) -> dict[str, Any]:
     rule never fires and nothing says so.
     """
     # ADK: `Context.state`; some versions expose it via the session instead.
-    state = getattr(context, "state", None)
-    if isinstance(state, Mapping):
-        return dict(state)
+    state = _as_mapping(getattr(context, "state", None))
+    if state is not None:
+        return state
     session = getattr(context, "session", None)
-    session_state = getattr(session, "state", None)
-    if isinstance(session_state, Mapping):
-        return dict(session_state)
+    session_state = _as_mapping(getattr(session, "state", None))
+    if session_state is not None:
+        return session_state
     # OpenAI Agents: `RunContextWrapper.context` is whatever the caller passed to
     # `Runner.run(..., context=...)` -- the conventional home for authorization
     # data a policy rule gates on.
@@ -184,6 +184,27 @@ def context_state(context: Any) -> dict[str, Any]:
     if isinstance(runtime, Mapping):
         return dict(runtime)
     return {}
+
+
+def _as_mapping(state: Any) -> dict[str, Any] | None:
+    """A state object as a plain dict, or ``None`` if it is not one.
+
+    ADK's ``State`` is not a :class:`~collections.abc.Mapping` -- it exposes
+    ``to_dict()`` instead -- so an ``isinstance`` check alone reads it as "no
+    state", and every policy rule that gates on session data then fails closed
+    on every request.
+    """
+    if isinstance(state, Mapping):
+        return dict(state)
+    to_dict = getattr(state, "to_dict", None)
+    if callable(to_dict):
+        try:
+            converted = to_dict()
+        except Exception:
+            return None
+        if isinstance(converted, Mapping):
+            return dict(converted)
+    return None
 
 
 def as_state(messages: Any, /, **extra: Any) -> dict[str, Any]:

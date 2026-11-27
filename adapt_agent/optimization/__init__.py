@@ -77,6 +77,7 @@ from adapt_agent.optimization.metrics import (
     token_f1,
 )
 from adapt_agent.optimization.optimizers import (
+    DEFAULT_NONDETERMINISTIC_REPEATS,
     BootstrapFewShotOptimizer,
     CoordinateAscentOptimizer,
     EvolutionaryOptimizer,
@@ -134,6 +135,7 @@ from adapt_agent.optimization.runners import (
     langgraph_inputs,
     openai_agents_runner,
 )
+from adapt_agent.optimization.significance import PairedComparison, compare_rows
 from adapt_agent.optimization.target import OptimizableAgent, wrap
 from adapt_agent.optimization.trajectory import (
     no_forbidden_tools,
@@ -144,6 +146,9 @@ from adapt_agent.optimization.trajectory import (
 )
 
 __all__ = [
+    "DEFAULT_NONDETERMINISTIC_REPEATS",
+    "PairedComparison",
+    "compare_rows",
     # legacy runtime metrics
     "AgentOptimizer",
     # parameters

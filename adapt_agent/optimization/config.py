@@ -219,6 +219,24 @@ class OptimizerSpec:
     kinds: list[str] | None = None
     suggest_tools: bool = True
     verbose: bool = False
+    #: Acceptance settings for the paired significance test. ``None`` keeps the
+    #: optimizer's own default.
+    alpha: float | None = None
+    repeats: int | None = None
+    holdout_fraction: float | None = None
+    allow_small_sample: bool | None = None
+    detect_nondeterminism: bool | None = None
+
+    def acceptance_kwargs(self) -> dict[str, Any]:
+        """The significance settings that were set, as optimizer keyword arguments."""
+        values = {
+            "alpha": self.alpha,
+            "repeats": self.repeats,
+            "holdout_fraction": self.holdout_fraction,
+            "allow_small_sample": self.allow_small_sample,
+            "detect_nondeterminism": self.detect_nondeterminism,
+        }
+        return {name: value for name, value in values.items() if value is not None}
 
 
 @dataclass
@@ -384,6 +402,11 @@ def parse_training_config(raw: dict[str, Any]) -> TrainingConfig:
         kinds=list(opt_raw["kinds"]) if opt_raw.get("kinds") else None,
         suggest_tools=bool(opt_raw.get("suggest_tools", True)),
         verbose=bool(opt_raw.get("verbose", False)),
+        alpha=_optional_number(opt_raw, "alpha", float),
+        repeats=_optional_number(opt_raw, "repeats", int),
+        holdout_fraction=_optional_number(opt_raw, "holdout_fraction", float),
+        allow_small_sample=_optional_bool(opt_raw, "allow_small_sample"),
+        detect_nondeterminism=_optional_bool(opt_raw, "detect_nondeterminism"),
     )
     if optimizer.kinds:
         for k in optimizer.kinds:
@@ -710,12 +733,52 @@ def _validate_bounds(spec: ParameterSpec) -> tuple[float, float] | None:
 # --------------------------------------------------------------------------- #
 
 
+def _optional_number(raw: dict[str, Any], key: str, kind: type) -> Any:
+    """``optimizer.<key>`` as ``kind``, or ``None`` when absent or null."""
+    value = raw.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):  # bool is an int; `repeats: true` is a mistake
+        raise TrainingConfigError(f"optimizer.{key} must be a number, got {value!r}")
+    try:
+        return kind(value)
+    except (TypeError, ValueError) as exc:
+        raise TrainingConfigError(f"optimizer.{key} must be a number, got {value!r}") from exc
+
+
+def _optional_bool(raw: dict[str, Any], key: str) -> bool | None:
+    """``optimizer.<key>`` as a bool, or ``None`` when absent or null."""
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise TrainingConfigError(f"optimizer.{key} must be true or false, got {value!r}")
+    return value
+
+
+def _pipeline_acceptance_kwargs(spec: OptimizerSpec) -> dict[str, Any]:
+    """Acceptance settings the default pipeline takes.
+
+    ``make_default_optimizer`` exposes no ``detect_nondeterminism`` switch, so a
+    config that sets it for the default pipeline is refused rather than
+    accepted and ignored.
+    """
+    kwargs = spec.acceptance_kwargs()
+    if "detect_nondeterminism" in kwargs:
+        raise TrainingConfigError(
+            "optimizer.detect_nondeterminism is not supported by the 'default' pipeline; "
+            "set optimizer.repeats explicitly, or choose a single strategy"
+        )
+    return kwargs
+
+
 def build_optimizer(config: TrainingConfig, harness: EvaluationHarness, judge: Any) -> Optimizer:
     spec = config.optimizer
     common: dict[str, Any] = {
         "max_evals": spec.max_evals,
         "seed": spec.seed,
         "verbose": spec.verbose,
+        **spec.acceptance_kwargs(),
     }
     if spec.min_improvement is not None:
         common["min_improvement"] = spec.min_improvement
@@ -732,6 +795,7 @@ def build_optimizer(config: TrainingConfig, harness: EvaluationHarness, judge: A
             verbose=spec.verbose,
             min_improvement=spec.min_improvement,
             suggest_tools=None if spec.suggest_tools else False,
+            **_pipeline_acceptance_kwargs(spec),
         )
 
     cls = _OPTIMIZER_TYPES[spec.type]

@@ -118,8 +118,57 @@ def test_optimize_json_output(agent_env, capsys):
     )
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["improved"] is True
+    # The better prompt is found and applied, but three rows cannot support a
+    # claim of improvement: 3/3 rows gaining has p = 0.125 under the paired
+    # test, so the run reports the gain without calling it one.
     assert payload["best_score"] == 1.0
+    assert payload["improved"] is False
+    assert payload["significant"] is False
+
+
+def test_optimize_reports_a_significant_improvement_on_enough_rows(agent_env, capsys):
+    module_name, _, tmp_path = agent_env
+    capitals = {
+        "France": "Paris",
+        "Japan": "Tokyo",
+        "Italy": "Rome",
+        "Spain": "Madrid",
+        "Peru": "Lima",
+        "Kenya": "Nairobi",
+        "Norway": "Oslo",
+        "Egypt": "Cairo",
+    }
+    module = (tmp_path / f"{module_name}.py").read_text(encoding="utf-8")
+    module = module.replace(
+        '_CAP = {"France": "Paris", "Japan": "Tokyo", "Italy": "Rome"}', f"_CAP = {capitals!r}"
+    )
+    (tmp_path / f"{module_name}.py").write_text(module, encoding="utf-8")
+    data = tmp_path / "more.jsonl"
+    data.write_text(
+        "\n".join(
+            json.dumps({"input": f"What is the capital of {country}?", "expected": capital})
+            for country, capital in capitals.items()
+        ),
+        encoding="utf-8",
+    )
+    code = main(
+        [
+            "optimize",
+            f"{module_name}:build()",
+            "--data",
+            str(data),
+            "--metric",
+            "exact_match",
+            "--optimizer",
+            "coordinate_ascent",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["best_score"] == 1.0
+    assert payload["improved"] is True
+    assert payload["significant"] is True
 
 
 def test_evaluate_unknown_metric_fails(agent_env, capsys):
@@ -359,3 +408,66 @@ def test_evaluate_metric_judge_requires_judge_flag(agent_env, capsys):
     code = main(["evaluate", f"{module_name}:build()", "--data", data, "--metric", "judge"])
     assert code == 1
     assert "--judge" in capsys.readouterr().out
+
+
+def test_optimize_text_output_states_whether_the_gain_is_significant(agent_env, capsys):
+    module_name, data, _ = agent_env
+    code = main(
+        [
+            "optimize",
+            f"{module_name}:build()",
+            "--data",
+            data,
+            "--metric",
+            "exact_match",
+            "--optimizer",
+            "coordinate_ascent",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "significant: no" in out and "3 rows" in out
+
+
+def test_optimize_acceptance_flags_reach_the_optimizer(agent_env, capsys):
+    module_name, data, _ = agent_env
+    code = main(
+        [
+            "optimize",
+            f"{module_name}:build()",
+            "--data",
+            data,
+            "--metric",
+            "exact_match",
+            "--optimizer",
+            "coordinate_ascent",
+            "--alpha",
+            "0.2",
+            "--repeats",
+            "2",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["alpha"] == 0.2 and payload["repeats"] == 2
+    # 3/3 rows gaining has p = 0.125, which clears a 0.2 threshold.
+    assert payload["significant"] is True and payload["improved"] is True
+
+
+def test_optimize_rejects_an_out_of_range_alpha(agent_env, capsys):
+    module_name, data, _ = agent_env
+    code = main(
+        [
+            "optimize",
+            f"{module_name}:build()",
+            "--data",
+            data,
+            "--metric",
+            "exact_match",
+            "--alpha",
+            "1.5",
+        ]
+    )
+    assert code == 1
+    assert "alpha" in capsys.readouterr().out
