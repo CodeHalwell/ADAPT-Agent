@@ -17,6 +17,7 @@ the implementation or the oracle is wrong; both are short enough to decide.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import re
 from typing import Any
@@ -351,9 +352,31 @@ _expressions = st.recursive(
 )
 
 
+def _numbers_only_mul(left: Any, right: Any) -> Any:
+    """Python's `*`, minus sequence repetition (the one deliberate restriction)."""
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left * right
+    raise TypeError("`*` is only supported between numbers")
+
+
+class _RestrictMul(ast.NodeTransformer):
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        self.generic_visit(node)
+        if isinstance(node.op, ast.Mult):
+            return ast.copy_location(
+                ast.Call(ast.Name("_mul", ast.Load()), [node.left, node.right], []), node
+            )
+        return node
+
+
 def _python_outcome(expression: str) -> str:
     try:
-        value = eval(expression, {"__builtins__": {}}, {"state": _STATE})  # noqa: S307
+        tree = ast.fix_missing_locations(_RestrictMul().visit(ast.parse(expression, mode="eval")))
+        value = eval(  # noqa: S307
+            compile(tree, "<condition>", "eval"),
+            {"__builtins__": {}},
+            {"state": _STATE, "_mul": _numbers_only_mul},
+        )
     except Exception:
         return "error"
     return "violation" if value else "pass"

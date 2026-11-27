@@ -302,7 +302,7 @@ def test_node_count_cap_allows_normal_condition():
         "len(state['messages']) > 5",  # function call
         "state.trust_score < 0.5",  # attribute access
         "not state['ok']",  # unary not
-        "state['messages'][-1] == 'x'",  # unary minus
+        "-state['n'] > 1",  # unary minus on an expression (only numeric literals are allowed)
         "state['messages'][0:2] == []",  # slice
         "state['n'] % 2 == 0",  # unsupported arithmetic operator
         "state['n'] ** 2 > 4",  # power: unbounded CPU and memory

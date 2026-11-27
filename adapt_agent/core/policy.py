@@ -2,7 +2,10 @@
 
 import ast
 import logging
+import math
+import numbers
 import operator
+import threading
 from collections import deque
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
@@ -10,6 +13,7 @@ from functools import lru_cache
 from typing import Any, cast
 
 from adapt_agent.core.types import AgentMessage, AgentState, PolicyRule
+from adapt_agent.exceptions import SecurityBlockedError
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +79,27 @@ def _condition_names(condition: str) -> frozenset[str]:
     return frozenset(node.id for node in ast.walk(tree) if isinstance(node, ast.Name))
 
 
+#: The rule actions the enforcer knows. ``add_rule`` refuses anything else: the
+#: gate compares ``action == "block"``, so a typo such as ``"Block"`` or
+#: ``"deny"`` was accepted and then enforced nothing at all.
+VALID_ACTIONS = frozenset({"warn", "block", "modify", REQUIRE_APPROVAL})
+
+#: The rule severities ``add_rule`` accepts (the same set the CLI validates).
+VALID_SEVERITIES = frozenset({"low", "medium", "high", "critical"})
+
+#: Largest number of expression levels the evaluator will descend. Checked at
+#: registration (``validate_condition``) as well as at run time, so a rule that
+#: could only ever error is refused rather than installed.
+MAX_EVAL_DEPTH = 50
+
+#: Violation records keep a bounded summary of the offending data, never the
+#: object itself: the live state keeps changing after the violation, and holding
+#: it would pin arbitrary conversation content in memory.
+_SUMMARY_MAX_KEYS = 20
+_SUMMARY_MAX_STR = 64
+_SUMMARY_SCALAR_KEYS = ("role", "name")
+
+
 def _is_tool_rule(rule: PolicyRule) -> bool:
     """Whether ``rule`` is scoped to tool calls (its condition names ``tool``)."""
     return TOOL_SCOPE in _condition_names(rule["condition"])
@@ -94,8 +119,32 @@ _SUPPORTED_NODES: tuple[type[ast.AST], ...] = (
     ast.And,
     ast.Or,
     ast.BinOp,
+    ast.UnaryOp,
+    ast.USub,
+    ast.UAdd,
     ast.Subscript,
 )
+
+
+def _max_eval_depth(tree: ast.AST) -> int:
+    """Deepest level the evaluator would reach, counting only evaluated nodes.
+
+    Mirrors ``_eval_node``: operator and context nodes (``Load``, ``Add``, ...)
+    are never evaluated and add no depth. Iterative, so a hostile condition
+    cannot exhaust the interpreter stack here.
+    """
+    deepest = 0
+    stack: list[tuple[ast.AST, int]] = [(tree, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, ast.Expression):
+            stack.append((node.body, 0))
+            continue
+        deepest = max(deepest, depth)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.expr):
+                stack.append((child, depth + 1))
+    return deepest
 
 
 def validate_condition(condition: str) -> None:
@@ -121,6 +170,13 @@ def validate_condition(condition: str) -> None:
         tree = _parse_condition(condition)
     except SyntaxError as exc:
         raise ValueError(f"Condition is not a valid expression: {exc.msg}") from exc
+    except (RecursionError, MemoryError) as exc:
+        raise ValueError("Condition is too deeply nested to parse") from exc
+    if _max_eval_depth(tree) > MAX_EVAL_DEPTH:
+        raise ValueError(
+            f"Condition is nested deeper than the evaluator's limit of {MAX_EVAL_DEPTH} "
+            "levels and could never be evaluated"
+        )
     for node in ast.walk(tree):
         if isinstance(node, _SUPPORTED_NODES):
             if isinstance(node, ast.Name) and node.id not in CONDITION_NAMES:
@@ -130,6 +186,15 @@ def validate_condition(condition: str) -> None:
                 )
             if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
                 raise ValueError("Slices are not supported in conditions")
+            if isinstance(node, ast.UnaryOp) and not (
+                isinstance(node.op, (ast.USub, ast.UAdd))
+                and isinstance(node.operand, ast.Constant)
+                and type(node.operand.value) in (int, float)
+            ):
+                raise ValueError(
+                    "Unary +/- is only supported on a numeric literal (e.g. -1), "
+                    "not on an expression"
+                )
         elif isinstance(node, ast.cmpop):
             if type(node) not in PolicyEnforcer._OPERATORS:
                 raise ValueError(f"Unsupported comparison in condition: {type(node).__name__}")
@@ -140,7 +205,7 @@ def validate_condition(condition: str) -> None:
             raise ValueError(
                 f"Unsupported construct in condition: {type(node).__name__} "
                 "(conditions allow literals, state[...]/message[...]/tool[...] lookups, "
-                "comparisons, and/or, and + - * /)"
+                "comparisons, and/or, numeric + - * /, and negative literals)"
             )
 
 
@@ -206,6 +271,11 @@ class PolicyEnforcer:
         # found. Bounded by the number of rules (entries die with their rule).
         self._rule_stats: dict[str, dict[str, int]] = {}
         self._rule_handlers: dict[str, Callable] = {}
+        # Guards the rule table and the per-rule counters. The check paths read a
+        # snapshot of the rules, so a concurrent add/remove can neither break
+        # iteration nor stall a check; only the counter update needs the lock
+        # (``x += 1`` on a dict item is not atomic).
+        self._lock = threading.Lock()
 
     def add_rule(
         self,
@@ -221,12 +291,29 @@ class PolicyEnforcer:
             name: Unique name for the rule
             description: Human-readable description
             condition: Condition expression to evaluate
-            action: Action to take on violation (warn, block, modify). A
+            action: One of :data:`VALID_ACTIONS` (``warn``, ``block``,
+                ``modify``, ``require_approval``), spelled exactly. A
                 tool-scoped rule -- one whose condition names ``tool`` -- may
-                also use ``require_approval``, which pauses the call for a
-                human decision rather than refusing it; see :meth:`check_tool`.
-            severity: Severity level (low, medium, high, critical)
+                use ``require_approval``, which pauses the call for a human
+                decision rather than refusing it; see :meth:`check_tool`. On any
+                other rule nothing could ever act on it, so it is refused.
+            severity: One of :data:`VALID_SEVERITIES` (``low``, ``medium``,
+                ``high``, ``critical``).
+
+        Raises:
+            ValueError: on an unknown action or severity, an unevaluable
+                condition (see :func:`validate_condition`), or
+                ``require_approval`` on a rule that is not tool-scoped.
         """
+        # SECURITY: a closed set. The gate compares ``action == "block"``, so an
+        # unrecognised spelling used to be accepted and then silently never
+        # enforced -- the worst kind of control.
+        if action not in VALID_ACTIONS:
+            raise ValueError(f"Invalid action {action!r}; expected one of {sorted(VALID_ACTIONS)}")
+        if severity not in VALID_SEVERITIES:
+            raise ValueError(
+                f"Invalid severity {severity!r}; expected one of {sorted(VALID_SEVERITIES)}"
+            )
         # SECURITY: Prevent CPU exhaustion DoS attacks by limiting the length of conditions parsed into ASTs
         if len(condition) > 1024:
             raise ValueError(
@@ -239,6 +326,12 @@ class PolicyEnforcer:
         # other than ``state``/``message``. Such a rule is vacuous: it would
         # never fire (fail-open) or fire on everything (fail-closed).
         validate_condition(condition)
+        if action == REQUIRE_APPROVAL and TOOL_SCOPE not in _condition_names(condition):
+            raise ValueError(
+                f"Action {REQUIRE_APPROVAL!r} needs a tool-scoped rule (a condition that "
+                f"names {TOOL_SCOPE!r}): a framework can pause a tool call for approval, "
+                "but not a message or state that has already arrived"
+            )
 
         rule: PolicyRule = {
             "name": name,
@@ -247,10 +340,11 @@ class PolicyEnforcer:
             "action": action,
             "severity": severity,
         }
-        self._rules[name] = rule
-        # A re-registered rule is a new rule: old counts would describe the
-        # condition it replaced.
-        self._rule_stats[name] = {"violation": 0, "pass": 0, "error": 0, "unresolved": 0}
+        with self._lock:
+            self._rules[name] = rule
+            # A re-registered rule is a new rule: old counts would describe the
+            # condition it replaced.
+            self._rule_stats[name] = {"violation": 0, "pass": 0, "error": 0, "unresolved": 0}
 
     def remove_rule(self, name: str) -> bool:
         """Remove a policy rule.
@@ -261,11 +355,12 @@ class PolicyEnforcer:
         Returns:
             True if rule was removed, False if not found
         """
-        if name in self._rules:
-            del self._rules[name]
-            self._rule_stats.pop(name, None)
-            return True
-        return False
+        with self._lock:
+            if name in self._rules:
+                del self._rules[name]
+                self._rule_stats.pop(name, None)
+                return True
+            return False
 
     def get_rule(self, name: str) -> PolicyRule | None:
         """Get a policy rule by name.
@@ -289,10 +384,23 @@ class PolicyEnforcer:
     def register_handler(self, action: str, handler: Callable) -> None:
         """Register a handler for a policy action.
 
+        A handler observes a violation (logging, alerting); it cannot make one
+        disappear. If it raises, the failure is logged and evaluation carries
+        on, so a faulty handler never turns a violation into a pass and never
+        hides the rules after it. The one exception is
+        :class:`~adapt_agent.exceptions.SecurityBlockedError`, which a handler
+        may raise on purpose to refuse the request outright.
+
         Args:
-            action: Action type (e.g., 'warn', 'block')
+            action: One of :data:`VALID_ACTIONS`. Any other spelling would never
+                be invoked, so it is refused.
             handler: Callable to handle the action
+
+        Raises:
+            ValueError: if ``action`` is not a valid action.
         """
+        if action not in VALID_ACTIONS:
+            raise ValueError(f"Invalid action {action!r}; expected one of {sorted(VALID_ACTIONS)}")
         self._rule_handlers[action] = handler
 
     def check_message(self, message: AgentMessage) -> list[str]:
@@ -308,7 +416,7 @@ class PolicyEnforcer:
         # ⚡ Bolt: Hoist context instantiation outside the loop to avoid redundant object creation
         context = {"message": message}
 
-        for rule_name, rule in self._rules.items():
+        for rule_name, rule in tuple(self._rules.items()):
             if _is_tool_rule(rule):
                 continue  # scoped to check_tool; `tool` is never in scope here
             if self._check_rule(rule_name, rule, context):
@@ -331,7 +439,7 @@ class PolicyEnforcer:
         # ⚡ Bolt: Hoist context instantiation outside the loop to avoid redundant object creation
         context = {"state": state}
 
-        for rule_name, rule in self._rules.items():
+        for rule_name, rule in tuple(self._rules.items()):
             if _is_tool_rule(rule):
                 continue  # scoped to check_tool; `tool` is never in scope here
             if self._check_rule(rule_name, rule, context):
@@ -384,7 +492,7 @@ class PolicyEnforcer:
         violations = []
         context: dict[Any, Any] = {"tool": tool, "state": state if state is not None else {}}
 
-        for rule_name, rule in self._rules.items():
+        for rule_name, rule in tuple(self._rules.items()):
             if not _is_tool_rule(rule):
                 continue
             if self._check_rule(rule_name, rule, context):
@@ -423,7 +531,7 @@ class PolicyEnforcer:
         if tool is not None:
             context["tool"] = tool
         outcomes: dict[str, str] = {}
-        for rule_name, rule in self._rules.items():
+        for rule_name, rule in tuple(self._rules.items()):
             try:
                 tree = _parse_condition(rule["condition"])
                 fired = bool(self._eval_node(tree.body, context))
@@ -447,7 +555,8 @@ class PolicyEnforcer:
         Returns:
             List of violation records
         """
-        violations = self._violations
+        # Snapshot first: a check on another thread may append while we scan.
+        violations = list(self._violations)
 
         if severity:
             # ⚡ Bolt: Fast path for finding limited recent violations with a specific severity
@@ -463,9 +572,9 @@ class PolicyEnforcer:
             return [v for v in violations if v["severity"] == severity]
 
         if limit:
-            return list(violations)[-limit:]
+            return violations[-limit:]
 
-        return list(violations)
+        return violations
 
     def _evaluate_condition(
         self,
@@ -528,12 +637,12 @@ class PolicyEnforcer:
         context.pop(_MISSED_LOOKUP, None)
         outcome = self._outcome(rule["condition"], context, rule_name)
         missed = context.pop(_MISSED_LOOKUP, False)
-        stats = self._rule_stats.setdefault(
-            rule_name, {"violation": 0, "pass": 0, "error": 0, "unresolved": 0}
-        )
-        stats[outcome] += 1
-        if outcome == "error" or missed:
-            stats["unresolved"] += 1
+        with self._lock:
+            stats = self._rule_stats.get(rule_name)
+            if stats is not None:  # absent when the rule was removed mid-check
+                stats[outcome] += 1
+                if outcome == "error" or missed:
+                    stats["unresolved"] += 1
         if outcome == "error":
             return self.fail_closed
         return outcome == "violation"
@@ -551,7 +660,8 @@ class PolicyEnforcer:
         the rule was registered (:meth:`evaluate_rules` is a dry run and is not
         counted).
         """
-        return {name: dict(stats) for name, stats in self._rule_stats.items()}
+        with self._lock:
+            return {name: dict(stats) for name, stats in self._rule_stats.items()}
 
     def vacuous_rules(self) -> list[str]:
         """Rules that have been evaluated and have **never once** seen their data.
@@ -570,14 +680,16 @@ class PolicyEnforcer:
         """
         return [
             name
-            for name, stats in self._rule_stats.items()
+            for name, stats in self.get_rule_stats().items()
             if stats["unresolved"] > 0
             and stats["unresolved"] == stats["violation"] + stats["pass"] + stats["error"]
         ]
 
     def _eval_node(self, node: ast.AST, context: dict[str, Any], depth: int = 0) -> Any:
         if depth > 50:
-            raise ValueError("Maximum evaluation depth exceeded (DoS protection)")
+            raise ValueError(
+                "Maximum evaluation depth exceeded (DoS protection)"
+            )  # = MAX_EVAL_DEPTH
         # NOTE: ``type(node) is X`` dispatch is intentionally used instead of
         # ``isinstance`` for speed in this hot path. mypy cannot narrow on
         # identity checks, so each branch uses ``cast`` (a zero-cost, runtime
@@ -610,6 +722,13 @@ class PolicyEnforcer:
             left = self._eval_node(cmp_node.left, context, depth + 1)
             for op, comp in zip(cmp_node.ops, cmp_node.comparators, strict=False):
                 right = self._eval_node(comp, context, depth + 1)
+                # NaN compares False with everything, so `x > 100` on a NaN is a
+                # quiet pass; an infinity is as unrepresentative. Neither is a
+                # verdict, so they are an evaluation error (fail-closed).
+                if (isinstance(left, float) and not math.isfinite(left)) or (
+                    isinstance(right, float) and not math.isfinite(right)
+                ):
+                    raise ValueError("Comparison involves a non-finite number (NaN or infinity)")
                 op_type = type(op)
                 if op_type not in self._OPERATORS:
                     raise ValueError(f"Unsupported operator: {op_type}")
@@ -645,7 +764,22 @@ class PolicyEnforcer:
             bin_op_type = type(bin_node.op)
             if bin_op_type not in self._BINOPS:
                 raise ValueError(f"Unsupported binary operator: {bin_op_type}")
+            if bin_op_type is ast.Mult and not (
+                isinstance(left, numbers.Real) and isinstance(right, numbers.Real)
+            ):
+                # Sequence repetition (`'a' * 400000000`) allocates without bound.
+                raise ValueError("`*` is only supported between numbers")
             return self._BINOPS[bin_op_type](left, right)
+        elif node_type is ast.UnaryOp:
+            un_node = cast(ast.UnaryOp, node)
+            operand = self._eval_node(un_node.operand, context, depth + 1)
+            if type(operand) not in (int, float):
+                raise ValueError("Unary +/- is only supported on numbers")
+            if type(un_node.op) is ast.USub:
+                return -operand
+            if type(un_node.op) is ast.UAdd:
+                return +operand
+            raise ValueError(f"Unsupported unary operator: {type(un_node.op)}")
         elif node_type is ast.Subscript:
             sub_node = cast(ast.Subscript, node)
             val = self._eval_node(sub_node.value, context, depth + 1)
@@ -664,6 +798,27 @@ class PolicyEnforcer:
         else:
             raise ValueError(f"Unsupported AST node: {node_type}")
 
+    @staticmethod
+    def _summarise(data: Any) -> Any:
+        """A bounded, shallow, content-light stand-in for the offending data.
+
+        Keeps what is needed to triage a violation -- the type, the size and the
+        key names (capped), plus a role/name when there is one -- and none of the
+        values, so the history cannot pin conversation content or grow with it.
+        """
+        if isinstance(data, Mapping):
+            summary: dict[str, Any] = {
+                "type": type(data).__name__,
+                "size": len(data),
+                "keys": [str(k)[:_SUMMARY_MAX_STR] for k in list(data)[:_SUMMARY_MAX_KEYS]],
+            }
+            for key in _SUMMARY_SCALAR_KEYS:
+                value = data.get(key)
+                if isinstance(value, str):
+                    summary[key] = value[:_SUMMARY_MAX_STR]
+            return summary
+        return {"type": type(data).__name__, "repr": repr(data)[:_SUMMARY_MAX_STR]}
+
     def _record_violation(
         self,
         rule_name: str,
@@ -675,24 +830,38 @@ class PolicyEnforcer:
         Args:
             rule_name: Name of violated rule
             violation_type: Type of violation
-            data: Associated data
+            data: Associated data. Only a bounded summary is stored (see
+                :meth:`_summarise`), never the object.
         """
-        rule = self._rules[rule_name]
+        rule = self._rules.get(rule_name)
         violation = {
             "rule_name": rule_name,
             "violation_type": violation_type,
-            "severity": rule["severity"],
+            "severity": rule["severity"] if rule is not None else "unknown",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "data": data,
+            "data": self._summarise(data),
         }
         self._violations.append(violation)
 
     def _handle_violation(self, rule: PolicyRule) -> None:
-        """Handle a policy violation.
+        """Run the handler for a violated rule, isolating its failures.
 
-        Args:
-            rule: The violated rule
+        The violation is already counted and recorded when this runs, so a
+        handler that raises cannot lose it; it also must not stop the remaining
+        rules being evaluated.
         """
         action = rule["action"]
-        if action in self._rule_handlers:
-            self._rule_handlers[action](rule)
+        handler = self._rule_handlers.get(action)
+        if handler is None:
+            return
+        try:
+            handler(rule)
+        except SecurityBlockedError:
+            raise  # a deliberate refusal from the handler
+        except Exception:
+            logger.exception(
+                "Policy handler for action %r raised while handling rule %r; "
+                "the violation stands and evaluation continues",
+                action,
+                rule["name"],
+            )

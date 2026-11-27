@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
+import threading
 from collections import deque
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any
+from functools import wraps
+from typing import Any, TypeVar, cast
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _locked(method: _F) -> _F:
+    """Run a :class:`MemorySystem` method under the instance lock."""
+
+    @wraps(method)
+    def wrapper(self: MemorySystem, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return cast(_F, wrapper)
 
 
 class MemorySystem:
@@ -25,8 +41,13 @@ class MemorySystem:
             short_term_capacity: Maximum items in short-term memory
             long_term_capacity: Maximum items in long-term memory
         """
+        if short_term_capacity < 0 or long_term_capacity < 0:
+            raise ValueError("Memory capacities must not be negative")
         self.short_term_capacity = short_term_capacity
         self.long_term_capacity = long_term_capacity
+        # Guards both stores: a search iterating while another thread stores
+        # raises ``RuntimeError: deque mutated during iteration``.
+        self._lock = threading.RLock()
 
         # Short-term memory is a FIFO ring buffer: a deque with maxlen evicts
         # the oldest item in O(1) on append instead of the O(N) ``list.pop(0)``.
@@ -34,6 +55,7 @@ class MemorySystem:
         self._long_term_memory: list[dict[str, Any]] = []
         self._metadata: dict[str, Any] = {}
 
+    @_locked
     def store_short_term(
         self,
         key: str,
@@ -59,6 +81,7 @@ class MemorySystem:
         # deque(maxlen=...) evicts the oldest item automatically on overflow.
         self._short_term_memory.append(memory_item)
 
+    @_locked
     def store_long_term(
         self,
         key: str,
@@ -115,6 +138,7 @@ class MemorySystem:
                     min_idx = i
             self._long_term_memory.pop(min_idx)
 
+    @_locked
     def retrieve(
         self,
         key: str,
@@ -139,6 +163,7 @@ class MemorySystem:
 
         return None
 
+    @_locked
     def search(
         self,
         query: str,
@@ -171,6 +196,7 @@ class MemorySystem:
 
         return results
 
+    @_locked
     def consolidate(self) -> int:
         """Consolidate short-term memory into long-term memory.
 
@@ -204,14 +230,17 @@ class MemorySystem:
 
         return consolidated
 
+    @_locked
     def clear_short_term(self) -> None:
         """Clear all short-term memory."""
         self._short_term_memory.clear()
 
+    @_locked
     def clear_long_term(self) -> None:
         """Clear all long-term memory."""
         self._long_term_memory.clear()
 
+    @_locked
     def get_stats(self) -> dict[str, Any]:
         """Get memory statistics.
 

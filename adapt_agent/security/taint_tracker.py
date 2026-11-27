@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from collections import deque
+import logging
+import threading
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class TaintLevel(Enum):
@@ -57,6 +61,21 @@ class TaintTracker:
     to UNTAINTED would be a security hole (an attacker could evict a CRITICAL
     source to launder its tainted data). For the same reason, eviction never
     removes a source that is still referenced by live tainted data.
+
+    The same promise holds for the *data* map. When it is full, the oldest item
+    is evicted -- but not forgotten: it moves to a bounded ``floor`` map that
+    remembers the highest level it had, so it keeps reading as tainted at that
+    level. If even that map overflows, the tracker is *saturated*: from then on
+    any identifier it has no record of reads as tainted at the highest level it
+    ever had to forget. That is the deliberate trade-off -- a flood of junk
+    identifiers can degrade a long-lived tracker to "everything unknown is
+    tainted" (an availability cost; :meth:`reset` clears it), but it can no
+    longer make real taint read clean. ``get_stats()["saturated"]`` reports it.
+
+    Levels only ratchet up: a source cannot be re-registered at a lower level
+    than it already had, and marking data with no
+    sources is a no-op, so neither can be used to wash out taint or to push
+    real entries out of the maps.
     """
 
     _LEVEL_PRIORITY = {
@@ -88,6 +107,47 @@ class TaintTracker:
         self._tainted_data: dict[str, set[str]] = {}  # data_id -> set of source_ids
         # deque(maxlen) bounds the ring buffer in O(1) without list.pop(0).
         self._taint_propagation: deque[dict[str, Any]] = deque(maxlen=max_propagations)
+        # data_id -> lowest level the item may read as. Holds items evicted from
+        # ``_tainted_data`` and items derived from them.
+        self._data_floor: OrderedDict[str, TaintLevel] = OrderedDict()
+        # Referenced sources that were evicted, with the fail-closed level they
+        # read as; a later registration may not go below it.
+        self._evicted_sources: OrderedDict[str, TaintLevel] = OrderedDict()
+        # Set once ``_data_floor`` itself overflowed: the highest level lost.
+        self._saturated_level: TaintLevel | None = None
+        self._lock = threading.RLock()
+
+    def _higher(self, a: TaintLevel, b: TaintLevel) -> TaintLevel:
+        return a if self._LEVEL_PRIORITY[a] >= self._LEVEL_PRIORITY[b] else b
+
+    def _remember_floor(self, data_id: str, level: TaintLevel) -> None:
+        """Record that ``data_id`` may never read below ``level`` (bounded)."""
+        previous = self._data_floor.get(data_id)
+        if previous is not None:
+            level = self._higher(level, previous)
+        self._data_floor[data_id] = level
+        if len(self._data_floor) > self.max_tracked_items:
+            # Out of room to remember individuals: fall back to a blanket floor.
+            _, dropped = self._data_floor.popitem(last=False)
+            if self._saturated_level is None:
+                logger.warning(
+                    "TaintTracker is saturated: taint records were evicted faster than they "
+                    "could be remembered, so identifiers it has no record of now read as "
+                    "tainted (fail-closed). Call reset() once the session is over."
+                )
+                self._saturated_level = dropped
+            else:
+                self._saturated_level = self._higher(self._saturated_level, dropped)
+
+    def reset(self) -> None:
+        """Forget every source, taint record and saturation state."""
+        with self._lock:
+            self._taint_sources.clear()
+            self._tainted_data.clear()
+            self._data_floor.clear()
+            self._evicted_sources.clear()
+            self._taint_propagation.clear()
+            self._saturated_level = None
 
     def register_source(
         self,
@@ -106,22 +166,39 @@ class TaintTracker:
 
         Returns:
             Created TaintSource
+
+        Raises:
+            ValueError: if ``source_id`` is already registered at a higher level
+                (or was evicted while still referenced, at a higher level than
+                the one now given). Re-registering would
+                silently downgrade every item the source already tainted;
+                raise the level, or use a new ``source_id``.
         """
-        source = TaintSource(source_id, source_type, level, metadata)
-        self._taint_sources[source_id] = source
+        with self._lock:
+            existing = self._taint_sources.get(source_id)
+            floor = existing.level if existing is not None else self._evicted_sources.get(source_id)
+            if floor is not None and self._LEVEL_PRIORITY[level] < self._LEVEL_PRIORITY[floor]:
+                raise ValueError(
+                    f"Cannot re-register taint source {source_id!r} at level "
+                    f"{level.value!r}: it is already {floor.value!r}, and lowering it would "
+                    "downgrade data it has already tainted"
+                )
+            source = TaintSource(source_id, source_type, level, metadata)
+            self._taint_sources[source_id] = source
+            self._evicted_sources.pop(source_id, None)
 
-        # SECURITY: Prevent memory exhaustion from an unbounded dictionary. Prefer
-        # evicting an unreferenced source (invisible), but the cap must hold even
-        # when every source is referenced -- otherwise the DoS bound is defeated.
-        if len(self._taint_sources) > self.max_tracked_items:
-            self._evict_source(protect=source_id)
+            # SECURITY: Prevent memory exhaustion from an unbounded dictionary. Prefer
+            # evicting an unreferenced source (invisible), but the cap must hold even
+            # when every source is referenced -- otherwise the DoS bound is defeated.
+            if len(self._taint_sources) > self.max_tracked_items:
+                self._evict_source(protect=source_id)
 
-        return source
+            return source
 
     def _referenced_source_ids(self) -> set[str]:
         """Return the set of source IDs referenced by live tainted data."""
         referenced: set[str] = set()
-        for sources in self._tainted_data.values():
+        for sources in list(self._tainted_data.values()):
             referenced.update(sources)
         return referenced
 
@@ -160,6 +237,11 @@ class TaintTracker:
                 continue
             if self._LEVEL_PRIORITY[source.level] <= unknown_priority:
                 del self._taint_sources[source_id]
+                # Remember the level it truly had, so that a later registration
+                # under the same id cannot quietly lower it.
+                self._evicted_sources[source_id] = source.level
+                if len(self._evicted_sources) > self.max_tracked_items:
+                    self._evicted_sources.popitem(last=False)
                 return
 
     def mark_tainted(
@@ -169,19 +251,29 @@ class TaintTracker:
     ) -> None:
         """Mark data as tainted by specific sources.
 
+        Marking with no sources is a no-op: it taints nothing, and recording it
+        would only use up a slot that real taint could be evicted to make room for.
+
         Args:
             data_id: Identifier for the data
             source_ids: List of taint source IDs
         """
-        if data_id not in self._tainted_data:
-            self._tainted_data[data_id] = set()
+        source_ids = list(source_ids)
+        if not source_ids:
+            return
+        with self._lock:
+            if data_id not in self._tainted_data:
+                self._tainted_data[data_id] = set()
 
-        self._tainted_data[data_id].update(source_ids)
+            self._tainted_data[data_id].update(source_ids)
 
-        # SECURITY: Prevent memory exhaustion from unbounded dictionary.
-        if len(self._tainted_data) > self.max_tracked_items:
-            oldest_data = next(iter(self._tainted_data))
-            del self._tainted_data[oldest_data]
+            # SECURITY: Prevent memory exhaustion from unbounded dictionary. The
+            # evicted item is NOT forgotten (that would read as clean): its level
+            # is kept in the bounded floor map.
+            if len(self._tainted_data) > self.max_tracked_items:
+                oldest_data = next(iter(self._tainted_data))
+                self._remember_floor(oldest_data, self._derived_level(oldest_data))
+                del self._tainted_data[oldest_data]
 
     def is_tainted(self, data_id: str) -> bool:
         """Check if data is tainted.
@@ -192,7 +284,10 @@ class TaintTracker:
         Returns:
             True if data is tainted, False otherwise
         """
-        return data_id in self._tainted_data and len(self._tainted_data[data_id]) > 0
+        with self._lock:
+            if data_id in self._tainted_data and len(self._tainted_data[data_id]) > 0:
+                return True
+            return data_id in self._data_floor or self._saturated_level is not None
 
     def get_taint_level(self, data_id: str) -> TaintLevel:
         """Get the highest taint level for data.
@@ -207,24 +302,23 @@ class TaintTracker:
         Returns:
             Highest taint level affecting the data
         """
-        if not self.is_tainted(data_id):
-            return TaintLevel.UNTAINTED
+        with self._lock:
+            if not self.is_tainted(data_id):
+                return TaintLevel.UNTAINTED
+            return self._derived_level(data_id)
 
-        source_ids = self._tainted_data[data_id]
-
+    def _derived_level(self, data_id: str) -> TaintLevel:
+        """Level from live sources, raised to any floor left by eviction."""
         max_level = TaintLevel.UNTAINTED
-        max_priority = 0
-
-        for sid in source_ids:
+        for sid in self._tainted_data.get(data_id, ()):
             source = self._taint_sources.get(sid)
             lvl = source.level if source is not None else self.unknown_source_level
-            if lvl is TaintLevel.CRITICAL:
-                return TaintLevel.CRITICAL
-            pri = self._LEVEL_PRIORITY[lvl]
-            if pri > max_priority:
-                max_level = lvl
-                max_priority = pri
-
+            max_level = self._higher(max_level, lvl)
+        floor = self._data_floor.get(data_id)
+        if floor is not None:
+            max_level = self._higher(max_level, floor)
+        elif data_id not in self._tainted_data and self._saturated_level is not None:
+            max_level = self._higher(max_level, self._saturated_level)
         return max_level
 
     def get_taint_sources(self, data_id: str) -> list[TaintSource]:
@@ -240,21 +334,34 @@ class TaintTracker:
         Returns:
             List of TaintSource objects
         """
-        if not self.is_tainted(data_id):
-            return []
+        with self._lock:
+            if not self.is_tainted(data_id):
+                return []
 
-        sources: list[TaintSource] = []
-        for sid in self._tainted_data[data_id]:
-            source = self._taint_sources.get(sid)
-            if source is None:
-                source = TaintSource(
-                    source_id=sid,
-                    source_type="unknown",
-                    level=self.unknown_source_level,
-                    metadata={"fail_closed": True},
+            sources: list[TaintSource] = []
+            for sid in self._tainted_data.get(data_id, ()):
+                source = self._taint_sources.get(sid)
+                if source is None:
+                    source = TaintSource(
+                        source_id=sid,
+                        source_type="unknown",
+                        level=self.unknown_source_level,
+                        metadata={"fail_closed": True},
+                    )
+                sources.append(source)
+            floor = self._data_floor.get(data_id)
+            if floor is None and data_id not in self._tainted_data:
+                floor = self._saturated_level
+            if floor is not None:
+                sources.append(
+                    TaintSource(
+                        source_id=f"evicted:{data_id}",
+                        source_type="evicted",
+                        level=floor,
+                        metadata={"fail_closed": True},
+                    )
                 )
-            sources.append(source)
-        return sources
+            return sources
 
     def propagate_taint(
         self,
@@ -269,12 +376,20 @@ class TaintTracker:
             to_data_id: Target data identifier
             operation: Description of the operation causing propagation
         """
-        if not self.is_tainted(from_data_id):
-            return
+        with self._lock:
+            if not self.is_tainted(from_data_id):
+                return
 
-        # Copy taint sources to target
-        source_ids = list(self._tainted_data[from_data_id])
-        self.mark_tainted(to_data_id, source_ids)
+            # Copy taint sources to target. Anything the source only carries as
+            # an eviction floor travels as a floor on the target, so propagation
+            # cannot be used to wash an evicted item clean.
+            source_ids = list(self._tainted_data.get(from_data_id, ()))
+            self.mark_tainted(to_data_id, source_ids)
+            inherited = self._data_floor.get(from_data_id)
+            if inherited is None and from_data_id not in self._tainted_data:
+                inherited = self._saturated_level
+            if inherited is not None:
+                self._remember_floor(to_data_id, inherited)
 
         # Record propagation (deque(maxlen) bounds this automatically).
         self._taint_propagation.append(
@@ -293,8 +408,9 @@ class TaintTracker:
         Args:
             data_id: Identifier for the data
         """
-        if data_id in self._tainted_data:
-            del self._tainted_data[data_id]
+        with self._lock:
+            self._tainted_data.pop(data_id, None)
+            self._data_floor.pop(data_id, None)
 
     def get_taint_flow(self, data_id: str) -> list[dict[str, Any]]:
         """Get the taint propagation flow for data.
@@ -308,7 +424,7 @@ class TaintTracker:
         flow = []
 
         # Find all propagations that led to this data
-        for prop in self._taint_propagation:
+        for prop in list(self._taint_propagation):
             if prop["to"] == data_id:
                 flow.append(prop)
 
@@ -328,8 +444,8 @@ class TaintTracker:
         # multiple data items must not be counted multiple times.
         taint_level_counts: dict[str, int] = {}
         seen_sources: set[str] = set()
-        for sources in self._tainted_data.values():
-            for source_id in sources:
+        for sources in list(self._tainted_data.values()):
+            for source_id in list(sources):
                 if source_id in seen_sources:
                     continue
                 seen_sources.add(source_id)
@@ -343,4 +459,6 @@ class TaintTracker:
             "tainted_data_count": len(self._tainted_data),
             "propagation_count": len(self._taint_propagation),
             "taint_level_distribution": taint_level_counts,
+            "evicted_data_count": len(self._data_floor),
+            "saturated": self._saturated_level is not None,
         }
