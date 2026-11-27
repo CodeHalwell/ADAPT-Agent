@@ -129,6 +129,19 @@ def main() -> None:
     except SecurityBlockedError as exc:
         print(f"  Blocked! reason={exc.reason!r} threats={exc.threats}")
 
+    print("\n=== Real SDK options (built, never run: running needs the CLI) ===")
+    if claude_agent_sdk is None:
+        print("  claude-agent-sdk not installed; skipped.")
+    else:
+        from adapt_agent.integrations.claude_agent import governance_hooks
+
+        options = claude_agent_sdk.ClaudeAgentOptions(
+            system_prompt="You are a concise, helpful assistant.",
+            hooks=governance_hooks(firewall=Firewall(), agent_id="claude-basic"),
+        )
+        print("  hooks registered:", sorted(options.hooks))
+        print("  pass it as query(prompt=..., options=options); see example 05 for tool calls.")
+
     # ------------------------------------------------------------------ #
     # Using the REAL Claude Agent SDK instead of fake_query:
     #
@@ -144,13 +157,12 @@ def main() -> None:
     #     )
     #     adapter = ClaudeAgentSDKAdapter(firewall=Firewall(), agent_id="claude")
     #     guarded = adapter.wrap_agent(query)
-    #     # The adapter calls query(prompt=...) and drains the async stream for you.
-    #     guarded.execute({"messages": [{"role": "user", "content": "hi"}]})
+    #     # The adapter calls query(prompt=...) and drains the async stream for you;
+    #     # extra keyword arguments are forwarded to query().
+    #     guarded.execute({"messages": [{"role": "user", "content": "hi"}]}, options=options)
     #
     # No other change is required -- the adapter only needs a callable that
     # accepts a `prompt=` keyword and returns an async stream of messages.
-    # (Options like system_prompt/model are passed when you build `query` with
-    # `functools.partial(query, options=options)` -- see example 03.)
     # ------------------------------------------------------------------ #
 
 

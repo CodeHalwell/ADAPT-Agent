@@ -86,7 +86,7 @@ def _hook_mutants() -> tuple[Mutant, ...]:
     sites = (
         ("agent-framework", "agent_framework", "resolved.review_input(", "input"),
         ("agent-framework", "agent_framework", "resolved.review_output(", "output"),
-        ("claude-agent", "claude_agent", "resolved.scan_input(", "input"),
+        ("claude-agent", "claude_agent", "resolved.review_input(", "input"),
         ("crewai", "crewai", "resolved.review_input(", "input"),
         ("crewai", "crewai", "resolved.review_output(", "output"),
         ("crewai-task", "crewai", "gate.scan_output(", "output"),

@@ -1,13 +1,15 @@
 # Claude Agent SDK examples
 
-A four-step ladder showing how to **guard** and **train** a
+A five-step ladder showing how to **guard** and **train** a
 [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) agent
 with ADAPT-Agent, climbing from a single guarded call to a governed,
 optimizable multi-agent pipeline.
 
 Every example runs **with no API key and no network**: each substitutes a tiny
 stand-in for the SDK's `query` async generator (and, for the training examples,
-a deterministic LLM-judge stub). Importing ADAPT-Agent never imports
+a deterministic LLM-judge stub). Examples 01 and 05 also build the **real**
+`ClaudeAgentOptions` when `claude-agent-sdk` is installed (they never start the
+CLI) and exit 0 without it. Importing ADAPT-Agent never imports
 `claude_agent_sdk`, so the only thing you change to go live is the agent you pass
 to `wrap_agent` / the `components` you optimize.
 
@@ -57,6 +59,7 @@ pip install 'adapt-agent[claude-agent]'   # or: pip install claude-agent-sdk
 | 2 | [`02_policy_observability_trust.py`](02_policy_observability_trust.py) | Add `PolicyEnforcer` (a block rule + a warn rule), `AdversarialDefense`, `AgentObserver` traces and `Middleware`; show `block_on_violation=False` (audit mode), plus standalone `TrustManager` and `TaintTracker`. |
 | 3 | [`03_evaluate_and_optimize.py`](03_evaluate_and_optimize.py) | Wrap one agent's `ClaudeAgentOptions` in `OptimizableAgent`, build a `GoldenDataset`, score with `EvaluationHarness` (`exact_match` + `token_f1` + an offline `LLMJudge`), run `CoordinateAscentOptimizer`, and print `introspect()`-discovered knobs and baseline -> best. |
 | 4 | [`04_multi_agent_and_training.py`](04_multi_agent_and_training.py) | A researcher -> writer -> reviewer orchestrator (three `ClaudeAgentOptions`), optimized as ONE system with `make_default_optimizer` (incl. tool/skill drop-one ablation and judge `recommendations`), a parallel YAML-config path via `run_training`, and the whole pipeline guarded as a single unit. |
+| 5 | [`05_tool_governance.py`](05_tool_governance.py) | Govern the agent's **tool calls**: real `ClaudeAgentOptions` with `governance_hooks` + `governance_can_use_tool` + `native_tool_options`, driven with hook inputs shaped like the SDK's typed dicts -- tool allow/deny, an MCP allow-list, an approval ask, a sub-agent, a poisoned tool result withheld. Shows the hook outputs; what the CLI does with them is not exercised offline. |
 
 Plus [`claude_agent.train.yaml`](claude_agent.train.yaml) — the declarative,
 real-world training config that example 4's "Path B" mirrors.
@@ -68,6 +71,7 @@ python examples/claude_agent/01_basic_guarded.py
 python examples/claude_agent/02_policy_observability_trust.py
 python examples/claude_agent/03_evaluate_and_optimize.py
 python examples/claude_agent/04_multi_agent_and_training.py
+python examples/claude_agent/05_tool_governance.py
 ```
 
 ## What gets introspected
