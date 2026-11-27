@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import BaseModel
 
 from adapt_agent.adapters import LangGraphAdapter
 from adapt_agent.core.governance import GovernanceGate, ToolPolicy
@@ -151,9 +150,27 @@ class _DataState:
     trust_score: float
 
 
-class _PydanticState(BaseModel):
-    messages: list[Any] = []
-    trust_score: float = 0.0
+try:
+    from pydantic import BaseModel
+except ImportError:  # pydantic is not a dependency of the core package
+
+    class _PydanticState:
+        """A stand-in shaped like a Pydantic v2 model: declared fields, ``model_dump``."""
+
+        model_fields: dict[str, Any] = {"messages": None, "trust_score": None}
+
+        def __init__(self, messages: list[Any], trust_score: float) -> None:
+            self.messages = messages
+            self.trust_score = trust_score
+
+        def model_dump(self) -> dict[str, Any]:
+            return {"messages": self.messages, "trust_score": self.trust_score}
+
+else:
+
+    class _PydanticState(BaseModel):  # type: ignore[no-redef]
+        messages: list[Any] = []
+        trust_score: float = 0.0
 
 
 class _Runtime:
