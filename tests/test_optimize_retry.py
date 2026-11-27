@@ -122,23 +122,37 @@ def test_retry_after_is_read_from_attribute_and_header() -> None:
 
 
 def test_an_unparseable_or_absurd_retry_after_is_ignored() -> None:
+    # RFC 9110 allows an HTTP-date; one already past means "retry now".
     http_date = RuntimeError("slow down")
-    http_date.retry_after = "Wed, 21 Oct 2026 07:28:00 GMT"  # type: ignore[attr-defined]
-    assert retry_after_seconds(http_date) is None
+    http_date.retry_after = "Wed, 21 Oct 2015 07:28:00 GMT"  # type: ignore[attr-defined]
+    assert retry_after_seconds(http_date) == 0.0
+
+    garbage = RuntimeError("slow down")
+    garbage.retry_after = "soon"  # type: ignore[attr-defined]
+    assert retry_after_seconds(garbage) is None
 
     absurd = RuntimeError("slow down")
     absurd.retry_after = 99_999  # type: ignore[attr-defined]
     assert retry_after_seconds(absurd) is None
 
 
-def test_retry_after_is_preferred_over_computed_backoff_but_capped() -> None:
-    policy = RetryPolicy(initial_backoff=0.5, max_backoff=5.0, jitter=0.0)
-    exc = RuntimeError("slow down")
+def test_retry_after_is_preferred_over_computed_backoff_and_not_shortened() -> None:
+    # A server-requested wait is honoured as given, not cut to `max_backoff`:
+    # retrying before the server said it would accept the call earns another
+    # 429. Past `max_retry_after` the retry is refused instead of slept.
+    policy = RetryPolicy(initial_backoff=0.5, max_backoff=5.0, jitter=0.0, max_retry_after=120.0)
+    exc = RuntimeError("rate limit: slow down")
     exc.retry_after = 3.0  # type: ignore[attr-defined]
     assert policy.delay_for(exc, 1) == 3.0
 
     exc.retry_after = 120.0  # type: ignore[attr-defined]
-    assert policy.delay_for(exc, 1) == 5.0
+    assert policy.delay_for(exc, 1) == 120.0
+    assert policy.should_retry(exc, 1) is True
+
+    exc.retry_after = 121.0  # type: ignore[attr-defined]
+    assert policy.should_retry(exc, 1) is False
+    # ...while still classified transient, so the row is excluded, not zeroed.
+    assert policy.should_retry(exc, 0) is True
 
 
 def test_backoff_grows_and_is_capped() -> None:
@@ -2655,3 +2669,70 @@ def test_a_wrapped_throttle_is_retried_and_left_out_of_the_score() -> None:
     assert report.n_transient_errors == 0
     assert report.is_complete is True
     assert len(report.failures()) == 1
+
+
+# -- server retry directives ----------------------------------------------------
+
+
+def _throttled(headers: dict) -> RuntimeError:
+    exc = RuntimeError("rate limit exceeded")
+    exc.response = _Response(429, headers)  # type: ignore[attr-defined]
+    return exc
+
+
+def test_retry_after_ms_is_read_and_preferred() -> None:
+    assert retry_after_seconds(_throttled({"retry-after-ms": "1500"})) == 1.5
+    assert retry_after_seconds(_throttled({"retry-after-ms": "250", "retry-after": "1"})) == 0.25
+
+
+def test_retry_after_http_date_in_the_future_is_honoured() -> None:
+    import email.utils
+
+    when = email.utils.formatdate(time.time() + 40, usegmt=True)
+    seconds = retry_after_seconds(_throttled({"retry-after": when}))
+    assert seconds is not None and 35.0 <= seconds <= 41.0
+
+
+def test_a_long_retry_after_is_neither_truncated_nor_slept_through() -> None:
+    policy = RetryPolicy(max_backoff=30.0, jitter=0.0)
+    sixty = _throttled({"retry-after": "60"})
+    assert policy.delay_for(sixty, 1) == 60.0  # was cut to 30s: a retry too early
+    assert policy.should_retry(sixty, 1) is True
+    long_wait = _throttled({"retry-after": "600"})
+    assert retry_after_seconds(long_wait) == 600.0
+    assert policy.should_retry(long_wait, 1) is False  # fail fast, no silent sleep
+    assert policy.should_retry(long_wait, 0) is True  # still transient: row excluded
+
+
+def test_x_should_retry_false_stops_retrying() -> None:
+    exc = _throttled({"x-should-retry": "false", "retry-after": "1"})
+    assert FAST.should_retry(exc, 1) is False
+    assert FAST.should_retry(exc, 0) is True
+
+
+def test_judge_with_sdk_client_makes_one_call_per_policy_attempt() -> None:
+    """The SDK's own retries are turned off, so retries do not stack."""
+    from adapt_agent.optimization.judge import LLMJudge
+    from adapt_agent.optimization.providers import AnthropicProvider
+
+    calls = {"n": 0}
+
+    class Messages:
+        def create(self, **kwargs: object) -> object:
+            calls["n"] += 1
+            raise _throttled({"retry-after": "0"})
+
+    class Client:
+        max_retries = 2
+        messages = Messages()
+
+        def with_options(self, *, max_retries: int) -> Client:
+            assert max_retries == 0
+            fresh = Client()
+            fresh.max_retries = 0
+            return fresh
+
+    judge = LLMJudge(AnthropicProvider(client=Client()), retry=FAST)
+    verdict = judge.score("q", "a")
+    assert verdict.metadata["error"] is True
+    assert calls["n"] == FAST.attempts

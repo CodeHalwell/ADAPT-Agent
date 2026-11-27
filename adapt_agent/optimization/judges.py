@@ -15,11 +15,15 @@ Example::
 
     from adapt_agent.optimization.judges import ClaudeJudge, OpenAIJudge, GeminiJudge
 
-    judge = ClaudeJudge(model="claude-opus-4-8")        # ANTHROPIC_API_KEY from env
+    judge = ClaudeJudge(model="claude-opus-5-5")        # ANTHROPIC_API_KEY from env
     judge.score("What is 2+2?", "4", "4").score          # -> ~1.0
 
     # Use a different vendor for grading vs. the agent under optimization:
-    grader = GeminiJudge(model="gemini-2.0-flash")
+    grader = GeminiJudge(model="gemini-3.5-flash")
+
+Each judge's default model comes from the one table of defaults in
+:mod:`adapt_agent.optimization.providers` (``DEFAULT_MODELS``), so the two
+modules cannot drift apart.
     harness = EvaluationHarness([grader.as_metric()], primary_metric="llm_judge")
 """
 
@@ -30,6 +34,18 @@ from typing import Any
 
 from adapt_agent.optimization.judge import _DEFAULT_RUBRIC, LLMJudge
 from adapt_agent.optimization.providers import (
+    ANTHROPIC_DEFAULT_MODEL,
+    AZURE_OPENAI_DEFAULT_DEPLOYMENT,
+    BEDROCK_DEFAULT_MODEL,
+    COHERE_DEFAULT_MODEL,
+    GEMINI_DEFAULT_MODEL,
+    GROQ_DEFAULT_MODEL,
+    HUGGINGFACE_DEFAULT_MODEL,
+    MISTRAL_DEFAULT_MODEL,
+    OLLAMA_DEFAULT_MODEL,
+    OPENAI_DEFAULT_MODEL,
+    OPENROUTER_DEFAULT_MODEL,
+    TOGETHER_DEFAULT_MODEL,
     AnthropicProvider,
     AzureOpenAIProvider,
     BedrockProvider,
@@ -112,7 +128,7 @@ class ClaudeJudge(ProviderJudge):
     """LLM judge backed by Anthropic Claude."""
 
     provider_cls = AnthropicProvider
-    default_model = "claude-opus-4-8"
+    default_model = ANTHROPIC_DEFAULT_MODEL
 
 
 # Backwards/everyday-friendly alias.
@@ -123,21 +139,21 @@ class OpenAIJudge(ProviderJudge):
     """LLM judge backed by OpenAI."""
 
     provider_cls = OpenAIProvider
-    default_model = "gpt-4o-mini"
+    default_model = OPENAI_DEFAULT_MODEL
 
 
 class AzureOpenAIJudge(ProviderJudge):
     """LLM judge backed by Azure OpenAI (``model`` is the deployment name)."""
 
     provider_cls = AzureOpenAIProvider
-    default_model = "gpt-4o-mini"
+    default_model = AZURE_OPENAI_DEFAULT_DEPLOYMENT
 
 
 class GeminiJudge(ProviderJudge):
     """LLM judge backed by Google Gemini."""
 
     provider_cls = GeminiProvider
-    default_model = "gemini-2.0-flash"
+    default_model = GEMINI_DEFAULT_MODEL
 
 
 # Friendly alias.
@@ -148,56 +164,56 @@ class MistralJudge(ProviderJudge):
     """LLM judge backed by Mistral."""
 
     provider_cls = MistralProvider
-    default_model = "mistral-large-latest"
+    default_model = MISTRAL_DEFAULT_MODEL
 
 
 class CohereJudge(ProviderJudge):
     """LLM judge backed by Cohere."""
 
     provider_cls = CohereProvider
-    default_model = "command-r-plus"
+    default_model = COHERE_DEFAULT_MODEL
 
 
 class GroqJudge(ProviderJudge):
     """LLM judge backed by Groq (OpenAI-compatible)."""
 
     provider_cls = GroqProvider
-    default_model = "llama-3.3-70b-versatile"
+    default_model = GROQ_DEFAULT_MODEL
 
 
 class TogetherJudge(ProviderJudge):
     """LLM judge backed by Together AI (OpenAI-compatible)."""
 
     provider_cls = TogetherProvider
-    default_model = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    default_model = TOGETHER_DEFAULT_MODEL
 
 
 class OpenRouterJudge(ProviderJudge):
     """LLM judge backed by OpenRouter (OpenAI-compatible)."""
 
     provider_cls = OpenRouterProvider
-    default_model = "openai/gpt-4o-mini"
+    default_model = OPENROUTER_DEFAULT_MODEL
 
 
 class OllamaJudge(ProviderJudge):
     """LLM judge backed by a local Ollama server (OpenAI-compatible)."""
 
     provider_cls = OllamaProvider
-    default_model = "llama3.1"
+    default_model = OLLAMA_DEFAULT_MODEL
 
 
 class BedrockJudge(ProviderJudge):
     """LLM judge backed by AWS Bedrock (Converse API)."""
 
     provider_cls = BedrockProvider
-    default_model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    default_model = BEDROCK_DEFAULT_MODEL
 
 
 class HuggingFaceJudge(ProviderJudge):
     """LLM judge backed by the Hugging Face Inference API."""
 
     provider_cls = HuggingFaceProvider
-    default_model = "meta-llama/Llama-3.3-70B-Instruct"
+    default_model = HUGGINGFACE_DEFAULT_MODEL
 
 
 #: Registry of provider-specific judges, keyed by short name.
