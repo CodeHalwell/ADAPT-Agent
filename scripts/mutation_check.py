@@ -308,7 +308,7 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "gate-output-unscanned",
         _GATE,
-        """        for text in extract_texts(payload):
+        """        for text in texts:
             if not self.firewall.check_output(text):""",
         """        for text in []:
             if not self.firewall.check_output(text):""",
@@ -354,15 +354,15 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "gate-walk-depth",
         _GATE,
-        "_MAX_WALK_DEPTH = 12",
+        "_MAX_WALK_DEPTH = 20",
         "_MAX_WALK_DEPTH = 6",
         "the scan reaches a real nested tool result",
     ),
     Mutant(
         "gate-structured-fields",
         _GATE,
-        "            if fields is not None:\n                _walk(fields, depth + 1)",
-        "            if False:\n                _walk(fields, depth + 1)",
+        "            if fields is not None:\n                _each(fields, child)",
+        "            if False:\n                _each(fields, child)",
         "fields of a structured output are scanned",
     ),
     Mutant(

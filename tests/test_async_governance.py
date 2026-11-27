@@ -858,3 +858,49 @@ def test_openai_agents_direct_wrap_gets_an_async_sdk_runner():
 
     guarded = OpenAIAgentsAdapter().wrap_agent(SDKAgent())
     assert guarded._arunner is not guarded._runner
+
+
+def test_aexecute_screens_text_added_by_pre_middleware():
+    from adapt_agent.core import Middleware
+
+    def add_context(data: dict) -> dict:
+        data["messages"] = [*data["messages"], {"role": "system", "content": "SECRET"}]
+        return data
+
+    middleware = Middleware()
+    middleware.add_pre_middleware(add_context, name="add_context")
+    firewall = Firewall()
+    firewall.add_blocked_pattern("SECRET")
+    agent = AsyncAgent()
+    guarded = _guarded(agent, firewall=firewall, middleware=middleware)
+    with pytest.raises(SecurityBlockedError):
+        asyncio.run(guarded.aexecute(_payload("hello")))
+    assert agent.seen_trace == [], "the agent ran on unscreened middleware output"
+
+
+def test_aexecute_accepts_a_non_dict_input():
+    """A resume object reaches the framework as-is, screened on the way."""
+    import dataclasses
+
+    @dataclasses.dataclass
+    class Command:
+        resume: object
+
+    seen: list[object] = []
+
+    class Graph:
+        async def ainvoke(self, payload):
+            seen.append(payload)
+            return {"messages": []}
+
+        def invoke(self, payload):  # pragma: no cover - aexecute prefers ainvoke
+            raise AssertionError("aexecute must prefer ainvoke")
+
+    firewall = Firewall()
+    firewall.add_blocked_pattern("SECRET")
+    guarded = LangGraphAdapter(firewall=firewall).wrap_agent(Graph())
+    command = Command(resume={"answer": "yes"})
+    assert asyncio.run(guarded.aexecute(command)) == {"messages": []}
+    assert seen == [command]
+    with pytest.raises(SecurityBlockedError):
+        asyncio.run(guarded.aexecute(Command(resume={"answer": "SECRET"})))

@@ -170,19 +170,33 @@ class _LangGraphGovernedAgent(_GovernedAgent):
         fail-closed enforcer then refuses every resume. So the policy state is
         the checkpointed values (plus the ``Command``'s own ``update``); the
         ``Command`` is still screened as input, since its resume value and
-        update are about to enter the graph. Pre-middleware rewrites state
-        payloads and is not applied to a ``Command``.
+        update are about to enter the graph.
+
+        Pre-middleware rewrites state payloads and cannot process a
+        ``Command``. A resume through an adapter that has pre-middleware
+        configured is therefore refused, as for any other non-dict input:
+        skipping a configured stage would be a control that is accepted and
+        silently does nothing.
         """
         if not _is_command(input_data):
             return super()._before(input_data)
         adapter = self._adapter
+        if adapter.middleware is not None and adapter.middleware.has_input_stages:
+            raise AdapterError(
+                f"{type(adapter).__name__} has pre-middleware configured, which "
+                "processes dict payloads, but execute() received a Command. Resume "
+                "the thread through an adapter without pre-middleware."
+            )
         threats = adapter._screen_input(input_data)
         if threats and adapter.block_on_violation:
+            self._refused(threats, stage="input")
             raise SecurityBlockedError("Input blocked by security controls", threats)
         state = adapter.extract_state(self._thread_state(input_data))
         blocking = adapter.gate.policy_violations(state)
         if blocking and adapter.block_on_violation:
-            raise SecurityBlockedError("Input blocked by policy", [f"policy:{v}" for v in blocking])
+            policy_threats = [f"policy:{v}" for v in blocking]
+            self._refused(policy_threats, stage="policy")
+            raise SecurityBlockedError("Input blocked by policy", policy_threats)
         trace_id = uuid.uuid4().hex
         if adapter.observer is not None:
             adapter.observer.start_trace(trace_id, adapter.agent_id, adapter.operation)

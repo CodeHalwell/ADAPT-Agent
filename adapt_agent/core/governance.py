@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
-from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any, cast
+import inspect
+import numbers
+from collections.abc import AsyncIterator, Collection, Iterable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from adapt_agent.exceptions import SecurityBlockedError
 
@@ -38,6 +40,9 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance, typing only
 #: and message objects (Pydantic AI ``.output``, Microsoft Agent Framework
 #: ``.text``, CrewAI ``.raw``, OpenAI Agents ``.final_output``, Claude
 #: ``ResultMessage.result`` / ``TextBlock.text``, LangChain ``.content`` ...).
+#:
+#: Only probed on objects that do *not* declare their fields (see
+#: :func:`_structured_fields`); a declared field set is walked in full instead.
 _TEXT_ATTRS = (
     "content",
     "text",
@@ -46,6 +51,23 @@ _TEXT_ATTRS = (
     "raw",
     "result",
     "data",
+    # Tool-call arguments under the names the SDKs use: ``arguments`` (OpenAI,
+    # Microsoft Agent Framework -- often a JSON string), ``args`` (LangChain,
+    # genai, and every exception), ``input`` (Claude ``ToolUseBlock``),
+    # ``tool_input`` (hook payloads). Arguments are where an injected
+    # instruction becomes an action, so they are text that matters most.
+    "arguments",
+    "args",
+    "input",
+    "tool_input",
+    # Model reasoning is model-visible text on the next turn.
+    "reasoning",
+    "thinking",
+    "summary",
+    # Retrieval results and request/error carriers.
+    "page_content",
+    "prompt",
+    "message",
 )
 
 #: Attribute names that hold *containers* of further text-bearing objects
@@ -54,8 +76,16 @@ _TEXT_ATTRS = (
 #: plain dicts/lists, so screening reaches deeply-structured results.
 _RECURSE_ATTRS = (
     "content",
+    # Microsoft Agent Framework ``Message.contents``: function calls, function
+    # results and reasoning live here, and ``Message.text`` joins only the
+    # plain-text parts -- so walking ``.text`` alone skips every tool call.
+    "contents",
     "parts",
     "messages",
+    "choices",
+    "tool_calls",
+    "function_call",
+    "function",  # OpenAI ``tool_calls[].function.arguments``
     "tasks_output",
     # Tool results returning to the model. A Google ADK ``Part`` carries them
     # under ``function_response`` (older/other SDKs: ``tool_response``), whose
@@ -67,14 +97,76 @@ _RECURSE_ATTRS = (
     "response",
 )
 
+#: Every attribute probed on an undeclared object, each name exactly once
+#: (``content`` is in both lists, and is one attribute).
+_PROBE_ATTRS = tuple(dict.fromkeys(_TEXT_ATTRS + _RECURSE_ATTRS))
 
-#: Recursion bound for :func:`extract_texts`, guarding against pathological or
-#: cyclic nesting. Sized from the deepest *real* payload rather than a guess: a
-#: governed ADK tool result is ``{"result": ...} -> [Content] -> Content ->
-#: parts -> Part -> function_response -> response -> text``, which is eight
-#: hops. At the previous bound of six that text was silently dropped -- and a
-#: security scan that stops early fails open, so the headroom is deliberate.
-_MAX_WALK_DEPTH = 12
+#: Recursion bound for :func:`extract_texts`. Measured against real results of
+#: every supported framework, the deepest needs 11 levels: Google ADK events
+#: carrying a tool's JSON reply (``Event -> Content -> parts -> Part ->
+#: function_response -> response -> ...``). The headroom is for the JSON a
+#: tool returns, which is attacker-shaped. Hitting the bound is not silent:
+#: :func:`walk_texts` reports the walk incomplete and the gate treats the
+#: payload as unscannable, so the bound limits cost, never coverage.
+_MAX_WALK_DEPTH = 20
+
+#: Containers and objects one walk may visit (strings and numbers are not
+#: counted). Real results visit far fewer -- about 200 for a 50-message
+#: LangGraph state with tool calls, 1,500 for a 500-item Pydantic result -- so
+#: this binds only on pathological input: an object graph that fabricates new
+#: objects on each access, or a payload built to make the scan itself the DoS.
+_MAX_WALK_NODES = 25_000
+
+#: Threat label for a payload the walk could not fully read (too deep, too
+#: many nodes, or holding a one-shot stream). Blocks like any other threat:
+#: text the scan never saw is text it cannot vouch for.
+UNSCANNABLE = "unscannable"
+
+#: Threat label for a payload whose distinct text exceeds the gate's
+#: ``max_payload_chars``. Scanning stops there rather than spending unbounded
+#: time on one request.
+PAYLOAD_TOO_LARGE = "payload_too_large"
+
+#: Default per-payload budget, in characters of distinct text. Large enough for
+#: a long-context request with a few inline attachments; small enough that the
+#: worst-case scan of one payload stays around a few seconds.
+DEFAULT_MAX_PAYLOAD_CHARS = 4_000_000
+
+#: An attribute name no real object defines. An object that nonetheless
+#: returns something for it fabricates attributes on demand
+#: (``unittest.mock.Mock``, permissive proxies): probing it would recurse into
+#: an endless supply of fresh children, and none of them is data.
+_ABSENT_ATTR = "adapt_agent_no_such_attribute"
+
+_PRIMITIVES = (int, float, bool, complex)
+_BYTES = (bytes, bytearray, memoryview)
+
+
+class TextExtraction(NamedTuple):
+    """What :func:`walk_texts` found, and whether it saw everything.
+
+    Attributes:
+        texts: Every string reached, in first-seen order. A string held by
+            several *distinct* containers appears once per container; one
+            object reachable along several paths is walked only once.
+        incomplete: Why the walk could not read the whole payload, each reason
+            once: ``"depth"`` (nesting beyond :data:`_MAX_WALK_DEPTH`),
+            ``"budget"`` (more than :data:`_MAX_WALK_NODES` objects),
+            ``"stream"`` (a one-shot iterator or async iterator, which cannot
+            be read without consuming it from its owner), ``"error"`` (a
+            container that raised while being iterated). Empty when complete.
+    """
+
+    texts: list[str]
+    incomplete: tuple[str, ...]
+
+    @property
+    def complete(self) -> bool:
+        return not self.incomplete
+
+
+class _BudgetExhausted(Exception):
+    """Unwinds the walk once the node budget is spent."""
 
 
 def _distinct(threats: list[str]) -> list[str]:
@@ -105,6 +197,12 @@ def _safe_getattr(obj: Any, attr: str) -> Any:
         return None
 
 
+def _decode(value: bytes | bytearray | memoryview) -> str:
+    # `errors="replace"` rather than strict: one invalid byte must not be
+    # enough to hide the valid text around it from the scan.
+    return bytes(value).decode("utf-8", errors="replace")
+
+
 def extract_texts(data: Any) -> list[str]:
     """Best-effort extraction of human-readable text from an arbitrary payload.
 
@@ -112,87 +210,270 @@ def extract_texts(data: Any) -> list[str]:
     arbitrary string fields, but framework result objects expose their text via
     attributes instead (see :data:`_TEXT_ATTRS`). We collect every string we can
     reach so the security controls can scan it without assuming a fixed schema.
+
+    This returns the texts only. A security decision must also know whether the
+    walk was *complete* -- use :func:`walk_texts`, which the gate does.
+    """
+    return walk_texts(data).texts
+
+
+def walk_texts(data: Any) -> TextExtraction:
+    """Collect every string reachable in ``data``, and report what was missed.
+
+    Reached: strings; ``bytes``-likes (decoded as UTF-8); every ``Mapping``
+    (keys of any type, values); every sized, re-iterable ``Collection`` (lists,
+    tuples, sets, deques, dict views, ...); the declared fields of structured
+    objects (dataclasses, Pydantic, attrs, msgspec, ``__slots__``, anything
+    with a ``to_dict()``); and on any other object, the well-known attributes
+    in :data:`_TEXT_ATTRS` / :data:`_RECURSE_ATTRS`.
+
+    Each container or object is walked once however many paths lead to it, so
+    aliases and cycles cost nothing. One-shot iterators are *not* consumed --
+    reading them would steal the data from their owner -- and are reported as
+    ``"stream"`` instead. Never raises.
     """
     texts: list[str] = []
+    reasons: dict[str, None] = {}
+    # id -> object: holding the object keeps its id from being reused by a
+    # temporary (a property's fresh return value) later in the same walk.
+    seen: dict[int, Any] = {}
+    # Read once per walk: module constants, so tests and callers can tune them.
+    max_depth = _MAX_WALK_DEPTH
+    max_nodes = _MAX_WALK_NODES
 
-    def _walk(value: Any, depth: int = 0) -> None:
-        if depth > _MAX_WALK_DEPTH:
-            return
+    # `_items` and `_each` inline the commonest leaves -- strings and numbers.
+    # A function call per leaf was most of the cost of a walk.
+
+    def _items(items: Iterable[tuple[Any, Any]], depth: int) -> None:
+        shallow = depth <= max_depth
+        for k, v in items:
+            # Keys too. A tool response is attacker-shaped data, not just an
+            # attacker-shaped *value*: `{"ignore previous instructions": ""}`
+            # renders to the model exactly like the same text in a value, and
+            # scanning only values let it through untouched.
+            if isinstance(k, str) and k:
+                texts.append(k)
+            elif not isinstance(k, str):
+                _walk(k, depth)
+            t = type(v)
+            if t is str and shallow:
+                texts.append(v)
+            elif not (v is None or t is int or t is float or t is bool):
+                _walk(v, depth)
+
+    def _each(values: Iterable[Any], depth: int) -> None:
+        shallow = depth <= max_depth
+        for v in values:
+            t = type(v)
+            if t is str and shallow:
+                texts.append(v)
+            elif not (v is None or t is int or t is float or t is bool):
+                _walk(v, depth)
+
+    def _walk(value: Any, depth: int) -> None:
         if isinstance(value, str):
-            texts.append(value)
-        elif value is None or isinstance(value, (int, float, bool)):
+            if depth > max_depth:
+                reasons.setdefault("depth", None)
+            else:
+                texts.append(value)
+            return
+        if value is None or isinstance(value, _PRIMITIVES):
             # Primitives carry no text and have no attributes worth probing;
             # returning early avoids pointless getattr lookups on large payloads.
             return
-        elif isinstance(value, dict):
-            for k, v in value.items():
-                # Keys too. A tool response is attacker-shaped data, not just an
-                # attacker-shaped *value*: `{"ignore previous instructions": ""}`
-                # renders to the model exactly like the same text in a value, and
-                # scanning only values let it through untouched.
-                if isinstance(k, str) and k:
-                    texts.append(k)
-                _walk(v, depth + 1)
-        elif isinstance(value, (list, tuple)):
-            for v in value:
-                _walk(v, depth + 1)
-        else:
-            # Framework message / result objects expose their text via one of a
-            # handful of well-known attributes. Recurse into anything walkable.
-            for attr in _TEXT_ATTRS:
-                inner = _safe_getattr(value, attr)
-                if isinstance(inner, str):
-                    texts.append(inner)
-                elif inner is not None and not isinstance(inner, (int, float, bool)):
-                    # Recurse into *any* non-primitive, not just dict/list/tuple.
-                    # A Pydantic AI ``AgentRunResult.output`` holds a BaseModel,
-                    # and stopping at container types here left every field of a
-                    # structured answer unscreened -- the wrapper was walked, the
-                    # model inside it was not.
-                    _walk(inner, depth + 1)
-            # Structured content containers (e.g. genai ``Content.parts``) hold
-            # further objects whose text we still want to scan.
-            for attr in _RECURSE_ATTRS:
-                inner = _safe_getattr(value, attr)
-                if inner is not None and not isinstance(inner, (str, int, float, bool)):
-                    _walk(inner, depth + 1)
-            # A *structured output* (a Pydantic model or dataclass, as produced
+        if depth > max_depth:
+            reasons.setdefault("depth", None)
+            return
+        if isinstance(value, _BYTES):
+            texts.append(_decode(value))
+            return
+
+        key = id(value)
+        if key in seen:
+            return
+        seen[key] = value
+        if len(seen) > max_nodes:
+            raise _BudgetExhausted
+
+        child = depth + 1
+        # Exact-type fast paths first: these are nearly every node of a real
+        # payload, and even a cached plan lookup costs more.
+        cls = type(value)
+        if cls is dict:
+            _items(value.items(), child)
+            return
+        if cls is list or cls is tuple:
+            _each(value, child)
+            return
+        kind = _plan(cls)[0]
+        if kind is _SKIP:
+            return
+        try:
+            if kind is _MAPPING:
+                _items(value.items(), child)
+                return
+            if kind is _COLLECTION:
+                _each(value, child)
+                return
+            # A structured output (a Pydantic model or dataclass, as produced
             # by a Pydantic AI ``output_type`` or a MAF structured response)
             # carries its text in arbitrarily-named fields -- ``lane``, ``note``,
-            # ``summary``. None of those appear above, so without this a
-            # structured answer would go almost entirely unscreened: injected
-            # text smuggled into one field would never be seen.
+            # ``summary``. None of those appear in the attribute lists, so
+            # without this a structured answer would go almost entirely
+            # unscreened: injected text smuggled into one field would never be
+            # seen.
             fields = _structured_fields(value)
             if fields is not None:
-                _walk(fields, depth + 1)
+                _each(fields, child)
+                return
+        except _BudgetExhausted:
+            raise
+        except Exception:
+            # A container that raised mid-iteration was only partly read.
+            reasons.setdefault("error", None)
+            return
+        if kind is _STREAM:
+            reasons.setdefault("stream", None)
+            return
+        if _safe_getattr(value, _ABSENT_ATTR) is not None:
+            return
+        # Framework message / result objects expose their text via one of a
+        # handful of well-known attributes. Recurse into anything walkable.
+        for attr in _PROBE_ATTRS:
+            inner = _safe_getattr(value, attr)
+            if inner is not None and not inspect.isroutine(inner):
+                _walk(inner, child)
 
-    _walk(data)
-    return texts
+    try:
+        _walk(data, 0)
+    except _BudgetExhausted:
+        reasons.setdefault("budget", None)
+    except RecursionError:  # pragma: no cover - bounded by _MAX_WALK_DEPTH
+        reasons.setdefault("depth", None)
+    return TextExtraction(texts, tuple(reasons))
 
 
-def _structured_fields(value: Any) -> dict[str, Any] | None:
-    """Return the field mapping of a Pydantic model or dataclass, else ``None``.
+def _structured_fields(value: Any) -> list[Any] | None:
+    """Return the field values of an object that declares its fields, else ``None``.
 
     Deliberately narrow: only objects that *declare* themselves structured are
-    walked. Scanning every object's ``__dict__`` would drag framework internals
-    (clients, sessions, loggers) into the security scan.
+    walked -- dataclasses, Pydantic models (v2 and v1), attrs classes,
+    ``msgspec.Struct``, classes with ``__slots__``, and objects whose class
+    offers ``to_dict()``. Scanning every object's ``__dict__`` would drag
+    framework internals (clients, sessions, loggers) into the security scan.
+
+    Field *names* are schema, not content, so only values are returned -- except
+    where the object's data is itself a mapping (``to_dict()``, Pydantic extra
+    fields), which is returned whole so its keys are scanned too.
     """
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+    kind, names = _plan(type(value))
+    if kind is _FIELDS:
+        return [_safe_getattr(value, name) for name in names]
+    if kind is _PYDANTIC:
+        # A v2 model keeps exactly its field values in `__dict__`; reading it
+        # directly is several times cheaper than a getattr per field.
+        stored = _safe_getattr(value, "__dict__")
+        if isinstance(stored, dict):
+            values = list(stored.values())
+        else:  # pragma: no cover - a model without instance storage
+            values = [_safe_getattr(value, name) for name in names]
+        extra = _safe_getattr(value, "__pydantic_extra__")
+        if extra:
+            values.append(extra)
+        return values
+    if kind is _TO_DICT:
         try:
-            return {f.name: getattr(value, f.name, None) for f in dataclasses.fields(value)}
+            dumped = value.to_dict()
         except Exception:
             return None
-    if hasattr(value, "model_fields") or hasattr(value, "__fields__"):  # pydantic v2 / v1
-        for attr in ("model_dump", "dict"):
-            method = _safe_getattr(value, attr)
-            if callable(method):
-                try:
-                    dumped = method()
-                except Exception:
-                    continue
-                if isinstance(dumped, dict):
-                    return dumped
+        return [dumped] if isinstance(dumped, Mapping) else None
     return None
+
+
+# How `walk_texts` reads an object, decided once per class (see `_plan`).
+_SKIP = "skip"
+_MAPPING = "mapping"
+_COLLECTION = "collection"
+_FIELDS = "fields"
+_PYDANTIC = "pydantic"
+_TO_DICT = "to_dict"
+_STREAM = "stream"
+_PROBE = "probe"
+
+_Plan = tuple[str, tuple[str, ...]]
+
+#: Per-class plans. A plain dict rather than a weak one -- a lookup happens on
+#: every node -- so it is bounded instead: classes made per object (a
+#: ``MagicMock`` makes one per instance) cannot grow it without limit.
+_PLANS: dict[type, _Plan] = {}
+_MAX_PLANS = 4096
+
+
+def _plan(cls: type) -> _Plan:
+    """Decide, once per class, how its instances are read: ``(kind, field names)``.
+
+    Every declaration is read off the **class**: Pydantic 2.11 deprecated
+    ``model_fields`` on an instance (removed in v3), and an instance that
+    fabricates attributes (a ``Mock``) must not pass for a structured one.
+    Precedence: mappings, then declared fields, then plain collections, then
+    one-shot streams; anything else gets the well-known-attribute probe.
+    """
+    plan = _PLANS.get(cls)
+    if plan is not None:
+        return plan
+    plan = _make_plan(cls)
+    if len(_PLANS) >= _MAX_PLANS:
+        _PLANS.clear()
+    _PLANS[cls] = plan
+    return plan
+
+
+def _make_plan(cls: type) -> _Plan:
+    # A class is code, not data; a range or a number holds no text.
+    if issubclass(cls, (type, range, numbers.Number)):
+        return _SKIP, ()
+    if issubclass(cls, Mapping):
+        return _MAPPING, ()
+    if dataclasses.is_dataclass(cls):
+        return _FIELDS, tuple(f.name for f in dataclasses.fields(cls))
+    model_fields = _safe_getattr(cls, "model_fields")  # pydantic v2
+    if isinstance(model_fields, Mapping):
+        return _PYDANTIC, tuple(name for name in model_fields if isinstance(name, str))
+    v1_fields = _safe_getattr(cls, "__fields__")  # pydantic v1 (and pydantic.v1)
+    if isinstance(v1_fields, Mapping):
+        return _FIELDS, tuple(name for name in v1_fields if isinstance(name, str))
+    attrs_fields = _safe_getattr(cls, "__attrs_attrs__")
+    if isinstance(attrs_fields, tuple):
+        names = (_safe_getattr(a, "name") for a in attrs_fields)
+        return _FIELDS, tuple(n for n in names if isinstance(n, str))
+    struct_fields = _safe_getattr(cls, "__struct_fields__")  # msgspec.Struct
+    if isinstance(struct_fields, tuple):
+        return _FIELDS, tuple(n for n in struct_fields if isinstance(n, str))
+    if callable(_safe_getattr(cls, "to_dict")):
+        return _TO_DICT, ()
+    slots = _slot_names(cls)
+    if slots:
+        return _FIELDS, slots
+    if issubclass(cls, Collection):
+        return _COLLECTION, ()
+    if issubclass(cls, (Iterator, AsyncIterator)):
+        return _STREAM, ()
+    return _PROBE, ()
+
+
+def _slot_names(cls: type) -> tuple[str, ...]:
+    """Every ``__slots__`` name declared by a pure-Python class and its bases."""
+    names: dict[str, None] = {}
+    for klass in cls.__mro__:
+        if klass.__module__ == "builtins":
+            continue
+        slots = klass.__dict__.get("__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for name in slots:
+            if isinstance(name, str) and name not in ("__dict__", "__weakref__"):
+                names.setdefault(name, None)
+    return tuple(names)
 
 
 def extract_prompt(payload: Any) -> str:
@@ -401,6 +682,19 @@ class GovernanceGate:
         tool_policy: Name-based allow / deny / approval lists consulted by
             :meth:`check_tool_call`. ``None`` restricts no tool by name; tool
             arguments and results are still screened by the other controls.
+        max_payload_chars: Budget for one payload, in characters of *distinct*
+            text (each repeated string counts once, as it is scanned once).
+            A payload over budget is not scanned and yields the threat
+            ``"payload_too_large"``. The firewall's ``max_content_length``
+            bounds each string separately, so it alone lets fifty strings
+            just under the cap through; this bounds their sum, and with it
+            the time one request can spend in the scanners. Defaults to
+            :data:`DEFAULT_MAX_PAYLOAD_CHARS`; ``None`` disables the bound.
+
+    A payload the scanners cannot read in full -- nested deeper than the walk
+    goes, too many objects to visit, or holding a one-shot stream -- yields
+    the threat ``"unscannable"``, and is blocked (or reported, when report-only)
+    like any other finding: an unread string is not a clean one.
     """
 
     def __init__(
@@ -412,13 +706,21 @@ class GovernanceGate:
         block_on_violation: bool = True,
         agent_id: str = "agent",
         tool_policy: ToolPolicy | None = None,
+        max_payload_chars: int | None = DEFAULT_MAX_PAYLOAD_CHARS,
     ):
+        if max_payload_chars is not None and (
+            isinstance(max_payload_chars, bool)
+            or not isinstance(max_payload_chars, int)
+            or max_payload_chars < 1
+        ):
+            raise ValueError("max_payload_chars must be a positive int or None")
         self.firewall = firewall
         self.defense = defense
         self.policy_enforcer = policy_enforcer
         self.block_on_violation = block_on_violation
         self.agent_id = agent_id
         self.tool_policy = tool_policy
+        self.max_payload_chars = max_payload_chars
 
     # -- scanning (never raises) ----------------------------------------------
 
@@ -429,8 +731,8 @@ class GovernanceGate:
         if self.firewall is None and self.defense is None:
             return []
 
-        threats: list[str] = []
-        for text in extract_texts(payload):
+        texts, threats = self._texts_to_scan(payload)
+        for text in texts:
             if self.firewall is not None and not self.firewall.check_input(text):
                 threats.append("firewall")
             if self.defense is not None:
@@ -441,13 +743,30 @@ class GovernanceGate:
 
     def scan_output(self, payload: Any) -> list[str]:
         """Run the firewall over an output payload, returning threats."""
-        threats: list[str] = []
         if self.firewall is None:
-            return threats
-        for text in extract_texts(payload):
+            return []
+        texts, threats = self._texts_to_scan(payload)
+        for text in texts:
             if not self.firewall.check_output(text):
                 threats.append("firewall")
         return _distinct(threats)
+
+    def _texts_to_scan(self, payload: Any) -> tuple[list[str], list[str]]:
+        """The distinct texts of ``payload`` to scan, and the threats found walking it.
+
+        Each distinct string is scanned once. Scanning it again cannot change a
+        verdict; it only multiplies the cost and the firewall's audit trail,
+        where one blocked output would record an event per copy and evict the
+        rest of the bounded history.
+        """
+        walk = walk_texts(payload)
+        threats = [UNSCANNABLE] if walk.incomplete else []
+        texts = list(dict.fromkeys(walk.texts))
+        if self.max_payload_chars is not None:
+            if sum(len(text) for text in texts) > self.max_payload_chars:
+                threats.append(PAYLOAD_TOO_LARGE)
+                return [], threats
+        return texts, threats
 
     def policy_violations(self, state: Mapping[str, Any]) -> list[str]:
         """Return the names of *blocking* policy rules ``state`` violates.
@@ -647,9 +966,14 @@ __all__ = [
     "ALLOW",
     "ASK",
     "BLOCK",
+    "DEFAULT_MAX_PAYLOAD_CHARS",
+    "PAYLOAD_TOO_LARGE",
+    "UNSCANNABLE",
     "GovernanceGate",
+    "TextExtraction",
     "ToolDecision",
     "ToolPolicy",
     "extract_prompt",
     "extract_texts",
+    "walk_texts",
 ]

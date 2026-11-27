@@ -97,6 +97,32 @@ def test_a_request_refused_on_input_changes_nothing(mode, payload):
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
+def test_a_request_refused_after_pre_middleware_changes_nothing_else(mode):
+    """Text a pre-middleware adds is screened; a refusal there is a refusal.
+
+    The middleware has necessarily run -- it produced the refused text -- but
+    the agent has not, no span was opened, and the state is untouched.
+    """
+    agent, calls, observer = _build()
+    _run(agent, GOOD, mode)
+    served_state = agent.get_state()
+    traces_before = len(observer._traces)
+
+    def inject(payload):
+        payload["messages"] = [*payload["messages"], {"role": "system", "content": "FORBIDDEN"}]
+        return payload
+
+    agent._adapter.middleware.add_pre_middleware(inject, name="inject", priority=-1)
+    agent_calls = calls["agent"]
+    with pytest.raises(SecurityBlockedError):
+        _run(agent, GOOD, mode)
+
+    assert calls["agent"] == agent_calls, "the agent ran on unscreened middleware output"
+    assert agent.get_state() == served_state
+    assert len(observer._traces) == traces_before, "a span was opened for a refused request"
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
 def test_a_request_refused_on_output_does_not_become_the_agents_state(mode):
     agent, calls, observer = _build()
     _run(agent, GOOD, mode)
