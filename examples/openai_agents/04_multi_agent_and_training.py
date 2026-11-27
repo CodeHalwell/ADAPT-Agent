@@ -35,10 +35,12 @@ from pathlib import Path
 try:
     import agents  # noqa: F401
 except ImportError:
-    raise SystemExit(
+    # Exit 0: a missing optional extra is not a failure of the example.
+    print(
         "This example needs the OpenAI Agents SDK: "
         "pip install 'adapt-agent[openai-agents]'  (or: pip install openai-agents)"
-    ) from None
+    )
+    raise SystemExit(0) from None
 
 from agents import Agent, function_tool
 

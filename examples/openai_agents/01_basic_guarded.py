@@ -9,10 +9,10 @@ safe prompt (which passes through to the agent) and a prompt-injection prompt
 Key idea: the adapter never imports ``agents`` itself; it lazily imports the
 SDK's ``Runner`` only when an OpenAI ``Agent`` is actually executed. So importing
 ``adapt_agent`` is always cheap and safe -- the framework is only needed at run
-time. Because actually *running* an OpenAI ``Agent`` calls the OpenAI API
-(network + key), the safe call here is guarded by a ``try/except`` so the example
-demonstrates the security behaviour even with no API key configured: the
-malicious input is rejected *before* any network call.
+time. To run offline -- no API key, no network -- the agent is given the SDK's
+own deterministic model double, ``agents.testing.ScriptedModel``, in place of a
+real model id. Drop the ``model=`` argument (the SDK default is
+``gpt-5.6-luna``) or name one to go live; nothing else changes.
 
 Run it with:
 
@@ -29,12 +29,15 @@ from typing import Any
 try:
     import agents  # noqa: F401
 except ImportError:
-    raise SystemExit(
+    # Exit 0: a missing optional extra is not a failure of the example.
+    print(
         "This example needs the OpenAI Agents SDK: "
         "pip install 'adapt-agent[openai-agents]'  (or: pip install openai-agents)"
-    ) from None
+    )
+    raise SystemExit(0) from None
 
-from agents import Agent
+from agents import Agent, set_tracing_disabled
+from agents.testing import ScriptedModel, assistant_message
 
 # adapt_agent always imports -- it does not depend on any framework.
 from adapt_agent import Firewall
@@ -46,12 +49,14 @@ def build_agent() -> Agent:
     """Define the smallest real OpenAI Agents SDK agent.
 
     An ``Agent`` needs only a ``name`` and ``instructions`` (the system prompt).
-    ``model`` defaults to the SDK's default OpenAI model; we leave it implicit
-    here. Tools and handoffs are optional and omitted at this rung.
+    ``model`` defaults to the SDK's default OpenAI model (``gpt-5.6-luna``); here
+    it is a scripted offline double that answers once. Tools and handoffs are
+    optional and omitted at this rung.
     """
     return Agent(
         name="Assistant",
         instructions="You are a concise, helpful assistant. Answer in one sentence.",
+        model=ScriptedModel([[assistant_message("The capital of France is Paris.")]]),
     )
 
 
@@ -75,6 +80,7 @@ def build_guarded_agent() -> Any:
 
 
 def main() -> None:
+    set_tracing_disabled(True)  # offline: there is no API key to export traces with
     guarded = build_guarded_agent()
 
     # The payload uses the standard `{"messages": [...]}` shape. Prompt-based
@@ -82,17 +88,9 @@ def main() -> None:
     # message, so this works uniformly across adapters.
     print("=== Safe input ===")
     safe_input = {"messages": [{"role": "user", "content": "What is the capital of France?"}]}
-    try:
-        result = guarded.execute(safe_input)
-        print("  Agent replied:", result)
-    except Exception as exc:  # noqa: BLE001 - running the real agent needs an API key
-        # The firewall already passed the input; this only fails if the OpenAI
-        # API call itself cannot run (e.g. no OPENAI_API_KEY). That is expected
-        # in an offline demo -- the point is that the SAFE input reached the run
-        # step, while the malicious input below never will.
-        print(
-            f"  (Safe input passed screening; live run unavailable offline: {type(exc).__name__})"
-        )
+    result = guarded.execute(safe_input)
+    # `execute` returns {"result": RunResult}; the answer is on `.final_output`.
+    print("  Agent replied:", result["result"].final_output)
 
     print("\n=== Malicious input (prompt injection, blocked before any run) ===")
     bad_input = {
@@ -103,7 +101,7 @@ def main() -> None:
     try:
         guarded.execute(bad_input)
     except SecurityBlockedError as exc:
-        # Blocked at the input-screening step -- the OpenAI API is never called.
+        # Blocked at the input-screening step -- the model is never called.
         print(f"  Blocked! reason={exc.reason!r} threats={exc.threats}")
 
 

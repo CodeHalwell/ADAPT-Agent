@@ -1,6 +1,6 @@
 # ADAPT-Agent x OpenAI Agents SDK examples
 
-A four-step ladder that climbs from a single guarded agent to a governed,
+A five-step ladder that climbs from a single guarded agent to a governed,
 optimizable multi-agent system built on the
 [OpenAI Agents SDK](https://openai.github.io/openai-agents-python) (PyPI package
 `openai-agents`, imported as `agents`).
@@ -10,20 +10,20 @@ python examples/openai_agents/01_basic_guarded.py
 python examples/openai_agents/02_policy_observability_trust.py
 python examples/openai_agents/03_evaluate_and_optimize.py
 python examples/openai_agents/04_multi_agent_and_training.py
+python examples/openai_agents/05_tool_calls_handoffs_streaming.py
 ```
 
 Each script **guards its framework import**: run it without the SDK installed and
-it prints a friendly install hint and exits cleanly. Install the extra with:
+it prints a friendly install hint and exits with status 0. Install the extra with:
 
 ```bash
 pip install 'adapt-agent[openai-agents]'   # or: pip install openai-agents
 ```
 
-Examples 02, 03 and 04 run **fully offline** (no API key, no network): the LLM
-judge is backed by a deterministic stub and the agents are driven by a local
-runner. Example 01 sends its *safe* prompt to the real OpenAI API; without
-`OPENAI_API_KEY` that one call is caught and reported, while the *malicious*
-prompt is still blocked before any network call.
+Every example runs **fully offline** (no API key, no network). Examples 01 and
+05 drive real SDK `Agent`s through the real `Runner` with the SDK's own
+deterministic model double, `agents.testing.ScriptedModel`; 02-04 use a local
+runner and a stubbed LLM judge.
 
 ## The ladder
 
@@ -58,10 +58,18 @@ runs the same optimization via the declarative config path
 (`run_training`); the project-style YAML lives in
 [`openai_agents.train.yaml`](./openai_agents.train.yaml).
 
+### `05_tool_calls_handoffs_streaming.py`
+Governance *inside* the run, through the SDK's own seams: `govern_tools` puts
+every tool call and result through the gate (a denied tool never runs, a poisoned
+page never reaches the model), a `ToolPolicy` approval pauses the run and is
+resumed through the adapter with `execute({"input": state})`,
+`governance_run_hooks` blocks a handoff target's leaking answer, and
+`govern_stream` withholds a flagged streamed response while a clean one streams.
+
 ## Going live
 
-Everywhere an offline runner is used, swapping in the real SDK is a one-line
-change: build `Agent(...)` instances and let the adapter drive them through the
+Everywhere an offline runner or `ScriptedModel` is used, swapping in the real SDK
+is a one-line change (drop `model=`; the SDK default is `gpt-5.6-luna`): build `Agent(...)` instances and let the adapter drive them through the
 SDK's `Runner` (`Runner.run_sync(agent, prompt)`), or wrap your own runner that
 calls `Runner.run`. See the commented "go live" snippets at the bottom of
 examples 01 and 02.
