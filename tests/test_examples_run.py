@@ -118,6 +118,33 @@ def test_the_middleware_async_rollout_example_shows_each_outcome():
     assert "policy rules that fired         : ['low_trust']" in out
 
 
+def test_the_multi_framework_example_governs_all_seven_adapters_alike():
+    out = _out("05_multi_framework_adapters.py")
+    adapters = (
+        "LangGraph",
+        "Pydantic AI",
+        "Microsoft Agent Framework",
+        "CrewAI",
+        "OpenAI Agents SDK",
+        "Google ADK",
+        "Claude Agent SDK",
+    )
+    for name in adapters:
+        assert f"[{name}] blocked: threats=['firewall', 'prompt_injection']" in out
+    served = out.split("=== 1.")[1].split("blocked the same way")[0]
+    assert served.count("What is the capital of France?'") == 6  # CrewAI gets template inputs
+    # Run-scoped keyword arguments reach the framework; a bare string is accepted.
+    assert "on thread user-42" in out
+    assert "(deps={'user': 'alice'})" in out
+    assert "answered: 'What is 2 + 2?'" in out
+    # An input refusal leaves no trace but is recorded as a refusal.
+    assert "support stage=input threats=['firewall', 'prompt_injection']" in out
+    assert "traces started     : 0" in out
+    assert "gate.check_tool_call('delete_records') -> block" in out
+    assert "gate.check_tool_call('send_email'    ) -> ask" in out
+    assert "without hooks=True -> tool_policy, on_tool_violation and approve" in out
+
+
 def test_the_native_hooks_example_shows_what_a_wrapper_misses():
     out = _out("12_native_framework_hooks.py")
     assert "outer wrapper       : allowed" in out
@@ -130,6 +157,41 @@ def test_the_native_hooks_example_shows_what_a_wrapper_misses():
     assert "[('maf-agent', 'completed'), ('maf-agent', 'error')]" in out
     assert "flagged text in a field : BLOCKED ['firewall'] [pai-agent]" in out
     assert "cannot honour policy_enforcer" in out
+
+
+def test_the_native_hooks_example_shows_each_tool_verdict():
+    # The parts of example 12 that run with no framework installed; a binding
+    # that builds SDK objects prints a skip line instead, so it is not pinned.
+    out = _out("12_native_framework_hooks.py")
+    # The gate's own tool API: allow, block, ask, and an ask that fails closed.
+    assert "search                : allow []" in out
+    assert "delete_user           : block ['tool:denied:delete_user']" in out
+    assert "send_email            : ask   ['tool:approval:send_email']" in out
+    assert "refund 900            : ask   ['policy:big_refunds']" in out
+    assert "search (bad argument) : block ['firewall', 'prompt_injection']" in out
+    assert "fetch result          : block ['firewall', 'prompt_injection']" in out
+    assert "ask, no approval path : block" in out
+    assert "report-only           : allow report_only=True" in out
+    # LangGraph's ToolNode wrapper: an ask with no checkpointer is a block.
+    lg = out.split("== 4a.")[1].split("deprecated constructor")[0]
+    assert "tool: search      -> allowed" in lg
+    assert "tool: delete_user -> BLOCKED ['tool:denied:delete_user']" in lg
+    assert "tool: send_email  -> BLOCKED ['tool:approval:send_email']" in lg
+    assert "tool result       -> BLOCKED ['firewall', 'prompt_injection']" in lg
+    # ADK: refusal as the tool's response, an ask routed to confirmation.
+    adk = out.split("== 4c.")[1].split("== 4d.")[0]
+    assert "refused by ADAPT-Agent [adk-agent]: tool:denied:delete_user." in adk
+    assert "confirmation requested: True" in adk
+    assert "withheld by ADAPT-Agent [adk-agent]: firewall, prompt_injection." in adk
+    # MAF function middleware: no AgentSession, so the ask is refused.
+    maf = out.split("== 4d.")[1].split("== 4e.")[0]
+    assert "tool: search      -> ok" in maf
+    assert "refused by ADAPT-Agent [maf-tools]: tool:denied:delete_user." in maf
+    assert "needs approval [maf-tools]: tool:approval:send_email. (refused)" in maf
+    assert "withheld by ADAPT-Agent [maf-tools]: firewall, prompt_injection." in maf
+    # Claude's CLI options are derived without the SDK, and never auto-approve.
+    assert "'disallowed_tools': ['Bash'], 'tools': ['Read', 'Grep']" in out
+    assert "allowed_tools" not in out.replace("disallowed_tools", "")
 
 
 def test_the_optimizer_strategies_example_reaches_its_stated_results():
