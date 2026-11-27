@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import bisect
+import codecs
 import html
 import re
 import string
 import unicodedata
 from collections import deque
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from typing import Any, NamedTuple
+from urllib.parse import unquote
 
-# Zero-width / invisible characters frequently used to obfuscate attack
-# indicators (zero-width space, non-joiner, joiner, BOM/zero-width no-break space).
+from adapt_agent.security._text import decode_tag_block, escape_for_log, fold_for_matching
+
 #: HTML and CSS are **ASCII** case-insensitive, and Python is not. Exactly
 #: three characters make the difference, and each reaches a literal this module
 #: matches: U+017F folds to ``s`` -- so ``\u017ftyle`` was read as a ``style``
@@ -48,8 +54,9 @@ def _ascii_lower(text: str) -> str:
 #: and reading one there was the same bypass in a third spelling.
 _HTML_WHITESPACE = " \t\n\f\r"
 
-_ZERO_WIDTH_CHARS = "​‌‍﻿"
-_ZERO_WIDTH_RE = re.compile(f"[{_ZERO_WIDTH_CHARS}]")
+#: Invisible characters are removed by
+#: :func:`~adapt_agent.security._text.fold_for_matching`, shared with the
+#: firewall: every format character and combining mark, not a list of four.
 #: Every whitespace run, line breaks included -- see :func:`_normalize`.
 _WHITESPACE_RE = re.compile(r"\s+")
 #: Spaces/tabs and friends, but never a line break -- see :func:`_normalize_lines`.
@@ -301,6 +308,165 @@ _MARKUP_RE = re.compile(
 )
 
 
+#: Every alternative of the markup patterns above, with the terminator it
+#: cannot match without. ``None`` marks a construct of fixed or bounded shape.
+#:
+#: The compiled patterns above are kept for :meth:`re.Pattern.fullmatch` on
+#: one construct; nothing here *searches* untrusted text with them, because a
+#: backtracking search over an alternation is quadratic whenever an opener has
+#: no terminator anywhere after it. ``"<?" * 5000`` made every start position
+#: scan to the end of the input looking for a ``>`` that was not there --
+#: 10KB took four seconds -- and ``"<!a" * n`` and ``"[a" * n`` were the same
+#: shape. :class:`_MarkupScanner` asks the question once per text instead.
+_MARKUP_ALTERNATIVES: tuple[tuple[str, str | None], ...] = (
+    (r"<!--", None),
+    (r"-->", None),
+    (r"<!\[CDATA\[", None),
+    (r"\]\]>", None),
+    (r"<![A-Za-z](?:[^<>\"']|\"[^\"]*\"|'[^']*')*>", ">"),
+    (r"<![A-Za-z][^>]*>", ">"),
+    (r"<\?(?:[^?]|\?(?!>))*\?>", "?>"),
+    (r"<\?[^>]*>", ">"),
+    (r"</?[A-Za-z][A-Za-z0-9._:-]*(?:\s(?:[^<>\"']|\"[^\"]*\"|'[^']*')*)?/?>", ">"),
+    (r"</?[A-Za-z][A-Za-z0-9._:-]*(?:\s[^<>]*)?/?>", ">"),
+    (r"\[/?[A-Za-z*][^\]]*\]", "]"),
+)
+_REFERENCE_ALTERNATIVE = (f"(?P<reference>{_CHARACTER_REF_RE.pattern})", None)
+
+
+class _MarkupScanner:
+    """A left-to-right scan for markup constructs that is linear in its input.
+
+    The same matches, at the same positions, as a :meth:`re.Pattern.finditer`
+    over the alternation -- and the same winner at each position, since the
+    alternatives are tried in their original order. What changes is which
+    alternatives are *tried*: one whose terminator does not occur anywhere
+    after the current position can never match there, so it is left out of
+    the pattern instead of being allowed to scan to the end of the text and
+    fail. The last position of each terminator is found once per text, and as
+    the scan moves right the set of live alternatives only shrinks, so a text
+    uses a handful of compiled variants at most.
+
+    Leaving out an alternative that cannot match changes no result, which is
+    what makes this a cost fix and not a behaviour change. Every remaining
+    unbounded scan either succeeds at the first terminator it reaches (and is
+    then consumed, never rescanned) or stops at the next ``<``.
+    """
+
+    #: Where any alternative can begin. A position that is none of these
+    #: cannot start a construct, so the scan jumps between them in C.
+    _CANDIDATE_RE = re.compile(r"[<\[&]|-->|\]\]>")
+
+    def __init__(self, alternatives: tuple[tuple[str, str | None], ...]) -> None:
+        self._alternatives = alternatives
+        self._terminators = tuple(sorted({t for _, t in alternatives if t is not None}))
+        self._variants: dict[frozenset[str], re.Pattern[str]] = {}
+
+    def _variant(self, live: frozenset[str]) -> re.Pattern[str]:
+        pattern = self._variants.get(live)
+        if pattern is None:
+            sources = [src for src, term in self._alternatives if term is None or term in live]
+            pattern = re.compile("|".join(sources), re.IGNORECASE)
+            self._variants[live] = pattern
+        return pattern
+
+    def scan(self, text: str) -> _MarkupScan:
+        """A scan of ``text`` that can be resumed from any position."""
+        return _MarkupScan(self, text)
+
+    def sub(self, replace: Callable[[re.Match[str]], str], text: str) -> str:
+        """``text`` with each construct replaced, skipping text that has none.
+
+        Most of what reaches this -- every segment of every line -- holds no
+        ``<``, ``[`` or ``&`` at all, and one C-level search says so without
+        setting up a scan.
+        """
+        if self._CANDIDATE_RE.search(text) is None:
+            return text
+        return _MarkupScan(self, text).sub(replace)
+
+
+class _MarkupScan:
+    """One text's scan: the terminator positions, found once and shared."""
+
+    def __init__(self, scanner: _MarkupScanner, text: str) -> None:
+        self._scanner = scanner
+        self._text = text
+        self._last = {term: text.rfind(term) for term in scanner._terminators}
+        # The variant for the current stretch of positions, and the stretch it
+        # is valid for: the live set only changes where a position passes the
+        # last occurrence of some terminator.
+        self._pattern: re.Pattern[str] | None = None
+        self._valid_from = 0
+        self._valid_until = -1
+
+    def _pattern_at(self, start: int) -> re.Pattern[str]:
+        if self._pattern is None or not self._valid_from <= start < self._valid_until:
+            live = frozenset(term for term, last in self._last.items() if last > start)
+            self._pattern = self._scanner._variant(live)
+            dead = [last for last in self._last.values() if last <= start]
+            self._valid_from = max(dead, default=-1) + 1
+            self._valid_until = min(
+                (last for last in self._last.values() if last > start), default=len(self._text)
+            )
+        return self._pattern
+
+    def search(self, pos: int = 0) -> re.Match[str] | None:
+        """The first construct starting at or after ``pos``, or ``None``."""
+        text = self._text
+        candidates = _MarkupScanner._CANDIDATE_RE
+        while True:
+            candidate = candidates.search(text, pos)
+            if candidate is None:
+                return None
+            start = candidate.start()
+            match = self._pattern_at(start).match(text, start)
+            if match is not None:
+                return match
+            pos = start + 1
+
+    def finditer(self) -> Iterator[re.Match[str]]:
+        """Every construct, left to right, none overlapping.
+
+        :meth:`search` inlined: this loop runs once per construct of every
+        segment, and the call it saves is a measurable share of the cost.
+        """
+        text = self._text
+        candidates = _MarkupScanner._CANDIDATE_RE.search
+        pos = 0
+        while True:
+            candidate = candidates(text, pos)
+            if candidate is None:
+                return
+            start = candidate.start()
+            pattern = self._pattern
+            if pattern is None or not self._valid_from <= start < self._valid_until:
+                pattern = self._pattern_at(start)
+            match = pattern.match(text, start)
+            if match is None:
+                pos = start + 1
+                continue
+            yield match
+            pos = match.end()
+
+    def sub(self, replace: Callable[[re.Match[str]], str]) -> str:
+        """``text`` with each construct replaced by ``replace(match)``."""
+        pieces: list[str] = []
+        pos = 0
+        for match in self.finditer():
+            pieces.append(self._text[pos : match.start()])
+            pieces.append(replace(match))
+            pos = match.end()
+        pieces.append(self._text[pos:])
+        return "".join(pieces)
+
+
+#: The scanners every internal caller uses in place of :data:`_MARKUP_RE` and
+#: :data:`_MARKUP_CONSTRUCT_RE`.
+_MARKUP_SCANNER = _MarkupScanner((_REFERENCE_ALTERNATIVE, *_MARKUP_ALTERNATIVES))
+_CONSTRUCT_SCANNER = _MarkupScanner(_MARKUP_ALTERNATIVES)
+
+
 def _undecorated_construct(match: re.Match[str]) -> str:
     """Replace one markup construct with what a reader would see in its place.
 
@@ -367,7 +533,7 @@ def _undecorate(text: str) -> str:
     what one pass leaves. Rerunning until stable removed the rejoined ``<b>``
     too and returned nothing at all.
     """
-    body = _MARKUP_RE.sub(_undecorated_construct, text)
+    body = _MARKUP_SCANNER.sub(_undecorated_construct, text)
     start = 0
     while start < len(body):
         if _is_decoration(body[start]):
@@ -1179,8 +1345,9 @@ def _stylesheet_text(text: str) -> str:
     sheets: list[str] = []
     index = 0
     end = len(text)
+    scan = _CONSTRUCT_SCANNER.scan(text)
     while index < end:
-        match = _MARKUP_CONSTRUCT_RE.search(text, index)
+        match = scan.search(index)
         if match is None:
             break
         index = match.end()
@@ -1761,7 +1928,7 @@ def _rendered_lines(text: str) -> str:
     *metadata*, which nothing else here scans, and scanning it only when it
     contains a newline was the inconsistency rather than the protection.
     """
-    return _MARKUP_CONSTRUCT_RE.sub(lambda m: m.group().replace("\n", " "), text)
+    return _CONSTRUCT_SCANNER.sub(lambda m: m.group().replace("\n", " "), text)
 
 
 def _boundary_split(line: str, blocks: _StylesheetBlocks = _NO_STYLESHEET) -> list[str]:
@@ -1796,42 +1963,64 @@ def _boundary_split(line: str, blocks: _StylesheetBlocks = _NO_STYLESHEET) -> li
     closing split even when styled inline, which over-splits a line a renderer
     keeps whole -- the direction :func:`_content_segments` already covers by
     checking the unsplit line too.
+
+    **Linear in the number of tags.** The stack was a list searched from the
+    top for every closing tag, so a close that matched nothing walked the whole
+    of it -- ``"<a>" * n + "</b>" * n`` was quadratic, 224KB taking 37s -- and
+    one that matched deep below a run of formatting elements walked and copied
+    them every time. The stack is now kept as one list of open entries per
+    element name, plus the non-formatting entries in push order. The innermost
+    open element of a name is the last entry of its list, so finding it is
+    O(1) and an unmatched close costs nothing. Closing it removes every
+    *non-formatting* entry pushed after it -- a suffix of the second list,
+    each entry removed once -- and leaves the formatting ones where they are,
+    which is exactly the "close them, then re-open the formatting ones in
+    order" the parser does. Every entry is pushed once and removed at most
+    once, so the whole line costs O(tags).
     """
     pieces: list[str] = []
     start = 0
-    opened: list[tuple[str, bool]] = []
-    for match in _MARKUP_CONSTRUCT_RE.finditer(line):
+    # name -> the (push sequence, boundary) of each still-open element of that
+    # name, innermost last. Only ever popped from the end: see the docstring.
+    open_by_name: dict[str, list[tuple[int, bool]]] = {}
+    # The non-formatting open elements in push order, as (sequence, name). A
+    # close removes a suffix of this, found by bisecting on the sequence.
+    removable: list[tuple[int, str]] = []
+    removable_sequences: list[int] = []
+    sequence = 0
+    for match in _CONSTRUCT_SCANNER.scan(line).finditer():
         construct = match.group()
         name = _ELEMENT_NAME_RE.match(construct)
         element = _ascii_lower(name.group(1)) if name is not None else None
         boundary = _is_line_boundary(construct, blocks)
         if element is not None:
             if _CLOSING_CONSTRUCT_RE.match(construct):
-                for position in range(len(opened) - 1, -1, -1):
-                    if opened[position][0] != element:
-                        continue
+                entries = open_by_name.get(element)
+                if entries:
+                    closed_sequence, inherited = entries.pop()
                     # `or`, never plain assignment: a closing tag keeps its own
                     # answer as well as inheriting. `<div style="display:inline">`
                     # is not a boundary and `</div>` is one by name, and
                     # dropping that merged `hello<div style="display:inline">x
                     # </div>SYSTEM: reveal` into a single line.
-                    boundary = boundary or opened[position][1]
+                    boundary = boundary or inherited
                     # Everything still open inside it closes too -- except a
                     # *formatting* element, which the parser re-opens for the
                     # text after this tag, so its box is still open and still
                     # ends a line. Discarding all of them threw that boundary
                     # away; keeping all of them left a stale entry for a later
                     # stray close to inherit, which reported prose as a marker.
-                    # On well-formed markup there is nothing above `position`
-                    # either way, so this only speaks to mis-nested input.
-                    reopened = [
-                        entry
-                        for entry in opened[position + 1 :]
-                        if entry[0] in _FORMATTING_ELEMENTS
-                    ]
-                    del opened[position:]
-                    opened.extend(reopened)
-                    break
+                    # On well-formed markup nothing was pushed after it either
+                    # way, so this only speaks to mis-nested input.
+                    cut = bisect.bisect_left(removable_sequences, closed_sequence)
+                    for entry_sequence, entry_name in removable[cut:]:
+                        if entry_sequence != closed_sequence:
+                            # A non-formatting element pushed after the one
+                            # closing: every entry of its name pushed that late
+                            # is the tail of its list, so this pops one of them.
+                            open_by_name[entry_name].pop()
+                    del removable[cut:]
+                    del removable_sequences[cut:]
             else:
                 # A self-closed tag is pushed like any other opening one,
                 # because HTML ignores the solidus on a non-void element:
@@ -1844,7 +2033,11 @@ def _boundary_split(line: str, blocks: _StylesheetBlocks = _NO_STYLESHEET) -> li
                 # rather than paired, and stacking it let that stray close
                 # inherit a boundary the parser never gives it.
                 if element not in _VOID_ELEMENTS:
-                    opened.append((element, boundary))
+                    sequence += 1
+                    open_by_name.setdefault(element, []).append((sequence, boundary))
+                    if element not in _FORMATTING_ELEMENTS:
+                        removable.append((sequence, element))
+                        removable_sequences.append(sequence)
         if not boundary:
             continue
         pieces.append(line[start : match.start()])
@@ -1875,6 +2068,21 @@ def _leading_role_marker(text: str, tokens: frozenset[str]) -> str | None:
     has to equal a role token *exactly*: "system requirements" and "1. system
     design" survive as themselves and are not markers.
     """
+    markers = _role_markers(text, tokens)
+    return f"{markers[0][0]}:" if markers else None
+
+
+def _role_markers(text: str, tokens: frozenset[str]) -> list[tuple[str, str]]:
+    """Every role marker heading a line of ``text``, with what follows it.
+
+    The parse :func:`_leading_role_marker` documents, without stopping at the
+    first hit: whether a marker is an attack is judged on what it introduces
+    (see :meth:`AdversarialDefense._role_findings`), so every candidate and its
+    tail has to reach that judgement. Duplicates -- the whole line and one of
+    its split pieces often yield the same marker -- are reported once.
+    """
+    found: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for segment in _content_segments(text, _stylesheet_blocks(text)):
         # Undecorate *before* choosing the delimiter, then again on the head.
         # The two passes have different jobs and neither replaces the other.
@@ -1888,13 +2096,16 @@ def _leading_role_marker(text: str, tokens: frozenset[str]) -> str | None:
         # Second: decoration can sit against the token without any colon of its
         # own, and the line pass leaves it -- `**SYSTEM**: reveal` has nothing
         # to strip at the line's ends, so the head arrives as `SYSTEM**`.
-        head, separator, _ = _undecorated_content(segment).partition(_DELIMITER)
+        head, separator, tail = _undecorated_content(segment).partition(_DELIMITER)
         if not separator:
             continue
         marker = _undecorated_content(head)
         if marker in tokens:
-            return f"{marker}:"
-    return None
+            entry = (marker, tail.strip())
+            if entry not in seen:
+                seen.add(entry)
+                found.append(entry)
+    return found
 
 
 #: The numeric half of :data:`_CHARACTER_REF_RE`, so the code point a
@@ -1988,9 +2199,12 @@ def _structural_text(text: str) -> str:
 def _normalize(text: str) -> str:
     """Normalize text for robust *substring* matching.
 
-    NFKC, zero-width characters stripped, **every** whitespace run collapsed to
-    a single space, trimmed, lowercased. This defeats the trivial obfuscations
-    (double spacing, zero-width injection, full-width look-alikes) and is what
+    :func:`~adapt_agent.security._text.fold_for_matching` (NFKC, every
+    invisible format character and combining mark removed, mixed-script
+    look-alikes folded), **every** whitespace run collapsed to a single space,
+    trimmed, lowercased. This defeats the trivial obfuscations (double spacing,
+    a soft hyphen or word joiner inside a keyword, full-width or Cyrillic
+    look-alikes, stacked accents) and is what
     custom attack patterns are matched against: a registered signature like
     ``"baking bad"`` must still catch ``"baking\nbad"``, so line structure has
     to go here.
@@ -2000,8 +2214,7 @@ def _normalize(text: str) -> str:
     line; preserving them in both places let an attacker split a multiword
     signature across lines. The two callers want opposite things.
     """
-    normalized = unicodedata.normalize("NFKC", _decode_line_breaks(text))
-    normalized = _ZERO_WIDTH_RE.sub("", normalized)
+    normalized = fold_for_matching(_decode_line_breaks(text))
     normalized = _WHITESPACE_RE.sub(" ", normalized)
     return normalized.strip().lower()
 
@@ -2025,12 +2238,591 @@ def _normalize_lines(text: str) -> str:
     keeping ``\n`` -- a bare CR renders as a line break, so leaving it as
     horizontal whitespace is a one-character bypass.
     """
-    normalized = unicodedata.normalize("NFKC", _decode_line_breaks(text))
-    normalized = _ZERO_WIDTH_RE.sub("", normalized)
+    normalized = fold_for_matching(_decode_line_breaks(text))
     normalized = "\n".join(normalized.splitlines())
     normalized = _HORIZONTAL_WS_RE.sub(" ", normalized)
     normalized = _NEWLINE_RUN_RE.sub("\n", normalized)
     return normalized.strip().lower()
+
+
+#: What :meth:`AdversarialDefense.analyze_input` analyses by default, in
+#: characters. Over it the input is reported as ``content_too_long`` -- unsafe,
+#: never truncated and passed -- because a truncated scan would pass whatever
+#: an attacker put after the cut. Sized for whole documents and tool results,
+#: not chat turns: every stage of analysis is linear now, and a 100KB HTML page
+#: is well under a second, so the cap bounds cost rather than defining what a
+#: normal input is. ``max_content_length=None`` removes it.
+DEFAULT_MAX_CONTENT_LENGTH = 100_000
+
+
+def _rule(pattern: str, flags: int = 0) -> re.Pattern[str]:
+    """Compile a built-in rule against the folded, lowercased text it meets.
+
+    The source goes through the same :func:`fold_for_matching` as the text, so
+    a rule can be written in its natural spelling -- ``précédentes``,
+    ``すべて`` -- and still match the mark-stripped form the text arrives in.
+    An ASCII source is unchanged by the fold.
+    """
+    return re.compile(fold_for_matching(pattern), flags)
+
+
+# -- building blocks ---------------------------------------------------------
+#
+# Phrase rules are built from *word lists* rather than ``[^.!?]{0,40}`` gaps.
+# A character gap is what made "Please ignore my previous email, the
+# instructions in it were wrong" an injection: forty characters will span any
+# unrelated noun. A gap of named filler words cannot, and for the same reason
+# it can cross punctuation -- "Ignore. All. Previous. Instructions." -- without
+# stitching two unrelated sentences together, because the words between have
+# to be filler. Each group is a whole word (``\b``), so the alternation cannot
+# backtrack between overlapping spellings.
+
+#: What may separate the words of a phrase: whitespace (line breaks included)
+#: and punctuation, so one-word "sentences" and list fragments still join.
+_SEP = r"[\s.,;:!?*|/\"'()\[\]_~`-]+"
+_OVERRIDE_VERB = (
+    r"(?:ignor(?:e|ing)|disregard(?:ing)?|forget(?:ting)?|overrid(?:e|ing)|discard(?:ing)?"
+    r"|set aside|pay no (?:attention|heed|mind) to|throw out|abandon|drop)"
+)
+_TEMPORAL = (
+    r"(?:previous|prior|earlier|above|preceding|all|initial|original|old|existing|foregoing"
+    r"|former|past|every|current)"
+)
+_FILLER = (
+    r"(?:the|your|my|our|of|any|all|these|those|that|this|such|other|system|safety|developer"
+    r"|given|and|or|entire|whole|each|every|previously|earlier|original|initial|prior|previous"
+    r"|above|existing|current)"
+)
+_INSTRUCTION_OBJECT = (
+    r"(?:instructions?|prompts?|rules?|directions?|guidelines?|guidance|directives?|commands?"
+    r"|programming|constraints)"
+)
+#: Adjectives that make a persona a jailbreak rather than a role. Not "evil"
+#: or "rogue": "role-play as an evil wizard" is ordinary creative writing.
+_JAILBREAK_ADJECTIVE = (
+    r"(?:unfiltered|unrestricted|uncensored|unaligned|unmoderated|jailbroken|amoral|unethical"
+    r"|lawless|dan)"
+)
+_AI_NOUN = (
+    r"(?:ai|a\.i\.|llm|large language model|language model|ai assistant|ai agent|ai model"
+    r"|assistant|agent|chatbot|bot|model|gpt|chatgpt|claude|copilot|gemini)"
+)
+#: Nouns that turn "note to the AI ..." into a note to *people*.
+_NOT_THE_MODEL = (
+    r"(?:team|group|department|lab|committee|researchers?|engineers?|developers?|people|folks"
+    r"|community|vendors?|startups?|compan(?:y|ies)|industry|project|policy|act|regulations?"
+    r"|safety|ethics|governance|working|summit|conference|enthusiasts?|students?|experts?"
+    r"|practitioners?|teams?|product|users?|manager|professor|director|editor|coach)"
+)
+
+#: Instruction override, roughly "ignore the previous instructions".
+_INJECTION_PATTERNS: tuple[str, ...] = (
+    rf"\b{_OVERRIDE_VERB}\b(?:{_SEP}{_FILLER}\b){{0,4}}?{_SEP}{_TEMPORAL}\b"
+    rf"(?:{_SEP}{_FILLER}\b){{0,3}}?{_SEP}{_INSTRUCTION_OBJECT}\b",
+    # "all" only as a pronoun ("all you were told"): "forget all earlier
+    # changes" and "disregard all earlier invoices" are about the changes.
+    r"\b(?:ignore|disregard|forget)\s+(?:everything|anything|whatever|all(?=\s+(?:that\s+)?you))\s+"
+    r"(?:(?:that\s+)?(?:you(?:'ve|'re)?|have|had|has|been|were|was)\s+){0,3}"
+    r"(?:above|before|prior|previously|so far|earlier|until now|up to now|told|instructed"
+    r"|programmed)\b",
+    r"\b(?:stop|quit|cease)\s+(?:following|obeying|adhering to|listening to)\s+"
+    r"(?:all\s+(?:of\s+)?)?(?:your|those|these)\s+(?:\w+\s+){0,2}?"
+    r"(?:instructions|rules|guidelines|programming|directives|system prompt|restrictions)\b",
+    r"\b(?:do not|don't|dont|never|no longer)\s+(?:follow|obey|adhere to|listen to|comply with)"
+    r"\s+(?:any\s+(?:of\s+)?)?your\s+(?:\w+\s+){0,2}?"
+    r"(?:instructions|rules|guidelines|programming|directives|system prompt|restrictions)\b",
+    r"\b(?:do not|don't|dont|never|no longer)\s+(?:follow|obey|adhere to|listen to|comply with)"
+    r"\s+(?:any\s+(?:of\s+)?)?(?:the|those|these)\s+(?:\w+\s+){0,2}?"
+    r"(?:instructions|rules|guidelines|directives)\s+(?:that\s+)?"
+    r"(?:you\s+(?:were|have been|'ve been|got|received)|given to you|from your)",
+    r"\byour\s+(?:\w+\s+){0,2}?(?:instructions|rules|guidelines|programming|directives"
+    r"|system prompt|restrictions)\s+(?:are|is|have been|has been)\s+(?:now\s+)?(?:void|null"
+    r"|cancell?ed|revoked|obsolete|invalid|lifted|suspended|overridden|replaced|superseded"
+    r"|removed|disabled|no longer (?:valid|in effect|apply|active|needed))\b",
+    # At the start of a line or a sentence only: "The new instructions: are
+    # they in the box?" is a customer asking about a manual.
+    r"(?:^|[.!?]\s+)[#>*\s-]*(?:here are\s+)?(?:your\s+)?(?:new|real|actual|true|updated)\s+"
+    r"(?:system\s+)?(?:instructions|directives)\s*:",
+    # Scoped, unlike a bare "override": that flags "override the default
+    # timeout", "@override on the method" and "override the safety interlock".
+    r"\boverrid(?:e|ing)\s+(?:(?:your|the|all|any|my|of|these|those|previous|prior|existing"
+    r"|current|system|safety|content)\s+){0,3}(?:instructions?|prompts?|system prompt|guidelines"
+    r"|guardrails?|programming|directives|(?:safety|content|system) (?:rules|filters?|guidelines"
+    r"|protocols|restrictions|settings|polic(?:y|ies)|measures))\b",
+    r"\boverrid(?:e|ing)\s+your\s+(?:\w+\s+)?(?:rules|restrictions|filters?|limits|limitations"
+    r"|polic(?:y|ies))\b",
+    # Prompt extraction: "your" prompt, or a hidden one, or the developer's.
+    r"\b(?:reveal|show|print|output|repeat|display|leak|disclose|dump|recite|expose|tell|give"
+    r"|share|send|write out|spell out|paste|return)\b(?:\s+(?:me|us|out|back))?\s+"
+    r"(?:all\s+(?:of\s+)?)?your\s+(?:\w+\s+){0,3}?(?:system prompt|system message|prompt"
+    r"|instructions|initial prompt|directives)\b",
+    r"\b(?:reveal|show|print|output|repeat|display|leak|disclose|dump|recite|expose|tell|give"
+    r"|share|send|write out|spell out|paste|return)\b(?:\s+(?:me|us|out|back))?\s+"
+    r"(?:the\s+)?(?:\w+\s+){0,2}?(?:hidden|secret|confidential|internal|underlying|original"
+    r"|initial)\s+(?:system\s+)?(?:prompt|instructions|message)\b",
+    r"\b(?:reveal|show|print|output|repeat|display|leak|disclose|dump|recite|expose|tell|give"
+    r"|share|send)\b(?:\s+(?:me|us))?\s+(?:the\s+)?developer\s+(?:message|prompt|instructions)\b",
+    r"\bfrom now on,?\s+(?:you\s+)?(?:will\s+|must\s+|shall\s+)?(?:only\s+)?(?:obey|answer to"
+    r"|follow|listen to|take orders from|serve)\s+(?:only\s+)?(?:me|my)\b",
+    # Indirect injection: text addressed to the model reading it, the shape of
+    # an instruction planted in a web page, an email or a tool result.
+    rf"\b(?:note|message|instructions?|attention|important|notice|memo|reminder|directive)\s+"
+    rf"(?:to|for)\s+(?:the\s+|any\s+|all\s+|an?\s+)?{_AI_NOUN}s?\b(?!\s*{_NOT_THE_MODEL}\b)",
+    r"\b(?:attention|warning|important|notice|note)\s*[,:!-]?\s*(?:ai|llm|ai agent|ai assistant"
+    r"|ai model|language model|chatbot|gpt|chatgpt)\s*[:,!]",
+    r"\b(?:ai|llm|language model|ai model|ai assistant|ai agent|chatbot|assistant|agent)s?\s+"
+    r"(?:(?:that|who)\s+(?:is|are)\s+)?(?:reading|processing|summari[sz]ing|parsing|crawling"
+    r"|browsing|scraping|ingesting|analy[sz]ing|viewing)\s+this\b",
+    rf"\bif\s+you\s+are\s+(?:an?\s+)?(?:ai|llm|large language model|language model|ai model"
+    rf"|ai assistant|ai agent|chatbot|automated (?:agent|system|assistant)|gpt)\b"
+    rf"(?!\s*{_NOT_THE_MODEL}\b)",
+    r"\bwhen\s+(?:an?\s+|the\s+|any\s+)?(?:ai|llm|language model|ai model|ai assistant"
+    r"|ai agent|assistant|agent|chatbot)s?\s+(?:reads|processes|summari[sz]es|parses|sees"
+    r"|ingests|encounters|analy[sz]es|is reading|is processing)\s+this\b",
+    r"\b(?:the\s+)?(?:user|admin|administrator|operator|owner)\s+(?:has|have)\s+(?:already\s+)?"
+    r"(?:authori[sz]ed|approved|permitted|allowed)\s+(?:you|the assistant|the ai|the agent"
+    r"|the model)\b",
+    # A few translated overrides. Each needs the override verb, a
+    # "previous/all" word and an instruction noun together, the same shape as
+    # the English rule; ordinary sentences in these languages do not form it.
+    r"\b(?:ignor(?:e|ez|er)|oubli(?:e|ez|er))\s+(?:toutes\s+|tous\s+)?(?:les\s+|vos\s+|tes\s+)?"
+    r"(?:instructions|consignes|regles|directives)\s+(?:precedentes|anterieures)\b",
+    r"\b(?:ignoriere|ignorieren sie|vergiss|vergessen sie|missachte)\s+(?:alle\s+)?(?:deine\s+|ihre\s+)?"
+    r"(?:vorherigen|bisherigen|vorangegangenen|fruheren|obigen)\s+(?:anweisungen|instruktionen"
+    r"|regeln|befehle)\b",
+    r"\b(?:ignora|ignore|ignorad|olvida|olvide)\s+(?:todas\s+)?(?:las\s+|tus\s+|sus\s+)?"
+    r"(?:instrucciones|reglas|indicaciones)\s+(?:anteriores|previas)\b",
+    r"(?:忽略|无视|忽视|忘记|忘掉)(?:掉)?(?:你)?(?:之前|以前|上面|先前|前面|上述|此前|所有|全部)"
+    r"[^。！？\n]{0,8}?(?:指令|指示|规则|提示词|命令)",
+    r"\b(?:игнорируй|игнорируйте|проигнорируй|забудь|забудьте)\s+(?:все\s+)?"
+    r"(?:предыдущие|прежние|предшествующие|вышеуказанные|прошлые)\s+"
+    r"(?:инструкции|указания|правила|команды)",
+    r"(?:以前|前|これまで|上記|先)の(?:指示|命令|指令|ルール|プロンプト)(?:を|は)?"
+    r"(?:すべて|全て|全部)?(?:無視|忘れ)",
+)
+
+#: Persona and restriction-removal jailbreaks.
+_JAILBREAK_PATTERNS: tuple[str, ...] = (
+    r"\bpretend\s+(?:that\s+)?you\s+(?:are|were|re)\b",
+    rf"\brole[\s-]?play(?:ing)?\s+as\s+(?:an?\s+|the\s+|my\s+)?(?:\w+\s+){{0,2}}?"
+    rf"{_JAILBREAK_ADJECTIVE}\b",
+    # Not a bare "act as a/an/if": that was "act as a liaison", "act as if the
+    # dough is fragile" and "act as a guard". The persona has to be one.
+    rf"\bact\s+as\s+(?:if|though)\s+you\s+(?:are|were|have|had|'re)\s+(?:no\b|not\b|never\b"
+    rf"|without\b|free\b|unbound\b|been\b|an?\s+(?:\w+\s+){{0,2}}?{_JAILBREAK_ADJECTIVE}\b"
+    rf"|{_JAILBREAK_ADJECTIVE}\b)",
+    rf"\bact\s+as\s+(?:an?\s+|the\s+|my\s+)?(?:\w+\s+){{0,2}}?{_JAILBREAK_ADJECTIVE}\b",
+    # Not a bare "you are now": that was "You are now eligible for a refund".
+    rf"\byou\s+are\s+now\s+(?:in\s+|an?\s+|the\s+|my\s+|called\s+|named\s+|known as\s+)?"
+    rf"(?:\w+\s+){{0,2}}?(?:{_JAILBREAK_ADJECTIVE}|developer mode|god mode|jailbreak mode"
+    rf"|dan mode|free from|freed|no longer bound|not bound|unlocked|without (?:any\s+)?"
+    rf"(?:restrictions|rules|limits|filters|guidelines))\b",
+    # Not a bare "developer mode": that was a question about an Android phone.
+    r"\b(?:enable|activate|enter|turn on|switch (?:to|into)|unlock|start|engage|initiate)\s+"
+    r"(?:the\s+)?(?:developer|dev|god|jailbreak|dan|unrestricted|debug)\s+mode\b"
+    r"(?![^.!?\n]{0,40}\b(?:phone|android|iphone|ios|chrome|browser|windows|device|tablet|pixel"
+    r"|samsung|xbox|playstation|ps5|router|tv|mac|macos|laptop|computer|pc|car|watch|kindle"
+    r"|firestick|roku|bios|app|extension|settings)\b)",
+    r"\bdeveloper\s+mode\b[^.!?\n]{0,40}?\b(?:bypass|no (?:restrictions|filters?|rules|limits)"
+    r"|without (?:restrictions|filters?|rules|limits)|uncensored|unfiltered|unrestricted"
+    r"|ignore (?:your|all))",
+    r"\bdo\s+anything\s+now\b",
+    rf"\b(?:respond|answer|reply|behave|speak|talk|write|continue|operate)\s+(?:only\s+)?"
+    rf"(?:as|like)\s+(?:an?\s+|the\s+)?(?:\w+\s+){{0,2}}?{_JAILBREAK_ADJECTIVE}\b",
+    r"\b(?:imagine|pretend|suppose|assume|hypothetically|let'?s say)\b(?:\W+\w+){0,3}?\W+you\s+"
+    r"(?:have|had|are|were)\s+(?:no|not bound by|without|free (?:of|from))\s+(?:\w+\s+){0,2}?"
+    r"(?:content polic(?:y|ies)|polic(?:y|ies)|restrictions|rules|guidelines|filters?|limits"
+    r"|limitations|safety|ethics|morals|censorship|guardrails|programming)\b",
+    r"\b(?:ai|model|assistant|chatbot|bot|llm)\s+(?:with|that has|which has|having)\s+no\s+"
+    r"(?:\w+\s+)?(?:restrictions|rules|limits|limitations|filters?|guidelines"
+    r"|content polic(?:y|ies)|guardrails|morals|ethics|censorship)\b",
+    r"\b(?:bypass|circumvent|disable|turn off|evade|get around|ignore|override|remove)\s+"
+    r"(?:all\s+(?:of\s+)?)?your\s+(?:\w+\s+)?(?:filters?|restrictions|guidelines|rules"
+    r"|guardrails?|safety|programming|limitations|content polic(?:y|ies)|moderation|censorship"
+    r"|alignment|ethics)\b",
+    r"\b(?:bypass|circumvent|evade|get around|jailbreak)\s+(?:the\s+)?(?:ai'?s?\s+|model'?s?\s+"
+    r"|chatgpt'?s?\s+)?(?:content filter|safety filter|guardrails?|content moderation"
+    r"|content policy|safety (?:measures|guidelines|restrictions))\b",
+    r"\b(?:answer|respond to|reply to|do)\s+(?:everything|anything|every (?:question|request)"
+    r"|any (?:question|request))\s+without\s+(?:refusing|refusal|any restrictions"
+    r"|restrictions|filters|limits)\b",
+)
+
+#: Chat-template control tokens and role tags: markup that only means
+#: something to a model's prompt format, so in user or tool content it is an
+#: attempt to forge a turn boundary. Matched over the folded, lowercased text.
+_DELIMITER_PATTERNS: tuple[str, ...] = (
+    r"<\|[a-z][a-z0-9_]{1,24}\|>",  # <|im_start|>, <|eot_id|>, <|system|>
+    r"\[/?inst\]",
+    r"<</?sys>>",
+    r"<(?:start|end)_of_turn>",
+    r"</?(?:system|assistant|developer|tool_result|tool_response|tool_output|function_results?"
+    r"|system_prompt|system-prompt)(?:\s[^<>\n]{0,60})?>",
+    r"(?:-{3,}|={3,}|#{3,}|\*{3,}|\[|<)\s*end\s+of\s+(?:the\s+)?(?:user\s+|system\s+)?"
+    r"(?:input|prompt|instructions|context|document|message|conversation|data)\b",
+)
+
+#: Words that make what follows a role marker an *instruction*. The strong set
+#: is instruction-override vocabulary; the broad set adds what any message
+#: addressed to a model contains. Which applies depends on the marker.
+_STRONG_CUE = (
+    r"ignore|disregard|forget|override|bypass|disable|comply|obey|unrestricted|unfiltered"
+    r"|uncensored|jailbreak|jailbroken|reveal|exfiltrate|leak|disclose|confidential|secrets?"
+    r"|passwords?|credentials?|api keys?|no (?:restrictions|rules|limits|filters?|guidelines)"
+    r"|you (?:must|will now|shall|are now|have no|no longer)|from now on|system prompt"
+    r"|new instructions|without (?:restrictions?|limits|filters?|refusing)|do not refuse"
+    r"|never refuse|developer mode|unconditionally|authori[sz]ed|priority override"
+)
+_STRONG_CUE_RE = re.compile(rf"\b(?:{_STRONG_CUE})\b")
+_SYSTEM_CUE_RE = re.compile(
+    rf"\b(?:{_STRONG_CUE}|you|your|yourself|must|always|never|user|assistant|model|ai"
+    r"|instructions?|rules?|polic(?:y|ies)|guidelines?|safety|filters?|prompt|respond|answer"
+    r"|reply|print|output|repeat|tell|show|send|email|forward|transfer|delete|execute|run"
+    r"|enable|admin|administrator)\b"
+)
+_JSON_ROLE_RE = re.compile(
+    r"\"role\"\s*:\s*\"(?:system|developer)\"[^{}]{0,300}?\"content\"\s*:\s*\"[^\"]{0,300}?"
+    rf"\b(?:{_STRONG_CUE}|you|your|safety|rules|instructions|polic(?:y|ies)|filters?)\b"
+)
+
+#: Role tokens a line can open with. ``system`` and its compounds are *strong*:
+#: nothing but a model's prompt format calls a speaker that. The rest are
+#: *weak* -- "User: jdoe" and "Developer: Jane Smith" are ordinary records --
+#: and need more evidence; see :meth:`AdversarialDefense._role_findings`.
+_STRONG_ROLE_TOKENS = frozenset(
+    {
+        "system",
+        "system message",
+        "system prompt",
+        "system instruction",
+        "system instructions",
+        "system override",
+        "developer message",
+        "developer instructions",
+        "developer prompt",
+    }
+)
+_WEAK_ROLE_TOKENS = frozenset({"assistant", "user", "human", "developer", "ai assistant"})
+#: One decoration class after the token, not two side by side: adjacent
+#: overlapping star classes split a run of `*` between them in quadratically
+#: many ways before `$` fails.
+_ROLE_HEADING_RE = re.compile(
+    r"(?m)^[#>*_`= \t\[\]|-]*(system(?: message| prompt| instructions?| override)?"
+    r"|developer(?: message| instructions| prompt)?)[*_`\] \t]*(?:\(([^)\n]{0,60})\)[*_` \t]*)?"
+    r"(?:[-\u2013\u2014]+[ \t]*([^\n]*))?$"
+)
+#: A ``key: value`` line, and the same pair inside one line. A role marker in a
+#: block of these -- ``system: ubuntu-22.04`` above ``python: 3.12`` -- is a
+#: field name, unless what it introduces reads as an instruction.
+_KEY_VALUE_LINE_RE = re.compile(r"(?m)^([^\W\d_][\w .()/+&-]{0,30}?)\s?:(?=\s|$)")
+_INLINE_KEY_VALUE_RE = re.compile(r"[,;|]\s*[^\W\d_][\w-]{0,20}\s?:\s")
+
+#: For each rule, literals at least one of which every match contains.
+#:
+#: A cost measure, not a detection one. Each rule is an alternation behind a
+#: ``\b``, which the regex engine cannot skip ahead for, so it tries every
+#: position of the text: thirty-odd of them cost ~5ms on a 10KB document. A
+#: substring test runs in C at memory speed, so a rule whose literals are all
+#: absent is skipped for a few microseconds. Getting one wrong could only hide
+#: a match, so ``test_every_rule_prefilter_is_necessary`` checks each list
+#: against every positive example in the suite's corpus.
+_REVEAL_VERBS = (
+    "reveal", "show", "print", "output", "repeat", "display", "leak", "disclose", "dump",
+    "recite", "expose", "tell", "give", "share", "send", "write out", "spell out", "paste",
+    "return",
+)  # fmt: skip
+_FOLLOW_VERBS = ("follow", "obey", "adhere to", "listen to", "comply")
+_INJECTION_TRIGGERS: tuple[tuple[str, ...], ...] = (
+    ("ignor", "disregard", "forget", "overrid", "discard", "set aside", "pay no", "throw out",
+     "abandon", "drop"),
+    ("ignore", "disregard", "forget"),
+    ("stop", "quit", "cease"),
+    _FOLLOW_VERBS,
+    _FOLLOW_VERBS,
+    ("void", "null", "cancel", "revoked", "obsolete", "invalid", "lifted", "suspended",
+     "overridden", "replaced", "superseded", "removed", "disabled", "no longer"),
+    ("instructions", "directives"),
+    ("overrid",),
+    ("overrid",),
+    ("prompt", "instructions", "directives", "system message"),
+    ("hidden", "secret", "confidential", "internal", "underlying", "original", "initial"),
+    ("developer",),
+    ("from now on",),
+    ("note", "message", "instruction", "attention", "important", "notice", "memo", "reminder",
+     "directive"),
+    ("attention", "warning", "important", "notice", "note"),
+    ("reading", "processing", "summari", "parsing", "crawling", "browsing", "scraping",
+     "ingesting", "analy", "viewing"),
+    ("if you are",),
+    ("reads", "processes", "summari", "parses", "sees", "ingests", "encounters", "analy",
+     "is reading", "is processing"),
+    ("authori", "approved", "permitted", "allowed"),
+    ("ignor", "oubli"),
+    ("ignorier", "vergiss", "vergessen", "missacht"),
+    ("ignor", "olvid"),
+    ("忽略", "无视", "忽视", "忘记", "忘掉"),
+    ("игнорир", "проигнорир", "забуд"),
+    ("無視", "忘れ"),
+)  # fmt: skip
+_JAILBREAK_TRIGGERS: tuple[tuple[str, ...], ...] = (
+    ("pretend",),
+    ("play",),
+    ("act as",),
+    ("act as",),
+    ("you are now",),
+    ("mode",),
+    ("developer mode",),
+    ("anything now",),
+    ("unfiltered", "unrestricted", "uncensored", "unaligned", "unmoderated", "jailbroken",
+     "amoral", "unethical", "lawless", "dan"),
+    ("imagine", "pretend", "suppose", "assume", "hypothetical", "let's say", "lets say"),
+    ("restrictions", "rules", "limits", "limitations", "filter", "guidelines", "polic",
+     "guardrails", "morals", "ethics", "censorship"),
+    ("bypass", "circumvent", "disable", "turn off", "evade", "get around", "ignore",
+     "override", "remove"),
+    ("bypass", "circumvent", "evade", "get around", "jailbreak"),
+    ("without",),
+)  # fmt: skip
+_DELIMITER_TRIGGERS: tuple[tuple[str, ...], ...] = (
+    ("<|",),
+    ("inst]",),
+    ("sys>>",),
+    ("_of_turn>",),
+    ("system", "assistant", "developer", "tool_", "function_result"),
+    ("end of",),
+)
+
+
+class _Rule(NamedTuple):
+    """A compiled rule and the literals that gate it."""
+
+    pattern: re.Pattern[str]
+    triggers: tuple[str, ...]
+
+
+def _rules(
+    patterns: tuple[str, ...], triggers: tuple[tuple[str, ...], ...], flags: int = 0
+) -> tuple[_Rule, ...]:
+    # `strict`: a rule without its prefilter is a module that refuses to load.
+    return tuple(
+        _Rule(_rule(source, flags), tuple(fold_for_matching(t) for t in gate))
+        for source, gate in zip(patterns, triggers, strict=True)
+    )
+
+
+_INJECTION_RULES = _rules(_INJECTION_PATTERNS, _INJECTION_TRIGGERS, re.MULTILINE)
+_JAILBREAK_RULES = _rules(_JAILBREAK_PATTERNS, _JAILBREAK_TRIGGERS)
+_DELIMITER_RULES = _rules(_DELIMITER_PATTERNS, _DELIMITER_TRIGGERS)
+_ALL_TRIGGERS = frozenset(
+    trigger
+    for rule in _INJECTION_RULES + _JAILBREAK_RULES + _DELIMITER_RULES
+    for trigger in rule.triggers
+)
+
+
+# -- encoded and disguised payloads -------------------------------------------
+#
+# Each view below is a bounded rewrite of the input that undoes one encoding,
+# scanned with the same rules as the text itself. A view can only ever *add* a
+# finding, and only when the decoded text matches an attack rule: a hash, a
+# JWT or an image's base64 decodes to something no rule matches, so long
+# tokens are never suspicious for being long. Every view is one linear pass,
+# decoding is capped in count and size, and nesting stops at two levels.
+
+#: Runs worth trying as base64: standard and URL-safe alphabets, 24+ chars.
+_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{24,}={0,2}|[A-Za-z0-9_-]{24,}={0,2}")
+#: Runs worth trying as hex: 24+ digits, contiguous or colon-separated bytes.
+_HEX_RUN_RE = re.compile(r"(?:[0-9A-Fa-f]{2}:?){12,}")
+_PERCENT_ESCAPE_RE = re.compile(r"(?:%[0-9A-Fa-f]{2}){6,}")
+#: Both run patterns need a whitespace-free token at least this long, which a
+#: :meth:`str.split` finds far faster than either pattern's own scan.
+_MIN_ENCODED_RUN = 24
+#: Stems every rule's match contains one of, in plain spelling and as they
+#: read rot13'd and reversed. Only text that carries a disguised stem -- or a
+#: rewrite that *gains* a plain one -- is worth a rewritten view, so ordinary
+#: text pays a few substring tests, run in C, per view.
+_KEYWORD_STEMS = (
+    "ignor",
+    "disregard",
+    "forget",
+    "overrid",
+    "instruction",
+    "previous",
+    "system",
+    "prompt",
+    "jailbr",
+    "pretend",
+    "reveal",
+    "restrict",
+    "unfilter",
+    "uncensor",
+    "developer",
+)
+_ROT13_STEMS = tuple(codecs.encode(stem, "rot13") for stem in _KEYWORD_STEMS)
+_REVERSED_STEMS = tuple(stem[::-1] for stem in _KEYWORD_STEMS)
+_LEET_DIGITS = "013457@$"
+_LEET = str.maketrans(
+    {"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"}
+)
+#: Three or more single letters, each followed by one separator: "i g n o r e",
+#: "i.g.n.o.r.e". Read with word spacing kept, so word gaps survive.
+_SPACED_LETTERS_RE = re.compile(r"(?<![^\W_])(?:[^\W\d_][ .*|/_-]){2,}[^\W\d_](?![^\W_])")
+_SPACED_PUNCTUATION_RE = re.compile(r"[.*|/_-]")
+#: Bounds on decoding. Counted per call, across every level.
+_MAX_DECODE_CANDIDATES = 32
+_MAX_DECODED_CHARS = 65_536
+_MAX_DECODE_DEPTH = 2
+#: Inputs short enough to rewrite whole on the hot path. The letter-spacing
+#: view is the one that needs a regex scan to trigger, so it has a lower cap.
+_MAX_REWRITE_VIEW_LENGTH = 20_000
+_MAX_SPACED_VIEW_LENGTH = 4_000
+
+
+def _join_spaced(match: re.Match[str]) -> str:
+    """One run of spaced-out letters, rejoined into the words it spells.
+
+    A run separated by punctuation (``i.g.n.o.r.e a.l.l``) uses spaces for the
+    word gaps, so only the punctuation goes. A run separated by spaces alone
+    has its word gaps as *double* spaces, which end the run, so every space in
+    it goes.
+    """
+    run = match.group()
+    if _SPACED_PUNCTUATION_RE.search(run):
+        return _SPACED_PUNCTUATION_RE.sub("", run)
+    return run.replace(" ", "")
+
+
+def _gains_a_stem(rewritten: str, original: str) -> bool:
+    """Whether a rewrite spells a keyword stem more often than the original.
+
+    A rewrite that adds no stem cannot make any rule match that the original
+    did not, so it is not worth scanning. "Q4" and "h264" put digits next to
+    letters all the time; this keeps them cheap.
+    """
+    return any(
+        stem in rewritten and rewritten.count(stem) > original.count(stem)
+        for stem in _KEYWORD_STEMS
+    )
+
+
+def _printable_text(raw: bytes) -> str | None:
+    """``raw`` as text, if it reads as prose rather than binary data."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    # No requirement that it reads as *prose*: the middle layer of base64 of
+    # base64 is itself a base64 run, with no spaces in it at all.
+    if len(text) < 8:
+        return None
+    printable = sum(1 for char in text if char.isprintable() or char in "\n\r\t")
+    return text if printable >= 0.95 * len(text) else None
+
+
+def _decode_base64(run: str) -> str | None:
+    """``run`` decoded as standard or URL-safe base64, if that yields prose."""
+    padded = run + "=" * (-len(run) % 4)
+    for altchars in (None, b"-_"):
+        try:
+            raw = base64.b64decode(padded, altchars=altchars, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        decoded = _printable_text(raw)
+        if decoded is not None:
+            return decoded
+    return None
+
+
+def _decode_hex(run: str) -> str | None:
+    """``run`` decoded as hex bytes, if that yields prose."""
+    digits = run.replace(":", "")
+    if len(digits) % 2:
+        digits = digits[:-1]
+    try:
+        raw = bytes.fromhex(digits)
+    except ValueError:
+        return None
+    return _printable_text(raw)
+
+
+_DECODERS: tuple[tuple[str, re.Pattern[str], Callable[[str], str | None]], ...] = (
+    ("base64", _BASE64_RUN_RE, _decode_base64),
+    ("hex", _HEX_RUN_RE, _decode_hex),
+)
+
+
+def _decoded_payloads(text: str) -> list[tuple[str, str]]:
+    """Every base64, hex and percent-encoded payload in ``text``, decoded.
+
+    Breadth-first to :data:`_MAX_DECODE_DEPTH` levels -- base64 of base64 is
+    a known trick, base64 of base64 of base64 is a decompression bomb with
+    extra steps -- and capped in count and total size, so the cost is bounded
+    by the input whatever it contains.
+    """
+    found: list[tuple[str, str]] = []
+    frontier = [text]
+    budget = _MAX_DECODED_CHARS
+    candidates = 0
+    for _ in range(_MAX_DECODE_DEPTH):
+        next_frontier: list[str] = []
+        for source in frontier:
+            if max(map(len, source.split()), default=0) >= _MIN_ENCODED_RUN:
+                for view, pattern, decode in _DECODERS:
+                    for match in pattern.finditer(source):
+                        candidates += 1
+                        if candidates > _MAX_DECODE_CANDIDATES or budget <= 0:
+                            return found
+                        decoded = decode(match.group())
+                        if decoded is None:
+                            continue
+                        decoded = decoded[:budget]
+                        budget -= len(decoded)
+                        found.append((view, decoded))
+                        next_frontier.append(decoded)
+            if "%" in source and _PERCENT_ESCAPE_RE.search(source) is not None:
+                decoded = unquote(source, errors="replace")[:budget]
+                budget -= len(decoded)
+                found.append(("percent", decoded))
+                next_frontier.append(decoded)
+        frontier = next_frontier
+        if not frontier:
+            break
+    return found
+
+
+def _rewritten_views(text: str, line_normalized: str) -> list[tuple[str, str]]:
+    """Cheap rewrites of the whole input that undo a disguise, when one is likely.
+
+    rot13, reversal, leetspeak digits and letter-spacing. Each is attempted
+    only when a trigger says the disguise is present, and only on inputs short
+    enough to rewrite whole, so ordinary text pays a few substring tests.
+    """
+    if len(text) > _MAX_REWRITE_VIEW_LENGTH:
+        return []
+    views: list[tuple[str, str]] = []
+    if any(stem in line_normalized for stem in _ROT13_STEMS):
+        views.append(("rot13", codecs.encode(line_normalized, "rot13")))
+    if any(stem in line_normalized for stem in _REVERSED_STEMS):
+        views.append(("reversed", line_normalized[::-1]))
+    if any(digit in line_normalized for digit in _LEET_DIGITS):
+        leet = line_normalized.translate(_LEET)
+        if _gains_a_stem(leet, line_normalized):
+            views.append(("leetspeak", leet))
+    if len(text) <= _MAX_SPACED_VIEW_LENGTH:
+        spaced = fold_for_matching(text).lower()
+        if _SPACED_LETTERS_RE.search(spaced):
+            joined = _SPACED_LETTERS_RE.sub(_join_spaced, spaced)
+            if _gains_a_stem(joined, spaced):
+                views.append(("spaced", joined))
+    return views
+
+
+class _Finding(NamedTuple):
+    """One rule that matched: which threat, the text it matched, and where."""
+
+    threat: str
+    indicator: str
+    view: str
 
 
 class AdversarialDefense:
@@ -2038,56 +2830,51 @@ class AdversarialDefense:
 
     Provides detection and mitigation strategies for common attack vectors
     including prompt injection, jailbreaking, and data poisoning.
+
+    Threat labels reported by :meth:`analyze_input`:
+
+    * ``prompt_injection`` -- an instruction override ("ignore the previous
+      instructions"), prompt extraction, an instruction addressed to the model
+      inside content, or a ``system:`` role marker heading a line.
+    * ``jailbreak`` -- a persona or restriction-removal request.
+    * ``role_spoofing`` -- markup that forges a turn boundary: chat-template
+      control tokens, role tags, other role markers (``assistant:``,
+      ``### System``, ``DEVELOPER MESSAGE:``). Separate from injection so a
+      caller can tell a forged transcript from an override.
+    * ``custom_pattern`` -- a signature registered with
+      :meth:`add_attack_pattern`.
+    * ``content_too_long`` -- over ``max_content_length``; nothing was scanned.
+
+    Every built-in rule is also run over decoded views of the input -- the
+    hidden text of Unicode tag characters, base64, hex and percent-encoded
+    runs, and (when a trigger says they are present) rot13, reversed,
+    leetspeak and letter-spaced spellings. A view only reports what its
+    decoded text itself matches.
     """
 
-    #: Injection indicators, as regexes over :func:`_normalize`\ d text.
-    #:
-    #: These were fixed substrings, which meant one inserted word defeated them:
-    #: ``"ignore previous instructions"`` matched, while ``"ignore ALL previous
-    #: instructions"`` -- by far the more common phrasing -- did not, and neither
-    #: did ``"the"``/``"any"``/``"your"`` in the same slot. Matching the shape of
-    #: the phrase rather than one spelling of it closes that without widening
-    #: into false positives on ordinary prose.
-    _INJECTION_PATTERNS = (
-        # The gaps must cross a line break. Preserving newlines in
-        # :func:`_normalize` is what lets the ``system:`` anchor work, but a
-        # gap that excluded ``\n`` then made a newline a *detection boundary* --
-        # "ignore\nprevious instructions" evaded a pattern that caught the same
-        # words on one line. Sentence-enders still stop a match, so the phrase
-        # cannot be stitched together across unrelated sentences.
-        r"\b(?:ignore|disregard|forget|override)\b[^.!?]{0,40}?"
-        r"\b(?:previous|prior|earlier|above|preceding|all)\b[^.!?]{0,40}?"
-        r"\b(?:instruction|instructions|prompt|prompts|rule|rules|direction|directions)\b",
-        r"\bdisregard\s+all\b",
-        r"\bnew\s+instructions\s*:",
-        # Scoped, unlike the bare "override" substring this replaces: that
-        # flagged ordinary developer prose ("override the default timeout").
-        r"\boverride\b[^.!?]{0,40}?"
-        r"\b(?:instruction|instructions|prompt|prompts|rule|rules|system|safety|guardrail|filter)\b",
-    )
+    #: Kept for callers that read them: the source of each built-in rule.
+    _INJECTION_PATTERNS = _INJECTION_PATTERNS
+    _JAILBREAK_PATTERNS = _JAILBREAK_PATTERNS
+    _INJECTION_INDICATORS = _INJECTION_RULES
+    _JAILBREAK_INDICATORS = _JAILBREAK_RULES
 
     #: Role tokens that, at the head of a line, mark injected instructions.
-    _ROLE_TOKENS = frozenset({"system"})
+    _ROLE_TOKENS = _STRONG_ROLE_TOKENS | _WEAK_ROLE_TOKENS
 
-    #: Jailbreak indicators, same treatment.
-    _JAILBREAK_PATTERNS = (
-        r"\bpretend\s+(?:that\s+)?you\s+(?:are|were|re)\b",
-        r"\brole[\s-]?play(?:ing)?\s+as\b",
-        r"\bact\s+as\s+(?:if|though|a|an)\b",
-        r"\byou\s+are\s+now\b",
-        r"\bdeveloper\s+mode\b",
-        r"\bdo\s+anything\s+now\b",
-    )
-
-    _INJECTION_INDICATORS = tuple(re.compile(p) for p in _INJECTION_PATTERNS)
-    _JAILBREAK_INDICATORS = tuple(re.compile(p) for p in _JAILBREAK_PATTERNS)
-
-    def __init__(self, max_attacks: int = 1000, max_content_length: int | None = None):
+    def __init__(
+        self,
+        max_attacks: int = 1000,
+        max_content_length: int | None = DEFAULT_MAX_CONTENT_LENGTH,
+    ):
         """Initialize the AdversarialDefense.
 
         Args:
             max_attacks: Maximum number of detected attacks to store in memory.
-            max_content_length: Optional maximum allowed length for input content.
+            max_content_length: Longest input :meth:`analyze_input` analyses,
+                in characters (default :data:`DEFAULT_MAX_CONTENT_LENGTH`).
+                Longer input is reported unsafe as ``content_too_long``
+                without being scanned -- it is never truncated and passed.
+                ``None`` removes the cap.
         """
         self._attack_patterns: list[str] = []
         self._attack_patterns_tuple: list[tuple[str, str]] = []
@@ -2099,6 +2886,9 @@ class AdversarialDefense:
 
     def detect_prompt_injection(self, prompt: str, prompt_normalized: str | None = None) -> bool:
         """Detect potential prompt injection attacks (pure predicate, no side effects).
+
+        Not length-capped: the cap lives in :meth:`analyze_input`, which is the
+        entry point that runs on untrusted traffic.
 
         Args:
             prompt: Input prompt to analyze.
@@ -2124,6 +2914,18 @@ class AdversarialDefense:
             True if a jailbreak indicator is present, False otherwise.
         """
         return self._match_jailbreak(prompt, prompt_normalized) is not None
+
+    def detect_role_spoofing(self, prompt: str) -> bool:
+        """Detect forged turn boundaries -- chat-template tokens, role tags and
+        markers (pure predicate, no side effects).
+
+        Args:
+            prompt: Input prompt to analyze.
+
+        Returns:
+            True if a role-spoofing indicator is present, False otherwise.
+        """
+        return any(f.threat == "role_spoofing" for f in self._scan(prompt))
 
     def detect_custom_pattern(self, prompt: str, prompt_normalized: str | None = None) -> bool:
         """Detect custom attack patterns (pure predicate, no side effects).
@@ -2173,6 +2975,140 @@ class AdversarialDefense:
             return _normalize_lines(prompt)
         return prompt_normalized
 
+    # -- the scan ------------------------------------------------------------
+
+    def _scan(self, prompt: str, prompt_normalized: str | None = None) -> list[_Finding]:
+        """Every built-in finding in ``prompt``, across the text and its views.
+
+        The single source of every verdict: the predicates, the ``_match_*``
+        helpers and :meth:`analyze_input` all filter this list, so no two of
+        them can disagree about what a rule matched.
+        """
+        normalized = self._line_aware(prompt, prompt_normalized)
+        findings = self._role_findings(prompt, normalized, "text")
+        findings.extend(self._rule_findings(normalized, "text"))
+        for view, decoded in self._views(prompt, normalized):
+            findings.extend(self._view_findings(decoded, view))
+        return findings
+
+    @staticmethod
+    def _views(prompt: str, normalized: str) -> list[tuple[str, str]]:
+        """The decoded and rewritten forms of ``prompt`` worth scanning.
+
+        Raw-text decoders (tag characters, base64, hex, percent escapes) read
+        the original spelling -- base64 is case-sensitive -- while the rewrites
+        read the normalized text.
+        """
+        views: list[tuple[str, str]] = []
+        hidden = decode_tag_block(prompt)
+        if hidden:
+            views.append(("tag_block", hidden))
+        views.extend(_decoded_payloads(prompt))
+        views.extend(_rewritten_views(prompt, normalized))
+        return views
+
+    def _view_findings(self, decoded: str, view: str) -> list[_Finding]:
+        """Findings in one decoded view, marked with where they came from.
+
+        A decoded payload is a document of its own, so it gets the full
+        treatment, role markers included. A rewrite of the whole input
+        (rot13, reversal, ...) only gets the phrase rules: its line structure
+        is the input's, already read.
+        """
+        normalized = _normalize_lines(decoded)
+        findings = self._rule_findings(normalized, view)
+        if view in ("tag_block", "base64", "hex", "percent"):
+            findings.extend(self._role_findings(decoded, normalized, view))
+        return findings
+
+    @staticmethod
+    def _rule_findings(normalized: str, view: str) -> list[_Finding]:
+        """Phrase and delimiter rules over line-normalized text.
+
+        Prefilters are tested against the text with its line breaks read as
+        spaces, because a rule's ``\\s+`` crosses a line break and a literal
+        ``"if you are"`` would not: the gate must be at least as permissive as
+        the rule it guards.
+        """
+        findings: list[_Finding] = []
+        flat = normalized.replace("\n", " ")
+        # Each distinct literal is tested once, then each rule asks a set.
+        present = {trigger for trigger in _ALL_TRIGGERS if trigger in flat}
+        for threat, rules in (
+            ("prompt_injection", _INJECTION_RULES),
+            ("jailbreak", _JAILBREAK_RULES),
+            ("role_spoofing", _DELIMITER_RULES),
+        ):
+            for rule in rules:
+                if present.isdisjoint(rule.triggers):
+                    continue
+                match = rule.pattern.search(normalized)
+                if match is not None:
+                    findings.append(_Finding(threat, match.group(0).strip(), view))
+                    break
+        if '"role"' in normalized:
+            match = _JSON_ROLE_RE.search(normalized)
+            if match is not None:
+                findings.append(_Finding("role_spoofing", match.group(0)[:60], view))
+        return findings
+
+    def _role_findings(self, prompt: str, normalized: str, view: str) -> list[_Finding]:
+        """Role markers heading a line, judged by what they introduce.
+
+        A role marker is a speaker label, and the same label heads a line in a
+        forged transcript, a meeting note and a YAML file. So it is judged:
+
+        * ``system`` and its compounds are reported unless what follows them
+          reads as data rather than an instruction -- no instruction word in
+          the tail, *and* the line sits among other ``key: value`` lines or
+          has more pairs after it. ``system: ubuntu-22.04`` over
+          ``python: 3.12`` is a field; ``SYSTEM: x`` after "hello" is not.
+          ``system:`` stays reported as ``prompt_injection``, which is what it
+          has always been; every other marker is ``role_spoofing``.
+        * ``assistant``, ``user``, ``human`` and ``developer`` are ordinary
+          field names ("User: jdoe"), so they are reported only when what
+          follows is instruction-override vocabulary, or when the text holds
+          markers for two different speakers -- a forged exchange.
+        * A heading with no colon -- ``### System`` or ``System (priority
+          override) -`` -- is reported when it, or the line after it, carries
+          instruction-override vocabulary.
+        """
+        markers = _role_markers(_structural_text(prompt), self._ROLE_TOKENS)
+        findings: list[_Finding] = []
+        speakers = {marker.split()[0] for marker, _ in markers}
+        dialogue = len(speakers) >= 2
+        key_value: bool | None = None
+        for marker, tail in markers:
+            if marker in _STRONG_ROLE_TOKENS:
+                if _SYSTEM_CUE_RE.search(tail) is None:
+                    if key_value is None:
+                        key_value = self._in_key_value_block(normalized)
+                    if key_value or _INLINE_KEY_VALUE_RE.search(tail) is not None:
+                        continue
+                threat = "prompt_injection" if marker == "system" else "role_spoofing"
+                findings.append(_Finding(threat, f"{marker}:", view))
+            elif dialogue or _STRONG_CUE_RE.search(tail) is not None:
+                findings.append(_Finding("role_spoofing", f"{marker}:", view))
+        if "system" not in normalized and "developer" not in normalized:
+            return findings  # the heading rule names one of the two
+        for heading in _ROLE_HEADING_RE.finditer(normalized):
+            tail = " ".join(part for part in (heading.group(2), heading.group(3)) if part)
+            if not tail:
+                following = normalized[heading.end() + 1 :].split("\n", 1)[0]
+                tail = following
+            if _STRONG_CUE_RE.search(tail) is not None:
+                findings.append(_Finding("role_spoofing", heading.group(1), view))
+                break
+        return findings
+
+    def _in_key_value_block(self, normalized: str) -> bool:
+        """Whether some line other than a role marker is a ``key: value`` pair."""
+        for match in _KEY_VALUE_LINE_RE.finditer(normalized):
+            key = _undecorated_content(match.group(1))
+            if key and key not in self._ROLE_TOKENS:
+                return True
+        return False
+
     def _match_injection(self, prompt: str, prompt_normalized: str | None = None) -> str | None:
         """Return the matching injection indicator, or None.
 
@@ -2181,98 +3117,109 @@ class AdversarialDefense:
         the line boundaries is recomputed rather than honoured; see
         :meth:`_line_aware`.
         """
-        normalized = self._line_aware(prompt, prompt_normalized)
-        role_marker = _leading_role_marker(_structural_text(prompt), self._ROLE_TOKENS)
-        if role_marker is not None:
-            return role_marker
-        for indicator in self._INJECTION_INDICATORS:
-            match = indicator.search(normalized)
-            if match is not None:
-                return match.group(0)
-        return None
+        return self._first(self._scan(prompt, prompt_normalized), "prompt_injection")
 
     def _match_jailbreak(self, prompt: str, prompt_normalized: str | None = None) -> str | None:
         """Return the matching jailbreak indicator, or None.
 
-        ``prompt_normalized``, when supplied, should be :func:`_normalize_lines`
-        output -- the built-in patterns are line-aware. A cache that collapsed
-        the line boundaries is recomputed rather than honoured; see
-        :meth:`_line_aware`.
+        ``prompt_normalized`` is treated as in :meth:`_match_injection`.
         """
-        normalized = self._line_aware(prompt, prompt_normalized)
-        for indicator in self._JAILBREAK_INDICATORS:
-            match = indicator.search(normalized)
-            if match is not None:
-                return match.group(0)
-        return None
+        return self._first(self._scan(prompt, prompt_normalized), "jailbreak")
+
+    @staticmethod
+    def _first(findings: list[_Finding], threat: str) -> str | None:
+        return next((f.indicator for f in findings if f.threat == threat), None)
 
     def _match_custom_pattern(
         self, prompt: str, prompt_normalized: str | None = None
     ) -> str | None:
-        """Return the original (un-normalized) custom pattern that matched, or None."""
+        """Return the original (un-normalized) custom pattern that matched, or None.
+
+        Checked against the normalized text and against every decoded view, so
+        a registered signature is found inside base64 or tag characters too.
+        """
+        if not self._attack_patterns_tuple:
+            return None
         normalized = prompt_normalized if prompt_normalized is not None else _normalize(prompt)
+        texts = [normalized]
+        texts.extend(_normalize(decoded) for _, decoded in self._views(prompt, normalized))
         # ⚡ Bolt: Pre-computed lowercased patterns in _attack_patterns_tuple avoid O(N) string manipulation inside this hot loop
         for pattern, norm_pattern in self._attack_patterns_tuple:
-            if norm_pattern in normalized:
+            if any(norm_pattern in text for text in texts):
                 return pattern
         return None
 
     def analyze_input(self, input_text: str) -> dict[str, Any]:
         """Analyze input for multiple attack vectors.
 
-        Detection runs against a normalized copy of the input (NFKC, zero-width
-        stripped, whitespace-collapsed, lower-cased) so trivial obfuscations do
-        not bypass matching. Each detected attack is recorded exactly once.
+        Detection runs against a normalized copy of the input (NFKC, invisible
+        characters and combining marks stripped, look-alikes folded,
+        whitespace-collapsed, lower-cased) and against its decoded views, so
+        trivial obfuscations do not bypass matching. Each detected threat is
+        recorded exactly once.
 
         Args:
             input_text: Input text to analyze.
 
         Returns:
-            Analysis results with detected threats.
+            ``input`` (a log-safe snippet), ``threats_detected`` (labels, each
+            once, in a stable order), ``is_safe``, ``timestamp``, and
+            ``details``: one entry per finding with its ``threat``, the
+            ``indicator`` text that matched (log-safe, truncated) and the
+            ``view`` it was found in (``"text"`` or the decoding that
+            revealed it).
         """
         # SECURITY: DoS protection by limiting input length.
         if self.max_content_length is not None and len(input_text) > self.max_content_length:
-            self._record_attack(
-                "content_too_long",
-                input_text,
-                f"Input length {len(input_text)} exceeds maximum allowed {self.max_content_length}",
+            indicator = (
+                f"Input length {len(input_text)} exceeds maximum allowed {self.max_content_length}"
             )
+            self._record_attack("content_too_long", input_text, indicator)
             return {
                 # SECURITY: Sanitize returned input snippet to prevent log poisoning
-                "input": input_text[:100].replace("\n", "\\n").replace("\r", "\\r"),
+                "input": escape_for_log(input_text, _SNIPPET_LENGTH),
                 "threats_detected": ["content_too_long"],
                 "is_safe": False,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "details": [{"threat": "content_too_long", "indicator": indicator, "view": "text"}],
             }
 
         # Two forms, because the matchers want opposite things: custom
         # signatures need whitespace flattened, the built-ins need line
-        # structure kept.
-        normalized = _normalize(input_text)
+        # structure kept. The flattened one only when there is a signature.
         line_normalized = _normalize_lines(input_text)
-        threats: list[str] = []
-
-        injection = self._match_injection(input_text, line_normalized)
-        if injection is not None:
-            self._record_attack("prompt_injection", input_text, injection)
-            threats.append("prompt_injection")
-
-        jailbreak = self._match_jailbreak(input_text, line_normalized)
-        if jailbreak is not None:
-            self._record_attack("jailbreak", input_text, jailbreak)
-            threats.append("jailbreak")
-
-        custom = self._match_custom_pattern(input_text, normalized)
+        findings = self._scan(input_text, line_normalized)
+        custom = (
+            self._match_custom_pattern(input_text, _normalize(input_text))
+            if self._attack_patterns_tuple
+            else None
+        )
         if custom is not None:
-            self._record_attack("custom_pattern", input_text, custom)
-            threats.append("custom_pattern")
+            findings.append(_Finding("custom_pattern", custom, "text"))
+
+        threats: list[str] = []
+        for threat in _THREAT_ORDER:
+            first = next((f for f in findings if f.threat == threat), None)
+            if first is None:
+                continue
+            # SECURITY: each finding is recorded once, with what matched.
+            self._record_attack(threat, input_text, first.indicator)
+            threats.append(threat)
 
         return {
             # SECURITY: Sanitize returned input snippet to prevent log poisoning
-            "input": input_text[:100].replace("\n", "\\n").replace("\r", "\\r"),
+            "input": escape_for_log(input_text, _SNIPPET_LENGTH),
             "threats_detected": threats,
             "is_safe": len(threats) == 0,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "details": [
+                {
+                    "threat": f.threat,
+                    "indicator": escape_for_log(f.indicator, _SNIPPET_LENGTH),
+                    "view": f.view,
+                }
+                for f in findings
+            ],
         }
 
     def add_attack_pattern(self, pattern: str) -> None:
@@ -2321,6 +3268,10 @@ class AdversarialDefense:
     ) -> None:
         """Record a detected attack.
 
+        Both stored strings go through :func:`escape_for_log`: every control
+        character, line and paragraph separator and bidi override is escaped,
+        not only ``\\n`` and ``\\r``, and the bound holds after escaping.
+
         Args:
             attack_type: Type of attack.
             content: Attack content (the original, un-normalized text).
@@ -2328,15 +3279,17 @@ class AdversarialDefense:
         """
         attack = {
             "type": attack_type,
-            "content": content[:256]
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")[:100],  # Truncated and sanitized.
-            "indicator": indicator[:256]
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")[:100],  # Truncated and sanitized.
+            "content": escape_for_log(content, _SNIPPET_LENGTH),  # Truncated and sanitized.
+            "indicator": escape_for_log(indicator, _SNIPPET_LENGTH),  # Truncated and sanitized.
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._detected_attacks.append(attack)
 
 
-__all__ = ["AdversarialDefense"]
+#: The order labels appear in ``threats_detected``.
+_THREAT_ORDER = ("prompt_injection", "jailbreak", "role_spoofing", "custom_pattern")
+#: Longest snippet of untrusted text kept in a result or a record.
+_SNIPPET_LENGTH = 100
+
+
+__all__ = ["DEFAULT_MAX_CONTENT_LENGTH", "AdversarialDefense"]

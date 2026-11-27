@@ -79,7 +79,7 @@ def test_the_adversarial_example_is_honest_about_both_sides():
     missed = missed.split("== 4.")[0]
     # Everything in section 2 is flagged; everything in section 3 gets through.
     hidden = caught.split("== 2.")[1]
-    assert hidden.count("FLAGGED") == 6 and " safe" not in hidden
+    assert hidden.count("FLAGGED") == 10 and " safe" not in hidden
     assert missed.count(" safe") == 5 and "FLAGGED" not in missed
     assert "a security tutorial    FLAGGED" in out  # the false positive
     assert "near miss              safe" in out

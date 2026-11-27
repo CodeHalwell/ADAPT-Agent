@@ -67,6 +67,7 @@ _TRUST = "adapt_agent/core/trust.py"
 _MEMORY = "adapt_agent/core/memory.py"
 _MIDDLEWARE = "adapt_agent/core/middleware.py"
 _DEFENSE = "adapt_agent/adversarial/__init__.py"
+_TEXT = "adapt_agent/security/_text.py"
 _OBSERVER = "adapt_agent/observability/__init__.py"
 _OPTIMIZERS = "adapt_agent/optimization/optimizers.py"
 _GOVERNED = "adapt_agent/adapters/_governed.py"
@@ -193,11 +194,11 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "fw-allow-search",
         _FIREWALL,
-        """        if self.whitelist_mode:
-            for pattern in self._allowed_patterns:
+        """        for pattern in self._allowed:
+            try:
                 if pattern.fullmatch(content):""",
-        """        if self.whitelist_mode:
-            for pattern in self._allowed_patterns:
+        """        for pattern in self._allowed:
+            try:
                 if pattern.search(content):""",
         "an allowed pattern must match the whole content",
         "2024-05-18 - [Firewall Whitelist Bypass via regex search]",
@@ -205,8 +206,8 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "fw-allow-before-block",
         _FIREWALL,
-        "        if self.whitelist_mode:\n            for pattern in self._allowed_patterns:",
-        "        if True:\n            for pattern in self._allowed_patterns:",
+        "        if self.whitelist_mode:\n            allowed = self._allowed_match(content)",
+        "        if True:\n            allowed = self._allowed_match(content)",
         "by default an allowed pattern never overrides a block",
     ),
     Mutant(
@@ -226,25 +227,25 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "fw-snippet-raw",
         _FIREWALL,
-        "self._truncate_escaped(self.sanitize(content), 100)",
-        "self._truncate_escaped(content, 100)",
+        "self._truncate_escaped(self.sanitize(visible), _SNIPPET_CHARS)",
+        "self._truncate_escaped(visible, _SNIPPET_CHARS)",
         "a blocked secret is redacted in the event that records it",
         "2024-05-14 - Exposed sensitive data in firewall events",
     ),
     Mutant(
         "fw-truncate-then-sanitize",
         _FIREWALL,
-        "self._truncate_escaped(self.sanitize(content), 100)",
-        "self.sanitize(self._truncate_escaped(content, 100))",
+        "self._truncate_escaped(self.sanitize(visible), _SNIPPET_CHARS)",
+        "self.sanitize(self._truncate_escaped(visible, _SNIPPET_CHARS))",
         "sanitise the whole string, then truncate",
         "2024-07-02 - Prevent Partial Secret Leakage via Early Truncation",
         also=("2024-05-25 - Firewall Partial Secret Leakage",),
     ),
     Mutant(
         "fw-snippet-newlines",
-        _FIREWALL,
-        'return bounded[:best].replace("\\n", "\\\\n").replace("\\r", "\\\\r")',
-        "return bounded[:best]",
+        _TEXT,
+        "    if _LOG_UNSAFE_RE.search(bounded) is None:\n        return bounded",
+        "    if True:\n        return bounded",
         "newlines are escaped in stored snippets",
         "2024-07-01 - Prevent log poisoning in firewall security events",
     ),
@@ -265,17 +266,17 @@ MUTANTS: tuple[Mutant, ...] = (
     ),
     Mutant(
         "fw-truncate-overflow",
-        _FIREWALL,
-        "            if escaped_len <= max_length:\n                best = mid",
-        "            if True:\n                best = mid",
+        _TEXT,
+        "        if used + len(piece) > max_length:\n            break",
+        "        if False:\n            break",
         "an escaped snippet never exceeds its length bound",
         "2024-10-27 - Fix flawed truncation logic for escapes",
     ),
     Mutant(
         "fw-redos-guard",
         _FIREWALL,
-        '_CATASTROPHIC_RE = re.compile(r"\\([^)(]*[+*]\\)[+*]")',
-        '_CATASTROPHIC_RE = re.compile(r"(?!)")',
+        "        risk = _backtracking_risk(pattern, flags)",
+        "        risk = None",
         "obviously catastrophic patterns are rejected",
         "2024-05-23 - ReDoS in Heuristic Regex Guard",
     ),
@@ -501,8 +502,8 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "defense-custom-patterns",
         _DEFENSE,
-        '        if custom is not None:\n            self._record_attack("custom_pattern"',
-        '        if False:\n            self._record_attack("custom_pattern"',
+        '        if custom is not None:\n            findings.append(_Finding("custom_pattern"',
+        '        if False:\n            findings.append(_Finding("custom_pattern"',
         "registered custom patterns are actually matched",
         "2026-05-13 - Broken Custom Attack Pattern Enforcement",
     ),
@@ -517,15 +518,15 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "defense-jailbreak-dropped",
         _DEFENSE,
-        "        if jailbreak is not None:",
-        "        if False:",
+        '_THREAT_ORDER = ("prompt_injection", "jailbreak", "role_spoofing", "custom_pattern")',
+        '_THREAT_ORDER = ("prompt_injection", "role_spoofing", "custom_pattern")',
         "a detected jailbreak marks the input unsafe",
     ),
     Mutant(
         "defense-injection-dropped",
         _DEFENSE,
-        "        if injection is not None:",
-        "        if False:",
+        '_THREAT_ORDER = ("prompt_injection", "jailbreak", "role_spoofing", "custom_pattern")',
+        '_THREAT_ORDER = ("jailbreak", "role_spoofing", "custom_pattern")',
         "a detected injection marks the input unsafe",
     ),
     Mutant(
@@ -539,29 +540,25 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "defense-content-newlines",
         _DEFENSE,
-        """            "content": content[:256]
-            .replace("\\n", "\\\\n")
-            .replace("\\r", "\\\\r")[:100],""",
-        """            "content": content[:100],""",
+        '"content": escape_for_log(content, _SNIPPET_LENGTH),',
+        '"content": content[:_SNIPPET_LENGTH],',
         "newlines are escaped in a recorded attack's content",
         "2024-06-06 - Log Poisoning Vulnerability in Adversarial Defense",
     ),
     Mutant(
         "defense-indicator-newlines",
         _DEFENSE,
-        """            "indicator": indicator[:256]
-            .replace("\\n", "\\\\n")
-            .replace("\\r", "\\\\r")[:100],""",
-        """            "indicator": indicator[:100],""",
+        '"indicator": escape_for_log(indicator, _SNIPPET_LENGTH),',
+        '"indicator": indicator[:_SNIPPET_LENGTH],',
         "newlines are escaped in a recorded attack's indicator",
         "2024-11-07 - Log Poisoning in Adversarial Attack Indicators",
     ),
     Mutant(
         "defense-result-newlines",
         _DEFENSE,
-        """            "input": input_text[:100].replace("\\n", "\\\\n").replace("\\r", "\\\\r"),
+        """            "input": escape_for_log(input_text, _SNIPPET_LENGTH),
             "threats_detected": threats,""",
-        """            "input": input_text[:100],
+        """            "input": input_text[:_SNIPPET_LENGTH],
             "threats_detected": threats,""",
         "newlines are escaped in the returned analysis snippet",
         "2024-10-27 - Fix log poisoning in AdversarialDefense analysis results",

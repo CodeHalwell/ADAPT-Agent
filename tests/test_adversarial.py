@@ -3511,6 +3511,43 @@ def test_reading_a_stylesheet_is_linear_in_its_length(label: str, build) -> None
     assert elapsed[1] < elapsed[0] * 3, (label, elapsed)
 
 
+#: Markup an adversarial prompt can carry with no terminator anywhere after it,
+#: and tags that close nothing. Each was quadratic: every start position of a
+#: backtracking search over the construct alternation scanned to the end of the
+#: text looking for a `>` or `]` that was not there (10KB of `<?` took ~4s),
+#: and `_boundary_split` walked the whole open-element stack for each closing
+#: tag that matched nothing (224KB took 37s).
+MARKUP_COST_SHAPES = [
+    ("unterminated processing instructions", lambda n: "<?" * n),
+    ("unterminated declarations", lambda n: "<!a" * n),
+    ("unterminated BBCode", lambda n: "[a" * n),
+    ("unmatched closing tags", lambda n: "<a>" * n + "</b>" * n),
+    ("terminated PIs with no `?>`", lambda n: "<?a>" * n),
+    ("closes below a run of formatting elements", lambda n: "<div>" * n + "<b>" * n + "</div>" * n),
+]
+
+
+@pytest.mark.parametrize(("label", "build"), MARKUP_COST_SHAPES)
+def test_scanning_markup_is_linear_in_its_length(label: str, build) -> None:
+    """The same two-size ratio as the stylesheet guards, on the entry point.
+
+    `max_content_length=None` because the default cap would refuse the larger
+    size before anything was scanned, and the property is about the scan.
+    """
+    defense = AdversarialDefense(max_content_length=None)
+    elapsed = [_fastest(partial(defense.analyze_input, build(size))) for size in (2500, 5000)]
+    assert elapsed[1] < elapsed[0] * 3, (label, elapsed)
+
+
+@pytest.mark.parametrize(("label", "build"), MARKUP_COST_SHAPES)
+def test_splitting_at_boundaries_is_linear_in_its_length(label: str, build) -> None:
+    """Measured where the stack lives, so the pipeline around it cannot hide it."""
+    from adapt_agent.adversarial import _boundary_split
+
+    elapsed = [_fastest(partial(_boundary_split, build(size))) for size in (4000, 8000)]
+    assert elapsed[1] < elapsed[0] * 3, (label, elapsed)
+
+
 def test_the_style_scan_does_not_copy_the_suffix_it_searches() -> None:
     """Timed on the function rather than end to end, because end to end cannot
     see it — and that is the finding, not an inconvenience.

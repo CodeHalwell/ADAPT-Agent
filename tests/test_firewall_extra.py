@@ -22,10 +22,17 @@ def test_add_blocked_pattern_blocks_and_records_redacted_event():
     assert event["severity"] == "high"
     assert "blocked pattern" in event["description"].lower()
 
-    # The recorded snippet must be redacted: no raw secret leaked.
+    # The recorded snippet must be redacted: no raw secret leaked. It is the
+    # same form every path stores -- a short scrubbed prefix and a hash.
     snippet = event["metadata"]["content_snippet"]
     assert "SECRET-12345" not in snippet
-    assert "[REDACTED]" in snippet
+    assert "sha256:" in snippet
+
+    # A secret inside the visible prefix is redacted, not shown.
+    assert firewall.check_input("SECRET-12345 at the start") is False
+    snippet = firewall.get_security_events()[-1]["metadata"]["content_snippet"]
+    assert snippet.startswith("[REDACTED]")
+    assert "12345" not in snippet
 
 
 def test_block_first_allowed_pattern_cannot_override_block():
@@ -227,7 +234,7 @@ def test_max_events_bounding():
     assert len(events) == 3
     # Oldest events were evicted; the newest survive. The blocked pattern
     # itself is redacted in the snippet, but the trailing index remains.
-    assert events[-1]["metadata"]["content_snippet"] == "[REDACTED] 9"
+    assert events[-1]["metadata"]["content_snippet"].startswith("[REDACTED] 9…(sha256:")
 
 
 def test_get_stats_counts():
@@ -269,11 +276,12 @@ def test_event_snippet_redacts_a_secret_spanning_the_truncation_boundary():
     fw = Firewall()
     fw.add_blocked_pattern(r"SECRET-\d{12}")
     secret = "SECRET-123456789012"
-    content = "x" * 90 + secret  # the secret straddles the 100-character cut
+    content = "x" * 5 + secret  # the secret straddles the 12-character cut
     assert fw.check_input(content) is False
     snippet = fw.get_security_events()[-1]["metadata"]["content_snippet"]
     assert "SECRET" not in snippet
     assert "1234" not in snippet
+    assert snippet.startswith("xxxxx[REDACT")
 
 
 def test_event_snippet_escapes_newlines():
