@@ -418,3 +418,20 @@ def test_the_tool_governance_api_is_exported_from_the_package_root() -> None:
         assert name in adapt_agent.__all__ and name in core.__all__
     for name in ("walk_texts", "TextExtraction", "UNSCANNABLE"):
         assert hasattr(core, name) and name in core.__all__
+
+
+@pytest.mark.parametrize("control", ["firewall", "defense", "policy_enforcer", "tool_policy"])
+def test_a_shared_gate_plus_a_control_is_refused_rather_than_dropped(control: str) -> None:
+    values = {
+        "firewall": Firewall(),
+        "defense": AdversarialDefense(),
+        "policy_enforcer": PolicyEnforcer(),
+        "tool_policy": ToolPolicy(deny=["x"]),
+    }
+    with pytest.raises(ValueError, match=f"gate= was passed together with {control}"):
+        build_gate(gate=GovernanceGate(), **{control: values[control]})
+
+
+def test_relabelling_a_shared_gate_keeps_its_payload_budget() -> None:
+    shared = GovernanceGate(max_payload_chars=123, agent_id="shared")
+    assert build_gate(gate=shared, agent_id="specialist").max_payload_chars == 123

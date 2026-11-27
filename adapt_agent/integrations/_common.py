@@ -35,8 +35,10 @@ def build_gate(
 
     Every integration factory accepts both forms: pass ``gate=`` to share one
     configured gate across several agents, or pass the controls directly for a
-    one-off. Passing ``gate=`` alongside controls ignores the controls -- the
-    gate already carries its own.
+    one-off. Passing ``gate=`` together with a control is refused: the gate
+    already carries its own, so the extra one could only be dropped, and a
+    ``firewall=`` or ``tool_policy=`` that is accepted and then never consulted
+    looks exactly like one that is working.
 
     ``agent_id`` is the exception, because it identifies the *binding* rather
     than the controls. Sharing one gate across a graph is exactly the case where
@@ -45,6 +47,22 @@ def build_gate(
     binding's id, so one violation was attributed two different ways.
     """
     if gate is not None:
+        dropped = [
+            name
+            for name, value in (
+                ("firewall", firewall),
+                ("defense", defense),
+                ("policy_enforcer", policy_enforcer),
+                ("tool_policy", tool_policy),
+            )
+            if value is not None
+        ]
+        if dropped:
+            raise ValueError(
+                f"gate= was passed together with {', '.join(dropped)}, which would be "
+                "ignored: a shared gate carries its own controls. Configure them on the "
+                "GovernanceGate, or drop gate= and pass the controls directly."
+            )
         if agent_id == _DEFAULT_AGENT_ID or agent_id == gate.agent_id:
             return gate
         return GovernanceGate(
@@ -54,6 +72,7 @@ def build_gate(
             block_on_violation=gate.block_on_violation,
             agent_id=agent_id,
             tool_policy=gate.tool_policy,
+            max_payload_chars=gate.max_payload_chars,
         )
     return GovernanceGate(
         firewall=firewall,

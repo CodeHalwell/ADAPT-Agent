@@ -628,6 +628,7 @@ class _GovernedAgent:
                 if after.incomplete or not before.issuperset(after.texts):
                     rewritten_threats = adapter._screen_input(payload)
                     if rewritten_threats and adapter.block_on_violation:
+                        self._refused(rewritten_threats, stage="middleware")
                         raise SecurityBlockedError(
                             "Input blocked by security controls after pre-middleware",
                             rewritten_threats,

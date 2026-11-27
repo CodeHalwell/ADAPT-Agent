@@ -94,7 +94,9 @@ def otel_demo() -> None:
             InMemorySpanExporter,
         )
     except ImportError:
-        print("opentelemetry-sdk is not installed; skipping (pip install 'adapt-agent[otel]').")
+        print(
+            "opentelemetry-sdk is not installed; skipping (pip install 'adapt-agent[otel]' opentelemetry-sdk)."
+        )
         return
 
     exporter = InMemorySpanExporter()

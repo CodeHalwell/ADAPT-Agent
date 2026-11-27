@@ -787,3 +787,20 @@ def test_an_output_block_closes_the_span_with_its_threats() -> None:
     (trace,) = observer.get_traces()
     assert trace["status"] == "error"
     assert trace["threats"] == ["firewall"] and trace["error_type"] == "SecurityBlockedError"
+
+
+def test_a_block_after_pre_middleware_is_recorded_as_a_refusal() -> None:
+    from adapt_agent.adapters import LangGraphAdapter
+
+    middleware = Middleware()
+    middleware.add_pre_middleware(
+        lambda data: {**data, "note": "malicious addition"}, name="adds-text"
+    )
+    observer = AgentObserver()
+    agent = LangGraphAdapter(
+        firewall=_firewall(), middleware=middleware, observer=observer
+    ).wrap_agent(lambda payload: {"messages": []})
+    with pytest.raises(SecurityBlockedError, match="after pre-middleware"):
+        agent.execute({"messages": []})
+    (refusal,) = observer.get_refusals()
+    assert refusal["stage"] == "middleware" and refusal["threats"] == ["firewall"]

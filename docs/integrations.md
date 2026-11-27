@@ -166,10 +166,13 @@ Every factory takes the same controls — `firewall`, `defense`,
 adapter. Set `agent_id` per agent: it is named in every refusal, error and span,
 which is how you tell *which* specialist in a graph refused.
 
-When you pass `gate=`, the controls passed alongside it are **ignored** —
-including `tool_policy=` — and only `agent_id` is applied (by building a gate
-with the same controls under the new label). Put the tool policy on the gate
-itself: `GovernanceGate(..., tool_policy=ToolPolicy(...))`.
+Pass `gate=` *or* the individual controls, not both: a shared gate carries its
+own, so `gate=` together with `firewall=`, `defense=`, `policy_enforcer=` or
+`tool_policy=` raises `ValueError` rather than quietly dropping the extra one.
+Put the tool policy on the gate itself:
+`GovernanceGate(..., tool_policy=ToolPolicy(...))`. `agent_id` is the exception
+— it labels the binding, so it is applied on top of a shared gate (by building a
+gate with the same controls under the new label).
 
 ### What every gate refuses to guess about
 
