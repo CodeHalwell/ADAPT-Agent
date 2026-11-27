@@ -151,13 +151,15 @@ VIEW_COST_SHAPES = [
 
 @pytest.mark.parametrize(("label", "build"), VIEW_COST_SHAPES)
 def test_the_views_and_rules_are_linear_in_their_length(label: str, build) -> None:
-    from tests.test_adversarial import _fastest
+    from functools import partial
+
+    from tests.test_adversarial import _within_ratio
 
     defense = AdversarialDefense(max_content_length=None)
-    elapsed = [
-        _fastest(lambda size=size: defense.analyze_input(build(size))) for size in (3000, 6000)
-    ]
-    assert elapsed[1] < elapsed[0] * 3, (label, elapsed)
+    linear, elapsed = _within_ratio(
+        [partial(defense.analyze_input, build(size)) for size in (3000, 6000)], 3
+    )
+    assert linear, (label, elapsed)
 
 
 # -- a finite default input cap, failing closed --------------------------------
