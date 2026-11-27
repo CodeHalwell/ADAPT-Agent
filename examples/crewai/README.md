@@ -17,9 +17,9 @@ pip install 'adapt-agent[crewai]'   # or: pip install crewai
 ```
 
 Every example **guards the `crewai` import**: run any of them without CrewAI
-installed and you get a friendly install hint instead of a traceback. The
+installed and you get a friendly install hint (exit code 0) instead of a traceback. The
 `adapt_agent` parts always import. All examples run **offline with no API key** --
-the crew model and the LLM judge are deterministic local stubs.
+the crew model (a `crewai.BaseLLM` subclass -- not `LLM`, whose constructor is now a provider router) and the LLM judge are deterministic local stubs.
 
 ## The ladder
 
@@ -29,6 +29,7 @@ the crew model and the LLM judge are deterministic local stubs.
 | 2 | [`02_policy_observability_trust.py`](02_policy_observability_trust.py) | Add `PolicyEnforcer` (a block rule), `AdversarialDefense`, `AgentObserver` (traces), and `Middleware`; `block_on_violation=False` records threats without blocking. |
 | 3 | [`03_evaluate_and_optimize.py`](03_evaluate_and_optimize.py) | Wrap one crew as an `OptimizableAgent`, score with `EvaluationHarness` (metric + offline `LLMJudge`), run `CoordinateAscentOptimizer`, print baseline→best and the introspected knobs. |
 | 4 | [`04_multi_agent_and_training.py`](04_multi_agent_and_training.py) | A two-agent crew (researcher + writer with tools) governed as one unit, optimized with `make_default_optimizer` (tool/skill ablation + adversarial judge recommendations), plus the YAML-config path via `run_training` and [`crewai.train.yaml`](crewai.train.yaml). |
+| 5 | [`05_tool_governance.py`](05_tool_governance.py) | CrewAI's interception hooks (`governance_hooks`): a denied tool never runs, a poisoned tool result never reaches the model, `raise` vs `refuse`, and approvals that fail closed. Needs CrewAI 1.15+. |
 
 ## Run them
 
@@ -37,6 +38,7 @@ python examples/crewai/01_basic_guarded.py
 python examples/crewai/02_policy_observability_trust.py
 python examples/crewai/03_evaluate_and_optimize.py
 python examples/crewai/04_multi_agent_and_training.py
+python examples/crewai/05_tool_governance.py
 ```
 
 For the full prose walkthrough -- every constructor argument, the 6-step

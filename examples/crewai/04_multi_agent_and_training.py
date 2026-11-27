@@ -33,12 +33,11 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from crewai import LLM, Agent, Crew, Process, Task
+    from crewai import Agent, BaseLLM, Crew, Process, Task
     from crewai.tools import tool
 except ImportError:
-    raise SystemExit(
-        "This example needs CrewAI: pip install 'adapt-agent[crewai]'\n" "(or: pip install crewai)"
-    )
+    print("This example needs CrewAI: pip install 'adapt-agent[crewai]'  (or: pip install crewai)")
+    raise SystemExit(0)
 
 from adapt_agent import Firewall
 from adapt_agent.adapters import CrewAIAdapter
@@ -83,7 +82,7 @@ def distracting_search(query: str) -> str:
 # --------------------------------------------------------------------------- #
 # Deterministic, network-free crew model.                                     #
 # --------------------------------------------------------------------------- #
-class OfflineLLM(LLM):
+class OfflineLLM(BaseLLM):
     """A deterministic LLM whose answer quality depends on the live prompts.
 
     It produces a clean ``"<Country>: <City>"`` answer only when the writer's
@@ -186,7 +185,7 @@ def _extract_fence(text: str, label: str) -> str:
     return "" if start == -1 or end == -1 else text[start + len(label) + 2 : end].strip()
 
 
-def judge_stub(prompt: str) -> str:
+def judge_stub(prompt: str, system: str | None = None, **_: Any) -> str:
     """Offline judge matching LLMJudge's prompt format (rewrite / grade / suggest).
 
     LLMJudge puts the task cues in the USER prompt: a rewrite request contains
@@ -251,7 +250,7 @@ def main() -> None:
             "question": "France",
         }
     )
-    print("  guarded crew output:", getattr(out, "raw", out))
+    print("  guarded crew output:", out["result"].raw)
 
     # === Part B: optimize the whole crew (Python path) ===================== #
     print("\n=== Optimize the whole crew (make_default_optimizer) ===")
