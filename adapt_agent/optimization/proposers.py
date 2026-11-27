@@ -53,6 +53,11 @@ class ProposalContext:
             every context and reads it back after the search; proposers that
             cannot return live values (such as :class:`LLMToolProposer`) append
             their ideas here instead.
+        demo_rows: Filled in by proposers whose candidates are *copied from*
+            dataset rows (:class:`FewShotProposer`): candidate value -> the
+            ``dataset`` row indices it was built from. The optimizer scores such
+            a candidate only on the other rows -- a demonstration answers the
+            very row it was copied from, so scoring it there measures the copy.
     """
 
     parameter: Parameter
@@ -63,6 +68,7 @@ class ProposalContext:
     rng: random.Random = field(default_factory=random.Random)
     n: int = 4
     recommendations: list[str] = field(default_factory=list)
+    demo_rows: dict[Any, tuple[int, ...]] = field(default_factory=dict)
 
 
 class Proposer:
@@ -170,6 +176,11 @@ class FewShotProposer(Proposer):
     parameter, it selects up to ``shots`` examples the agent already answers well
     (per the latest report) and formats them into a demonstration block. Several
     blocks are proposed using different example subsets.
+
+    Each block's source rows are recorded in :attr:`ProposalContext.demo_rows`,
+    and the optimizer scores the block only on the *other* rows -- so a block
+    built from every row of a small dataset has nothing left to be measured
+    on, and is never accepted.
     """
 
     name = "few_shot"
@@ -182,21 +193,27 @@ class FewShotProposer(Proposer):
         return parameter.kind is ParameterKind.FEW_SHOT
 
     def propose(self, ctx: ProposalContext) -> list[Any]:
-        pool = self._labeled_pool(ctx)
-        if not pool:
+        rows = self._labeled_rows(ctx)
+        if not rows:
             return []
         out: list[Any] = []
         for _ in range(self.variants):
-            if len(pool) <= self.shots:
-                chosen = list(pool)
+            if len(rows) <= self.shots:
+                chosen = list(rows)
             else:
-                chosen = ctx.rng.sample(pool, self.shots)
-            block = self._format(chosen)
+                chosen = ctx.rng.sample(rows, self.shots)
+            block = self._format([(inputs, expected) for _, inputs, expected in chosen])
             if block and block not in out:
                 out.append(block)
+                ctx.demo_rows[block] = tuple(sorted(index for index, _, _ in chosen))
         return out
 
     def _labeled_pool(self, ctx: ProposalContext) -> list[tuple[Any, Any]]:
+        """The ``(inputs, expected)`` pairs demonstrations are drawn from."""
+        return [(inputs, expected) for _, inputs, expected in self._labeled_rows(ctx)]
+
+    def _labeled_rows(self, ctx: ProposalContext) -> list[tuple[int, Any, Any]]:
+        """Like :meth:`_labeled_pool`, with each pair's dataset row index."""
         # Prefer examples the agent currently gets right (high-quality demos).
         correct_inputs: set[int] = set()
         if ctx.report is not None:
@@ -204,17 +221,14 @@ class FewShotProposer(Proposer):
             for r in ctx.report.results:
                 if r.error is None and r.scores.get(primary, 0.0) >= 1.0:
                     correct_inputs.add(r.index)
-        pool: list[tuple[Any, Any]] = []
-        for i, ex in enumerate(ctx.dataset):
-            if ex.expected is None:
-                continue
-            if correct_inputs and i not in correct_inputs:
-                continue
-            pool.append((ex.inputs, ex.expected))
+        labeled = [
+            (i, ex.inputs, ex.expected)
+            for i, ex in enumerate(ctx.dataset)
+            if ex.expected is not None
+        ]
+        pool = [row for row in labeled if not correct_inputs or row[0] in correct_inputs]
         # Fall back to all labeled rows if filtering left nothing.
-        if not pool:
-            pool = [(ex.inputs, ex.expected) for ex in ctx.dataset if ex.expected is not None]
-        return pool
+        return pool or labeled
 
     @staticmethod
     def _format(pairs: list[tuple[Any, Any]]) -> str:
@@ -260,31 +274,69 @@ class LLMProposer(Proposer):
         current = ctx.parameter.read()
         if judge is None or not isinstance(current, str) or not current:
             return []
-        failures = self._collect_failures(ctx, judge)
-        if not failures:
+        batches = self._failure_batches(ctx, judge)
+        if not batches:
             return []
         criteria = self._criteria(ctx)
         out: list[Any] = []
-        for _ in range(self.rewrites):
+        for failures in batches:
             rewritten = judge.improve_prompt(current, failures, criteria=criteria)
             if rewritten and rewritten not in out and rewritten != current:
                 out.append(rewritten)
         return out
 
-    def _collect_failures(self, ctx: ProposalContext, judge: LLMJudge) -> list[dict[str, Any]]:
+    def _failure_batches(self, ctx: ProposalContext, judge: LLMJudge) -> list[list[dict[str, Any]]]:
+        """Up to ``rewrites`` *distinct* failure samples, one per rewrite request.
+
+        Each rewrite is asked about a different sample of failures. Sending the
+        same instruction and the same failures twice is the same request: a
+        deterministic judge answers it identically, so the second call bought
+        nothing. When the failure pool is too small to vary, one call is made.
+        Critiques are requested once per failing row, however many samples
+        include it.
+        """
         if ctx.report is None:
             return []
         failing = ctx.report.failures()
         if not failing:
             return []
-        # Sample (seeded) across the whole failure pool rather than always taking
-        # the first few, so later-failing examples are not systematically ignored.
-        sample = ctx.rng.sample(failing, min(len(failing), self.critique_samples))
+        size = min(len(failing), self.critique_samples)
+        samples: list[list[Any]] = []
+        keys: set[tuple[int, ...]] = set()
+        # Bounded retries: with a pool barely larger than a sample, a fresh
+        # draw often repeats an earlier one.
+        for _ in range(max(1, self.rewrites) * 4):
+            if len(samples) >= max(1, self.rewrites):
+                break
+            # Sample (seeded) across the whole failure pool rather than always
+            # taking the first few, so later-failing examples are not ignored.
+            sample = ctx.rng.sample(failing, size)
+            key = tuple(sorted(id(r) for r in sample))
+            if key in keys:
+                if size == len(failing):
+                    break  # only one distinct sample exists
+                continue
+            keys.add(key)
+            samples.append(sample)
+        critiques: dict[int, str] = {}
+        return [self._records(sample, judge, critiques) for sample in samples]
+
+    def _collect_failures(self, ctx: ProposalContext, judge: LLMJudge) -> list[dict[str, Any]]:
+        """One sample of judged failures (the first rewrite's)."""
+        batches = self._failure_batches(ctx, judge)
+        return batches[0] if batches else []
+
+    @staticmethod
+    def _records(
+        sample: list[Any], judge: LLMJudge, critiques: dict[int, str]
+    ) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
         for r in sample:
             critique = ""
             if r.error is None:
-                critique = judge.critique(r.inputs, r.output, r.expected)
+                if id(r) not in critiques:
+                    critiques[id(r)] = judge.critique(r.inputs, r.output, r.expected)
+                critique = critiques[id(r)]
             records.append(
                 {
                     "input": r.inputs,

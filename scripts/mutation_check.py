@@ -692,7 +692,7 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         "opt-gate-never-rejects",
         _OPTIMIZERS,
-        "if comparable and tuned.score < baseline.score - self.validation_tolerance:",
+        "if not held_out_gain:",
         "if False:",
         "a config that regresses on held-out data is not applied",
     ),
@@ -705,10 +705,12 @@ MUTANTS: tuple[Mutant, ...] = (
     ),
     Mutant(
         "opt-gate-trusts-partial-scores",
-        _OPTIMIZERS,
-        "if comparable and tuned.score < baseline.score - self.validation_tolerance:",
-        "if tuned.score < baseline.score - self.validation_tolerance:",
-        "the gate never rejects on an incomplete held-out pass",
+        "adapt_agent/optimization/significance.py",
+        "        if result.transient or primary in result.transient_metrics:\n"
+        "            continue\n",
+        "        if result.transient or primary in result.transient_metrics:\n"
+        "            pass\n",
+        "a throttled held-out row is left out of both sides, not scored as a zero",
     ),
     *_hook_mutants(),
 )

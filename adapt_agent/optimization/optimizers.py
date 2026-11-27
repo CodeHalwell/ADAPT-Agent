@@ -27,6 +27,21 @@ Strategies provided:
 * :class:`BootstrapFewShotOptimizer` -- coordinate ascent restricted to few-shot.
 * :class:`EvolutionaryOptimizer` -- population-based mutation + selection.
 * :class:`PipelineOptimizer` -- run several optimizers in sequence.
+
+What "better" means
+-------------------
+
+A candidate replaces the incumbent only on a **paired statistical test** over
+per-row deltas (see :mod:`adapt_agent.optimization.significance`), never on a
+bare comparison of two means: an agent that is right 70% of the time differs
+from itself by 0.2 on ten rows about a third of the time. A target whose
+per-row results change between two runs of the same configuration is detected
+up front and every comparison is then re-measured ``repeats`` times, incumbent
+and challenger interleaved. The final configuration is applied only when it
+shows a gain on held-out rows (``val_dataset``, or an automatic split of a
+large enough golden set), and :attr:`OptimizationResult.improved` is ``True``
+only when that gain is significant -- with the delta, p-value, interval, row
+count and repeats recorded alongside it.
 """
 
 from __future__ import annotations
@@ -34,6 +49,8 @@ from __future__ import annotations
 import logging
 import random
 import time
+import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -47,6 +64,13 @@ from adapt_agent.optimization.proposers import (
     Proposer,
     default_proposers,
     proposers_for,
+)
+from adapt_agent.optimization.significance import (
+    PairedComparison,
+    compare_rows,
+    mean_rows,
+    row_scores,
+    rows_differ,
 )
 from adapt_agent.optimization.target import OptimizableAgent, wrap
 
@@ -67,6 +91,17 @@ class Trial:
     complete: bool = True
     #: How many rows were dropped for transient failures.
     n_transient_errors: int = 0
+    #: Mean per-row delta against the incumbent this trial was compared with
+    #: (``None`` when no per-row comparison was possible).
+    delta: float | None = None
+    #: One-sided p-value of that paired comparison.
+    p_value: float | None = None
+    #: Whether the paired comparison was significant (``None``: not assessed).
+    significant: bool | None = None
+    #: Rows the paired comparison covered.
+    n_rows: int = 0
+    #: Measurements of this configuration averaged into :attr:`score`.
+    repeats: int = 1
 
 
 #: Reserved top-level name: the exported file's own metadata block. A tuned
@@ -92,11 +127,13 @@ class OptimizationResult:
         validation_baseline_score: Score of the *untuned* agent on the same
             held-out set, when it was measured (the validation gate needs it).
         validation_rejected: ``True`` when the search found a configuration
-            that beat the baseline on the training data but scored worse than
+            that beat the baseline on the training data but showed no gain over
             the baseline on the held-out set, so it was **not** applied. In
             that case ``best_config`` is empty, the agent is left as it was,
             and the discarded configuration is in ``rejected_config``.
-        rejected_config: The configuration the validation gate discarded.
+        rejected_config: The configuration the final verdict discarded (on
+            held-out data, or as not significant on the training rows; see
+            ``rejected_reason``).
         recommendations: Advisory, human-readable suggestions gathered during the
             run (e.g. new tools/skills the judge proposes). These are never applied
             automatically -- the optimizer only *selects* among existing tools.
@@ -137,10 +174,50 @@ class OptimizationResult:
     validation_rejected: bool = False
     #: What the gate discarded -- kept for inspection, never applied.
     rejected_config: dict[str, Any] = field(default_factory=dict)
+    #: Whether the gain of ``best_config`` over the untuned agent passed the
+    #: paired significance test (see :mod:`adapt_agent.optimization.significance`).
+    #: ``None`` only on a hand-built result that carries no such evidence; a
+    #: run always sets it. When ``False`` the result is not an improvement,
+    #: whatever the two means say.
+    significant: bool | None = None
+    #: Mean per-row delta behind that verdict (tuned minus untuned).
+    delta: float | None = None
+    #: One-sided p-value of the paired test.
+    p_value: float | None = None
+    #: Two-sided ``1 - alpha`` interval for :attr:`delta` (bootstrap).
+    ci_low: float | None = None
+    ci_high: float | None = None
+    #: Rows the verdict was measured on.
+    n_rows: int = 0
+    #: Measurements per configuration averaged into each row of the verdict.
+    repeats: int = 1
+    #: Significance level used.
+    alpha: float | None = None
+    #: Which rows the verdict was measured on: ``"held_out"`` (the
+    #: ``val_dataset``), ``"held_out_auto"`` (an automatic split of the golden
+    #: set), or ``"training"`` (the rows the search selected on, which flatters
+    #: the winner). Empty when nothing was compared.
+    significance_basis: str = ""
+    #: The target's per-row results changed between two runs of the same
+    #: configuration, so every comparison was re-measured ``repeats`` times.
+    nondeterministic: bool = False
+    #: Parameters in this optimizer's search space that no trial ever varied
+    #: (the budget ran out, or no candidate was produced). A warning names
+    #: them too; they were left exactly as they were.
+    untuned_parameters: list[str] = field(default_factory=list)
+    #: Why ``rejected_config`` was discarded, in one line ("" when nothing was).
+    rejected_reason: str = ""
 
     @property
     def improved(self) -> bool:
-        return self.best_score > self.baseline_score
+        """``True`` only for a significant gain over the untuned agent.
+
+        A hand-built result with no significance evidence (``significant is
+        None``) falls back to comparing the two scores.
+        """
+        if self.significant is None:
+            return self.best_score > self.baseline_score
+        return self.significant and self.best_score > self.baseline_score
 
     @property
     def improvement(self) -> float:
@@ -295,6 +372,10 @@ class OptimizationResult:
                         f"{'' if provenance['validation_complete'] else ' (PARTIAL)'} "
                         f"over {provenance['n_evals']} evals in "
                         f"{provenance['duration_seconds']:.1f}s.\n"
+                        f"# significant={provenance['significant']} "
+                        f"p={_fmt_p(provenance['p_value'])} n_rows={provenance['n_rows']} "
+                        f"repeats={provenance['repeats']} "
+                        f"basis={provenance['significance_basis'] or 'none'}.\n"
                         "# Review this diff before committing: prompts here were "
                         "machine-written.\n"
                     ) + text
@@ -316,6 +397,23 @@ class OptimizationResult:
             "validation_rejected": self.validation_rejected,
             "n_evals": self.n_evals,
             "duration_seconds": self.duration_seconds,
+            **self._significance_fields(),
+        }
+
+    def _significance_fields(self) -> dict[str, Any]:
+        return {
+            "significant": self.significant,
+            "delta": self.delta,
+            "p_value": self.p_value,
+            "ci_low": self.ci_low,
+            "ci_high": self.ci_high,
+            "n_rows": self.n_rows,
+            "repeats": self.repeats,
+            "alpha": self.alpha,
+            "significance_basis": self.significance_basis,
+            "nondeterministic": self.nondeterministic,
+            "untuned_parameters": list(self.untuned_parameters),
+            "rejected_reason": self.rejected_reason,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -332,26 +430,52 @@ class OptimizationResult:
             "duration_seconds": self.duration_seconds,
             "best_config": self.best_config,
             "recommendations": list(self.recommendations),
+            **self._significance_fields(),
         }
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        verdict = ""
+        if self.significant is not None:
+            verdict = (
+                f", significant={self.significant} (p={_fmt_p(self.p_value)}, n={self.n_rows})"
+            )
         return (
             f"OptimizationResult(baseline={self.baseline_score:.3f}, "
             f"best={self.best_score:.3f}, improvement={self.improvement:+.3f}, "
-            f"evals={self.n_evals}, duration={self.duration_seconds:.1f}s)"
+            f"evals={self.n_evals}, duration={self.duration_seconds:.1f}s{verdict})"
         )
 
 
 @dataclass
 class _ValidationGate:
-    """What the held-out pass found, and what was done about it."""
+    """The final verdict on the search's winner, and what was done about it."""
 
     score: float | None = None
     complete: bool = True
     baseline_score: float | None = None
+    #: The *held-out* check discarded the winner (``validation_rejected``).
     rejected: bool = False
     rejected_config: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    #: The paired comparison the verdict rests on, when one could be made.
+    comparison: PairedComparison | None = None
+    #: ``"held_out"``, ``"held_out_auto"``, ``"training"`` or ``""``.
+    basis: str = ""
+    #: The winner was discarded, by the held-out check *or* the training one.
+    discarded: bool = False
+    reason: str = ""
+    #: A verdict was reached (False only for a nested pipeline stage, whose
+    #: pipeline decides for it).
+    assessed: bool = True
+
+
+#: Default ``repeats`` once a target is found to be non-deterministic: enough
+#: to halve the per-row variance's effect on a comparison, and each one costs a
+#: pass over the dataset for both incumbent and challenger.
+DEFAULT_NONDETERMINISTIC_REPEATS = 3
+
+#: Sentinel for "attribute was absent" when a pipeline borrows a stage.
+_MISSING = object()
 
 
 class Optimizer:
@@ -359,13 +483,45 @@ class Optimizer:
 
     Args:
         harness: The :class:`EvaluationHarness` used to score configurations.
-        max_evals: Hard cap on candidate evaluations (budget guard).
-        seed: RNG seed for reproducible search.
-        min_improvement: Minimum primary-metric gain required to accept a
-            candidate over the current best. Defaults to ``1e-3``: small enough to
-            keep real gains, but large enough to avoid *chasing judge noise* -- an
-            LLM judge's score wobbles by far more than ``1e-9`` between runs, so a
-            near-zero threshold would "accept" candidates that only won by jitter.
+        max_evals: Hard cap on candidate evaluations (budget guard): the number
+            of trials, each a comparison of one candidate with the incumbent.
+            Must be at least 1. With ``repeats > 1`` a trial costs
+            ``2 * repeats`` passes over the dataset.
+        seed: RNG seed for reproducible search. The RNG is re-seeded at the
+            start of every ``optimize`` call, so one instance reused for
+            several runs proposes the same trials each time.
+        min_improvement: Minimum mean per-row gain (the *effect size*) a
+            candidate must show over the current best, on top of passing the
+            significance test. Defaults to ``1e-3``: small enough to keep real
+            gains, but large enough to avoid *chasing judge noise*.
+        alpha: Significance level of the paired test every acceptance rests on
+            (default ``0.05``). A candidate replaces the incumbent only if its
+            per-row deltas are unlikely under "the change does nothing"; see
+            :mod:`adapt_agent.optimization.significance`.
+        repeats: Measurements of each configuration per comparison, with the
+            incumbent and the challenger re-measured alternately on the same
+            rows. ``None`` (default) means 1 for a deterministic target and
+            :data:`DEFAULT_NONDETERMINISTIC_REPEATS` once the baseline is found
+            to be non-deterministic. Any value above 1 makes every measurement
+            a real re-run (the evaluation cache is bypassed).
+        detect_nondeterminism: Re-run the baseline once and compare per-row
+            results (default ``True``; one extra pass). A target whose rows
+            change between identical runs is measured with ``repeats`` and a
+            warning, rather than having its noise read as signal. Skipped when
+            ``repeats`` is given explicitly.
+        holdout_fraction: When no ``val_dataset`` is given, hold out this
+            fraction of the golden set for the final check (default ``0.25``)
+            -- but only when both parts keep at least ``min_holdout_rows`` rows;
+            a smaller set is searched whole and the result says so. ``0``
+            disables the automatic split.
+        min_holdout_rows: Rows each side of an automatic split must keep
+            (default 10).
+        allow_small_sample: A comparison over fewer rows than any outcome
+            could make significant (five at ``alpha=0.05``) cannot reach a
+            verdict. ``True`` (default) decides such comparisons on the point
+            estimate -- the agent can still be tuned on a toy set -- but the
+            result reports ``significant=False`` and ``improved=False`` and says
+            why. ``False`` accepts nothing that has not been shown significant.
         judge: Optional LLM judge made available to proposers.
         proposer_judge: A *separate* judge for the proposing side -- critiquing
             failures and rewriting prompts -- leaving ``judge`` (or whatever
@@ -378,22 +534,27 @@ class Optimizer:
             be the scoring judge, the run says so in
             ``OptimizationResult.recommendations`` -- and the validation gate
             cannot help, because the same judge scores the held-out set too.
-        validation_gate: When ``True`` (default) and ``optimize`` is given a
-            ``val_dataset``, the winning configuration is applied only if it
-            does not score worse than the untuned agent on that held-out set.
-            The search only ever sees the training data, and it is rewarded for
-            whatever raises that one number -- including a prompt that has
-            memorised the training rows, or one that scores better by dropping
-            an instruction the dataset happens not to exercise. The held-out
-            set is the one thing the search cannot have fitted, so it gets the
+        validation_gate: When ``True`` (default) and there is a held-out set
+            (``val_dataset``, or the automatic split), the winning
+            configuration is applied only if it shows a **gain** over the
+            untuned agent on those rows: significant under the paired test, or
+            -- on a held-out set too small for any outcome to be significant,
+            with ``allow_small_sample`` -- a positive point estimate. Not
+            scoring worse is not enough: a no-op that won the training search
+            by luck does not regress either. The search only ever sees the
+            training data, and is rewarded for whatever raises that one number
+            -- including a prompt that has memorised the training rows. The
+            held-out set is the one thing it cannot have fitted, so it gets the
             final say. A rejected run leaves the agent exactly as it was and
-            reports ``validation_rejected=True``. Costs one extra pass over
-            ``val_dataset`` (the baseline's). Without a ``val_dataset`` there
-            is nothing to gate on and the training winner is applied as before.
-        validation_tolerance: How far below the baseline's held-out score the
-            tuned configuration may fall before the gate rejects it. Defaults
-            to ``1e-3`` for the same reason as ``min_improvement``: a judge's
-            score is noisy, and a drop inside that noise is not a regression.
+            reports ``validation_rejected=True``. Rows lost to throttling in
+            either held-out pass drop out of *both* sides of the comparison.
+            ``False`` reports the held-out score without acting on it; the
+            training verdict then decides.
+        validation_tolerance: No longer used, and refused loudly (a
+            ``FutureWarning``) when given: the gate used to accept anything
+            within this distance of the baseline, which let a no-op through.
+            The held-out requirement is now a gain, sized by ``min_improvement``
+            and ``alpha``.
         cache_evaluations: Reuse the report of an already-measured
             configuration instead of re-running the agent over the dataset
             (default ``True``). The cache is keyed on this optimizer's
@@ -408,9 +569,9 @@ class Optimizer:
             stops costing a full-dataset pass. Only complete reports are
             reused, so the transient-failure machinery (baseline re-runs,
             incomplete-trial exclusion) is unaffected. Set ``False`` to
-            re-measure every configuration -- e.g. when agent outputs are
-            stochastic enough that you want repeated measurements of
-            identical configurations. A pipeline's own ``False`` also
+            re-measure every configuration. (A non-deterministic target does
+            not need this: its repeated measurements always bypass the cache;
+            see ``repeats``.) A pipeline's own ``False`` also
             suppresses caching in every stage for that run, even one left at
             its own default ``True``; a stage's own ``False`` inside a
             caching pipeline is still respected.
@@ -444,15 +605,58 @@ class Optimizer:
         cache_evaluations: bool = True,
         verbose: bool = False,
         validation_gate: bool = True,
-        validation_tolerance: float = 1e-3,
+        validation_tolerance: float | None = None,
         proposer_judge: Any = None,
+        alpha: float = 0.05,
+        repeats: int | None = None,
+        detect_nondeterminism: bool = True,
+        holdout_fraction: float = 0.25,
+        min_holdout_rows: int = 10,
+        allow_small_sample: bool = True,
     ):
+        _check_budget("max_evals", max_evals)
+        if not 0.0 < alpha < 1.0:
+            raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
+        if repeats is not None:
+            _check_budget("repeats", repeats)
+        if not 0.0 <= holdout_fraction < 1.0:
+            raise ValueError(f"holdout_fraction must be in [0, 1), got {holdout_fraction!r}")
+        _check_budget("min_holdout_rows", min_holdout_rows)
+        if min_improvement < 0:
+            raise ValueError(f"min_improvement must be >= 0, got {min_improvement!r}")
+        if validation_tolerance is not None:
+            # Accepting it silently would promise a behaviour that no longer
+            # exists: the gate now requires a held-out gain.
+            warnings.warn(
+                "validation_tolerance is no longer used: the validation gate now requires a "
+                "held-out gain (see min_improvement and alpha), not merely no regression.",
+                FutureWarning,
+                stacklevel=2,
+            )
         self.harness = harness
         self.max_evals = max_evals
         self.seed = seed
         self.min_improvement = min_improvement
         self.validation_gate = validation_gate
         self.validation_tolerance = validation_tolerance
+        self.alpha = alpha
+        self.repeats = repeats
+        self.detect_nondeterminism = detect_nondeterminism
+        self.holdout_fraction = holdout_fraction
+        self.min_holdout_rows = min_holdout_rows
+        self.allow_small_sample = allow_small_sample
+        # Per-run measurement mode, set by ``optimize`` (or a pipeline that
+        # owns this stage): whether the target is non-deterministic and how
+        # many measurements each comparison averages.
+        self._nondeterministic = False
+        self._repeats_eff = repeats if repeats is not None else 1
+        # Few-shot candidates' source rows: (parameter, repr(value)) -> row
+        # indices. A demonstration block is never scored on the rows it was
+        # copied from. Shared across a pipeline's stages.
+        self._demo_rows: dict[tuple[str, str], frozenset[int]] = {}
+        # True while a PipelineOptimizer runs this optimizer as a stage: the
+        # pipeline owns the split, the non-determinism check and the verdict.
+        self._nested = False
         self.judge = judge
         self.proposer_judge = proposer_judge
         self.suggest_tools = suggest_tools
@@ -490,16 +694,30 @@ class Optimizer:
         """Optimize ``agent`` against ``dataset`` and return the result.
 
         The best configuration is applied to the live agent before returning --
-        unless a ``val_dataset`` was given and that configuration scores worse
-        than the untuned agent on it, in which case nothing is applied (see
-        ``validation_gate``).
+        unless the final verdict discards it: no gain on the held-out set
+        (``val_dataset``, or an automatic split of ``dataset``; see
+        ``validation_gate``), or a gain that is not significant where enough
+        rows exist to tell. A discarded run leaves the agent exactly as it was.
         Extra kwargs (``runner``/``components``/``parameters``) are forwarded to
         :func:`~adapt_agent.optimization.target.wrap` when ``agent`` is not
         already an :class:`OptimizableAgent`.
+
+        Raises:
+            ValueError: If ``dataset`` is empty, or ``val_dataset`` is given but
+                empty (an empty held-out set would silently disable the gate).
         """
         target = wrap(agent, runner=runner, components=components, parameters=parameters)
         if not dataset:
             raise ValueError("Cannot optimize against an empty dataset")
+        nested = getattr(self, "_nested", False)
+        # Re-seeded per call: the same instance and seed must propose the same
+        # trials on its second run as on its first.
+        self._rng = random.Random(self.seed)
+        if nested:
+            train, holdout, auto = dataset, val_dataset, False
+        else:
+            self._demo_rows = {}
+            train, holdout, auto = self._resolve_holdout(dataset, val_dataset)
 
         # Own a fresh evaluation cache for this run -- unless one was injected
         # (a PipelineOptimizer sharing hits across its stages), which outlives
@@ -510,7 +728,12 @@ class Optimizer:
         self._run_started_at = time.perf_counter()
         try:
             baseline_snapshot = target.snapshot()
-            baseline_report = self._evaluate_baseline(target, dataset)
+            baseline_report = self._evaluate_baseline(target, train)
+            baseline_rows = row_scores(baseline_report)
+            if not nested:
+                baseline_rows = self._detect_nondeterminism(
+                    target, train, baseline_report, baseline_rows
+                )
             baseline_score = baseline_report.score
             if self.verbose:
                 logger.info(
@@ -531,40 +754,36 @@ class Optimizer:
                 best_report=baseline_report,
                 baseline_snapshot=baseline_snapshot,
                 history=[],
+                best_rows=baseline_rows,
             )
-            self._search(target, dataset, state)
+            self._search(target, train, state)
 
             # Apply the winning configuration permanently to the live agent.
             target.restore(baseline_snapshot)
             if state.best_config:
                 target.apply(state.best_config)
 
-            gate = self._gate_on_validation(
-                target, val_dataset, baseline_snapshot, state.best_config
-            )
-            if gate.rejected:
+            if nested:
+                # The owning pipeline judges the cumulative result once.
+                gate = _ValidationGate(assessed=False)
+            else:
+                gate = self._final_verdict(
+                    target, train, holdout, auto, baseline_snapshot, baseline_rows, state
+                )
+            if gate.discarded:
                 state.best_config = {}
                 state.best_score = baseline_score
                 state.best_report = baseline_report
 
+            untuned = self._untuned(self._tunable_names(target), state.history, baseline_snapshot)
             recommendations = list(self._recommendations)
             recommendations.extend(gate.notes)
+            if untuned and not nested:
+                recommendations.append(self._warn_untuned(untuned))
             recommendations.extend(self._suggest_tools(target, state))
 
-            result = OptimizationResult(
-                best_config=state.best_config,
-                best_score=state.best_score,
-                baseline_score=baseline_score,
-                baseline_config=baseline_snapshot,
-                history=state.history,
-                best_report=state.best_report,
-                validation_score=gate.score,
-                validation_complete=gate.complete,
-                recommendations=recommendations,
-                duration_seconds=time.perf_counter() - self._run_started_at,
-                validation_baseline_score=gate.baseline_score,
-                validation_rejected=gate.rejected,
-                rejected_config=gate.rejected_config,
+            result = self._build_result(
+                state, baseline_score, baseline_snapshot, gate, recommendations, untuned
             )
             if self.verbose:
                 logger.info("[%s] %r", self.strategy_name, result)
@@ -572,6 +791,485 @@ class Optimizer:
         finally:
             if owns_cache:
                 self._eval_cache = None
+
+    def _build_result(
+        self,
+        state: _SearchState,
+        baseline_score: float,
+        baseline_snapshot: dict[str, Any],
+        gate: _ValidationGate,
+        recommendations: list[str],
+        untuned: list[str],
+    ) -> OptimizationResult:
+        """Assemble the result, carrying the verdict's evidence alongside the scores."""
+        comparison = gate.comparison
+        significant: bool | None = None
+        if gate.assessed:
+            significant = bool(comparison is not None and comparison.significant)
+            if gate.discarded:
+                significant = False
+        return OptimizationResult(
+            best_config=state.best_config,
+            best_score=state.best_score,
+            baseline_score=baseline_score,
+            baseline_config=baseline_snapshot,
+            history=state.history,
+            best_report=state.best_report,
+            validation_score=gate.score,
+            validation_complete=gate.complete,
+            recommendations=recommendations,
+            duration_seconds=time.perf_counter() - self._run_started_at,
+            validation_baseline_score=gate.baseline_score,
+            validation_rejected=gate.rejected,
+            rejected_config=gate.rejected_config,
+            significant=significant,
+            delta=comparison.delta if comparison is not None else None,
+            p_value=comparison.p_value if comparison is not None else None,
+            ci_low=comparison.ci_low if comparison is not None else None,
+            ci_high=comparison.ci_high if comparison is not None else None,
+            n_rows=comparison.n_rows if comparison is not None else 0,
+            repeats=self._repeats(),
+            alpha=self.alpha,
+            significance_basis=gate.basis,
+            nondeterministic=self._nondeterministic,
+            untuned_parameters=list(untuned),
+            rejected_reason=gate.reason,
+        )
+
+    # -- measurement mode --------------------------------------------------------
+
+    def _resolve_holdout(
+        self, dataset: GoldenDataset, val_dataset: GoldenDataset | None
+    ) -> tuple[GoldenDataset, GoldenDataset | None, bool]:
+        """Return ``(train, holdout, automatic)`` for this run.
+
+        An explicit but empty ``val_dataset`` is an error rather than "no
+        validation": treating it as absent would switch the gate off without a
+        word, and the caller plainly meant to have one.
+        """
+        if val_dataset is not None:
+            if len(val_dataset) == 0:
+                raise ValueError(
+                    "val_dataset is empty, so the validation gate could not check anything. "
+                    "Pass val_dataset=None to optimize without one."
+                )
+            return dataset, val_dataset, False
+        fraction = self.holdout_fraction
+        if fraction <= 0:
+            return dataset, None, False
+        n_holdout = int(round(len(dataset) * fraction))
+        floor = self.min_holdout_rows
+        if n_holdout < floor or len(dataset) - n_holdout < floor:
+            return dataset, None, False
+        train, holdout = dataset.split(1.0 - fraction, seed=self._stat_seed)
+        logger.info(
+            "[%s] no val_dataset given: holding out %d of %d rows for the final check",
+            self.strategy_name,
+            len(holdout),
+            len(dataset),
+        )
+        return train, holdout, True
+
+    def _detect_nondeterminism(
+        self,
+        target: OptimizableAgent,
+        dataset: GoldenDataset,
+        baseline_report: EvaluationReport,
+        baseline_rows: list[float | None] | None,
+    ) -> list[float | None] | None:
+        """Re-run the baseline once; if rows change, measure everything repeatedly.
+
+        One measurement of a non-deterministic target is a sample, not a
+        score: comparing one sample per configuration is how a knob with no
+        effect at all came out "better" most of the time. Returns the baseline
+        rows to seed the search with (averaged over both runs when they
+        differed).
+        """
+        self._nondeterministic = False
+        if self.repeats is not None:
+            self._repeats_eff = self.repeats
+            return baseline_rows
+        self._repeats_eff = 1
+        if not self.detect_nondeterminism or baseline_rows is None:
+            return baseline_rows
+        again = self.harness.evaluate(target, dataset)
+        again_rows = row_scores(again)
+        if again_rows is None or not rows_differ(baseline_rows, again_rows):
+            return baseline_rows
+        changed = sum(
+            1
+            for a, b in zip(baseline_rows, again_rows, strict=False)
+            if a is not None and b is not None and a != b
+        )
+        self._nondeterministic = True
+        self._repeats_eff = DEFAULT_NONDETERMINISTIC_REPEATS
+        logger.warning(
+            "[%s] the target is non-deterministic: %d of %d rows scored differently on a "
+            "second run of the unchanged baseline. Every comparison is now measured %d "
+            "times per configuration (incumbent and challenger alternately); set repeats= "
+            "to choose the count.",
+            self.strategy_name,
+            changed,
+            len(baseline_rows),
+            self._repeats_eff,
+        )
+        return mean_rows([baseline_rows, again_rows])
+
+    def _repeats(self) -> int:
+        return max(1, int(getattr(self, "_repeats_eff", 1) or 1))
+
+    def _fresh_measurements(self) -> bool:
+        """Whether each measurement must be a real re-run (never a cache hit)."""
+        return bool(getattr(self, "_nondeterministic", False)) or self._repeats() > 1
+
+    @property
+    def _stat_seed(self) -> int:
+        """Seed for resampling in the significance test and the automatic split.
+
+        Fixed, and separate from the search RNG, so testing a candidate never
+        perturbs which candidates are proposed next.
+        """
+        seed = getattr(self, "seed", 0)
+        return seed if isinstance(seed, int) else 0
+
+    def _passes(self, comparison: PairedComparison) -> bool:
+        """The acceptance rule: a large enough gain that chance does not explain.
+
+        Below the row count at which any outcome could be significant the test
+        cannot decide; ``allow_small_sample`` then falls back to the point
+        estimate (and the result reports the gain as unproven).
+        """
+        if comparison.delta <= getattr(self, "min_improvement", 0.0):
+            return False
+        if comparison.decidable:
+            return comparison.significant
+        return bool(getattr(self, "allow_small_sample", True))
+
+    def _compare(
+        self,
+        incumbent: Sequence[float | None] | None,
+        challenger: Sequence[float | None] | None,
+        *,
+        exclude: frozenset[int] = frozenset(),
+        repeats: int = 1,
+        interval: bool = False,
+    ) -> PairedComparison | None:
+        if incumbent is None or challenger is None or len(incumbent) != len(challenger):
+            return None
+        return compare_rows(
+            incumbent,
+            challenger,
+            alpha=getattr(self, "alpha", 0.05),
+            min_effect=getattr(self, "min_improvement", 0.0),
+            exclude=exclude,
+            repeats=repeats,
+            interval=interval,
+            seed=self._stat_seed,
+        )
+
+    def _excluded_rows(self, *states: dict[str, Any]) -> frozenset[int]:
+        """Rows any few-shot block in these live states was built from.
+
+        A demonstration copied from a row answers that row; scoring the block
+        there measures the copy, not the agent. Rows excluded for either side
+        are left out of both, so the comparison stays paired.
+        """
+        registry: dict[tuple[str, str], frozenset[int]] = getattr(self, "_demo_rows", {})
+        if not registry:
+            return frozenset()
+        rows: set[int] = set()
+        for state in states:
+            for name, value in state.items():
+                found = registry.get((name, _value_key(value)))
+                if found:
+                    rows.update(found)
+        return frozenset(rows)
+
+    def _register_demo_rows(self, param: Parameter, ctx: ProposalContext) -> None:
+        """Record which rows each proposed few-shot block was copied from."""
+        demo_rows = getattr(ctx, "demo_rows", None)
+        if not demo_rows:
+            return
+        registry = getattr(self, "_demo_rows", None)
+        if registry is None:
+            registry = self._demo_rows = {}
+        for value, rows in demo_rows.items():
+            registry[(param.name, _value_key(value))] = frozenset(rows)
+
+    def _measure_config(
+        self,
+        target: OptimizableAgent,
+        snapshot: dict[str, Any],
+        config: dict[str, Any],
+        dataset: GoldenDataset,
+    ) -> EvaluationReport:
+        """A fresh, uncached pass of ``snapshot`` + ``config`` (re-run once if throttled)."""
+        target.restore(snapshot)
+        if config:
+            target.apply(config)
+        return self._evaluate_validation(target, dataset)
+
+    def _paired_passes(
+        self,
+        target: OptimizableAgent,
+        snapshot: dict[str, Any],
+        config: dict[str, Any],
+        dataset: GoldenDataset,
+    ) -> tuple[list[EvaluationReport], list[EvaluationReport]]:
+        """Measure ``config`` and the untuned agent alternately, ``repeats`` times each.
+
+        Alternating -- tuned, untuned, tuned, ... -- rather than all of one and
+        then all of the other keeps a drifting provider (load, a model update
+        mid-run) from landing on one side of the comparison. Leaves the target
+        at the untuned snapshot.
+        """
+        tuned: list[EvaluationReport] = []
+        untuned: list[EvaluationReport] = []
+        for _ in range(self._repeats()):
+            tuned.append(self._measure_config(target, snapshot, config, dataset))
+            untuned.append(self._measure_config(target, snapshot, {}, dataset))
+        target.restore(snapshot)
+        return tuned, untuned
+
+    @staticmethod
+    def _rows_of(reports: Sequence[EvaluationReport]) -> list[float | None] | None:
+        rows = [row_scores(r) for r in reports]
+        present = [r for r in rows if r is not None]
+        if not rows or len(present) != len(rows):
+            return None
+        return mean_rows(present)
+
+    # -- final verdict -----------------------------------------------------------
+
+    def _final_verdict(
+        self,
+        target: OptimizableAgent,
+        train: GoldenDataset,
+        holdout: GoldenDataset | None,
+        automatic: bool,
+        baseline_snapshot: dict[str, Any],
+        baseline_rows: list[float | None] | None,
+        state: _SearchState,
+    ) -> _ValidationGate:
+        """Decide whether the search's winner is applied, and how sure that is.
+
+        On entry the live ``target`` carries ``state.best_config``; on exit it
+        carries it if the verdict passed and the baseline if it did not.
+
+        With a held-out set (and the gate on) the winner needs a held-out
+        **gain**. Otherwise it is judged on the training rows -- re-measured
+        afresh for a non-deterministic target, since the search's own
+        measurements of the winner are the lucky draws that made it win.
+        """
+        basis = "held_out_auto" if automatic else "held_out"
+        if holdout is not None and not state.best_config:
+            # Nothing was tuned: the agent *is* the baseline, measured once.
+            tuned = self._evaluate_validation(target, holdout)
+            return _ValidationGate(
+                score=tuned.score,
+                complete=tuned.is_complete,
+                baseline_score=tuned.score,
+                basis=basis,
+            )
+        if not state.best_config:
+            return _ValidationGate(basis="")
+        if holdout is not None and self.validation_gate:
+            return self._held_out_verdict(
+                target, holdout, baseline_snapshot, state.best_config, basis
+            )
+        gate = self._training_verdict(target, train, baseline_snapshot, baseline_rows, state)
+        if holdout is not None:
+            # The gate is off: the held-out score is reported, not acted on.
+            # Measured on whatever the training verdict left applied.
+            tuned = self._evaluate_validation(target, holdout)
+            gate.score = tuned.score
+            gate.complete = tuned.is_complete
+        return gate
+
+    def _held_out_verdict(
+        self,
+        target: OptimizableAgent,
+        holdout: GoldenDataset,
+        baseline_snapshot: dict[str, Any],
+        best_config: dict[str, Any],
+        basis: str,
+    ) -> _ValidationGate:
+        """Apply the winner only if it gains on rows the search never saw.
+
+        Both sides are compared on the rows *both* passes scored, so a row
+        throttled in one pass drops out of the other too and a partial pass is
+        still a like-for-like comparison. If no row survives, there is no
+        evidence of a gain and the winner is not applied.
+        """
+        tuned_reports, base_reports = self._paired_passes(
+            target, baseline_snapshot, best_config, holdout
+        )
+        tuned_score = _mean_score(tuned_reports)
+        base_score = _mean_score(base_reports)
+        base_complete = all(r.is_complete for r in base_reports)
+        complete = base_complete and all(r.is_complete for r in tuned_reports)
+        comparison = self._compare(
+            self._rows_of(base_reports),
+            self._rows_of(tuned_reports),
+            repeats=self._repeats(),
+            interval=True,
+        )
+        if comparison is None:
+            # The harness kept fewer records than rows: no per-row evidence.
+            # Only a complete pair of means is comparable at all.
+            held_out_gain = complete and tuned_score - base_score > self.min_improvement
+        else:
+            held_out_gain = self._passes(comparison)
+        if not held_out_gain:
+            # Leave the baseline applied: the agent is exactly as it was given.
+            evidence = comparison.describe() if comparison is not None else "no per-row results"
+            note = (
+                f"Validation gate: the tuned configuration scored {tuned_score:.4f} on the "
+                f"held-out set against {base_score:.4f} for the untuned agent ({evidence}). "
+                "A held-out gain is required, so it was NOT applied. The gain on the "
+                "training data did not generalise; add rows or review "
+                "OptimizationResult.rejected_config by hand."
+            )
+            logger.warning("[%s] %s", self.strategy_name, note)
+            return _ValidationGate(
+                score=base_score,
+                complete=base_complete,
+                baseline_score=base_score if base_complete else None,
+                rejected=True,
+                rejected_config=dict(best_config),
+                notes=[note],
+                comparison=comparison,
+                basis=basis,
+                discarded=True,
+                reason="no gain on the held-out set",
+            )
+        target.restore(baseline_snapshot)
+        target.apply(best_config)
+        notes = self._verdict_notes(comparison, basis)
+        return _ValidationGate(
+            score=tuned_score,
+            complete=complete,
+            baseline_score=base_score if base_complete else None,
+            comparison=comparison,
+            basis=basis,
+            notes=notes,
+        )
+
+    def _training_verdict(
+        self,
+        target: OptimizableAgent,
+        train: GoldenDataset,
+        baseline_snapshot: dict[str, Any],
+        baseline_rows: list[float | None] | None,
+        state: _SearchState,
+    ) -> _ValidationGate:
+        """Judge the winner on the training rows, when there is no held-out set."""
+        exclude = self._excluded_rows(_compose(baseline_snapshot, state.best_config))
+        if self._fresh_measurements():
+            tuned_reports, base_reports = self._paired_passes(
+                target, baseline_snapshot, state.best_config, train
+            )
+            incumbent = self._rows_of(base_reports)
+            challenger = self._rows_of(tuned_reports)
+        else:
+            incumbent = baseline_rows
+            challenger = state.best_rows
+            if challenger is None:
+                challenger = row_scores(state.best_report)
+        comparison = self._compare(
+            incumbent, challenger, exclude=exclude, repeats=self._repeats(), interval=True
+        )
+        if comparison is not None and not self._passes(comparison):
+            target.restore(baseline_snapshot)
+            note = (
+                f"Significance: the best configuration found is not a significant gain over "
+                f"the untuned agent ({comparison.describe()}), so it was NOT applied. Add "
+                "rows, or raise repeats for a noisy target."
+            )
+            logger.warning("[%s] %s", self.strategy_name, note)
+            return _ValidationGate(
+                rejected_config=dict(state.best_config),
+                notes=[note],
+                comparison=comparison,
+                basis="training",
+                discarded=True,
+                reason="gain not significant",
+            )
+        target.restore(baseline_snapshot)
+        target.apply(state.best_config)
+        notes = self._verdict_notes(comparison, "training")
+        if comparison is None:
+            notes.append(
+                "Significance could not be assessed: the harness stored fewer per-row "
+                "results than rows were run (raise EvaluationHarness max_results)."
+            )
+        return _ValidationGate(comparison=comparison, basis="training", notes=notes)
+
+    def _verdict_notes(self, comparison: PairedComparison | None, basis: str) -> list[str]:
+        """What an applied-but-unproven or selection-biased verdict needs to say."""
+        if comparison is None:
+            return []
+        notes: list[str] = []
+        if not comparison.decidable:
+            notes.append(
+                f"Small sample: {comparison.describe()}. The configuration was applied on "
+                "its point estimate, but the gain is unproven (significant=False, "
+                "improved=False) until it holds on more rows."
+            )
+        elif basis == "training" and comparison.significant:
+            split_hint = ""
+            if self.holdout_fraction > 0:
+                split_hint = (
+                    f" (or give the golden set at least {self._rows_for_auto_holdout()} rows "
+                    "for an automatic hold-out)"
+                )
+            notes.append(
+                "Significance was measured on the training rows the search selected on, "
+                f"which flatters the winner. Pass a val_dataset{split_hint} for an unbiased "
+                "check."
+            )
+        return notes
+
+    def _rows_for_auto_holdout(self) -> int:
+        """The smallest golden set :meth:`_resolve_holdout` would split."""
+        n = self.min_holdout_rows
+        while True:
+            held = int(round(n * self.holdout_fraction))
+            if held >= self.min_holdout_rows and n - held >= self.min_holdout_rows:
+                return n
+            n += 1
+
+    def _tunable_names(self, target: OptimizableAgent) -> list[str]:
+        """Parameters this strategy could vary: those with more than one value."""
+        names: list[str] = []
+        for param in target.search_space.optimizable():
+            try:
+                options = param.enumerate_candidates()
+            except Exception:
+                continue
+            if len(options) > 1:
+                names.append(param.name)
+        return names
+
+    @staticmethod
+    def _untuned(names: list[str], history: list[Trial], snapshot: dict[str, Any]) -> list[str]:
+        """Which of ``names`` no trial ever moved away from its starting value."""
+        return [
+            name
+            for name in names
+            if not any(
+                name in t.config and not _same(t.config[name], snapshot.get(name)) for t in history
+            )
+        ]
+
+    def _warn_untuned(self, untuned: list[str]) -> str:
+        note = (
+            f"Not tuned: {', '.join(untuned)} received zero evaluations (the budget ran out "
+            "or no candidate was proposed) and were left as they were. Raise max_evals or "
+            "narrow the search space."
+        )
+        logger.warning("[%s] %s", self.strategy_name, note)
+        return note
 
     # -- strategy hook ---------------------------------------------------------
 
@@ -584,7 +1282,12 @@ class Optimizer:
     # -- shared helpers --------------------------------------------------------
 
     def _eval_config(
-        self, target: OptimizableAgent, config: dict[str, Any], dataset: GoldenDataset
+        self,
+        target: OptimizableAgent,
+        config: dict[str, Any],
+        dataset: GoldenDataset,
+        *,
+        fresh: bool = False,
     ) -> EvaluationReport:
         """Evaluate a *full* config relative to the baseline snapshot.
 
@@ -594,16 +1297,73 @@ class Optimizer:
         dataset, the recorded report is returned without re-running the agent
         -- the restore/apply still happens, so live-state side effects (what
         proposers read off the components) are identical either way.
+
+        ``fresh=True`` always re-runs and never stores: a repeated measurement
+        of a non-deterministic target is only a measurement if it is a new
+        draw, and a cached one would make every "repeat" the same sample.
         """
         target.restore(self._current_baseline)
         if config:
             target.apply(config)
+        if fresh:
+            return self.harness.evaluate(target, dataset)
         cached = self._cached_report(target, dataset)
         if cached is not None:
             return cached
         report = self.harness.evaluate(target, dataset)
         self._store_report(target, dataset, report)
         return report
+
+    def _trial(
+        self,
+        target: OptimizableAgent,
+        state: _SearchState,
+        config: dict[str, Any],
+        dataset: GoldenDataset,
+    ) -> tuple[bool, float]:
+        """Measure ``config`` against the incumbent, record the trial.
+
+        Deterministic target: one (cacheable) measurement of the challenger,
+        compared row by row with the incumbent's recorded rows. Otherwise both
+        are re-measured ``repeats`` times, alternately, on the same rows -- a
+        fresh incumbent each time, so one lucky-low incumbent measurement
+        cannot make every later challenger look good.
+
+        Returns ``(accepted, rank_score)``; the rank score is the challenger's
+        mean over the rows it was compared on (its own demonstration rows
+        left out), for strategies that rank a population.
+        """
+        exclude = self._excluded_rows(
+            _compose(self._current_baseline, config),
+            _compose(self._current_baseline, state.best_config),
+        )
+        repeats = self._repeats()
+        if self._fresh_measurements():
+            incumbent_reports: list[EvaluationReport] = []
+            reports: list[EvaluationReport] = []
+            for _ in range(repeats):
+                incumbent_reports.append(
+                    self._eval_config(target, state.best_config, dataset, fresh=True)
+                )
+                reports.append(self._eval_config(target, config, dataset, fresh=True))
+            incumbent = self._rows_of(incumbent_reports)
+            challenger = self._rows_of(reports)
+        else:
+            reports = [self._eval_config(target, config, dataset)]
+            incumbent = getattr(state, "best_rows", None)
+            if incumbent is None:
+                incumbent = row_scores(state.best_report)
+            challenger = row_scores(reports[0])
+        comparison = self._compare(incumbent, challenger, exclude=exclude, repeats=repeats)
+        accepted = self._record(
+            state, config, reports[-1], comparison=comparison, rows=challenger, reports=reports
+        )
+        rank = _mean_score(reports)
+        if challenger is not None:
+            kept = [v for i, v in enumerate(challenger) if v is not None and i not in exclude]
+            if kept:
+                rank = sum(kept) / len(kept)
+        return accepted, rank
 
     # -- evaluation cache ------------------------------------------------------
 
@@ -766,62 +1526,6 @@ class Optimizer:
             logger.warning("[%s] %s", self.strategy_name, note)
         return [note]
 
-    def _gate_on_validation(
-        self,
-        target: OptimizableAgent,
-        val_dataset: GoldenDataset | None,
-        baseline_snapshot: dict[str, Any],
-        best_config: dict[str, Any],
-    ) -> _ValidationGate:
-        """Score the winner on held-out data and un-apply it if it regressed.
-
-        On entry the live ``target`` carries ``best_config``. On exit it carries
-        ``best_config`` if the gate passed and the baseline if it did not.
-
-        The gate only *rejects* on a comparison it can trust: both held-out
-        passes complete. A partial pass is a mean over whichever rows survived
-        throttling, and two such means are not over the same rows -- so an
-        incomplete validation is reported (``complete=False``) rather than
-        acted on, exactly as before the gate existed.
-        """
-        if not val_dataset:
-            return _ValidationGate()
-        tuned = self._evaluate_validation(target, val_dataset)
-        if not best_config:
-            # Nothing was tuned: the agent *is* the baseline, measured once.
-            return _ValidationGate(
-                score=tuned.score, complete=tuned.is_complete, baseline_score=tuned.score
-            )
-        if not self.validation_gate:
-            return _ValidationGate(score=tuned.score, complete=tuned.is_complete)
-
-        target.restore(baseline_snapshot)
-        baseline = self._evaluate_validation(target, val_dataset)
-        comparable = tuned.is_complete and baseline.is_complete
-        if comparable and tuned.score < baseline.score - self.validation_tolerance:
-            # Leave the baseline applied: the agent is exactly as it was given.
-            note = (
-                f"Validation gate: the tuned configuration scored {tuned.score:.4f} on the "
-                f"held-out set against {baseline.score:.4f} for the untuned agent, so it was "
-                "NOT applied. The gain on the training data did not generalise; add training "
-                "rows or review OptimizationResult.rejected_config by hand."
-            )
-            logger.warning("[%s] %s", self.strategy_name, note)
-            return _ValidationGate(
-                score=baseline.score,
-                complete=True,
-                baseline_score=baseline.score,
-                rejected=True,
-                rejected_config=dict(best_config),
-                notes=[note],
-            )
-        target.apply(best_config)
-        return _ValidationGate(
-            score=tuned.score,
-            complete=comparable,
-            baseline_score=baseline.score if baseline.is_complete else None,
-        )
-
     def _evaluate_validation(
         self, target: OptimizableAgent, dataset: GoldenDataset
     ) -> EvaluationReport:
@@ -863,8 +1567,18 @@ class Optimizer:
         state: _SearchState,
         config: dict[str, Any],
         report: EvaluationReport,
+        *,
+        comparison: PairedComparison | None = None,
+        rows: list[float | None] | None = None,
+        reports: Sequence[EvaluationReport] | None = None,
     ) -> bool:
         """Record a trial and update the best-so-far. Returns True if accepted.
+
+        Acceptance is a statistical decision on the per-row deltas between the
+        challenger and the incumbent (:meth:`_passes`), never a comparison of
+        two means. ``comparison`` is computed here from the two reports when
+        the caller has not already made it; only when neither side has per-row
+        results (a report built by hand) does the mean comparison remain.
 
         An *incomplete* trial can never be accepted, however well it scored.
         Transient failures drop rows from the score, so an incomplete trial's
@@ -875,16 +1589,34 @@ class Optimizer:
         partial trial stops it from *rewarding* one. Both are needed, or the
         search still selects for luck, just in the opposite direction.
         """
-        complete = report.is_complete
-        accepted = complete and report.score > state.best_score + self.min_improvement
+        measured = list(reports) if reports else [report]
+        complete = all(r.is_complete for r in measured)
+        score = _mean_score(measured)
+        if comparison is None:
+            incumbent = getattr(state, "best_rows", None)
+            if incumbent is None:
+                incumbent = row_scores(state.best_report)
+            if rows is None:
+                rows = row_scores(report)
+            comparison = self._compare(incumbent, rows)
+        if comparison is None:
+            gain = score > state.best_score + self.min_improvement
+        else:
+            gain = self._passes(comparison)
+        accepted = complete and gain
         trial = Trial(
             config=dict(config),
-            score=report.score,
+            score=score,
             strategy=self.strategy_name,
             accepted=accepted,
-            metrics=dict(report.aggregate),
+            metrics=_mean_aggregate(measured),
             complete=complete,
-            n_transient_errors=report.n_transient_errors,
+            n_transient_errors=sum(r.n_transient_errors for r in measured),
+            delta=comparison.delta if comparison is not None else None,
+            p_value=comparison.p_value if comparison is not None else None,
+            significant=comparison.significant if comparison is not None else None,
+            n_rows=comparison.n_rows if comparison is not None else 0,
+            repeats=len(measured),
         )
         if not complete:
             logger.warning(
@@ -900,8 +1632,9 @@ class Optimizer:
         state.history.append(trial)
         if accepted:
             state.best_config = dict(config)
-            state.best_score = report.score
+            state.best_score = score
             state.best_report = report
+            state.best_rows = rows if rows is not None else row_scores(report)
         if self.verbose:
             # Position out of the run's budget plus wall-clock elapsed time --
             # not just the score -- so a long run distinguishes "still
@@ -911,7 +1644,7 @@ class Optimizer:
                 self.strategy_name,
                 len(state.history),
                 self.max_evals,
-                report.score,
+                score,
                 "ACCEPT" if accepted else "",
                 time.perf_counter() - self._run_started_at,
             )
@@ -1019,6 +1752,9 @@ class _SearchState:
     best_report: EvaluationReport | None
     baseline_snapshot: dict[str, Any]
     history: list[Trial]
+    #: Per-row scores of the current best (averaged over repeats when there
+    #: were any); ``None`` when unknown, and then derived from ``best_report``.
+    best_rows: list[float | None] | None = None
 
 
 # A tiny helper so strategies can set the baseline snapshot on the optimizer.
@@ -1027,7 +1763,16 @@ def _bind_baseline(opt: Optimizer, snapshot: dict[str, Any]) -> None:
 
 
 class GridSearchOptimizer(Optimizer):
-    """Exhaustively evaluate the Cartesian product of discrete candidate sets."""
+    """Evaluate the Cartesian product of discrete candidate sets.
+
+    When the full product fits the budget (``min(max_configs, max_evals)``) it
+    is searched exhaustively. When it does not, truncating the product would
+    try only the first few values of the first knob and never move the others
+    -- so the search falls back to sweeping each knob in turn, holding the
+    rest at the best found so far, with the budget shared fairly between
+    knobs. Any knob that still received no evaluation is named in a warning
+    and on :attr:`OptimizationResult.untuned_parameters`.
+    """
 
     strategy_name = "grid"
 
@@ -1040,27 +1785,106 @@ class GridSearchOptimizer(Optimizer):
         **kw: Any,
     ):
         super().__init__(harness, **kw)
+        _check_budget("numeric_points", numeric_points)
+        _check_budget("max_configs", max_configs)
         self.numeric_points = numeric_points
         self.max_configs = max_configs
+
+    def _knobs(self, target: OptimizableAgent) -> list[tuple[str, list[Any]]]:
+        knobs: list[tuple[str, list[Any]]] = []
+        for param in target.search_space.optimizable():
+            options = param.enumerate_candidates(numeric_points=self.numeric_points)
+            if len(options) > 1:
+                knobs.append((param.name, options))
+        return knobs
+
+    def _tunable_names(self, target: OptimizableAgent) -> list[str]:
+        return [name for name, _ in self._knobs(target)]
 
     def _search(
         self, target: OptimizableAgent, dataset: GoldenDataset, state: _SearchState
     ) -> None:
         _bind_baseline(self, state.baseline_snapshot)
-        configs = target.search_space.grid(
-            numeric_points=self.numeric_points, max_configs=self.max_configs
+        knobs = self._knobs(target)
+        if not knobs:
+            return
+        size = 1
+        for _, options in knobs:
+            size *= len(options)
+        if size <= min(self.max_configs, self.max_evals):
+            configs = target.search_space.grid(
+                numeric_points=self.numeric_points, max_configs=self.max_configs
+            )
+            for config in configs:
+                if len(state.history) >= self.max_evals:
+                    return
+                if not config:
+                    continue
+                self._trial(target, state, config, dataset)
+            return
+        logger.info(
+            "[%s] the full grid has %d configurations but the budget allows %d; sweeping "
+            "each of the %d knobs in turn instead, so none is skipped",
+            self.strategy_name,
+            size,
+            min(self.max_configs, self.max_evals),
+            len(knobs),
         )
-        for config in configs[: self.max_evals]:
-            if not config:
-                continue
-            report = self._eval_config(target, config, dataset)
-            self._record(state, config, report)
+        self._sweep(target, dataset, state, knobs)
+
+    def _sweep(
+        self,
+        target: OptimizableAgent,
+        dataset: GoldenDataset,
+        state: _SearchState,
+        knobs: list[tuple[str, list[Any]]],
+    ) -> None:
+        """Coordinate sweep over ``knobs`` within the budget.
+
+        The first pass gives every knob a fair share of what is left (values
+        spread evenly across its range when the share is smaller than its
+        candidate list); later passes spend any remainder on untried values.
+        """
+        pending = {
+            name: [o for o in options if not _same(o, state.baseline_snapshot.get(name))]
+            for name, options in knobs
+        }
+        order = [name for name, _ in knobs]
+        first_pass = True
+        while any(pending.values()):
+            for position, name in enumerate(order):
+                queue = pending[name]
+                remaining = self.max_evals - len(state.history)
+                if remaining <= 0:
+                    return
+                if not queue:
+                    continue
+                if first_pass:
+                    knobs_left = sum(1 for n in order[position:] if pending[n])
+                    chosen = _spread(len(queue), max(1, remaining // knobs_left))
+                else:
+                    chosen = list(range(len(queue)))
+                for index in chosen:
+                    if len(state.history) >= self.max_evals:
+                        return
+                    config = dict(state.best_config)
+                    config[name] = queue[index]
+                    self._trial(target, state, config, dataset)
+                pending[name] = [v for i, v in enumerate(queue) if i not in set(chosen)]
+            first_pass = False
 
 
 class RandomSearchOptimizer(Optimizer):
     """Sample random whole-space configurations and keep the best."""
 
     strategy_name = "random"
+
+    def _tunable_names(self, target: OptimizableAgent) -> list[str]:
+        return [
+            p.name
+            for p in target.search_space.optimizable()
+            if (p.candidates and len(p.candidates) > 1) or p.bounds is not None
+        ]
 
     def _search(
         self, target: OptimizableAgent, dataset: GoldenDataset, state: _SearchState
@@ -1075,8 +1899,7 @@ class RandomSearchOptimizer(Optimizer):
             if key in seen:
                 continue
             seen.add(key)
-            report = self._eval_config(target, config, dataset)
-            self._record(state, config, report)
+            self._trial(target, state, config, dataset)
 
 
 class CoordinateAscentOptimizer(Optimizer):
@@ -1084,9 +1907,13 @@ class CoordinateAscentOptimizer(Optimizer):
 
     For each optimizable parameter, ask the supporting proposers for candidate
     values, evaluate each (holding the current best for all other parameters),
-    and keep any improvement. Repeat for ``rounds`` passes or until a pass yields
-    no improvement. This is the flagship strategy for prompt and few-shot
-    optimization and is where the LLM judge improves instructions.
+    and keep any significant improvement. Repeat for ``rounds`` passes or until
+    a pass yields no improvement. This is the flagship strategy for prompt and
+    few-shot optimization and is where the LLM judge improves instructions.
+
+    A few-shot block is scored only on rows it was not built from: its
+    demonstrations are copies of dataset rows, and a block scored on the rows
+    it copied measures the copy.
 
     Args:
         proposers: Candidate generators. Defaults to
@@ -1117,15 +1944,21 @@ class CoordinateAscentOptimizer(Optimizer):
         self.candidates_per_param = candidates_per_param
         self.kinds = kinds
 
-    def _search(
-        self, target: OptimizableAgent, dataset: GoldenDataset, state: _SearchState
-    ) -> None:
-        _bind_baseline(self, state.baseline_snapshot)
-        params = [
+    def _params(self, target: OptimizableAgent) -> list[Parameter]:
+        return [
             p
             for p in target.search_space.optimizable()
             if self.kinds is None or p.kind in self.kinds
         ]
+
+    def _tunable_names(self, target: OptimizableAgent) -> list[str]:
+        return [p.name for p in self._params(target) if proposers_for(p, self.proposers)]
+
+    def _search(
+        self, target: OptimizableAgent, dataset: GoldenDataset, state: _SearchState
+    ) -> None:
+        _bind_baseline(self, state.baseline_snapshot)
+        params = self._params(target)
         if not params:
             return
 
@@ -1150,14 +1983,15 @@ class CoordinateAscentOptimizer(Optimizer):
                         logger.warning(
                             "Proposer %s failed for %s: %s", proposer.name, param.name, exc
                         )
+                self._register_demo_rows(param, ctx)
                 for value in _dedup(candidates):
                     if len(state.history) >= self.max_evals:
                         return
                     # Compose on top of the current best configuration.
                     config = dict(state.best_config)
                     config[param.name] = value
-                    report = self._eval_config(target, config, dataset)
-                    if self._record(state, config, report):
+                    accepted, _ = self._trial(target, state, config, dataset)
+                    if accepted:
                         improved_this_round = True
             if not improved_this_round:
                 if self.verbose:
@@ -1166,7 +2000,11 @@ class CoordinateAscentOptimizer(Optimizer):
 
 
 class BootstrapFewShotOptimizer(CoordinateAscentOptimizer):
-    """Coordinate ascent restricted to few-shot parameters (DSPy-style bootstrap)."""
+    """Coordinate ascent restricted to few-shot parameters (DSPy-style bootstrap).
+
+    Each proposed block is scored on the rows it did not copy its
+    demonstrations from, so a block can only win by helping on unseen rows.
+    """
 
     strategy_name = "bootstrap_few_shot"
 
@@ -1177,6 +2015,10 @@ class BootstrapFewShotOptimizer(CoordinateAscentOptimizer):
 
 class EvolutionaryOptimizer(Optimizer):
     """Population-based search: mutate configs with proposers, select the best.
+
+    Survivors carry their measured score into the next generation instead of
+    being re-evaluated, and a configuration already evaluated in this run is
+    never evaluated again, so the whole budget goes on new candidates.
 
     Args:
         proposers: Mutation operators (default proposer set).
@@ -1205,6 +2047,13 @@ class EvolutionaryOptimizer(Optimizer):
         self.generations = generations
         self.mutations_per_parent = mutations_per_parent
 
+    def _tunable_names(self, target: OptimizableAgent) -> list[str]:
+        return [
+            p.name
+            for p in target.search_space.optimizable()
+            if proposers_for(p, self.proposers) or p.candidates or p.bounds is not None
+        ]
+
     def _search(
         self, target: OptimizableAgent, dataset: GoldenDataset, state: _SearchState
     ) -> None:
@@ -1212,25 +2061,33 @@ class EvolutionaryOptimizer(Optimizer):
         params = target.search_space.optimizable()
         if not params:
             return
-        # Seed population with the baseline (empty diff) plus random samples.
-        population: list[dict[str, Any]] = [{}]
+        # The baseline joins the population with the score it already has:
+        # re-recording it would spend a budgeted evaluation to learn nothing.
+        seen: set[str] = {_config_key({})}
+        population: list[dict[str, Any]] = []
         for _ in range(self.population - 1):
             population.append(target.search_space.sample_config(self._rng))
 
-        scored = self._score_population(target, dataset, state, population)
+        scored: list[tuple[dict[str, Any], float]] = [({}, state.best_score)]
+        scored.extend(self._score_population(target, dataset, state, population, seen=seen))
+        scored.sort(key=lambda cs: cs[1], reverse=True)
         for _ in range(self.generations):
             if len(state.history) >= self.max_evals:
                 break
-            survivors = [cfg for cfg, _ in scored[: max(1, self.population // 2)]]
+            survivors = scored[: max(1, self.population // 2)]
             offspring: list[dict[str, Any]] = []
-            for parent in survivors:
+            for parent, _ in survivors:
                 for _ in range(self.mutations_per_parent):
                     child = self._mutate(target, dataset, state, parent)
                     if child is not None:
                         offspring.append(child)
             if not offspring:
                 break
-            scored = self._score_population(target, dataset, state, survivors + offspring)
+            # Survivors keep their scores; only children not yet measured in
+            # this run spend budget.
+            scored = list(survivors)
+            scored.extend(self._score_population(target, dataset, state, offspring, seen=seen))
+            scored.sort(key=lambda cs: cs[1], reverse=True)
 
     def _mutate(
         self,
@@ -1250,6 +2107,7 @@ class EvolutionaryOptimizer(Optimizer):
             candidates = proposer.propose(ctx)
         except Exception:
             return None
+        self._register_demo_rows(param, ctx)
         if not candidates:
             return None
         child = dict(parent)
@@ -1262,28 +2120,46 @@ class EvolutionaryOptimizer(Optimizer):
         dataset: GoldenDataset,
         state: _SearchState,
         population: list[dict[str, Any]],
+        *,
+        seen: set[str] | None = None,
     ) -> list[tuple[dict[str, Any], float]]:
+        """Evaluate the not-yet-seen members of ``population``, best first.
+
+        ``seen`` is shared across generations by :meth:`_search`, so a child
+        identical to an earlier configuration is skipped rather than paid for.
+        """
         scored: list[tuple[dict[str, Any], float]] = []
-        seen: set[str] = set()
+        seen = set() if seen is None else seen
         for config in population:
             if len(state.history) >= self.max_evals:
                 break
-            key = repr(sorted(config.items()))
+            key = _config_key(config)
             if key in seen:
                 continue
             seen.add(key)
-            report = self._eval_config(target, config, dataset)
-            self._record(state, config, report)
-            if not report.is_complete:
+            _, rank = self._trial(target, state, config, dataset)
+            if not state.history[-1].complete:
                 # `_record` only guards the global best. Survivors and parents
                 # are chosen from *this* list, so an incomplete candidate left
                 # in it would breed from a score measured over an easier subset
                 # -- throttling would steer the search even while being barred
                 # from winning it.
                 continue
-            scored.append((config, report.score))
+            scored.append((config, rank))
         scored.sort(key=lambda cs: cs[1], reverse=True)
         return scored
+
+
+#: Stage attributes a pipeline overrides for the duration of one stage.
+_STAGE_ATTRS = (
+    "max_evals",
+    "_eval_cache",
+    "cache_evaluations",
+    "_nested",
+    "_nondeterministic",
+    "_repeats_eff",
+    "_demo_rows",
+)
 
 
 class PipelineOptimizer(Optimizer):
@@ -1292,6 +2168,13 @@ class PipelineOptimizer(Optimizer):
     Each stage starts from the previous stage's best configuration (applied to
     the live agent), so you can, e.g., first bootstrap few-shot examples, then
     rewrite prompts with the LLM judge, then tune temperature.
+
+    The pipeline owns the run-level decisions: the automatic hold-out split,
+    the non-determinism check (stages inherit the verdict and the repeat
+    count), and the one final verdict on the cumulative configuration. Budget
+    a stage leaves unused -- a few-shot stage on an agent with no few-shot
+    knob uses none of it -- is carried forward to the stages after it, always
+    within the pipeline's own ``max_evals``.
     """
 
     strategy_name = "pipeline"
@@ -1301,6 +2184,19 @@ class PipelineOptimizer(Optimizer):
         if not stages:
             raise ValueError("PipelineOptimizer requires at least one stage")
         self.stages = stages
+
+    def _tunable_names(self, target: OptimizableAgent) -> list[str]:
+        names: list[str] = []
+        for stage in self.stages:
+            tunable = getattr(stage, "_tunable_names", None)
+            if not callable(tunable):
+                continue
+            try:
+                found = tunable(target)
+            except Exception:
+                continue
+            names.extend(n for n in found if n not in names)
+        return names
 
     def optimize(
         self,
@@ -1313,6 +2209,11 @@ class PipelineOptimizer(Optimizer):
         parameters: list[Parameter] | None = None,
     ) -> OptimizationResult:
         target = wrap(agent, runner=runner, components=components, parameters=parameters)
+        if not dataset:
+            raise ValueError("Cannot optimize against an empty dataset")
+        self._rng = random.Random(self.seed)
+        self._demo_rows = {}
+        train, holdout, auto = self._resolve_holdout(dataset, val_dataset)
 
         # One evaluation cache for the whole pipeline. Injected into every
         # stage, so a stage's baseline -- the previous stage's winner, already
@@ -1334,7 +2235,10 @@ class PipelineOptimizer(Optimizer):
         self._run_started_at = time.perf_counter()
         try:
             baseline_snapshot = target.snapshot()
-            baseline_report = self._evaluate_baseline(target, dataset)
+            baseline_report = self._evaluate_baseline(target, train)
+            baseline_rows = self._detect_nondeterminism(
+                target, train, baseline_report, row_scores(baseline_report)
+            )
             baseline_score = baseline_report.score
             if self.verbose:
                 logger.info(
@@ -1350,6 +2254,7 @@ class PipelineOptimizer(Optimizer):
             best_config: dict[str, Any] = {}
             best_score = baseline_score
             best_report: EvaluationReport | None = None
+            carried = 0
 
             for stage_index, stage in enumerate(self.stages, start=1):
                 # Enforce a shared budget so the pipeline never exceeds the documented
@@ -1369,13 +2274,12 @@ class PipelineOptimizer(Optimizer):
                         self.max_evals,
                         time.perf_counter() - self._run_started_at,
                     )
-                original_max = stage.max_evals
                 # ``getattr`` because a stage may be a minimal Optimizer
                 # subclass that skipped ``__init__`` -- the same pattern the
                 # cache helpers themselves tolerate.
-                original_cache = getattr(stage, "_eval_cache", None)
-                original_cache_flag = getattr(stage, "cache_evaluations", False)
-                stage.max_evals = min(original_max, remaining)
+                saved = {name: getattr(stage, name, _MISSING) for name in _STAGE_ATTRS}
+                allowance = min(stage.max_evals + carried, remaining)
+                stage.max_evals = allowance
                 stage._eval_cache = shared_cache
                 # A pipeline-level opt-out must reach the stages: with the
                 # shared cache merely absent, a stage's own default flag would
@@ -1383,17 +2287,31 @@ class PipelineOptimizer(Optimizer):
                 # configurations would still be reused -- exactly what
                 # ``cache_evaluations=False`` promises to prevent. A stage's
                 # own opt-out inside a caching pipeline is still respected.
-                stage.cache_evaluations = original_cache_flag and self.cache_evaluations
+                own_flag = saved["cache_evaluations"]
+                stage.cache_evaluations = (
+                    own_flag is not _MISSING and bool(own_flag) and self.cache_evaluations
+                )
+                stage._nested = True
+                stage._nondeterministic = self._nondeterministic
+                stage._repeats_eff = self._repeats()
+                stage._demo_rows = self._demo_rows
                 try:
-                    stage_result = stage.optimize(target, dataset)  # applies stage best in place
+                    stage_result = stage.optimize(target, train)  # applies stage best in place
                 finally:
-                    stage.max_evals = original_max
-                    stage._eval_cache = original_cache
-                    stage.cache_evaluations = original_cache_flag
+                    for name, value in saved.items():
+                        if value is _MISSING:
+                            if name in vars(stage):
+                                delattr(stage, name)
+                        else:
+                            setattr(stage, name, value)
                 combined_history.extend(stage_result.history)
                 combined_recommendations.extend(stage_result.recommendations)
-                # The live target now carries this stage's best; accumulate the diff.
-                if stage_result.best_score >= best_score:
+                carried = max(0, allowance - len(stage_result.history))
+                # The live target now carries this stage's best; accumulate the
+                # diff. A stage only reports a config it accepted on the
+                # significance rule, relative to the cumulative state it began
+                # from.
+                if stage_result.best_config:
                     best_score = stage_result.best_score
                     best_config.update(stage_result.best_config)
                     best_report = stage_result.best_report or best_report
@@ -1404,37 +2322,38 @@ class PipelineOptimizer(Optimizer):
             if best_config:
                 target.apply(best_config)
 
-            gate = self._gate_on_validation(target, val_dataset, baseline_snapshot, best_config)
-            if gate.rejected:
-                best_config = {}
-                best_score = baseline_score
-                best_report = baseline_report
-            combined_recommendations.extend(gate.notes)
-
-            # Optionally run the pipeline-level tool suggestion on the cumulative best,
-            # then dedupe so a repeated suggestion from several stages appears once.
             pipeline_state = _SearchState(
                 best_config=best_config,
                 best_score=best_score,
                 best_report=best_report,
                 baseline_snapshot=baseline_snapshot,
                 history=combined_history,
+                best_rows=row_scores(best_report) if best_config else baseline_rows,
             )
+            gate = self._final_verdict(
+                target, train, holdout, auto, baseline_snapshot, baseline_rows, pipeline_state
+            )
+            if gate.discarded:
+                pipeline_state.best_config = {}
+                pipeline_state.best_score = baseline_score
+                pipeline_state.best_report = baseline_report
+            combined_recommendations.extend(gate.notes)
+            untuned = self._untuned(
+                self._tunable_names(target), combined_history, baseline_snapshot
+            )
+            if untuned:
+                combined_recommendations.append(self._warn_untuned(untuned))
+
+            # Optionally run the pipeline-level tool suggestion on the cumulative best,
+            # then dedupe so a repeated suggestion from several stages appears once.
             combined_recommendations.extend(self._suggest_tools(target, pipeline_state))
-            result = OptimizationResult(
-                best_config=best_config,
-                best_score=best_score,
-                baseline_score=baseline_score,
-                baseline_config=baseline_snapshot,
-                history=combined_history,
-                best_report=best_report,
-                validation_score=gate.score,
-                validation_complete=gate.complete,
-                recommendations=_dedup(combined_recommendations),
-                duration_seconds=time.perf_counter() - self._run_started_at,
-                validation_baseline_score=gate.baseline_score,
-                validation_rejected=gate.rejected,
-                rejected_config=gate.rejected_config,
+            result = self._build_result(
+                pipeline_state,
+                baseline_score,
+                baseline_snapshot,
+                gate,
+                _dedup(combined_recommendations),
+                untuned,
             )
             if self.verbose:
                 logger.info("[%s] %r", self.strategy_name, result)
@@ -1459,6 +2378,10 @@ def make_default_optimizer(
     min_improvement: float | None = None,
     suggest_tools: bool | None = None,
     proposer_judge: Any = None,
+    alpha: float | None = None,
+    repeats: int | None = None,
+    holdout_fraction: float | None = None,
+    allow_small_sample: bool | None = None,
 ) -> PipelineOptimizer:
     """Build a sensible "do all the optimizations" pipeline.
 
@@ -1466,7 +2389,11 @@ def make_default_optimizer(
     (LLM-judge-driven when a ``judge`` is supplied), then grid over models /
     hyperparameters / routing, then coordinate-ascent over tools/skills
     (drop-one ablation, plus judge-driven new-tool *suggestions* when a judge is
-    supplied). Budget is split across the four stages.
+    supplied). Budget is split across the four stages, and whatever a stage
+    leaves unused (an agent with no few-shot knob, say) goes to the stages
+    after it. The grid stage sweeps knob by knob when the full product does
+    not fit its share, so no model, hyperparameter or routing knob is silently
+    left untried.
 
     ``suggest_tools`` controls whether the pipeline records advisory new-tool/skill
     recommendations: ``None`` (default) auto-enables it whenever a ``judge`` is
@@ -1475,7 +2402,12 @@ def make_default_optimizer(
     ``proposer_judge`` is a separate judge used for critique and prompt
     rewriting, so the model that writes a candidate is not the one that scores
     it (see :class:`Optimizer`).
+
+    ``alpha``, ``repeats``, ``holdout_fraction`` and ``allow_small_sample`` are
+    passed to every stage and the pipeline (see :class:`Optimizer`); ``None``
+    keeps the library default.
     """
+    _check_budget("max_evals", max_evals)
     per_stage = max(5, max_evals // 4)
     common: dict[str, Any] = {"seed": seed, "judge": judge, "verbose": verbose}
     if proposer_judge is not None:
@@ -1484,6 +2416,14 @@ def make_default_optimizer(
         common["proposer_judge"] = proposer_judge
     if min_improvement is not None:
         common["min_improvement"] = min_improvement
+    for name, value in (
+        ("alpha", alpha),
+        ("repeats", repeats),
+        ("holdout_fraction", holdout_fraction),
+        ("allow_small_sample", allow_small_sample),
+    ):
+        if value is not None:
+            common[name] = value
     suggest = (judge is not None) if suggest_tools is None else suggest_tools
     stages: list[Optimizer] = [
         BootstrapFewShotOptimizer(harness, max_evals=per_stage, **common),
@@ -1493,7 +2433,11 @@ def make_default_optimizer(
             kinds=(ParameterKind.PROMPT,),
             **common,
         ),
-        GridSearchOptimizer(harness, max_evals=per_stage, max_configs=per_stage, **common),
+        # `max_configs` is the overall budget: the stage's real limit is the
+        # allowance the pipeline hands it (its share plus what earlier stages
+        # left), and past that the grid sweeps knob by knob rather than
+        # truncating.
+        GridSearchOptimizer(harness, max_evals=per_stage, max_configs=max_evals, **common),
         CoordinateAscentOptimizer(
             harness,
             max_evals=per_stage,
@@ -1503,6 +2447,71 @@ def make_default_optimizer(
         ),
     ]
     return PipelineOptimizer(harness, stages, max_evals=max_evals, suggest_tools=suggest, **common)
+
+
+def _check_budget(name: str, value: Any) -> None:
+    """Refuse a budget that is not a positive integer, before any work starts.
+
+    ``max_evals=-1`` used to run as if unbounded for a grid, and ``0`` as "do
+    nothing and report the baseline as the result" -- neither is what a caller
+    who typed it could have wanted, and both looked like a completed run.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+
+def _compose(snapshot: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """The live state ``config`` produces on top of ``snapshot``."""
+    if not config:
+        return snapshot
+    return {**snapshot, **config}
+
+
+def _same(a: Any, b: Any) -> bool:
+    """Equality that never raises (live objects may compare badly)."""
+    try:
+        return bool(a == b)
+    except Exception:
+        return a is b
+
+
+def _value_key(value: Any) -> str:
+    try:
+        return repr(value)
+    except Exception:
+        return f"<{type(value).__name__}@{id(value)}>"
+
+
+def _config_key(config: dict[str, Any]) -> str:
+    return repr(sorted(config.items(), key=lambda kv: kv[0]))
+
+
+def _spread(n: int, k: int) -> list[int]:
+    """``k`` indices spread evenly over ``range(n)`` (all of them when ``k >= n``)."""
+    if k >= n:
+        return list(range(n))
+    if k == 1:
+        return [n // 2]
+    picked = sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
+    return picked
+
+
+def _fmt_p(p_value: float | None) -> str:
+    return "n/a" if p_value is None else f"{p_value:.4g}"
+
+
+def _mean_score(reports: Sequence[EvaluationReport]) -> float:
+    return sum(r.score for r in reports) / len(reports) if reports else 0.0
+
+
+def _mean_aggregate(reports: Sequence[EvaluationReport]) -> dict[str, float]:
+    if len(reports) == 1:
+        return dict(reports[0].aggregate)
+    names = {name for r in reports for name in r.aggregate}
+    return {
+        name: sum(r.aggregate.get(name, 0.0) for r in reports) / len(reports)
+        for name in sorted(names)
+    }
 
 
 def _dedup(values: list[Any]) -> list[Any]:

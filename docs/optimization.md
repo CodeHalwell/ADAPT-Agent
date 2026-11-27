@@ -55,7 +55,7 @@ harness = EvaluationHarness(
 
 # 4. Optimize. The best configuration is applied to the live agent in place.
 result = CoordinateAscentOptimizer(harness, judge=judge).optimize(agent, data)
-print(result)               # baseline vs best, improvement, #evals
+print(result)               # baseline vs best, improvement, #evals, significance
 print(result.best_config)   # the winning prompt/model/... values
 ```
 
@@ -230,47 +230,116 @@ judge = LLMJudge(lambda prompt, system=None: my_model_call(prompt, system=system
 ## Optimizers
 
 All optimizers share `optimize(agent, dataset, val_dataset=None)` and apply the
-best configuration to the live agent before returning — subject to the
-validation gate below.
+best configuration to the live agent before returning — subject to the final
+verdict described next.
+
+### What "improved" means
+
+A candidate replaces the current best only when it wins a **paired statistical
+test**, never because its mean came out higher. Two means of a noisy agent
+differ all the time: an agent that is right 70% of the time, scored twice on
+ten rows, differs by 0.2 about a third of the time with nothing changed. So
+every comparison works on **per-row deltas** (candidate minus incumbent, on
+the same row) and asks whether they are bigger than chance would produce:
+
+* **The test** is an exact sign-flip (paired permutation) test, implemented in
+  `adapt_agent.optimization.significance` with no SciPy dependency. A candidate
+  is accepted when its one-sided p-value is at most `alpha` (default `0.05`)
+  *and* its mean per-row gain exceeds `min_improvement` (default `1e-3`, the
+  minimum effect size).
+* **Non-deterministic targets are measured, not sampled.** At the start of a
+  run the baseline is evaluated twice. If any row scores differently between
+  the two runs, a warning is logged, `result.nondeterministic` is `True`, and
+  every comparison is measured `repeats` times per configuration (default 3
+  once noise is detected), incumbent and challenger **alternately** on the same
+  rows, each a real re-run (the evaluation cache is bypassed). A trial then
+  costs `2 * repeats` passes over the dataset; `max_evals` still counts trials.
+  Pass `repeats=` to choose the count yourself (detection is then skipped), or
+  `detect_nondeterminism=False` to skip the extra baseline pass.
+* **The final verdict needs a held-out gain.** With a held-out set the winner is
+  applied only if it does *better* than the untuned agent on it — not merely
+  "no worse": a no-op that won the training search by luck does not regress
+  either. Without a `val_dataset`, a golden set big enough for both halves to
+  keep `min_holdout_rows` (default 10) rows is split automatically
+  (`holdout_fraction=0.25`, so from 38 rows up); smaller sets are judged on the
+  training rows, and the result says that this flatters the winner.
+* **Small samples are reported as what they are.** With `n` rows the strongest
+  possible evidence — every row improves — has `p = 0.5 ** n`, so at
+  `alpha=0.05` fewer than five rows can never be significant. Such comparisons
+  cannot reach a verdict; by default (`allow_small_sample=True`) the optimizer
+  still decides them on the point estimate so a toy set can be tuned, but the
+  result reports `significant=False`, `improved=False`, and a `Small sample:`
+  note in `recommendations`. `allow_small_sample=False` accepts nothing that
+  has not been shown significant.
+
+`result.improved` is `True` only when the final gain was significant. The
+evidence travels with the result (and with `to_dict()` and the `to_config()`
+header):
+
+| Field | Meaning |
+| --- | --- |
+| `significant` | The gain over the untuned agent passed the paired test. `None` only on a hand-built result. |
+| `delta` | Mean per-row gain behind the verdict. |
+| `p_value` | One-sided p-value of the paired test. |
+| `ci_low`, `ci_high` | A two-sided `1 - alpha` bootstrap interval for `delta` (for reading; the decision uses the test). |
+| `n_rows`, `repeats`, `alpha` | What the verdict was measured on. |
+| `significance_basis` | `"held_out"`, `"held_out_auto"` (automatic split) or `"training"`. |
+| `nondeterministic` | Rows changed between two runs of the same configuration. |
+| `untuned_parameters` | Knobs no trial ever varied (see below). |
+| `rejected_reason` | Why `rejected_config` was discarded. |
+
+Each `Trial` in `result.history` also records its own `delta`, `p_value`,
+`significant`, `n_rows` and `repeats`.
 
 ### The validation gate
 
 A search is rewarded for whatever raises the score on the data it can see. That
 includes a prompt that has memorised the training rows, and one that scores
 better by dropping an instruction the dataset happens not to exercise. The
-held-out set is the one thing the search cannot have fitted, so when you pass
-one it gets the final say:
+held-out set is the one thing the search cannot have fitted, so it gets the
+final say:
 
 ```python
 train, holdout = data.split(0.8, seed=0)
 result = optimizer.optimize(agent, train, val_dataset=holdout)
 
 if result.validation_rejected:
-    # The training winner scored worse than the untuned agent on `holdout`.
+    # The training winner showed no gain over the untuned agent on `holdout`.
     # Nothing was applied: the agent is exactly as you passed it in.
     print(result.rejected_config)          # what was discarded, for inspection
-    print(result.recommendations[-1])      # the two scores, in words
+    print(result.recommendations[-1])      # the two scores and the test, in words
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `validation_score` | Held-out score of the configuration that is **applied**. |
 | `validation_baseline_score` | Held-out score of the untuned agent. |
-| `validation_rejected` | The training winner regressed on held-out data and was discarded; `best_config` is empty. |
+| `validation_rejected` | The training winner showed no held-out gain and was discarded; `best_config` is empty. |
 | `rejected_config` | The discarded configuration. Never applied, never exported by `to_config()`. |
 
 Things to know:
 
-* The gate costs one extra pass over `val_dataset` (the baseline's).
-* It rejects only when the tuned score is more than `validation_tolerance`
-  (default `1e-3`) below the baseline's, so judge noise does not trip it.
-* It rejects only on a comparison it can trust. If throttling cost either
-  held-out pass some rows, the result is reported with
-  `validation_complete=False` and the configuration is left applied, as before.
-* Without a `val_dataset` there is nothing to gate on, and the training winner
-  is applied unconditionally. **Always hold data back.**
-* `Optimizer(..., validation_gate=False)` restores the old report-only
-  behaviour.
+* The gate costs one extra pass over the held-out set (the baseline's), or
+  `repeats` of each for a non-deterministic target.
+* A row lost to throttling in either held-out pass drops out of **both** sides,
+  so a partial pass is still a like-for-like comparison; it is reported with
+  `validation_complete=False`. A pass with no surviving row is no evidence of a
+  gain, and nothing is applied.
+* An explicitly empty `val_dataset` raises `ValueError` rather than silently
+  switching the gate off.
+* `Optimizer(..., validation_gate=False)` reports the held-out score without
+  acting on it; the training verdict then decides.
+* `validation_tolerance` no longer has any effect and warns (`FutureWarning`)
+  when passed: the gate requires a gain now, not a bounded loss.
+
+### Few-shot demonstrations are scored on other rows
+
+`FewShotProposer` builds demonstration blocks by copying dataset rows. A block
+scored on the very rows it copied measures the copy: an agent that can only
+look answers up in its prompt "improved" from 0.0 to 0.3 that way while
+gaining nothing on held-out data. Each block's source rows are now recorded
+(`ProposalContext.demo_rows`) and left out of *both* sides of the comparison
+that decides on it, in every strategy and in the final verdict.
 
 ### Who marks the homework
 
@@ -299,21 +368,59 @@ The gate checks the score, not the content. It will not notice a rewritten
 prompt that lost a safety instruction if your held-out rows never probe for it —
 put such rows in the dataset, and read `best_config` before shipping it.
 
+### Strategies
+
 * **`CoordinateAscentOptimizer`** -- greedy per-parameter improvement via
   proposers; the flagship for prompt / few-shot tuning and where the LLM judge
-  rewrites instructions. Restrict with `kinds=(ParameterKind.PROMPT,)`.
+  rewrites instructions. Restrict with `kinds=(ParameterKind.PROMPT,)`. Each
+  `LLMProposer` rewrite request carries a different sample of failures; a
+  failure pool too small to vary gets one request, not several identical ones.
 * **`BootstrapFewShotOptimizer`** -- coordinate ascent over few-shot blocks only.
-* **`GridSearchOptimizer`** / **`RandomSearchOptimizer`** -- exhaustive / sampled
-  search over discrete candidate sets and numeric bounds.
+* **`GridSearchOptimizer`** -- the full Cartesian product when it fits
+  `min(max_configs, max_evals)`; otherwise a knob-by-knob sweep (each knob
+  tried in turn on top of the best so far, the budget shared fairly between
+  knobs) rather than a truncated product that only ever moves the first knob.
+* **`RandomSearchOptimizer`** -- sampled search over candidate sets and bounds.
 * **`EvolutionaryOptimizer`** -- population-based mutation + selection.
+  Survivors carry their scores forward, and no configuration is evaluated
+  twice in one run, so every budgeted evaluation is a new candidate.
 * **`PipelineOptimizer`** -- run several stages in sequence, threading the best
-  configuration forward. `make_default_optimizer(harness, judge=...)` builds a
-  "do all the optimizations" pipeline (few-shot → prompts → models/hyperparams).
+  configuration forward. The pipeline owns the automatic split, the
+  non-determinism check and the one final verdict; budget a stage leaves unused
+  (a few-shot stage on an agent with no few-shot knob) is carried forward to
+  the next stage. `make_default_optimizer(harness, judge=...)` builds a "do all
+  the optimizations" pipeline (few-shot → prompts → models/hyperparams/routing →
+  tools), and accepts `alpha`, `repeats`, `holdout_fraction` and
+  `allow_small_sample`.
 
 ```python
 from adapt_agent.optimization import make_default_optimizer
 result = make_default_optimizer(harness, judge=judge, max_evals=60).optimize(agent, data)
 ```
+
+**No knob is skipped silently.** After a run, any parameter in the strategy's
+search space that no trial ever varied is logged in a warning (`Not tuned: ...
+received zero evaluations`), added to `recommendations`, and listed in
+`result.untuned_parameters`.
+
+**Budgets are validated up front.** `max_evals` (and `repeats`,
+`numeric_points`, `max_configs`, `min_holdout_rows`) must be positive integers;
+`0`, negatives and booleans raise `ValueError` before any evaluation runs.
+
+### Reproducibility
+
+The search RNG is re-seeded from `seed` at the start of **every** `optimize()`
+call, so one optimizer instance run twice proposes the same trials both times,
+and a fresh instance with the same seed matches it. The significance test's
+resampling and the automatic split use their own fixed seed (derived from
+`seed`), so testing a candidate never perturbs which candidates come next. A
+non-deterministic target still produces different scores run to run — that is
+what `repeats` and the paired test are for.
+
+Candidates are evaluated one at a time (row-level concurrency comes from
+`EvaluationHarness(concurrency=...)`); the live agent is mutated in place per
+candidate, so evaluating several candidates at once would need isolated agent
+copies, which the optimizers do not make.
 
 ### Evaluation caching
 
@@ -327,12 +434,12 @@ harness identity and the live parameter state — the harness because a report
 is only reusable by the evaluator that would have produced it, so stages
 built with different metrics or a different judge never share a hit. Only
 *complete* reports are ever cached (the transient-failure machinery is
-unaffected), and the cache never outlives the `optimize` call. Pass
-`cache_evaluations=False` to re-measure every configuration — useful when
-agent outputs are stochastic enough that you want repeated measurements of
-identical configurations to average out; setting it on a `PipelineOptimizer`
-also disables caching in every stage for that run, while a stage's own
-`False` inside a caching pipeline is still respected.
+unaffected), and the cache never outlives the `optimize` call. Repeated
+measurements of a non-deterministic target, the non-determinism check itself
+and the final verdict's held-out passes never use the cache. Pass
+`cache_evaluations=False` to re-measure every configuration; setting it on a
+`PipelineOptimizer` also disables caching in every stage for that run, while a
+stage's own `False` inside a caching pipeline is still respected.
 
 ### Watching a long run
 
@@ -386,7 +493,8 @@ Parameter names follow `"<component>.<knob>"`, so the file nests by component:
 
 ```yaml
 # Tuned by adapt-agent.
-# baseline=0.6300 best=0.9100 improvement=+0.2800 over 60 evals.
+# baseline=0.6300 best=0.9100 improvement=+0.2800 validation=0.88 over 60 evals in 412.0s.
+# significant=True p=0.0004 n_rows=40 repeats=1 basis=held_out.
 # Review this diff before committing: prompts here were machine-written.
 researcher:
   system_prompt: |
