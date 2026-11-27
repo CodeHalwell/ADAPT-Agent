@@ -50,6 +50,6 @@ pre-run hook, so screen its input with an adapter or ``aexecute``. See that
 module's docstring.
 """
 
-from adapt_agent.core.governance import GovernanceGate
+from adapt_agent.core.governance import GovernanceGate, ToolDecision, ToolPolicy
 
-__all__ = ["GovernanceGate"]
+__all__ = ["GovernanceGate", "ToolDecision", "ToolPolicy"]

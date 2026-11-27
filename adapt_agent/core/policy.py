@@ -4,7 +4,7 @@ import ast
 import logging
 import operator
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, cast
@@ -50,9 +50,35 @@ def _parse_condition(condition: str) -> ast.Expression:
     return tree
 
 
-#: Names a condition may reference. ``check_state`` binds ``state`` and
-#: ``check_message`` binds ``message``; nothing else is ever in scope.
-CONDITION_NAMES = frozenset({"state", "message"})
+#: Names a condition may reference. ``check_state`` binds ``state``,
+#: ``check_message`` binds ``message`` and ``check_tool`` binds ``tool`` (plus
+#: ``state`` when the caller has one); nothing else is ever in scope.
+CONDITION_NAMES = frozenset({"state", "message", "tool"})
+
+#: The name that scopes a rule to tool calls. A rule whose condition mentions it
+#: is evaluated by :meth:`PolicyEnforcer.check_tool` and by nothing else.
+TOOL_SCOPE = "tool"
+
+#: Rule action that asks for a human decision instead of refusing outright.
+#: Only meaningful on a tool-scoped rule: a framework can pause *a tool call*
+#: for approval, but has no way to pause a message that already arrived.
+REQUIRE_APPROVAL = "require_approval"
+
+
+@lru_cache(maxsize=1024)
+def _condition_names(condition: str) -> frozenset[str]:
+    """The bare names a condition references (``state``, ``message``, ``tool``)."""
+    try:
+        tree = _parse_condition(condition)
+    except Exception:
+        return frozenset()
+    return frozenset(node.id for node in ast.walk(tree) if isinstance(node, ast.Name))
+
+
+def _is_tool_rule(rule: PolicyRule) -> bool:
+    """Whether ``rule`` is scoped to tool calls (its condition names ``tool``)."""
+    return TOOL_SCOPE in _condition_names(rule["condition"])
+
 
 _SUPPORTED_NODES: tuple[type[ast.AST], ...] = (
     ast.Expression,
@@ -88,7 +114,8 @@ def validate_condition(condition: str) -> None:
     Raises:
         ValueError: on a syntax error, an oversized condition, an unsupported
             construct (calls, attribute access, ``not``, slices, ...), an
-            unsupported operator, or a name other than ``state``/``message``.
+            unsupported operator, or a name other than
+            ``state``/``message``/``tool``.
     """
     try:
         tree = _parse_condition(condition)
@@ -112,7 +139,7 @@ def validate_condition(condition: str) -> None:
         else:
             raise ValueError(
                 f"Unsupported construct in condition: {type(node).__name__} "
-                "(conditions allow literals, state[...]/message[...] lookups, "
+                "(conditions allow literals, state[...]/message[...]/tool[...] lookups, "
                 "comparisons, and/or, and + - * /)"
             )
 
@@ -194,7 +221,10 @@ class PolicyEnforcer:
             name: Unique name for the rule
             description: Human-readable description
             condition: Condition expression to evaluate
-            action: Action to take on violation (warn, block, modify)
+            action: Action to take on violation (warn, block, modify). A
+                tool-scoped rule -- one whose condition names ``tool`` -- may
+                also use ``require_approval``, which pauses the call for a
+                human decision rather than refusing it; see :meth:`check_tool`.
             severity: Severity level (low, medium, high, critical)
         """
         # SECURITY: Prevent CPU exhaustion DoS attacks by limiting the length of conditions parsed into ASTs
@@ -279,6 +309,8 @@ class PolicyEnforcer:
         context = {"message": message}
 
         for rule_name, rule in self._rules.items():
+            if _is_tool_rule(rule):
+                continue  # scoped to check_tool; `tool` is never in scope here
             if self._check_rule(rule_name, rule, context):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "message", message)
@@ -300,9 +332,64 @@ class PolicyEnforcer:
         context = {"state": state}
 
         for rule_name, rule in self._rules.items():
+            if _is_tool_rule(rule):
+                continue  # scoped to check_tool; `tool` is never in scope here
             if self._check_rule(rule_name, rule, context):
                 violations.append(rule_name)
                 self._record_violation(rule_name, "state", state)
+                self._handle_violation(rule)
+
+        return violations
+
+    def check_tool(
+        self,
+        tool: Mapping[str, Any],
+        state: Mapping[str, Any] | None = None,
+    ) -> list[str]:
+        """Check one tool call against the tool-scoped policy rules.
+
+        A rule is *tool-scoped* when its condition names ``tool``. Only those
+        rules are evaluated here, and they are skipped by :meth:`check_state`
+        and :meth:`check_message` -- so, unlike ``state`` and ``message``
+        rules, tool rules can live on the same enforcer as the rest without
+        every request tripping a fail-closed "name not in scope" violation.
+
+        ``tool`` is ``{"name": str, "arguments": <mapping or value>}``. A rule
+        may combine it with the caller's ``state``::
+
+            enforcer.add_rule(
+                name="no_wire_when_untrusted",
+                description="Wire transfers need a trusted session",
+                condition="tool['name'] == 'wire_transfer' and state['trust_score'] < 0.8",
+                action="block",
+            )
+            enforcer.add_rule(
+                name="approve_large_refunds",
+                description="A human signs off refunds over 500",
+                condition="tool['name'] == 'refund' and tool['arguments']['amount'] > 500",
+                action="require_approval",
+            )
+
+        Args:
+            tool: The call under review.
+            state: The framework's session/runtime state, when the caller has
+                one. Absent, ``state`` is an empty mapping -- so a rule reading
+                ``state['trust_score']`` cannot be evaluated and, under the
+                default fail-closed setting, counts as violated.
+
+        Returns:
+            Names of the violated tool-scoped rules. Look each up with
+            :meth:`get_rule` to act on its ``action``.
+        """
+        violations = []
+        context: dict[Any, Any] = {"tool": tool, "state": state if state is not None else {}}
+
+        for rule_name, rule in self._rules.items():
+            if not _is_tool_rule(rule):
+                continue
+            if self._check_rule(rule_name, rule, context):
+                violations.append(rule_name)
+                self._record_violation(rule_name, "tool", tool)
                 self._handle_violation(rule)
 
         return violations
@@ -312,6 +399,7 @@ class PolicyEnforcer:
         *,
         state: AgentState | None = None,
         message: AgentMessage | None = None,
+        tool: Mapping[str, Any] | None = None,
     ) -> dict[str, str]:
         """Dry-run every rule against an example, without side effects.
 
@@ -332,6 +420,8 @@ class PolicyEnforcer:
             context["state"] = state
         if message is not None:
             context["message"] = message
+        if tool is not None:
+            context["tool"] = tool
         outcomes: dict[str, str] = {}
         for rule_name, rule in self._rules.items():
             try:

@@ -8,6 +8,7 @@ optional dependencies.
 """
 
 import importlib.util
+from typing import Any
 
 import pytest
 
@@ -431,3 +432,87 @@ def test_get_state_reflects_non_dict_result():
     state = wrapped.get_state()
     # The custom result object is tracked in context, not the stale input.
     assert state["context"].get("result").output == "the answer"
+
+
+# -- run-scoped keyword arguments reach the framework ---------------------------
+
+
+def test_execute_forwards_run_kwargs_to_the_runner() -> None:
+    seen: dict[str, Any] = {}
+
+    class Graph:
+        def invoke(self, payload: Any, *, config: Any = None, context: Any = None) -> Any:
+            seen.update(payload=payload, config=config, context=context)
+            return {"messages": []}
+
+    from adapt_agent.adapters import LangGraphAdapter
+
+    agent = LangGraphAdapter().wrap_agent(Graph())
+    agent.execute({"messages": []}, config={"configurable": {"thread_id": "t1"}}, context={"u": 1})
+    assert seen == {
+        "payload": {"messages": []},
+        "config": {"configurable": {"thread_id": "t1"}},
+        "context": {"u": 1},
+    }
+
+
+def test_aexecute_forwards_run_kwargs_to_async_and_sync_runners() -> None:
+    import asyncio
+
+    from adapt_agent.adapters import LangGraphAdapter
+
+    calls: list[tuple[str, Any]] = []
+
+    class AsyncGraph:
+        async def ainvoke(self, payload: Any, *, config: Any = None) -> Any:
+            calls.append(("ainvoke", config))
+            return {"messages": []}
+
+        def invoke(self, payload: Any, *, config: Any = None) -> Any:  # pragma: no cover
+            raise AssertionError("aexecute must prefer ainvoke")
+
+    class SyncGraph:
+        def invoke(self, payload: Any, *, config: Any = None) -> Any:
+            calls.append(("invoke", config))
+            return {"messages": []}
+
+    adapter = LangGraphAdapter()
+    asyncio.run(adapter.wrap_agent(AsyncGraph()).aexecute({"messages": []}, config={"k": 1}))
+    asyncio.run(adapter.wrap_agent(SyncGraph()).aexecute({"messages": []}, config={"k": 2}))
+    assert calls == [("ainvoke", {"k": 1}), ("invoke", {"k": 2})]
+
+
+def test_run_kwargs_are_not_screened_as_content() -> None:
+    from adapt_agent.adapters import LangGraphAdapter
+    from adapt_agent.security import Firewall
+
+    firewall = Firewall()
+    firewall.add_blocked_pattern("secret-thread")
+
+    class Graph:
+        def invoke(self, payload: Any, *, config: Any = None) -> Any:
+            return {"messages": []}
+
+    agent = LangGraphAdapter(firewall=firewall).wrap_agent(Graph())
+    assert agent.execute({"messages": []}, config={"thread_id": "secret-thread"}) == {
+        "messages": []
+    }
+
+
+def test_claude_and_crewai_adapters_forward_run_kwargs() -> None:
+    from adapt_agent.adapters import ClaudeAgentSDKAdapter, CrewAIAdapter
+
+    seen: dict[str, Any] = {}
+
+    def query(*, prompt: str, options: Any = None) -> Any:
+        seen["claude"] = (prompt, options)
+        return []
+
+    class Crew:
+        def kickoff(self, inputs: Any = None, *, extra: Any = None) -> Any:
+            seen["crew"] = (inputs, extra)
+            return "done"
+
+    ClaudeAgentSDKAdapter().wrap_agent(query).execute({"prompt": "hi"}, options="OPTS")
+    CrewAIAdapter().wrap_agent(Crew()).execute({"topic": "x"}, extra=7)
+    assert seen == {"claude": ("hi", "OPTS"), "crew": ({"topic": "x"}, 7)}

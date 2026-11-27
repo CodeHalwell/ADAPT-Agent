@@ -303,9 +303,15 @@ class GovernedAdapter(BaseAdapter):
         """
         return payload
 
-    def _call_runner(self, runner: Runner, payload: dict[str, Any]) -> Any:
-        """Invoke ``runner`` with the prepared input and return the raw result."""
-        return runner(self._prepare_input(payload))
+    def _call_runner(self, runner: Runner, payload: dict[str, Any], **run_kwargs: Any) -> Any:
+        """Invoke ``runner`` with the prepared input and return the raw result.
+
+        ``run_kwargs`` are the extra keyword arguments the caller gave
+        ``execute``/``aexecute`` -- a LangGraph ``config``, a Pydantic AI
+        ``deps``, an OpenAI Agents ``session`` -- forwarded to the framework
+        untouched. They configure the run; they are not screened as content.
+        """
+        return runner(self._prepare_input(payload), **run_kwargs)
 
     # -- BaseAdapter contract --------------------------------------------------
 
@@ -426,11 +432,17 @@ class _GovernedAgent:
         self._arunner: Runner = cast(Runner, adapter._resolve_async_runner(agent))
         self._last_state: AgentState = {"messages": [], "context": {}}
 
-    def execute(self, input_data: dict[str, Any]) -> dict[str, Any]:
+    def execute(self, input_data: dict[str, Any], **run_kwargs: Any) -> dict[str, Any]:
         """Run the wrapped agent with governance applied, synchronously.
 
         Order of operations: input screening -> policy check -> pre-middleware
         -> traced run -> post-middleware -> output screening.
+
+        Extra keyword arguments are forwarded to the framework's run method
+        unchanged, which is how run-scoped configuration reaches it: a
+        LangGraph ``config={"configurable": {"thread_id": ...}}``, a Pydantic
+        AI ``deps=``/``message_history=``, an OpenAI Agents ``session=``. They
+        are configuration, not content, and are not screened.
 
         An async-native framework is driven by running its coroutine to
         completion, which is impossible from inside a running event loop. In an
@@ -445,14 +457,14 @@ class _GovernedAgent:
         """
         trace_id, payload = self._before(input_data)
         try:
-            raw = self._adapter._call_runner(self._runner, payload)
+            raw = self._adapter._call_runner(self._runner, payload, **run_kwargs)
             result = _resolve_result(raw)
         except BaseException as exc:  # close the span on KeyboardInterrupt too
             self._trace_error(trace_id, exc)
             raise
         return self._after(trace_id, result)
 
-    async def aexecute(self, input_data: dict[str, Any]) -> dict[str, Any]:
+    async def aexecute(self, input_data: dict[str, Any], **run_kwargs: Any) -> dict[str, Any]:
         """Run the wrapped agent with governance applied, asynchronously.
 
         The async twin of :meth:`execute`, and the right entry point for an
@@ -472,7 +484,7 @@ class _GovernedAgent:
         """
         trace_id, payload = self._before(input_data)
         try:
-            raw = await self._acall_runner(payload)
+            raw = await self._acall_runner(payload, **run_kwargs)
             result = await _aresolve_result(raw)
         except BaseException as exc:
             # BaseException, not Exception: `asyncio.CancelledError` derives from
@@ -482,7 +494,7 @@ class _GovernedAgent:
             raise
         return self._after(trace_id, result)
 
-    async def _acall_runner(self, payload: dict[str, Any]) -> Any:
+    async def _acall_runner(self, payload: dict[str, Any], **run_kwargs: Any) -> Any:
         """Invoke the async-preferred runner without blocking the caller's loop.
 
         A framework with no async entry point still reaches `aexecute` -- the
@@ -502,8 +514,8 @@ class _GovernedAgent:
         """
         runner = self._arunner
         if inspect.iscoroutinefunction(runner) or inspect.isasyncgenfunction(runner):
-            return self._adapter._call_runner(runner, payload)
-        return await asyncio.to_thread(self._adapter._call_runner, runner, payload)
+            return self._adapter._call_runner(runner, payload, **run_kwargs)
+        return await asyncio.to_thread(self._adapter._call_runner, runner, payload, **run_kwargs)
 
     # -- shared governance stages ---------------------------------------------
     # execute() and aexecute() differ only in how the framework result is

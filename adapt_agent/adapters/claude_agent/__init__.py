@@ -42,8 +42,8 @@ class ClaudeAgentSDKAdapter(GovernedAdapter):
     def _prepare_input(self, payload: dict[str, Any]) -> Any:
         return _extract_prompt(payload)
 
-    def _call_runner(self, runner: Runner, payload: dict[str, Any]) -> Any:
-        return runner(prompt=self._prepare_input(payload))
+    def _call_runner(self, runner: Runner, payload: dict[str, Any], **run_kwargs: Any) -> Any:
+        return runner(prompt=self._prepare_input(payload), **run_kwargs)
 
 
 __all__ = ["ClaudeAgentSDKAdapter"]

@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
-from adapt_agent.core.governance import GovernanceGate
+from adapt_agent.core.governance import GovernanceGate, ToolPolicy
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from adapt_agent.adversarial import AdversarialDefense
@@ -28,6 +28,7 @@ def build_gate(
     policy_enforcer: PolicyEnforcer | None = None,
     block_on_violation: bool = True,
     agent_id: str = _DEFAULT_AGENT_ID,
+    tool_policy: ToolPolicy | None = None,
 ) -> GovernanceGate:
     """Return the supplied gate, or build one from individual controls.
 
@@ -51,6 +52,7 @@ def build_gate(
             policy_enforcer=gate.policy_enforcer,
             block_on_violation=gate.block_on_violation,
             agent_id=agent_id,
+            tool_policy=gate.tool_policy,
         )
     return GovernanceGate(
         firewall=firewall,
@@ -58,6 +60,7 @@ def build_gate(
         policy_enforcer=policy_enforcer,
         block_on_violation=block_on_violation,
         agent_id=agent_id,
+        tool_policy=tool_policy,
     )
 
 

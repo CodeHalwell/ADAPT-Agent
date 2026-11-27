@@ -45,12 +45,12 @@ class CrewAIAdapter(GovernedAdapter):
         # CrewAI's ``inputs`` are template variables, not a chat transcript.
         return {k: v for k, v in payload.items() if k != "messages"}
 
-    def _call_runner(self, runner: Runner, payload: dict[str, Any]) -> Any:
+    def _call_runner(self, runner: Runner, payload: dict[str, Any], **run_kwargs: Any) -> Any:
         inputs = self._prepare_input(payload)
         # Prefer the idiomatic ``kickoff(inputs=...)`` call when supported.
         if self._accepts_kwarg(runner, "inputs"):
-            return runner(inputs=inputs)
-        return runner(inputs)
+            return runner(inputs=inputs, **run_kwargs)
+        return runner(inputs, **run_kwargs)
 
     @staticmethod
     def _accepts_kwarg(runner: Runner, name: str) -> bool:

@@ -22,7 +22,8 @@ framework at once, and the two can never drift apart.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+import fnmatch
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from adapt_agent.exceptions import SecurityBlockedError
@@ -238,6 +239,146 @@ def extract_prompt(payload: Any) -> str:
     return str(payload)
 
 
+#: :attr:`ToolDecision.action` values.
+ALLOW = "allow"
+BLOCK = "block"
+ASK = "ask"
+
+
+@dataclasses.dataclass(frozen=True)
+class ToolDecision:
+    """The gate's verdict on one tool call or one tool result.
+
+    Attributes:
+        action: ``"allow"``, ``"block"`` or ``"ask"``. ``"ask"`` means *pause
+            for a human decision*; a binding maps it onto the framework's own
+            approval mechanism (a LangGraph interrupt, an OpenAI Agents
+            ``needs_approval``, a Claude ``permissionDecision: "ask"``) and
+            treats it as ``"block"`` where the framework has none -- see
+            :meth:`resolve`.
+        tool_name: The tool the decision is about.
+        threats: What was found, in first-seen order: ``"tool:denied:<name>"``,
+            ``"tool:not_allowed:<name>"``, ``"tool:approval:<name>"``,
+            ``"firewall"``, an adversarial-defense label, or
+            ``"policy:<rule>"``. Populated even when ``action`` is
+            ``"allow"`` under a report-only gate.
+        report_only: ``True`` when the gate is in report-only mode
+            (``block_on_violation=False``) and would otherwise have blocked or
+            asked. ``action`` is then ``"allow"`` so a binding needs no special
+            case, and ``threats`` still says what was seen.
+        agent_id: The gate's ``agent_id``, for attribution inside a graph.
+    """
+
+    action: str
+    tool_name: str
+    threats: tuple[str, ...] = ()
+    report_only: bool = False
+    agent_id: str = ""
+
+    @property
+    def allowed(self) -> bool:
+        return self.action == ALLOW
+
+    @property
+    def blocked(self) -> bool:
+        return self.action == BLOCK
+
+    @property
+    def needs_approval(self) -> bool:
+        return self.action == ASK
+
+    def resolve(self, *, approvals_supported: bool) -> str:
+        """The action to take given whether the framework can pause for approval.
+
+        Without an approval mechanism an ``"ask"`` must not become an
+        ``"allow"``: a call somebody wanted a human to see would run unseen.
+        It fails closed to ``"block"``.
+        """
+        if self.action == ASK and not approvals_supported:
+            return BLOCK
+        return self.action
+
+    @property
+    def reason(self) -> str:
+        """A one-line explanation safe to show the model or put in an error.
+
+        Names the tool and the threat *labels* only -- never the arguments or
+        the result, which may be the very content being withheld.
+        """
+        who = f" [{self.agent_id}]" if self.agent_id else ""
+        found = ", ".join(self.threats) if self.threats else "no threats"
+        if self.action == ASK:
+            return f"Tool call {self.tool_name!r} needs approval{who}: {found}."
+        if self.action == BLOCK:
+            return f"Tool call {self.tool_name!r} refused by ADAPT-Agent{who}: {found}."
+        return f"Tool call {self.tool_name!r} allowed{who}: {found}."
+
+
+class ToolPolicy:
+    """Name-based allow / deny / approval lists for tool calls.
+
+    The coarse control that needs no rule language: which tools an agent may
+    call at all, and which need a human. Patterns are shell-style globs matched
+    case-sensitively against the tool name, so one entry can cover a family --
+    ``"mcp__*"`` for every MCP tool as the Claude Agent SDK names them,
+    ``"github_*"``, or an exact ``"Bash"``.
+
+    Precedence is deny, then allow-list, then approval: a denied tool is
+    refused even if it is also allow-listed, and a tool outside a configured
+    allow-list is refused rather than sent for approval.
+
+    Args:
+        allow: When given, *only* matching tools may be called (an allow-list).
+            ``None`` (default) places no restriction; an empty collection
+            refuses every tool.
+        deny: Tools that may never be called.
+        require_approval: Tools whose every call pauses for a human decision.
+    """
+
+    def __init__(
+        self,
+        *,
+        allow: Iterable[str] | None = None,
+        deny: Iterable[str] = (),
+        require_approval: Iterable[str] = (),
+    ):
+        self.allow: tuple[str, ...] | None = None if allow is None else _patterns("allow", allow)
+        self.deny: tuple[str, ...] = _patterns("deny", deny)
+        self.require_approval: tuple[str, ...] = _patterns("require_approval", require_approval)
+
+    def verdict(self, tool_name: str) -> tuple[str, str | None]:
+        """Return ``(action, threat_label)`` for ``tool_name``; never raises."""
+        if _matches(tool_name, self.deny):
+            return BLOCK, f"tool:denied:{tool_name}"
+        if self.allow is not None and not _matches(tool_name, self.allow):
+            return BLOCK, f"tool:not_allowed:{tool_name}"
+        if _matches(tool_name, self.require_approval):
+            return ASK, f"tool:approval:{tool_name}"
+        return ALLOW, None
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return (
+            f"ToolPolicy(allow={self.allow!r}, deny={self.deny!r}, "
+            f"require_approval={self.require_approval!r})"
+        )
+
+
+def _patterns(label: str, values: Iterable[str]) -> tuple[str, ...]:
+    # A bare string is iterable, so `deny="Bash"` would silently become the
+    # four patterns "B", "a", "s", "h" -- denying nothing anyone calls.
+    if isinstance(values, str):
+        raise TypeError(f"ToolPolicy {label} must be a collection of patterns, not a str")
+    patterns = tuple(values)
+    for pattern in patterns:
+        if not isinstance(pattern, str) or not pattern:
+            raise TypeError(f"ToolPolicy {label} patterns must be non-empty strings")
+    return patterns
+
+
+def _matches(tool_name: str, patterns: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatchcase(tool_name, pattern) for pattern in patterns)
+
+
 class GovernanceGate:
     """Applies ADAPT-Agent's security controls to arbitrary payloads.
 
@@ -257,6 +398,9 @@ class GovernanceGate:
             useful for a report-only rollout.
         agent_id: Identifier used in raised errors, so a violation inside a
             multi-agent graph names the specific agent that produced it.
+        tool_policy: Name-based allow / deny / approval lists consulted by
+            :meth:`check_tool_call`. ``None`` restricts no tool by name; tool
+            arguments and results are still screened by the other controls.
     """
 
     def __init__(
@@ -267,12 +411,14 @@ class GovernanceGate:
         policy_enforcer: PolicyEnforcer | None = None,
         block_on_violation: bool = True,
         agent_id: str = "agent",
+        tool_policy: ToolPolicy | None = None,
     ):
         self.firewall = firewall
         self.defense = defense
         self.policy_enforcer = policy_enforcer
         self.block_on_violation = block_on_violation
         self.agent_id = agent_id
+        self.tool_policy = tool_policy
 
     # -- scanning (never raises) ----------------------------------------------
 
@@ -354,8 +500,156 @@ class GovernanceGate:
             raise SecurityBlockedError(self._reason("Output blocked by security controls"), threats)
         return threats
 
+    # -- tool calls ------------------------------------------------------------
+    #
+    # The boundary of an agent is the wrong place to stop an agent from doing
+    # something: by the time the final answer is screened the tool has run.
+    # Every supported framework exposes a seam around the individual tool call,
+    # and these four methods are the one contract each binding implements
+    # against. `check_*` returns a verdict and never raises; `review_*` raises
+    # on a block, for a seam whose refusal mechanism is an exception.
+
+    def check_tool_call(
+        self,
+        tool_name: str,
+        arguments: Any = None,
+        *,
+        state: Mapping[str, Any] | None = None,
+    ) -> ToolDecision:
+        """Decide whether a tool call may run. Never raises.
+
+        Evaluated in order, collecting every threat found:
+
+        1. :class:`ToolPolicy` -- deny list, allow-list, approval list.
+        2. The firewall and adversarial defense over every string in
+           ``arguments`` (keys included).
+        3. Tool-scoped policy rules (conditions naming ``tool``) against
+           ``{"name": tool_name, "arguments": arguments}`` and ``state``. A
+           violated ``block`` rule blocks; a violated ``require_approval`` rule
+           asks.
+
+        A block outranks an ask. Under a report-only gate
+        (``block_on_violation=False``) the decision is ``"allow"`` with
+        ``report_only=True`` and the threats still listed.
+
+        Args:
+            tool_name: The tool as the framework names it (MCP tools included --
+                they surface through the same seam as local ones).
+            arguments: The call's arguments: usually a mapping, sometimes a JSON
+                string or a framework object. Scanned as-is.
+            state: The framework's session/runtime state, for policy rules that
+                combine the call with it. See
+                :meth:`PolicyEnforcer.check_tool <adapt_agent.core.policy.PolicyEnforcer.check_tool>`.
+        """
+        action = ALLOW
+        threats: list[str] = []
+
+        if self.tool_policy is not None:
+            action, label = self.tool_policy.verdict(tool_name)
+            if label is not None:
+                threats.append(label)
+
+        found = self.scan_input(arguments)
+        if found:
+            threats.extend(found)
+            action = BLOCK
+
+        if self.policy_enforcer is not None:
+            tool = {"name": tool_name, "arguments": arguments}
+            for violation in self.policy_enforcer.check_tool(tool, state):
+                rule = self.policy_enforcer.get_rule(violation)
+                rule_action = rule.get("action") if rule is not None else None
+                if rule_action == "block":
+                    threats.append(f"policy:{violation}")
+                    action = BLOCK
+                elif rule_action == "require_approval":
+                    threats.append(f"policy:{violation}")
+                    if action != BLOCK:
+                        action = ASK
+
+        return self._decision(action, tool_name, threats)
+
+    def check_tool_result(
+        self,
+        tool_name: str,
+        result: Any,
+        *,
+        state: Mapping[str, Any] | None = None,
+    ) -> ToolDecision:
+        """Decide whether a tool's result may be returned to the model. Never raises.
+
+        This is the indirect-injection seam: whatever a tool fetched -- a web
+        page, an email, a file, an MCP server's reply -- reaches the next model
+        call as trusted-looking context. The result is therefore screened as
+        *input*: firewall plus adversarial defense over every string in it.
+
+        The verdict is ``"allow"`` or ``"block"`` only; there is nothing to
+        approve once the tool has run. A binding acts on a block by withholding
+        or replacing the result, or by aborting the run.
+
+        ``state`` is accepted for symmetry with :meth:`check_tool_call` and is
+        reserved; no control reads it today.
+        """
+        threats = self.scan_input(result)
+        return self._decision(BLOCK if threats else ALLOW, tool_name, threats)
+
+    def review_tool_call(
+        self,
+        tool_name: str,
+        arguments: Any = None,
+        *,
+        state: Mapping[str, Any] | None = None,
+    ) -> ToolDecision:
+        """:meth:`check_tool_call`, raising on a block.
+
+        Returns the decision when it is ``"allow"`` or ``"ask"`` -- an ask is
+        the binding's to route to the framework's approval mechanism (see
+        :meth:`ToolDecision.resolve`).
+
+        Raises:
+            SecurityBlockedError: When the call is blocked.
+        """
+        decision = self.check_tool_call(tool_name, arguments, state=state)
+        if decision.blocked:
+            raise SecurityBlockedError(decision.reason, list(decision.threats))
+        return decision
+
+    def review_tool_result(
+        self,
+        tool_name: str,
+        result: Any,
+        *,
+        state: Mapping[str, Any] | None = None,
+    ) -> ToolDecision:
+        """:meth:`check_tool_result`, raising on a block.
+
+        Raises:
+            SecurityBlockedError: When the result is blocked.
+        """
+        decision = self.check_tool_result(tool_name, result, state=state)
+        if decision.blocked:
+            raise SecurityBlockedError(decision.reason, list(decision.threats))
+        return decision
+
+    def _decision(self, action: str, tool_name: str, threats: list[str]) -> ToolDecision:
+        distinct = tuple(_distinct(threats))
+        if action != ALLOW and not self.block_on_violation:
+            return ToolDecision(
+                ALLOW, tool_name, distinct, report_only=True, agent_id=self.agent_id
+            )
+        return ToolDecision(action, tool_name, distinct, agent_id=self.agent_id)
+
     def _reason(self, message: str) -> str:
         return f"{message} [{self.agent_id}]" if self.agent_id else message
 
 
-__all__ = ["GovernanceGate", "extract_prompt", "extract_texts"]
+__all__ = [
+    "ALLOW",
+    "ASK",
+    "BLOCK",
+    "GovernanceGate",
+    "ToolDecision",
+    "ToolPolicy",
+    "extract_prompt",
+    "extract_texts",
+]
