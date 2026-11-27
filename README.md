@@ -1,5 +1,7 @@
 # ADAPT-Agent
 
+![ADAPT-Agent: Security and governance for AI agents](docs/assets/adapt-agent-readme-banner.png)
+
 **A**dversarial **D**efense &amp; **P**olicy **T**raining for LLM **Agent**s — a security and governance toolkit for LLM agents.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
