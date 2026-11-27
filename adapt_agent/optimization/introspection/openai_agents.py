@@ -48,7 +48,7 @@ def _slugify(name: Any) -> str:
 
 #: Markers that belong to *other* frameworks. An object carrying any of these is
 #: not an OpenAI Agents ``Agent`` -- ``chat_client`` is the Microsoft Agent
-#: Framework ``ChatAgent`` signal, ``kickoff`` is CrewAI, ``sub_agents`` is Google
+#: Framework ``Agent`` (formerly ``ChatAgent``) signal, ``kickoff`` is CrewAI, ``sub_agents`` is Google
 #: ADK. Rejecting them stops this introspector (registered *before* Microsoft)
 #: from hijacking a Microsoft Agent / magentic orchestrator.
 _FOREIGN_MARKERS = ("chat_client", "kickoff", "sub_agents")

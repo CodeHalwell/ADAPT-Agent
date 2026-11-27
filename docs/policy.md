@@ -25,8 +25,8 @@ policy.add_rule(
 )
 ```
 
-Both sets are closed and spelled exactly (`policy.VALID_ACTIONS` /
-`policy.VALID_SEVERITIES` in `adapt_agent.core.policy`). `add_rule` raises
+Both sets are closed and spelled exactly (`VALID_ACTIONS` /
+`VALID_SEVERITIES` in the `adapt_agent.core.policy` module). `add_rule` raises
 `ValueError`, naming the valid values, for anything else -- `"Block"`, `"deny"`
 and `"blok"` used to be accepted and then enforced nothing, because the gate
 compares `action == "block"`. `register_handler` validates its action the same
@@ -34,7 +34,8 @@ way, since a handler for an unknown action could never run.
 
 `add_rule` enforces a **1024-character limit** on the condition string and raises
 `ValueError` if exceeded (CPU-exhaustion DoS protection — long strings are
-expensive to parse into ASTs):
+expensive to parse into ASTs), and a limit of **200 AST nodes** on the parsed
+condition:
 
 ```python
 policy.add_rule("big", "too long", condition="x" * 2000)
@@ -84,7 +85,7 @@ policy.add_rule(
     policy.add_rule("long", "too long", condition="len(state['context']) > 0")
     # ValueError: Unsupported construct in condition: Call (...)
     policy.add_rule("typo", "typo", condition="stat['trust_score'] < 0.5")
-    # ValueError: Unknown name 'stat' in condition; only ['message', 'state'] are available
+    # ValueError: Unknown name 'stat' in condition; only ['message', 'state', 'tool'] are available
     ```
 
 ---
@@ -100,7 +101,7 @@ supported:
 | Category | Supported forms |
 |----------|-----------------|
 | Literals | numbers, strings, `True`/`False`/`None` (`ast.Constant`) |
-| Names | variables in the evaluation context (`message`, `state`) |
+| Names | variables in the evaluation context (`message`, `state`, and `tool` for [tool-scoped rules](#tool-scoped-rules-and-check_tool)) |
 | Collections | list `[...]`, tuple `(...)`, set `{...}`, dict `{k: v}` |
 | Comparisons | `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `not in` (chained allowed) |
 | Boolean ops | `and`, `or` |
@@ -124,12 +125,12 @@ under the default).
 
 - **Function calls** — `len(...)`, `str(...)`, `any(...)`, etc.
 - **Attribute access** — `message.content`, `obj.attr`.
-- **Slices** — `seq[1:2]` raises `"Slices are not supported"`.
+- **Slices** — `seq[1:2]` (`"Slices are not supported in conditions"`).
 - **Unary `not` / `~` / unary minus on an expression / bitwise / power / modulo**
   and any other operator not listed. (A negative *literal* such as `-1` or
   `-0.5` is supported, including as an index: `state['messages'][-1]`.)
-- **Unknown variables** — referencing a name not in the context raises
-  `"Unknown variable: ..."`.
+- **Unknown names** — any name other than `message`, `state` and `tool`
+  (`"Unknown name 'x' in condition; ..."`).
 
 Every item above is detectable from the condition text alone, so `add_rule`
 (and `adapt validate`) rejects it with a `ValueError` at registration. What
@@ -152,9 +153,10 @@ was a rule that looked installed and never fired.
     `check_state` puts only `state` in scope and `check_message` only
     `message`. A rule naming the other one cannot be evaluated, so under the
     default it is reported as violated on every call. Keep `message` rules and
-    `state` rules on **separate** `PolicyEnforcer` instances. A governed
-    adapter only ever calls `check_state`, so the enforcer you give it should
-    hold `state` rules only.
+    `state` rules on **separate** `PolicyEnforcer` instances. The governance
+    gate (every adapter and framework binding) calls only `check_state` and
+    `check_tool`, so the enforcer you give it should hold `state` rules and
+    [tool-scoped rules](#tool-scoped-rules-and-check_tool) only.
 
 !!! note "Changed in 0.5.0"
     The default was `fail_closed=False`. Pass it explicitly to keep the old
@@ -258,9 +260,11 @@ policy.check_message({"role": "user", "content": "password: hunter2"})
 # prints: BLOCKED by rule no_passwords (severity=high)
 ```
 
-The LangGraph adapter inspects rule actions directly: a fired rule whose
-`action == "block"` causes a `SecurityBlockedError` when
-`block_on_violation=True`. See [Framework Adapters](adapters.md).
+The governance gate behind every adapter and framework binding inspects rule
+actions directly: a fired state rule whose `action == "block"` refuses the
+request (a `SecurityBlockedError`, reported with the threat label
+`policy:<rule name>`) when `block_on_violation=True`; `warn` and `modify` rules
+are recorded but do not block. See [Framework Adapters](adapters.md).
 
 **A handler cannot weaken a verdict.** The violation is counted and recorded
 *before* the handler runs. If the handler raises, the failure is logged

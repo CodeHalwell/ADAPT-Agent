@@ -50,7 +50,7 @@ adapt-agent info
 ```
 
 ```text
-ADAPT-Agent v0.2.0
+ADAPT-Agent v0.5.1
 Adversarial Defense & Policy Training for LLM Agents
 ...
 Features:
@@ -60,6 +60,9 @@ Features:
   - Adapters: LangGraph, Microsoft Agent Framework, Google ADK,
     Pydantic AI, CrewAI, OpenAI Agents SDK, Claude Agent SDK
   - Performance optimization, evaluation and observability
+  - Golden-dataset evals: text/number checks and LLM-as-judge
+  - A bundled agent skill so coding agents can drive all of the above
+...
 ```
 
 ---
@@ -105,7 +108,7 @@ JSON output shape:
 {
   "status": "ready",
   "agent_id": "agent-007",
-  "version": "0.2.0",
+  "version": "0.5.1",
   "controls": {
     "policy_rules": 2,
     "firewall_blocked_patterns": 1,
@@ -148,9 +151,11 @@ Dataset files are dispatched by extension: `.json`, `.jsonl`, `.csv`. Metrics
 `tool_call_budget` (rows declare `expected_tools` etc. -- see
 [Running Evals](evals.md#trajectory-tool-call-evals)). Rows may also be
 multi-turn conversations (`"turns": [...]`). Adding `--judge PROVIDER` appends
-an LLM-judge metric named `judge` (providers include `claude`, `openai`,
-`gemini`, `mistral`, `cohere`, `groq`, `together`, `ollama`, `bedrock`,
-`huggingface`). `--primary` selects the headline metric (defaults to the
+an LLM-judge metric named `judge` (providers: `claude` or `anthropic`,
+`openai`, `azure_openai`, `gemini` or `google`, `mistral`, `cohere`, `groq`, `together`,
+`openrouter`, `ollama`, `bedrock`, `huggingface`; each defaults to the model in
+`adapt_agent.optimization.providers.DEFAULT_MODELS` unless `--judge-model` is
+given). `--primary` selects the headline metric (defaults to the
 first). `--concurrency N` runs N rows at once (thread pool).
 
 Every run prints what the score covers -- rows total, scored, errored (scored
@@ -245,15 +250,41 @@ Shares all of `evaluate`'s options, plus:
 | `--optimizer` | `default` (pipeline), `coordinate_ascent`, `bootstrap_few_shot`, `grid`, `random`, `evolutionary`. |
 | `--max-evals` | Evaluation budget (default 60). |
 | `--seed` | RNG seed for reproducible search (default 0). |
+| `--alpha` | Significance level a gain must meet to count as an improvement (default `0.05`). |
+| `--repeats` | Measure each comparison this many times, incumbent and challenger interleaved. Default: once, or three times when the agent is detected to be non-deterministic (a baseline re-run whose per-row results differ). |
+| `--holdout-fraction` | Share of the dataset held out for the final check when `--val-data` is not given (default `0.25`; the split happens only when both parts keep at least 10 rows; `0` disables it). |
 | `--component NAME=module:attr` | Register a framework component to introspect for tunable knobs (repeatable). With components, `target`/`--runner` is the system entrypoint. |
 | `--runner module:attr` | Explicit runner callable driving the whole system. |
-| `--val-data FILE` | Held-out dataset; its score is reported as `validation`, and a tuned config that scores worse on it than the untuned agent is not applied. |
+| `--val-data FILE` | Held-out dataset; its score is reported as `validation`, and the tuned config is applied only if it shows a **gain** over the untuned agent on it (significant under the paired test, or a positive point estimate on a set too small for any outcome to be significant). Otherwise the agent is left unchanged and `validation_rejected` is set. |
 | `--save-config FILE` | Write the winning configuration where `load_tuned_config` reads it back: `.json` as flat `{"component.knob": value}`, `.yaml`/`.yml` nested by component via `OptimizationResult.to_config`. Values that cannot round-trip -- live tool lists, callables, SDK objects -- are **not** written (a stand-in string would break the agent when re-applied); they are named under `_provenance.unexportable` (JSON) or a comment header (YAML) and on the console. |
 | `--concurrency N` | Rows evaluated at once per trial. |
 | `--verbose` | Log each trial. |
 
-`--json` emits the `OptimizationResult` summary (`improved`, `baseline_score`,
-`best_score`, `improvement`, `validation_score`, `n_evals`, `best_config`).
+A candidate replaces the incumbent only on a paired statistical test over the
+per-row deltas, and every run prints the verdict next to the numbers:
+
+```text
+Optimized 'capitals:build()' with strategy 'coordinate_ascent':
+  baseline   : 0.0000
+  best       : 1.0000  (improvement +1.0000)
+  significant: yes (p=0.004, 8 rows)
+  evaluations: 10
+  best config:
+    - agent.prompt = 'Answer with ONLY the capital city name.'
+```
+
+On a toy dataset (fewer than five rows at `alpha=0.05`) no outcome can be
+significant: the line reads `significant: no (...)` with the reason, and
+`improved` is `False` even when `best` is higher. See
+[Optimization & Evaluation](optimization.md#what-improved-means).
+
+`--json` emits `OptimizationResult.to_dict()`: `improved`, `baseline_score`,
+`best_score`, `improvement`, `validation_score`, `validation_complete`,
+`validation_baseline_score`, `validation_rejected`, `n_evals`,
+`duration_seconds`, `best_config`, `recommendations`, and the significance
+fields `significant`, `delta`, `p_value`, `ci_low`, `ci_high`, `n_rows`,
+`repeats`, `alpha`, `significance_basis`, `nondeterministic`,
+`untuned_parameters`, `rejected_reason`.
 
 !!! warning "The target executes: configs and targets are code"
     `module:attribute` **imports** that module -- running its top-level code --
@@ -287,6 +318,16 @@ else -- notably `base_url` and `api_key` -- is refused, so a config cannot send
 graded outputs to another host or carry a credential (use the provider's
 environment variable). `metrics:` entries are names or mappings for metrics
 that need options, e.g. `{name: field_match, field: lane}`.
+
+The `optimizer:` section takes `type`, `max_evals` (default 60), `seed`
+(default 0), `min_improvement`, `kinds`, `suggest_tools`, `verbose`, and the
+same acceptance settings as the `optimize` flags: `alpha`, `repeats`,
+`holdout_fraction`, plus `allow_small_sample` (default `true`: a comparison
+too small to be significant is decided on the point estimate but reported as
+not significant; `false` accepts nothing unproven) and
+`detect_nondeterminism` (default `true`). `detect_nondeterminism` is refused
+for `type: default`, whose pipeline has no such switch. The text output
+prints the same `significant:` line as `optimize`.
 
 ---
 
@@ -342,7 +383,7 @@ The config root must be a JSON **object**. All top-level keys are optional.
     `validate` applies the same check as `PolicyEnforcer.add_rule`: the
     condition must parse, be within the length limit, use only the supported
     safe nodes (comparisons, boolean ops, arithmetic, subscripts, literals — no
-    function calls or attribute access), and reference only `state` or
-    `message`. A config that validates is one whose rules will register. It
+    function calls or attribute access), and reference only `state`,
+    `message` or `tool`. A config that validates is one whose rules will register. It
     cannot check that the keys a rule reads exist in your data; see
     [Policy Enforcement](policy.md) for `evaluate_rules`.

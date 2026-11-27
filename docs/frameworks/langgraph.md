@@ -12,7 +12,7 @@ constructor both projects now recommend. ADAPT-Agent governs either at two level
 
 This page is written against **langgraph 1.2** and **langchain 1.5**.
 
-> Examples: [`examples/langgraph/`](../../examples/langgraph/) -- a five-step ladder
+> Examples: [`examples/langgraph/`](https://github.com/CodeHalwell/ADAPT-Agent/tree/main/examples/langgraph/) -- a five-step ladder
 > from a one-node graph to tool governance with approvals and stream screening.
 
 ---
@@ -36,7 +36,7 @@ callback handler as a run-wide backstop, and the adapter at the edge.
 ## 2. Install & import-safety
 
 ```bash
-pip install 'adapt-agent[langgraph]' 'langchain>=1.0'
+pip install 'adapt-agent[langgraph]'   # langgraph>=1.0 and langchain>=1.0
 ```
 
 `create_agent` and its middleware live in the `langchain` package. Importing
@@ -343,7 +343,7 @@ taint = TaintTracker(); taint.register_source("web-form", "user_input", TaintLev
 taint.mark_tainted("req-1", ["web-form"]); taint.get_taint_level("req-1")  # HIGH
 ```
 
-See [`examples/langgraph/02_policy_observability_trust.py`](../../examples/langgraph/02_policy_observability_trust.py).
+See [`examples/langgraph/02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/langgraph/02_policy_observability_trust.py).
 
 
 ## 8. The deprecated `create_react_agent` and `governance_hooks`
@@ -480,7 +480,7 @@ the grade.
 
 ```python
 from adapt_agent.optimization.judges import ClaudeJudge
-judge = ClaudeJudge(model="claude-opus-4-8", adversarial=True)   # ANTHROPIC_API_KEY from env
+judge = ClaudeJudge(model="claude-opus-5-5", adversarial=True)   # ANTHROPIC_API_KEY from env
 ```
 
 ### Optimizers
@@ -515,7 +515,7 @@ from adapt_agent.optimization.config import run_training
 result = run_training("examples/langgraph/langgraph.train.yaml")
 ```
 
-See [`langgraph.train.yaml`](../../examples/langgraph/langgraph.train.yaml). Out-of-range
+See [`langgraph.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/langgraph/langgraph.train.yaml). Out-of-range
 temperature bounds are clamped to the provider's maximum with a warning; unknown
 metric/provider/optimizer names raise a clear `TrainingConfigError`.
 
@@ -542,7 +542,7 @@ own runner + sub-task golden set). A good recipe: tune specialists in isolation
 first (cheap, isolates which prompt is failing), then a whole-team pass to tune the
 router/coordination prompt with the improved specialists in place. The full
 worked example is
-[`04_multi_agent_and_training.py`](../../examples/langgraph/04_multi_agent_and_training.py).
+[`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/langgraph/04_multi_agent_and_training.py).
 
 ---
 
@@ -581,11 +581,11 @@ worked example is
 
 | File | What it shows |
 |------|---------------|
-| [`01_basic_guarded.py`](../../examples/langgraph/01_basic_guarded.py) | Smallest guarded graph; safe vs. blocked input. |
-| [`02_policy_observability_trust.py`](../../examples/langgraph/02_policy_observability_trust.py) | Full guard stack in monitor mode + trust/taint. |
-| [`03_evaluate_and_optimize.py`](../../examples/langgraph/03_evaluate_and_optimize.py) | Evaluate + optimize a single graph (offline). |
-| [`04_multi_agent_and_training.py`](../../examples/langgraph/04_multi_agent_and_training.py) | Router team governed + optimized as one unit + YAML training. |
-| [`05_tool_governance_middleware.py`](../../examples/langgraph/05_tool_governance_middleware.py) | `create_agent` + `governance_middleware`: denied tool, withheld result, approval interrupt/resume, `screen_stream`, run-level callback. |
+| [`01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/langgraph/01_basic_guarded.py) | Smallest guarded graph; safe vs. blocked input. |
+| [`02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/langgraph/02_policy_observability_trust.py) | Full guard stack in monitor mode + trust/taint. |
+| [`03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/langgraph/03_evaluate_and_optimize.py) | Evaluate + optimize a single graph (offline). |
+| [`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/langgraph/04_multi_agent_and_training.py) | Router team governed + optimized as one unit + YAML training. |
+| [`05_tool_governance_middleware.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/langgraph/05_tool_governance_middleware.py) | `create_agent` + `governance_middleware`: denied tool, withheld result, approval interrupt/resume, `screen_stream`, run-level callback. |
 
 See also the general [Framework Adapters](../adapters.md) and
 [Optimization & Evaluation](../optimization.md) guides.

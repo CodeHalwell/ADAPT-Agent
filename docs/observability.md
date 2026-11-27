@@ -104,8 +104,12 @@ warning, and its OpenTelemetry span is ended with `error.type="evicted"`. A late
 ### Refusals
 
 A request refused on *input* is refused before the governed run starts, so it has
-no trace to end. Record it with `record_refusal`; refusals have their own buffer,
-so trace counts keep meaning "runs that started":
+no trace to end. Every governed adapter (`execute` / `aexecute`) records such a
+refusal itself -- `stage="input"` for a firewall/defense block, `stage="policy"`
+for a policy block -- and a run that fails after it started ends its trace with
+`error=`, so the trace carries the exception class and its threat labels. Code
+that refuses requests on its own records them with `record_refusal`; refusals
+have their own buffer, so trace counts keep meaning "runs that started":
 
 ```python
 obs.record_refusal("agent-007", "answer_question", ["prompt_injection"], stage="input")
@@ -118,8 +122,9 @@ obs.get_refusals(agent_id="agent-007", limit=20)
 
 ### Tool decisions
 
-Framework bindings report each tool call and the gate's
-[`ToolDecision`](integrations.md) on it. Two forms:
+Code that drives the gate's tool API itself records each tool call and the
+gate's `ToolDecision` on it (see [Native Framework Hooks](integrations.md)). Two
+forms:
 
 ```python
 # One verdict, e.g. a block where the tool never runs:
@@ -143,6 +148,14 @@ phases recorded, `duration_ms`, and a `status` of `"completed"`, `"blocked"`,
 `"approval_required"` or `"error"` (the block raised). With a known `parent_id`
 the verdict is also logged as a `tool_decision` event on that trace. Read them
 back with `obs.get_tool_decisions(agent_id=..., tool_name=..., limit=...)`.
+
+The framework bindings in `adapt_agent.integrations` do **not** call
+`record_tool_decision` yet. Given `observer=`, they record each governed model
+call and tool call as an ordinary trace (operations such as
+`langgraph.tool:<name>`, `pydantic_ai.tool:<name>`, `google_adk.tool_call`),
+ended as an error with the threat labels when a block is raised as an exception
+(some bindings also write the verdict to `observer.log`). Query them with
+`get_traces(...)`, not `get_tool_decisions(...)`.
 
 ### Logs
 

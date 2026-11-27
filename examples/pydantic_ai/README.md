@@ -37,12 +37,19 @@ python examples/pydantic_ai/04_multi_agent_and_training.py
 python examples/pydantic_ai/05_tool_governance.py
 ```
 
+Each script prints what it ran, what passed, what
+was blocked and why (the `SecurityBlockedError` threat labels), and exits 0. The
+optimization examples print an `OptimizationResult` line such as
+`baseline=0.200, best=0.900, ..., significant=False (p=0.0625, n=4)`: the gain is
+applied, but on a handful of rows no outcome can pass the paired significance
+test, so `improved` stays `False` -- use a larger golden set for a real verdict.
+
 ## Going from offline to real
 
 Each example notes the one-line swap from the offline `FunctionModel` to a hosted
-model (e.g. `Agent("openai:gpt-4o")` or `Agent("anthropic:claude-opus-4-8")`) and
+model (e.g. `Agent("openai:gpt-5.6-luna")` or `Agent("anthropic:claude-opus-5-5")`) and
 from the deterministic judge stub to a real provider
-(`LLMJudge(ClaudeJudge(model="claude-opus-4-8"))`). Export the relevant API key
+(`ClaudeJudge(model="claude-opus-5-5")`). Export the relevant API key
 first.
 
 See the full guide: [`docs/frameworks/pydantic_ai.md`](../../docs/frameworks/pydantic_ai.md).

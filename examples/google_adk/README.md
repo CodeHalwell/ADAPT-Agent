@@ -1,6 +1,6 @@
 # Google ADK + ADAPT-Agent examples
 
-A four-step ladder from a single guarded [Google ADK](https://google.github.io/adk-docs)
+A five-step ladder from a single guarded [Google ADK](https://google.github.io/adk-docs)
 agent to a governed, optimized multi-agent system. Each script is self-contained.
 
 ADAPT-Agent has two halves, both framework-agnostic:
@@ -48,6 +48,13 @@ python examples/google_adk/04_multi_agent_and_training.py
 python examples/google_adk/05_tools_approvals_streaming.py
 ```
 
+Each script prints what it ran, what passed, what
+was blocked and why (the `SecurityBlockedError` threat labels), and exits 0. The
+optimization examples print an `OptimizationResult` line such as
+`baseline=0.200, best=0.900, ..., significant=False (p=0.0625, n=4)`: the gain is
+applied, but on a handful of rows no outcome can pass the paired significance
+test, so `improved` stays `False` -- use a larger golden set for a real verdict.
+
 Every example runs offline (no API key, no network): 01 and 05 drive a real ADK
 `Runner` with a scripted `BaseLlm` stand-in, and print a skip message (exit 0)
 when the extra is missing; 02-04 use a small ADK-*shaped* stand-in object, which
@@ -93,7 +100,7 @@ is caught on the aggregate with `buffer_stream=True` -- nothing of it delivered.
 
 | Attribute | Kind | Notes |
 |---|---|---|
-| `instruction`, `global_instruction` | PROMPT | only when plain strings (not instruction-provider callables) |
+| `instruction`, `global_instruction` | PROMPT | only when plain strings (not instruction-provider callables); `global_instruction` only on releases that do not deprecate it (ADK 2.x does) |
 | `model` | MODEL | a string id, or a model object's `model` / `model_name` |
 | `generate_content_config.temperature` / `top_p` / `max_output_tokens` | HYPERPARAM | bounds clamped to provider max with a warning |
 | `tools` | TOOL | drop-one ablation candidates when 2+ tools |

@@ -213,11 +213,11 @@ async for message in query(
     prompt="What is the capital of France?",
     options=ClaudeAgentOptions(
         system_prompt="Answer with only the city name.",
-        model="claude-opus-4-8",
+        model="claude-opus-5-5",
         allowed_tools=[],            # permission allow-list (auto-approved tools)
         disallowed_tools=[],         # tools to block
         max_turns=1,                 # cap the agent's turn budget
-        permission_mode="default",   # default | acceptEdits | plan | bypassPermissions
+        permission_mode="default",   # the SDK's permission mode (a security setting)
     ),
 ):
     ...
@@ -343,7 +343,7 @@ keyword) and call `execute`:
 ```python
 from claude_agent_sdk import query, ClaudeAgentOptions
 
-options = ClaudeAgentOptions(system_prompt="Be concise.", model="claude-opus-4-8")
+options = ClaudeAgentOptions(system_prompt="Be concise.", model="claude-opus-5-5")
 
 guarded = adapter.wrap_agent(query)
 # Extra keyword arguments are forwarded to query(): options, transport, ...
@@ -541,11 +541,12 @@ surfaces these knobs — without importing the SDK:
 | Field on `ClaudeAgentOptions` | Parameter kind | Notes |
 |-------------------------------|----------------|-------|
 | `system_prompt` | `PROMPT` | A string is bound directly; a preset mapping with an `"append"` key binds the appended text (keeping the preset). |
-| `model` | `MODEL` | e.g. `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`. |
-| `allowed_tools` | `TOOL` | With ≥2 tools, drop-one ablation candidates are offered so the optimizer can *search which tools to keep*. |
-| `disallowed_tools` | `TOOL` | |
+| `model` | `MODEL` | e.g. `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`. |
+| `allowed_tools` | `TOOL` | **Narrowed only**: with ≥2 tools, drop-one ablation candidates are offered so the optimizer can *search which tools to keep*; a candidate that adds a tool is refused. |
+| `disallowed_tools` | `TOOL` | **Read-only**: reported, never written -- the deny list is a security control. |
 | `max_turns` | `HYPERPARAM` | Bounded to `(1, 100)`. |
-| `permission_mode` | `ROUTING` | Candidates: `default`, `acceptEdits`, `plan`, `bypassPermissions`. |
+| `effort` | `HYPERPARAM` | Candidates are the effort levels the installed SDK accepts. On an SDK with no `effort` field, `max_thinking_tokens` (bounds `(1024, 32000)`) is offered instead. |
+| `permission_mode` | `ROUTING` | **Read-only**: reported, never written. Which tool calls run without a human is a security decision, not a tunable. |
 
 Detect and list the knobs for any options object:
 
@@ -645,7 +646,7 @@ def stub(prompt, system=None):
     return f'{{"score": {score}, "pass": {str(score >= 6).lower()}, "reasoning": "auto"}}'
 
 judge = LLMJudge(stub)                                 # offline
-# Real providers: LLMJudge(ClaudeJudge(model="claude-opus-4-8")), OpenAIJudge(...), etc.
+# Real providers: ClaudeJudge(model="claude-opus-5-5"), OpenAIJudge(...), etc.
 harness = EvaluationHarness([exact_match(), judge.as_metric("quality")],
                             primary_metric="quality")
 ```
@@ -712,7 +713,7 @@ introspect), a `dataset` (a file path), an optional `judge` block
 (`provider`/`model`/`adversarial`), `metrics`, an `optimizer` block
 (`type`/`max_evals`/`min_improvement`/`suggest_tools`), and explicit
 `parameters[]` for knobs introspection cannot reach. See
-[`examples/claude_agent/claude_agent.train.yaml`](../../examples/claude_agent/claude_agent.train.yaml).
+[`examples/claude_agent/claude_agent.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/claude_agent.train.yaml).
 
 > **Offline vs real.** The bundled YAML names the `anthropic` judge provider and
 > a file dataset, so running it needs `ANTHROPIC_API_KEY` and a `golden.jsonl`.
@@ -816,39 +817,42 @@ the researcher's prompt and the writer's model in the same run. To optimize a
   `Parameter` with `candidates=[...]`).
 - **`run_training` rejects my dataset.** The config dataset is a *file*
   (`path:`) — write a temp `.jsonl`/`.json`/`.csv`. There is no inline-rows form.
-- **Don't put the model id in commit messages.** Use current ids
-  (`claude-opus-4-8` / `claude-sonnet-4-6` / `claude-haiku-4-5`) in code and docs
-  only.
-- **Sampling params on Opus/Fable.** Anthropic Opus 4.8/4.7 and Fable 5 reject
-  `temperature`/`top_p`; ADAPT-Agent's providers omit/clamp them, so a tuned
-  temperature bound is clamped with a warning rather than crashing the run.
+- **Use current model ids** (`claude-opus-5-5` / `claude-sonnet-5-5` /
+  `claude-haiku-5-5`); `adapt_agent.optimization.providers.DEFAULT_MODELS` holds
+  the library's default.
+- **Sampling params on current Claude models.** Opus 4.7 and later, the Fable /
+  Mythos line and the 5-series Sonnet and Haiku reject user-set
+  `temperature`/`top_p`/`top_k`. ADAPT-Agent's Anthropic provider sends them only
+  when the installed SDK accepts them and the model is not one of those, and
+  retries without them if the API refuses, so a tuned temperature does not crash
+  the run (it has no effect on those models).
 
 ---
 
 ## 8. The examples
 
 A runnable, four-step ladder lives in
-[`examples/claude_agent/`](../../examples/claude_agent/). Each runs offline (no
+[`examples/claude_agent/`](https://github.com/CodeHalwell/ADAPT-Agent/tree/main/examples/claude_agent/). Each runs offline (no
 API key, no SDK) by substituting a stand-in for `query`.
 
-1. [`01_basic_guarded.py`](../../examples/claude_agent/01_basic_guarded.py) —
+1. [`01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/01_basic_guarded.py) —
    smallest guarded agent: firewall + a safe run + a blocked injection.
-2. [`02_policy_observability_trust.py`](../../examples/claude_agent/02_policy_observability_trust.py)
+2. [`02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/02_policy_observability_trust.py)
    — policy (block + warn rules), adversarial defense, observer traces,
    middleware, audit mode, plus `TrustManager` and `TaintTracker`.
-3. [`03_evaluate_and_optimize.py`](../../examples/claude_agent/03_evaluate_and_optimize.py)
+3. [`03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/03_evaluate_and_optimize.py)
    — introspect one agent's options, build a dataset, score with metrics + an
    offline judge, run `CoordinateAscentOptimizer`, print baseline → best.
-4. [`04_multi_agent_and_training.py`](../../examples/claude_agent/04_multi_agent_and_training.py)
+4. [`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/04_multi_agent_and_training.py)
    — a researcher → writer → reviewer orchestrator, optimized as one system with
    `make_default_optimizer` (tool/skill ablation + judge recommendations), a
    parallel YAML-config path via `run_training`, and the whole pipeline guarded
    as a single unit.
-5. [`05_tool_governance.py`](../../examples/claude_agent/05_tool_governance.py) —
+5. [`05_tool_governance.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/05_tool_governance.py) —
    tool-call governance: real `ClaudeAgentOptions` with the hooks, a
    `can_use_tool` callback and native tool options, driven with typed hook inputs
    (needs `claude-agent-sdk`; exits 0 without it).
 
 Plus
-[`claude_agent.train.yaml`](../../examples/claude_agent/claude_agent.train.yaml)
+[`claude_agent.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/claude_agent.train.yaml)
 — the declarative training config example 4's "Path B" mirrors.

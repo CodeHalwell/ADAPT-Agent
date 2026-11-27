@@ -47,7 +47,7 @@ agent = OptimizableAgent.from_agent(my_pydantic_ai_agent)
 print([p.name for p in agent.parameters])   # discovered knobs
 
 # 3. An LLM judge (provider-agnostic). Used for scoring AND prompt rewrites.
-judge = ClaudeJudge(model="claude-opus-4-8")        # ANTHROPIC_API_KEY from env
+judge = ClaudeJudge(model="claude-opus-5-5")        # ANTHROPIC_API_KEY from env
 harness = EvaluationHarness(
     metrics=[exact_match(), judge.as_metric("quality")],
     primary_metric="quality",
@@ -140,7 +140,10 @@ collision is *not* a mistake:
   ```python
   agent = OptimizableAgent.from_agent(
       my_agent,
-      parameters=[Parameter(name="agent.instructions", ..., setter=my_setter)],
+      parameters=[Parameter(
+          name="agent.instructions", kind=ParameterKind.PROMPT,
+          getter=my_getter, setter=my_setter,
+      )],
       replace=True,
   )
   ```
@@ -159,10 +162,10 @@ framework.
 | --- | --- |
 | **CrewAI** | per-agent `role`/`goal`/`backstory` (prompt), `llm` model + temperature/top_p/max_tokens, `tools`, `max_iter`, `allow_delegation` (a searchable routing switch); per-task `description`/`expected_output` (a task's `name` becomes its component, so exported configs survive task reordering) |
 | **OpenAI Agents SDK** | `instructions` and `handoff_description` (both prompts), `model`, `model_settings` (temperature/top_p/max_tokens), `tools`, `handoffs` (routing) -- recurses into handed-off sub-agents, and binds a `Handoff` wrapper's `tool_description` (the text the routing LLM reads) |
-| **Google ADK** | `instruction`/`global_instruction`, `model`, `generate_content_config` (temperature/top_p/top_k/max_output_tokens), `tools`, `sub_agents` (routing) -- recurses |
+| **Google ADK** | `instruction` (and `global_instruction` on releases that do not deprecate it; ADK 2.x does), `model`, `generate_content_config` (temperature/top_p/top_k/max_output_tokens), `tools`, `sub_agents` (routing) -- recurses |
 | **Pydantic AI** | system prompt(s), `model`, `model_settings` (temperature/top_p/max_tokens, frequency/presence penalties), tools |
 | **Microsoft Agent Framework** | `instructions`, model (a chat-client attribute, or `model_id` in `default_options`), temperature/top_p/max_tokens + frequency/presence penalties, tools, skills |
-| **Claude Agent SDK** | `system_prompt` (str or preset `append`), `model`, `allowed_tools`/`disallowed_tools`, `max_turns`, `max_thinking_tokens`, `permission_mode`; each subagent definition in `agents` contributes its `prompt`/`description` (prompts), `model`, `tools` and `skills` |
+| **Claude Agent SDK** | `system_prompt` (str or preset `append`), `model`, `allowed_tools` (narrowed only, never widened), `max_turns`, `effort`; `permission_mode` and `disallowed_tools` are reported read-only (security settings are never searched); each subagent definition in `agents` contributes its `prompt`/`description` (prompts), `model`, `tools` and `skills` |
 | **LangGraph** | best-effort structural walk of compiled-graph nodes for prompts, bound model + temperature/top_p/max_tokens, tools (declare extra params for prompts buried in closures) |
 
 ```python
@@ -198,8 +201,8 @@ from adapt_agent.optimization.judges import (
     GroqJudge, TogetherJudge, OllamaJudge, BedrockJudge, HuggingFaceJudge, get_judge,
 )
 
-judge = OpenAIJudge(model="gpt-4o-mini")          # OPENAI_API_KEY from env
-judge = get_judge("gemini", model="gemini-2.0-flash")
+judge = OpenAIJudge(model="gpt-5.6-luna")         # OPENAI_API_KEY from env
+judge = get_judge("gemini", model="gemini-3.5-flash")
 
 # Or wrap your own client / a deterministic stub (great for tests):
 from adapt_agent.optimization import LLMJudge, CallableProvider
@@ -501,7 +504,7 @@ researcher:
     You are a careful researcher...
   temperature: 0.2
 writer:
-  model: gpt-4o
+  model: gpt-5.6-luna
 ```
 
 The loop becomes **optimize → diff → review → commit**, and the application

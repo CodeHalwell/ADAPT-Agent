@@ -24,7 +24,7 @@ your agent / judge actually uses it.
 from adapt_agent.evaluation import evaluate_agent
 
 report = evaluate_agent(
-    my_agent,                     # LangGraph graph, MAF ChatAgent, Pydantic AI Agent, ...
+    my_agent,                     # LangGraph graph, MAF Agent, Pydantic AI Agent, ...
     [
         # exact text match (the default check)
         {"input": "What is the capital of France?", "expected": "Paris"},
@@ -34,14 +34,19 @@ report = evaluate_agent(
         {"input": "Summarise our refund policy", "check": "judge",
          "criteria": "Mentions the 30-day window and the exceptions."},
     ],
+    metrics="checks",             # each row picks its check (the default without a judge)
     judge="claude",               # optional; needed only for judge rows
 )
 
 print(report.score)               # headline score in [0, 1]
-print(report.aggregate)           # {"checks": 0.83, ...}
+print(report.aggregate)           # {"checks": 0.83}
 for failure in report.failures():
     print(failure.inputs, failure.output, failure.expected)
 ```
+
+Without `metrics=`, a supplied `judge` grades **every** row and the `check`
+fields are ignored; `metrics="checks"` keeps the per-row checks and spends judge
+calls only on the rows that ask for one (see [LLM-as-judge](#llm-as-judge)).
 
 `evaluate_agent` does four things in one call:
 
@@ -53,7 +58,7 @@ for failure in report.failures():
    coroutines and drains async streams, and adapts plain-string inputs for
    LangGraph message-state graphs automatically.
 3. **Extracts the output** -- unwraps framework-native results (a Pydantic AI
-   `AgentRunResult`, a LangGraph state dict, a Microsoft `AgentRunResponse`,
+   `AgentRunResult`, a LangGraph state dict, a Microsoft `AgentResponse`,
    Google ADK events, ...) to the final response text so checks compare
    answers, not `repr()`s.
 4. **Scores and reports** -- returns the standard
@@ -77,7 +82,7 @@ Every check maps `(output, expected)` to a score in `[0, 1]`; most are binary.
 | `judge` / `llm_judge` | the LLM judge grades the row (needs `judge=`) |
 | `tool_called`, `tool_call_args_match`, `tool_sequence`, `no_forbidden_tools`, `tool_call_budget` | trajectory checks on the tool calls the agent made -- see [Trajectory evals](#trajectory-tool-call-evals) |
 
-### Metric semantics (changed in 0.6)
+### Metric semantics (changed since 0.5.1)
 
 These defaults changed because the old ones scored wrong answers as right.
 Each old behaviour is still one option away.
@@ -109,7 +114,8 @@ report = evaluate_agent(
 
 ## Per-row checks
 
-With the default `metrics="checks"`, each row picks its own scorer via a
+With `metrics="checks"` (also the default when no `judge` is given), each row
+picks its own scorer via a
 `check` field (`checks` in the plural also works); rows without one fall back
 to `exact_match`:
 
@@ -173,8 +179,15 @@ report = evaluate_agent(
 * Rows can carry their own `criteria` metadata; `judge_criteria=` sets the
   task-level default and `judge_rubric=` replaces the grading rubric.
 
-Judges are prompt-injection hardened (agent output is fenced as data) and fail
-closed (an unreachable judge scores `0.0`, never inflates results). In tests,
+Judges are prompt-injection hardened (agent output is fenced as data) and never
+turn a failure into a grade. Used as a metric, a row the judge could not grade
+(an unusable or unparseable answer) raises `JudgeError`, so it is recorded as a
+**metric error** for that row (`result.metric_errors`, `report.n_metric_errors`)
+and scored with the judge's `on_error` fallback (`0.0` by default) -- never as a
+pass. A transient provider error (429, 5xx) that outlives its retries drops the
+row as transient instead (see [What counts as transient](#what-counts-as-transient)),
+and an authentication or configuration error raises immediately rather than
+scoring every row. In tests,
 pass a deterministic stub callable -- see
 [`examples/08_agent_evals.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/08_agent_evals.py).
 
@@ -193,7 +206,8 @@ report = evaluate_agent(graph, "golden.jsonl")
 
 Plain-string inputs are wrapped into
 `{"messages": [{"role": "user", "content": ...}]}` automatically (the
-`MessagesState` convention used by `create_react_agent` and most graphs), and
+`MessagesState` convention used by `langchain.agents.create_agent` and most
+graphs), and
 the final message's text is read back out of the returned state. Dataset
 inputs that are already dicts pass through untouched -- put graph-native state
 in your dataset for custom schemas, or pass `input_adapter=` / `None` to
@@ -202,13 +216,15 @@ override the adaptation.
 ### Microsoft Agent Framework
 
 ```python
-agent = ChatAgent(chat_client=..., instructions=...)
+agent = Agent(client, "You are a helpful assistant.")   # agent_framework.Agent
 report = evaluate_agent(agent, "golden.jsonl")
 ```
 
 The async `agent.run(...)` coroutine is awaited internally and the
-`AgentRunResponse.text` is scored. (Inside an already-running event loop --
-e.g. a notebook -- run the eval in a worker thread.)
+`AgentResponse.text` is scored. Inside an already-running event loop -- e.g.
+a notebook or an async service -- use `await harness.aevaluate(agent, data)`
+instead (see [Running examples concurrently](#running-examples-concurrently)),
+which awaits the agent in your loop.
 
 ### Google ADK
 
@@ -233,7 +249,7 @@ becomes the `new_message`).
 ### Pydantic AI
 
 ```python
-agent = Agent("openai:gpt-5", system_prompt=...)
+agent = Agent("openai:gpt-5.6-luna", system_prompt=...)
 report = evaluate_agent(agent, "golden.jsonl")
 ```
 
@@ -556,12 +572,13 @@ score (so a throttled run is not ranked below an unthrottled one), counted in
 **An exception raised by the agent under test is only eligible when something
 shows it came from infrastructure**: a link in its cause chain was raised by a
 provider SDK or HTTP client package (`openai`, `anthropic`, `google`, `httpx`,
-`requests`, ...; see `evaluation.INFRASTRUCTURE_MODULES`), carries an HTTP
+`requests`, ...; see
+`adapt_agent.optimization.evaluation.INFRASTRUCTURE_MODULES`), carries an HTTP
 status attribute, or names an HTTP status in its message (`"Error code: 429"`,
 `"503 Service Unavailable"`). Anything else -- an agent's own
 `ToolTimeout("step budget exceeded")`, a bare `TimeoutError` from your tool --
 is a **failure of that row**: scored 0, kept in the denominator, reported as an
-error. (Before 0.6 such a row was dropped, so an agent failing two rows of
+error. (Up to 0.5.1 such a row was dropped, so an agent failing two rows of
 three on its own timeouts printed `1.0000`.) A judge or metric call keeps the
 generous classification, since its provider is the harness's own
 infrastructure. Pass `retry=RetryPolicy(is_transient=...)` to decide yourself;

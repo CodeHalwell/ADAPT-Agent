@@ -13,6 +13,13 @@ python examples/openai_agents/04_multi_agent_and_training.py
 python examples/openai_agents/05_tool_calls_handoffs_streaming.py
 ```
 
+Each script prints what it ran, what passed, what
+was blocked and why (the `SecurityBlockedError` threat labels), and exits 0. The
+optimization examples print an `OptimizationResult` line such as
+`baseline=0.200, best=0.900, ..., significant=False (p=0.0625, n=4)`: the gain is
+applied, but on a handful of rows no outcome can pass the paired significance
+test, so `improved` stays `False` -- use a larger golden set for a real verdict.
+
 Each script **guards its framework import**: run it without the SDK installed and
 it prints a friendly install hint and exits with status 0. Install the extra with:
 

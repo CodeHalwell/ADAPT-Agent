@@ -132,7 +132,7 @@ Verified against the installed release with an offline chat client:
 | Layer | MAF seam | Runs | Sees | Does |
 |-------|----------|------|------|------|
 | agent | `@agent_middleware` | once per `agent.run` | the caller's **new** messages only (not session history, not context-provider content) | screens input; evaluates `policy_enforcer` once per run; screens the final response |
-| chat | `@chat_middleware` | once per **model call**, inside the tool loop | the full request: history, `ContextProvider` messages (RAG, memory), tool results of the previous step | screens every non-`assistant`, non-`system` message; screens each response before MAF acts on it or persists it |
+| chat | `@chat_middleware` | once per **model call**, inside the tool loop | the full request: history, `ContextProvider` messages (RAG, memory), tool results of the previous step | screens every non-`assistant`, non-`system` message; screens each response before MAF acts on it or persists it -- what the model *says* (text, reasoning, a structured value); function-call arguments in a response are left to the function layer, so `on_tool_violation` decides them |
 | function | `@function_middleware` | once per **tool call** (MCP tools included) | tool name, arguments, result | `check_tool_call` before, `check_tool_result` after |
 
 Two of those facts are why the chat layer exists:
@@ -291,7 +291,10 @@ Without a session, rules see only `messages` and `context`.
 ### 3.8 Workflows and multi-agent teams
 
 Give each agent in a workflow its own bundle. A shared gate with per-agent ids
-makes every refusal name the agent:
+makes every refusal name the agent. Put the tool policy (and every other
+control) on the gate you share: with `gate=`, only `agent_id` may differ per
+bundle -- do not also pass `tool_policy=`, `firewall=` and the like to the
+factory.
 
 ```python
 gate = GovernanceGate(firewall=firewall, tool_policy=ToolPolicy(deny=["shell"]))
@@ -416,8 +419,8 @@ context-provider document inside the run is invisible to it; use the bundle
 
 `block_on_violation=False` turns the adapter into an audit tool: threats are
 detected and recorded but nothing raises. See
-[`01_basic_guarded.py`](../../examples/microsoft_agent_framework/01_basic_guarded.py)
-and [`02_policy_observability_trust.py`](../../examples/microsoft_agent_framework/02_policy_observability_trust.py).
+[`01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/microsoft_agent_framework/01_basic_guarded.py)
+and [`02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/microsoft_agent_framework/02_policy_observability_trust.py).
 
 ---
 
@@ -517,7 +520,7 @@ Knobs no attribute exposes -- workflow routing limits -- are explicit
 ### 6.4 The YAML path
 
 `run_training("train.yaml")` runs a whole optimization from a declarative file;
-see [`magentic.train.yaml`](../../examples/microsoft_agent_framework/magentic.train.yaml)
+see [`magentic.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/microsoft_agent_framework/magentic.train.yaml)
 and Part D of example 4.
 
 ---
@@ -538,7 +541,7 @@ with `workflow.as_agent()`. For governance, put a bundle on each participant
    the same history; a responder or metric that reads the *first* user message
    sees the first question forever.
 
-See [`04_magentic_team_and_training.py`](../../examples/microsoft_agent_framework/04_magentic_team_and_training.py).
+See [`04_magentic_team_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/microsoft_agent_framework/04_magentic_team_and_training.py).
 
 ---
 
@@ -574,15 +577,15 @@ See [`04_magentic_team_and_training.py`](../../examples/microsoft_agent_framewor
 All four drive real MAF objects with an offline chat client (no API key, no
 network) and exit cleanly when MAF is not installed:
 
-1. [`01_basic_guarded.py`](../../examples/microsoft_agent_framework/01_basic_guarded.py)
+1. [`01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/microsoft_agent_framework/01_basic_guarded.py)
    -- the bundle on a real `Agent`: clean tool run, blocked injection, denied
    tool, withheld tool result, approval round trip, blocked stream, the adapter.
-2. [`02_policy_observability_trust.py`](../../examples/microsoft_agent_framework/02_policy_observability_trust.py)
+2. [`02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/microsoft_agent_framework/02_policy_observability_trust.py)
    -- policy + defense + observer + middleware + trust/taint in audit mode, then
    a policy rule on `AgentSession.state`.
-3. [`03_evaluate_and_optimize.py`](../../examples/microsoft_agent_framework/03_evaluate_and_optimize.py)
+3. [`03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/microsoft_agent_framework/03_evaluate_and_optimize.py)
    -- introspect, evaluate and optimize one agent.
-4. [`04_magentic_team_and_training.py`](../../examples/microsoft_agent_framework/04_magentic_team_and_training.py)
-   + [`magentic.train.yaml`](../../examples/microsoft_agent_framework/magentic.train.yaml)
+4. [`04_magentic_team_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/microsoft_agent_framework/04_magentic_team_and_training.py)
+   + [`magentic.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/microsoft_agent_framework/magentic.train.yaml)
    -- a five-agent workflow governed per agent and as a unit, trained as a whole
    and per agent, with tool ablation and the YAML path.

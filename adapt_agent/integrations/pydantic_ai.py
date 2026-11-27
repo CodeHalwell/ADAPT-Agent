@@ -19,7 +19,7 @@ one that binds every ADAPT-Agent control to those hooks:
         tool_policy=ToolPolicy(deny=["delete_*"], require_approval=["send_email"]),
         agent_id="triage",
     )
-    agent = Agent("openai:gpt-4o", tools=[...], capabilities=[governance])
+    agent = Agent("openai:gpt-5.6-luna", tools=[...], capabilities=[governance])
     # ...or govern an agent you did not construct, for one run:
     result = await other_agent.run(prompt, capabilities=[governance])
 

@@ -50,7 +50,7 @@ from pydantic_ai import Agent
 from pydantic_ai.settings import ModelSettings
 
 agent = Agent(
-    "openai:gpt-4o",                       # "provider:model" identifier
+    "openai:gpt-5.6-luna",                 # "provider:model" identifier
     system_prompt="You are a concise geography assistant.",
     model_settings=ModelSettings(temperature=0.2),
 )
@@ -86,8 +86,8 @@ print(agent.run_sync("capital of France?").output)   # -> "Paris", no network
 ```
 
 Every example on this page uses `FunctionModel` so it runs with no API key. The
-swap to a real model is a single line: `Agent("openai:gpt-4o", ...)` or
-`Agent("anthropic:claude-opus-4-8", ...)`.
+swap to a real model is a single line: `Agent("openai:gpt-5.6-luna", ...)` or
+`Agent("anthropic:claude-opus-5-5", ...)`.
 
 ---
 
@@ -138,7 +138,7 @@ governance = governance_capability(
 )
 
 # Per agent, at construction ...
-agent = Agent("openai:gpt-4o", deps_type=Deps, tools=[...], capabilities=[governance])
+agent = Agent("openai:gpt-5.6-luna", deps_type=Deps, tools=[...], capabilities=[governance])
 # ... or per run, for an agent you did not construct:
 result = await other_agent.run(prompt, deps=deps, capabilities=[governance])
 ```
@@ -335,7 +335,7 @@ capability per run instead. Both refuse `policy_enforcer`, `defense` and
 `tool_policy` with a `ValueError` naming `governance_capability`, because an
 output validator never sees state, input or tool calls.
 
-See [`examples/pydantic_ai/05_tool_governance.py`](../../examples/pydantic_ai/05_tool_governance.py).
+See [`examples/pydantic_ai/05_tool_governance.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/05_tool_governance.py).
 
 ---
 
@@ -448,14 +448,14 @@ policy violations are recorded (inspect them on `observer.get_traces()` and
 `policy_enforcer.get_violations()`) but the run completes normally. This is the
 right setting when rolling a new rule out to production before enforcing it.
 
-See [`examples/pydantic_ai/01_basic_guarded.py`](../../examples/pydantic_ai/01_basic_guarded.py).
+See [`examples/pydantic_ai/01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/01_basic_guarded.py).
 
 ---
 
 ## 5. Policy, adversarial defense, observability, trust & taint
 
 These compose on the same adapter. The full example is
-[`examples/pydantic_ai/02_policy_observability_trust.py`](../../examples/pydantic_ai/02_policy_observability_trust.py).
+[`examples/pydantic_ai/02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/02_policy_observability_trust.py).
 
 ### PolicyEnforcer
 
@@ -474,7 +474,7 @@ policy.add_rule(                               # condition counts as a violation
     action="block",                            # "block" aborts; "warn" only records
     severity="high",
 )
-adapter = PydanticAIAdapter(policy_enforcer=policy, block_on_violation=True, ...)
+adapter = PydanticAIAdapter(policy_enforcer=policy, block_on_violation=True)
 ```
 
 > **Gotcha.** The safe evaluator supports subscripting (`state['messages'][0]`)
@@ -634,7 +634,7 @@ def stub(prompt: str) -> str:
 judge = LLMJudge(stub)
 ```
 
-For real runs, swap in `ClaudeJudge(model="claude-opus-4-8")`,
+For real runs, swap in `ClaudeJudge(model="claude-opus-5-5")`,
 `OpenAIJudge(...)`, etc. Set **`adversarial=True`** to make the judge grade as a
 harsh critic that hunts for missing requirements and unsafe behaviour -- a
 reward-hack-resistant signal.
@@ -675,13 +675,13 @@ result = run_training("examples/pydantic_ai/pydantic_ai.train.yaml")
 
 The schema (`target.entrypoint`/`components`, `dataset`, `judge`, `metrics`,
 `optimizer`, `parameters[]`) is documented in
-[`pydantic_ai.train.yaml`](../../examples/pydantic_ai/pydantic_ai.train.yaml).
+[`pydantic_ai.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/pydantic_ai.train.yaml).
 Temperature bounds that exceed a provider's maximum are **clamped with a warning**
 rather than crashing. Note that a YAML `parameter` binds to an *attribute* on a
 resolved component (`component` + `attr_path`); knobs that live in a free-standing
 dict must instead be declared in Python with explicit getters/setters.
 
-See [`examples/pydantic_ai/03_evaluate_and_optimize.py`](../../examples/pydantic_ai/03_evaluate_and_optimize.py).
+See [`examples/pydantic_ai/03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/03_evaluate_and_optimize.py).
 
 ---
 
@@ -742,7 +742,7 @@ result = make_default_optimizer(harness, judge=judge, max_evals=40, seed=0).opti
 
 The full example -- guard + whole-system/per-agent optimization + tool ablation +
 recommendations + the YAML path -- is
-[`examples/pydantic_ai/04_multi_agent_and_training.py`](../../examples/pydantic_ai/04_multi_agent_and_training.py).
+[`examples/pydantic_ai/04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/04_multi_agent_and_training.py).
 
 > **Note on other frameworks' orchestrators.** Frameworks with a built-in
 > orchestrator (e.g. Microsoft Agent Framework's *magentic* workflow, or OpenAI's
@@ -788,18 +788,18 @@ recommendations + the YAML path -- is
 
 A ladder from a tiny guarded agent to a governed, optimizable multi-agent system:
 
-1. [`examples/pydantic_ai/01_basic_guarded.py`](../../examples/pydantic_ai/01_basic_guarded.py)
+1. [`examples/pydantic_ai/01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/01_basic_guarded.py)
    -- smallest guarded `Agent`; safe input vs. a blocked injection.
-2. [`examples/pydantic_ai/02_policy_observability_trust.py`](../../examples/pydantic_ai/02_policy_observability_trust.py)
+2. [`examples/pydantic_ai/02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/02_policy_observability_trust.py)
    -- policy, defense, observer, middleware, trust; blocking vs. monitor-only.
-3. [`examples/pydantic_ai/03_evaluate_and_optimize.py`](../../examples/pydantic_ai/03_evaluate_and_optimize.py)
+3. [`examples/pydantic_ai/03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/03_evaluate_and_optimize.py)
    -- introspect, evaluate, and optimize one agent with a judge.
-4. [`examples/pydantic_ai/04_multi_agent_and_training.py`](../../examples/pydantic_ai/04_multi_agent_and_training.py)
+4. [`examples/pydantic_ai/04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/04_multi_agent_and_training.py)
    -- a multi-agent orchestrator: guarded as one unit, optimized whole-system +
    per-agent with `make_default_optimizer`, plus a YAML
-   [`pydantic_ai.train.yaml`](../../examples/pydantic_ai/pydantic_ai.train.yaml)
+   [`pydantic_ai.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/pydantic_ai.train.yaml)
    path via `run_training`.
-5. [`examples/pydantic_ai/05_tool_governance.py`](../../examples/pydantic_ai/05_tool_governance.py)
+5. [`examples/pydantic_ai/05_tool_governance.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/05_tool_governance.py)
    -- `governance_capability`: denied tools (raise / refuse), a poisoned tool
    result, the approval round trip, policy on `deps`, buffered vs. unbuffered
    streaming, and an MCP tool.

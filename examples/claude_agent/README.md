@@ -24,10 +24,10 @@ async for message in query(
     prompt="What is the capital of France?",
     options=ClaudeAgentOptions(
         system_prompt="Answer with only the city name.",
-        model="claude-opus-4-8",
+        model="claude-opus-5-5",
         allowed_tools=[],            # permission allow-list
         max_turns=1,
-        permission_mode="default",   # default | acceptEdits | plan | bypassPermissions
+        permission_mode="default",   # the SDK permission mode (a security setting)
     ),
 ):
     ...   # AssistantMessage(content=[TextBlock(text=...)]) ... then a ResultMessage
@@ -74,6 +74,13 @@ python examples/claude_agent/04_multi_agent_and_training.py
 python examples/claude_agent/05_tool_governance.py
 ```
 
+Each script prints what it ran, what passed, what
+was blocked and why (the `SecurityBlockedError` threat labels), and exits 0. The
+optimization examples print an `OptimizationResult` line such as
+`baseline=0.200, best=0.900, ..., significant=False (p=0.0625, n=4)`: the gain is
+applied, but on a handful of rows no outcome can pass the paired significance
+test, so `improved` stays `False` -- use a larger golden set for a real verdict.
+
 ## What gets introspected
 
 For a `ClaudeAgentOptions` object, ADAPT-Agent discovers:
@@ -82,10 +89,11 @@ For a `ClaudeAgentOptions` object, ADAPT-Agent discovers:
 |-------|----------------|
 | `system_prompt` (string, or a preset's `append`) | `PROMPT` |
 | `model` | `MODEL` |
-| `allowed_tools` | `TOOL` (drop-one ablation when ≥2 tools) |
-| `disallowed_tools` | `TOOL` |
+| `allowed_tools` | `TOOL` (narrowed only: drop-one ablation when ≥2 tools, never a new tool) |
+| `disallowed_tools` | `TOOL`, **read-only** (reported, never written: a security control) |
 | `max_turns` | `HYPERPARAM` (bounds 1–100) |
-| `permission_mode` | `ROUTING` (candidates: `default`/`acceptEdits`/`plan`/`bypassPermissions`) |
+| `effort` | `HYPERPARAM` (the levels the installed SDK accepts; `max_thinking_tokens` on an SDK without `effort`) |
+| `permission_mode` | `ROUTING`, **read-only** (reported, never written: choosing one is a security decision) |
 
 See [`docs/frameworks/claude_agent.md`](../../docs/frameworks/claude_agent.md)
 for the full, teach-everything walkthrough.

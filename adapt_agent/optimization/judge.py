@@ -274,16 +274,23 @@ class LLMJudge:
             ``score_is_normalized`` is set.
         max_failures: Maximum number of failures embedded in an
             :meth:`improve_prompt` meta-prompt (keeps prompts bounded).
-        on_error: Score returned when a grading call or parse fails. Defaults to
+        on_error: Score recorded when a grading call or parse fails. Defaults to
             ``0.0`` so a broken judge fails closed rather than inflating results.
+            Through :meth:`as_metric` such a row is a metric *error* (the
+            harness counts it) scored with this fallback, never a grade.
         adversarial: When ``True`` the judge grades as a harsh critical adversary
             (assume the answer is flawed until proven otherwise; hunt missing
             requirements, edge cases and unsafe behaviour; reserve high scores).
             The stance is injected into the scoring/critique system prompt.
         score_is_normalized: When ``True`` the model is expected to return a score
-            already in ``[0, 1]`` and it is used as-is (only clamped). When
-            ``False`` (default) the model returns ``0..scale`` and the value is
-            divided by ``scale``.
+            already in ``[0, 1]`` and it is used as-is. When ``False`` (default)
+            the model returns ``0..scale`` and the value is divided by
+            ``scale``. Either way an out-of-range or non-finite score is
+            rejected as a failed grade, not clamped.
+        retry: The :class:`~adapt_agent.optimization.retry.RetryPolicy` for the
+            provider call (``None``: the default policy). Transient errors are
+            retried; through :meth:`as_metric` one that outlives its retries is
+            re-raised so the harness drops the row rather than scoring it.
     """
 
     def __init__(

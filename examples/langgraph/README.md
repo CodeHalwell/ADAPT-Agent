@@ -11,8 +11,8 @@ Install the extra first:
 pip install 'adapt-agent[langgraph]'
 ```
 
-Example 5 also needs LangChain v1 (`pip install 'langchain>=1.0'`), which provides
-`create_agent` and its middleware.
+The extra installs LangGraph and LangChain v1 (`langchain>=1.0`), which provides
+`create_agent` and the middleware example 5 uses.
 
 Each script guards its framework imports, prints a hint and exits 0 if they are
 not installed. The examples themselves run **offline** (plain-Python nodes, a
@@ -35,6 +35,13 @@ python examples/langgraph/03_evaluate_and_optimize.py
 python examples/langgraph/04_multi_agent_and_training.py
 python examples/langgraph/05_tool_governance_middleware.py
 ```
+
+Each script prints what it ran, what passed, what
+was blocked and why (the `SecurityBlockedError` threat labels), and exits 0. The
+optimization examples print an `OptimizationResult` line such as
+`baseline=0.200, best=0.900, ..., significant=False (p=0.0625, n=4)`: the gain is
+applied, but on a handful of rows no outcome can pass the paired significance
+test, so `improved` stays `False` -- use a larger golden set for a real verdict.
 
 See [`langgraph.train.yaml`](langgraph.train.yaml) for the file-based declarative
 training config, and [`docs/frameworks/langgraph.md`](../../docs/frameworks/langgraph.md)

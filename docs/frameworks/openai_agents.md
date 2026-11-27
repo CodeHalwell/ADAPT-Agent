@@ -15,7 +15,7 @@ halves, both framework-agnostic and import-safe:
   let an optimizer find and apply a better configuration in place.
 
 The five runnable examples referenced throughout live in
-[`examples/openai_agents/`](../../examples/openai_agents/).
+[`examples/openai_agents/`](https://github.com/CodeHalwell/ADAPT-Agent/tree/main/examples/openai_agents/).
 
 ---
 
@@ -695,11 +695,11 @@ judge = LLMJudge(lambda prompt: '{"score": 8, "pass": true, "reasoning": "ok"}')
 # Real providers — convenience subclasses of LLMJudge (use them directly, do not
 # wrap them in another LLMJudge). Keys come from the environment.
 from adapt_agent.optimization.judges import ClaudeJudge, OpenAIJudge, GeminiJudge
-judge = ClaudeJudge(model="claude-opus-4-8")    # ANTHROPIC_API_KEY
+judge = ClaudeJudge(model="claude-opus-5-5")    # ANTHROPIC_API_KEY
 judge = OpenAIJudge(model="gpt-5.6-luna")       # OPENAI_API_KEY
 
 # Adversarial: grade like a harsh critic and resist reward-hacking:
-judge = ClaudeJudge(model="claude-opus-4-8", adversarial=True)
+judge = ClaudeJudge(model="claude-opus-5-5", adversarial=True)
 
 harness = EvaluationHarness([exact_match(), judge.as_metric("quality")],
                             primary_metric="quality")
@@ -761,7 +761,7 @@ The config has `target` (`entrypoint` + introspectable `components`), `dataset`,
 explicit `parameters`. Each component/entrypoint is a `"module:attribute"`
 reference to the **same live objects** your entrypoint runs. A temperature bound
 that exceeds the provider's max is clamped with a warning rather than crashing.
-See [`openai_agents.train.yaml`](../../examples/openai_agents/openai_agents.train.yaml)
+See [`openai_agents.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/openai_agents/openai_agents.train.yaml)
 for a fully-commented schema; example 04 also builds the equivalent config
 in-process so it runs offline.
 
@@ -882,17 +882,17 @@ raises a clear `AdapterError` pointing you at the SDK's native async API
 
 ## 9. The examples
 
-- [`examples/openai_agents/01_basic_guarded.py`](../../examples/openai_agents/01_basic_guarded.py)
+- [`examples/openai_agents/01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/openai_agents/01_basic_guarded.py)
   — smallest guarded agent; safe vs. prompt-injection input.
-- [`examples/openai_agents/02_policy_observability_trust.py`](../../examples/openai_agents/02_policy_observability_trust.py)
+- [`examples/openai_agents/02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/openai_agents/02_policy_observability_trust.py)
   — policy + defense + observer + middleware + trust, in monitor mode.
-- [`examples/openai_agents/03_evaluate_and_optimize.py`](../../examples/openai_agents/03_evaluate_and_optimize.py)
+- [`examples/openai_agents/03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/openai_agents/03_evaluate_and_optimize.py)
   — introspect, evaluate, and optimize a single agent (offline).
-- [`examples/openai_agents/04_multi_agent_and_training.py`](../../examples/openai_agents/04_multi_agent_and_training.py)
+- [`examples/openai_agents/04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/openai_agents/04_multi_agent_and_training.py)
   — triage + handoffs governed as one unit; whole-system + per-agent optimization,
   tool ablation, recommendations, and the YAML config path.
-- [`examples/openai_agents/05_tool_calls_handoffs_streaming.py`](../../examples/openai_agents/05_tool_calls_handoffs_streaming.py)
+- [`examples/openai_agents/05_tool_calls_handoffs_streaming.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/openai_agents/05_tool_calls_handoffs_streaming.py)
   — `govern_tools` (denied tool, poisoned result), an approval resumed through the
   adapter, run hooks covering a handoff target, and a governed stream.
-- [`examples/openai_agents/openai_agents.train.yaml`](../../examples/openai_agents/openai_agents.train.yaml)
+- [`examples/openai_agents/openai_agents.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/openai_agents/openai_agents.train.yaml)
   — declarative training config schema for an OpenAI Agents multi-agent system.

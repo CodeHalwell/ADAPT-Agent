@@ -42,6 +42,13 @@ python examples/microsoft_agent_framework/03_evaluate_and_optimize.py
 python examples/microsoft_agent_framework/04_magentic_team_and_training.py
 ```
 
+Each script prints what it ran, what passed, what
+was blocked and why (the `SecurityBlockedError` threat labels), and exits 0. The
+optimization examples print an `OptimizationResult` line such as
+`baseline=0.200, best=0.900, ..., significant=False (p=0.0625, n=4)`: the gain is
+applied, but on a handful of rows no outcome can pass the paired significance
+test, so `improved` stays `False` -- use a larger golden set for a real verdict.
+
 ## What ADAPT-Agent introspects for an `Agent`
 
 `detect(agent)` returns `"microsoft_agent_framework"`; `introspect(agent)`

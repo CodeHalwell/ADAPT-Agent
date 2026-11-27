@@ -71,7 +71,7 @@ _MAPPING_KEYS = (
     "message",
 )
 
-#: Where LangGraph's ``create_react_agent(response_format=...)`` puts the
+#: Where LangGraph's ``create_agent`` / ``create_react_agent(response_format=...)`` put the
 #: declared structured output -- see ``AgentStateWithStructuredResponse``.
 #: Attribute marking a governed adapter's own ``{"result": ...}`` wrapper. See
 #: ``adapt_agent.adapters._governed.GovernedEnvelope``: the shape alone cannot

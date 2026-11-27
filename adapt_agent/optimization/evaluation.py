@@ -567,6 +567,21 @@ class EvaluationHarness:
             text/number metrics compare against the answer rather than a
             ``repr``. ``None`` (the default) keeps raw outputs. Extractor
             errors are non-fatal: the raw output is scored instead.
+        concurrency: Default number of examples :meth:`evaluate` runs at once
+            (a thread pool; ``1``, the default, is serial). Values below 1 are
+            treated as 1. Results are reported in example order either way.
+        retry: The :class:`~adapt_agent.optimization.retry.RetryPolicy` that
+            decides which failures are transient infrastructure faults (retried,
+            then dropped from the score) rather than failures of the row.
+            ``None`` uses the default policy, under which an exception raised by
+            the agent counts as transient only when it shows it came from a
+            provider SDK, an HTTP client or an HTTP status.
+        conversation_input: How a multi-turn row's history reaches the agent on
+            each turn: ``"messages"`` (default), the conversation so far as a
+            ``[{"role": ..., "content": ...}]`` list ending with the new user
+            turn; ``"text"``, the new turn's input only; or a callable
+            ``(history, turn_input) -> payload``. Anything else raises
+            :class:`ValueError`.
     """
 
     def __init__(

@@ -41,6 +41,13 @@ python examples/crewai/04_multi_agent_and_training.py
 python examples/crewai/05_tool_governance.py
 ```
 
+Each script prints what it ran, what passed, what
+was blocked and why (the `SecurityBlockedError` threat labels), and exits 0. The
+optimization examples print an `OptimizationResult` line such as
+`baseline=0.200, best=0.900, ..., significant=False (p=0.0625, n=4)`: the gain is
+applied, but on a handful of rows no outcome can pass the paired significance
+test, so `improved` stays `False` -- use a larger golden set for a real verdict.
+
 For the full prose walkthrough -- every constructor argument, the 6-step
 pipeline, what gets introspected, and the multi-agent/YAML patterns -- see
 [`docs/frameworks/crewai.md`](../../docs/frameworks/crewai.md).

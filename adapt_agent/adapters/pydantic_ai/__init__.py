@@ -32,7 +32,7 @@ the adapter too: ``guarded.execute(payload, capabilities=[governance])``.
 Example
 -------
 >>> from pydantic_ai import Agent                       # doctest: +SKIP
->>> agent = Agent("openai:gpt-4o", deps_type=Deps)      # doctest: +SKIP
+>>> agent = Agent("openai:gpt-5.6-luna", deps_type=Deps)      # doctest: +SKIP
 >>> from adapt_agent.adapters import PydanticAIAdapter
 >>> from adapt_agent.security import Firewall
 >>> adapter = PydanticAIAdapter(firewall=Firewall())

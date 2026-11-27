@@ -123,7 +123,7 @@ def langgraph_inputs(input_data: Any) -> Any:
     """Adapt a plain dataset input into LangGraph message-state form.
 
     A string becomes ``{"messages": [{"role": "user", "content": <s>}]}`` (the
-    ``MessagesState`` convention used by ``create_react_agent`` and most
+    ``MessagesState`` convention used by ``langchain.agents.create_agent`` and most
     graphs); a list is taken as a ready message list and wrapped the same way;
     mappings and anything else pass through unchanged (the dataset already
     carries graph-native state).

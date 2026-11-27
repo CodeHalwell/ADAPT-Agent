@@ -183,7 +183,7 @@ template variables substituted into task descriptions. The return value is a
 ```python
 from crewai import LLM, Agent, Crew, Process, Task
 
-llm = LLM(model="openai/gpt-4o", temperature=0.2)   # "provider/model" id
+llm = LLM(model="openai/gpt-5.6-luna", temperature=0.2)   # "provider/model" id
 
 geographer = Agent(
     role="Geographer",
@@ -237,7 +237,7 @@ callbacks, guardrail and adapter work on older releases.
 > with no API key. Do *not* subclass `crewai.LLM`: on current CrewAI `LLM.__new__`
 > is a provider-routing factory and `class X(LLM)` fails with `TypeError:
 > LLM.__new__() missing 1 required positional argument: 'model'`. In real use you
-> pass a normal `LLM(model="openai/gpt-4o")` (or a `"provider/model"` string).
+> pass a normal `LLM(model="openai/gpt-5.6-luna")` (or a `"provider/model"` string).
 
 ---
 
@@ -376,8 +376,8 @@ out = guarded.execute(bad_payload)   # still returns a CrewOutput
 # Inspect observer.get_traces() to see what fired.
 ```
 
-Full runnable versions: [`01_basic_guarded.py`](../../examples/crewai/01_basic_guarded.py)
-and [`02_policy_observability_trust.py`](../../examples/crewai/02_policy_observability_trust.py).
+Full runnable versions: [`01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/01_basic_guarded.py)
+and [`02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/02_policy_observability_trust.py).
 
 ---
 
@@ -415,7 +415,7 @@ firewall at step 1.
 
 ```python
 observer = AgentObserver()
-adapter = CrewAIAdapter(observer=observer, ...)
+adapter = CrewAIAdapter(observer=observer, agent_id="research-crew")
 # ... after some runs ...
 for trace in observer.get_traces():
     print(trace["trace_id"][:8], trace["operation"], trace["status"])
@@ -577,7 +577,7 @@ Built-in metrics include `exact_match`, `token_f1`, `contains`, `regex_match`,
 `jaccard`, `numeric_close`, `json_subset`, and `levenshtein_ratio`.
 
 **The judge** (`LLMJudge`) is provider-agnostic -- back it with any
-`Callable[[str], str]`. For real runs use `ClaudeJudge(model="claude-opus-4-8")`,
+`Callable[[str], str]`. For real runs use `ClaudeJudge(model="claude-opus-5-5")`,
 `OpenAIJudge(...)`, etc. **For offline, no-key runs, pass a deterministic stub**:
 
 ```python
@@ -641,8 +641,8 @@ call**: register `components={"crew": crew}` (or several named agents) and the
 optimizer searches across all of their knobs at once. To tune a single agent in
 isolation, wrap just that agent's runner and register only that component.
 
-Runnable: [`03_evaluate_and_optimize.py`](../../examples/crewai/03_evaluate_and_optimize.py)
-(one crew) and [`04_multi_agent_and_training.py`](../../examples/crewai/04_multi_agent_and_training.py)
+Runnable: [`03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/03_evaluate_and_optimize.py)
+(one crew) and [`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/04_multi_agent_and_training.py)
 (two-agent crew, full pipeline, recommendations).
 
 ### The YAML config path
@@ -664,7 +664,7 @@ dataset:
   path: "golden.jsonl"                  # jsonl / json / csv
 judge:
   provider: anthropic                   # or openai / gemini / a registered custom provider
-  model: claude-opus-4-8
+  model: claude-opus-5-5
   adversarial: true
   metric_name: quality
 metrics: [exact_match, token_f1]
@@ -697,8 +697,8 @@ a dotted `attr_path` that resolves through attribute access).
 > Register it **before** `run_training` -- the judge is built before the target
 > module is imported, so top-level registration in the script that calls
 > `run_training` is the reliable place. See
-> [`crewai.train.yaml`](../../examples/crewai/crewai.train.yaml) and
-> [`04_multi_agent_and_training.py`](../../examples/crewai/04_multi_agent_and_training.py).
+> [`crewai.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/crewai.train.yaml) and
+> [`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/04_multi_agent_and_training.py).
 
 ---
 
@@ -733,10 +733,10 @@ manager delegates tasks to the workers. Either way:
   per-agent tool ablation.
 
 This is the capstone example,
-[`04_multi_agent_and_training.py`](../../examples/crewai/04_multi_agent_and_training.py),
+[`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/04_multi_agent_and_training.py),
 which governs a researcher+writer crew, optimizes it end to end with an
 adversarial judge (printing `result.recommendations`), and also runs the same job
-from [`crewai.train.yaml`](../../examples/crewai/crewai.train.yaml).
+from [`crewai.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/crewai.train.yaml).
 
 ---
 
@@ -795,16 +795,16 @@ drives CrewAI's native `akickoff` in your loop).
 
 ## 8. The examples
 
-- [`05_tool_governance.py`](../../examples/crewai/05_tool_governance.py) -- the
+- [`05_tool_governance.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/05_tool_governance.py) -- the
   interception hooks: denied tool, aborting run, poisoned tool result, approvals.
-- [`01_basic_guarded.py`](../../examples/crewai/01_basic_guarded.py) -- smallest
+- [`01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/01_basic_guarded.py) -- smallest
   real crew, wrapped with a `Firewall`; safe input vs. blocked injection.
-- [`02_policy_observability_trust.py`](../../examples/crewai/02_policy_observability_trust.py)
+- [`02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/02_policy_observability_trust.py)
   -- policy block rule, adversarial defense, observer traces, middleware,
   `block_on_violation=False`.
-- [`03_evaluate_and_optimize.py`](../../examples/crewai/03_evaluate_and_optimize.py)
+- [`03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/03_evaluate_and_optimize.py)
   -- introspect + evaluate + `CoordinateAscentOptimizer` on one crew.
-- [`04_multi_agent_and_training.py`](../../examples/crewai/04_multi_agent_and_training.py)
-  + [`crewai.train.yaml`](../../examples/crewai/crewai.train.yaml) -- two-agent
+- [`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/04_multi_agent_and_training.py)
+  + [`crewai.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/crewai.train.yaml) -- two-agent
   crew governed as one unit, optimized with `make_default_optimizer` (tool
   ablation + adversarial recommendations), plus the YAML `run_training` path.

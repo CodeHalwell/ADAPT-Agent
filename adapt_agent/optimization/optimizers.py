@@ -255,7 +255,7 @@ class OptimizationResult:
                 You are a careful researcher...
               temperature: 0.2
             writer:
-              model: gpt-4o
+              model: gpt-5.6-luna
             temperature: 0.2        # a bare name, unchanged
 
         Round-trips through :func:`load_tuned_config`, which flattens it back

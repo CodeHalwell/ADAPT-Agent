@@ -90,7 +90,7 @@ def evaluate_agent(
 
     Args:
         agent: The system under test: a framework object (LangGraph compiled
-            graph, Microsoft Agent Framework ``ChatAgent``, Pydantic AI
+            graph, Microsoft Agent Framework ``Agent``, Pydantic AI
             ``Agent``, CrewAI ``Crew``, ...), a governed adapter, an
             :class:`~adapt_agent.optimization.target.OptimizableAgent`, or any
             callable -- including the callable built by

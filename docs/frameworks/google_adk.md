@@ -92,6 +92,9 @@ with reraise_security_blocks():           # works around `for` and `async for`
         ...
 
 # or, in an existing handler:
+try:
+    async for event in runner.run_async(user_id="u", session_id="s", new_message=msg):
+        ...
 except RuntimeError as exc:
     blocked = find_security_error(exc)    # the SecurityBlockedError, or None
 ```
@@ -353,7 +356,7 @@ taint.propagate_taint("question_1", "answer_1", operation="llm_answer")
 taint.is_tainted("answer_1")               # -> True
 ```
 
-See [`examples/google_adk/02_policy_observability_trust.py`](../../examples/google_adk/02_policy_observability_trust.py).
+See [`examples/google_adk/02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/google_adk/02_policy_observability_trust.py).
 
 ---
 
@@ -440,7 +443,7 @@ recognises an ADK agent and lists its tunable
 
 | Attribute | `ParameterKind` | Notes |
 |---|---|---|
-| `instruction`, `global_instruction` | `PROMPT` | only when plain strings (instruction-provider callables are skipped) |
+| `instruction`, `global_instruction` | `PROMPT` | only when plain strings (instruction-provider callables are skipped); `global_instruction` only on releases that do not deprecate it (ADK 2.x does) |
 | `model` | `MODEL` | a string id, or a model object's `model` / `model_name` |
 | `generate_content_config.temperature` | `HYPERPARAM` | bounds `(0.0, 2.0)` |
 | `generate_content_config.top_p` | `HYPERPARAM` | bounds `(0.0, 1.0)` |
@@ -544,7 +547,7 @@ def stub(prompt, system=None):
 judge = LLMJudge(stub)
 ```
 
-For real use, swap in `ClaudeJudge(model="claude-opus-4-8")`, `OpenAIJudge(...)`,
+For real use, swap in `ClaudeJudge(model="claude-opus-5-5")`, `OpenAIJudge(...)`,
 or `GeminiJudge(...)`. Set `adversarial=True` to grade like a harsh critic
 (resistant to reward-hacking) and to surface tougher tool/skill suggestions.
 
@@ -597,7 +600,7 @@ from adapt_agent.optimization.config import run_training
 result = run_training("examples/google_adk/google_adk.train.yaml")
 ```
 
-The schema (see [`google_adk.train.yaml`](../../examples/google_adk/google_adk.train.yaml)):
+The schema (see [`google_adk.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/google_adk/google_adk.train.yaml)):
 
 - **`target.entrypoint`** - `"module:attribute"` of a callable `input -> output`
   that drives the whole system.
@@ -614,8 +617,8 @@ The schema (see [`google_adk.train.yaml`](../../examples/google_adk/google_adk.t
 - **`parameters`** - explicit knobs the framework doesn't auto-expose, each bound
   live to a component attribute via `attr` / `attr_path`.
 
-See [`examples/google_adk/03_evaluate_and_optimize.py`](../../examples/google_adk/03_evaluate_and_optimize.py)
-and [`examples/google_adk/04_multi_agent_and_training.py`](../../examples/google_adk/04_multi_agent_and_training.py).
+See [`examples/google_adk/03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/google_adk/03_evaluate_and_optimize.py)
+and [`examples/google_adk/04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/google_adk/04_multi_agent_and_training.py).
 
 ---
 
@@ -685,16 +688,16 @@ Introspection recognises an ADK agent by having both `instruction` and
 All run offline with the framework installed, and exit 0 with a skip message
 without it.
 
-- [`01_basic_guarded.py`](../../examples/google_adk/01_basic_guarded.py)
+- [`01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/google_adk/01_basic_guarded.py)
   - the plugin on an `App`, the adapter around the `Runner`; a safe call and a
     blocked prompt injection.
-- [`02_policy_observability_trust.py`](../../examples/google_adk/02_policy_observability_trust.py)
+- [`02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/google_adk/02_policy_observability_trust.py)
   - policy, defense, observability, middleware, trust, taint; `block_on_violation=False`.
-- [`03_evaluate_and_optimize.py`](../../examples/google_adk/03_evaluate_and_optimize.py)
+- [`03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/google_adk/03_evaluate_and_optimize.py)
   - introspect + evaluate + optimize a single ADK agent.
-- [`04_multi_agent_and_training.py`](../../examples/google_adk/04_multi_agent_and_training.py)
+- [`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/google_adk/04_multi_agent_and_training.py)
   - coordinator + sub_agents optimized as one unit, plus the YAML
-    `run_training` path ([`google_adk.train.yaml`](../../examples/google_adk/google_adk.train.yaml)).
-- [`05_tools_approvals_streaming.py`](../../examples/google_adk/05_tools_approvals_streaming.py)
+    `run_training` path ([`google_adk.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/google_adk/google_adk.train.yaml)).
+- [`05_tools_approvals_streaming.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/google_adk/05_tools_approvals_streaming.py)
   - a denied tool in a sub-agent, a poisoned tool result, an approval round trip,
     and a buffered SSE stream, all under one plugin.
