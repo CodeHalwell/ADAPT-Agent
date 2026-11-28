@@ -430,7 +430,8 @@ either a shared `gate=` or the individual `firewall=` / `defense=` /
   by parallel nodes or model calls were each screened in pieces and a pattern
   split between them was delivered. Chunks are now held per message until it is
   complete (its last chunk is marked, its node's `updates` event or a `values`
-  event arrives, or the stream ends) and released in arrival order.
+  event arrives, or the stream ends) and released in arrival order. A streamed
+  tool call's argument fragments are assembled per call and screened whole too.
 
 ### Known limitations
 

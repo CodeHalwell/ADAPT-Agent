@@ -523,3 +523,70 @@ def test_a_finish_reason_marks_the_last_chunk():
     rest = [(_Chunk("SEC", "b"), {}), (_Chunk("RET-7", "b"), {})]
     released, blocked = _stream(first + rest, stream_mode="messages")
     assert released == first and blocked is not None
+
+
+# -- streamed tool-call arguments are screened assembled, per call ---------------
+
+
+class _ToolChunk(_Chunk):
+    """A chunk with no text, carrying fragments of streamed tool-call arguments."""
+
+    def __init__(self, id: str, *pieces: dict[str, Any]):
+        super().__init__("", id)
+        self.tool_call_chunks = list(pieces)
+
+
+def test_a_pattern_split_across_tool_call_argument_fragments_is_caught():
+    items = [
+        (_ToolChunk("m", {"name": "search", "args": '{"q":"SEC', "id": "c1", "index": 0}), {}),
+        (_ToolChunk("m", {"name": None, "args": 'RET-7"}', "id": None, "index": 0}), {}),
+    ]
+    released, blocked = _stream(items, stream_mode="messages")
+    assert blocked is not None and released == []
+
+
+def test_clean_tool_call_arguments_are_released():
+    items = [
+        (_ToolChunk("m", {"name": "search", "args": '{"q":"wea', "id": "c1", "index": 0}), {}),
+        (_ToolChunk("m", {"name": None, "args": 'ther"}', "id": None, "index": 0}), {}),
+    ]
+    assert _stream(items, stream_mode="messages") == (items, None)
+
+
+def test_parallel_tool_calls_are_assembled_separately():
+    """Fragments of two calls are not joined: that text reaches no tool."""
+    items = [
+        (
+            _ToolChunk(
+                "m",
+                {"name": "a", "args": '{"q":"SEC', "id": "c1", "index": 0},
+                {"name": "b", "args": '{"q":"RET-7', "id": "c2", "index": 1},
+            ),
+            {},
+        ),
+        (
+            _ToolChunk(
+                "m",
+                {"name": None, "args": 'OND"}', "id": None, "index": 0},
+                {"name": None, "args": 'IRED"}', "id": None, "index": 1},
+            ),
+            {},
+        ),
+    ]
+    assert _stream(items, stream_mode="messages") == (items, None)
+
+
+def test_tool_call_fragments_without_an_index_are_grouped_by_id():
+    from adapt_agent.adapters.langgraph import _tool_call_arguments
+
+    class Piece:  # an object-shaped fragment, as some integrations emit
+        def __init__(self, args: Any, id: Any):
+            self.args, self.id, self.index = args, id, None
+
+    chunks = [
+        _ToolChunk("m", {"args": "ab", "id": "c1"}, {"args": "xy", "id": "c2"}),
+        _ToolChunk("m", {"args": "cd", "id": "c1"}, {"args": None, "id": "c2"}),
+    ]
+    chunks[1].tool_call_chunks.append(Piece("z", "c2"))
+    assert _tool_call_arguments(chunks) == ["abcd", "xyz"]
+    assert _tool_call_arguments([_Chunk("text", "m")]) == []

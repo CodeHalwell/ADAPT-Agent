@@ -443,7 +443,10 @@ class _MessageBuffer:
         chunks = [self._classify(h.item)[2][0] for h in held]
         # The chunks' text, joined: a pattern split across tokens is matched.
         joined = "".join(c for c in (_chunk_text(chunk) for chunk in chunks) if c)
-        self._agent._screen_items([joined, chunks])
+        # A streamed tool call carries its arguments the same way -- a JSON
+        # string in fragments, with `content` empty -- so they are assembled
+        # per call before screening, or each fragment is judged alone.
+        self._agent._screen_items([joined, *_tool_call_arguments(chunks), chunks])
         for h in held:
             h.ready = True
 
@@ -476,6 +479,44 @@ def _is_final_chunk(chunk: Any) -> bool:
     if isinstance(metadata, dict):
         return bool(metadata.get("finish_reason") or metadata.get("stop_reason"))
     return False
+
+
+def _tool_call_arguments(chunks: list[Any]) -> list[str]:
+    """Each streamed tool call's argument string, reassembled from its fragments.
+
+    LangChain streams a tool call as ``tool_call_chunks`` entries whose ``args``
+    are consecutive pieces of one JSON string, tied together by ``index`` (the
+    ``id`` and ``name`` arrive on the first piece only). Calls are kept apart:
+    joining the fragments of two parallel calls would screen text no tool was
+    ever going to receive.
+    """
+    assembled: dict[Any, list[str]] = {}
+    for chunk in chunks:
+        pieces = getattr(chunk, "tool_call_chunks", None)
+        if not isinstance(pieces, (list, tuple)):
+            continue
+        for position, piece in enumerate(pieces):
+            fragment = _piece_field(piece, "args")
+            index = _piece_field(piece, "index")
+            call_id = _piece_field(piece, "id")
+            if not isinstance(fragment, str) or not fragment:
+                continue
+            # `index` is the stable key; a provider that omits it sends an id on
+            # every piece, and failing both the position within the chunk is
+            # the best evidence of which call a fragment continues.
+            key = ("index", index) if index is not None else ("id", call_id or position)
+            assembled.setdefault(key, []).append(fragment)
+    return ["".join(fragments) for fragments in assembled.values()]
+
+
+def _piece_field(piece: Any, name: str) -> Any:
+    """A field of one ``tool_call_chunks`` entry, a dict or an object."""
+    if isinstance(piece, dict):
+        return piece.get(name)
+    try:
+        return getattr(piece, name, None)
+    except Exception:
+        return None
 
 
 def _chunk_text(chunk: Any) -> str:
