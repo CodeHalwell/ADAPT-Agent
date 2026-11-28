@@ -1337,6 +1337,44 @@ def _event_text(event: Any) -> list[str]:
     return found
 
 
+class _HeldResponse:
+    """The text events of one model response, held until it has been screened.
+
+    Screening needs the response's text *assembled*: a provider's
+    ``...done`` event carries the full text, but a response that fails or is
+    cut short never sends one, and then all there is to judge are the deltas.
+    Scanned one by one, ``"TOP"`` and ``"SECRET"`` both pass a rule against
+    ``TOPSECRET``. So the deltas are joined here, per output item and content
+    part, whatever else the stream goes on to say.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+        self._texts: list[Any] = []
+        self._deltas: dict[tuple[Any, ...], list[str]] = {}
+
+    def __bool__(self) -> bool:
+        return bool(self.events)
+
+    def add(self, event: Any, kind: str) -> None:
+        self.events.append(event)
+        self._texts.extend(_event_text(event))
+        delta = getattr(event.data, "delta", None)
+        if isinstance(delta, str) and delta:
+            data = event.data
+            part = (
+                kind,
+                getattr(data, "item_id", None),
+                getattr(data, "output_index", None),
+                getattr(data, "content_index", None),
+            )
+            self._deltas.setdefault(part, []).append(delta)
+
+    def screenable(self) -> list[Any]:
+        """Everything to screen: each part's deltas joined, then the raw texts."""
+        return ["".join(pieces) for pieces in self._deltas.values()] + self._texts
+
+
 class GovernedStream:
     """A ``RunResultStreaming`` whose text events are released only once screened.
 
@@ -1395,34 +1433,32 @@ class GovernedStream:
 
     async def stream_events(self) -> AsyncIterator[Any]:
         """The governed event stream."""
-        held: list[Any] = []
-        texts: list[Any] = []
+        held = _HeldResponse()
         try:
             async for event in self.result.stream_events():
                 kind = _raw_type(event)
                 if kind is not None and _is_text_event(event, kind):
-                    held.append(event)
-                    texts.extend(_event_text(event))
+                    held.add(event, kind)
                     continue
                 if kind in _RESPONSE_END_TYPES:
                     if held:
-                        self._screen(texts)
-                        for released in held:
+                        self._screen(held.screenable())
+                        for released in held.events:
                             yield released
-                        held, texts = [], []
+                        held = _HeldResponse()
                     yield event
                     continue
                 if held and kind is None:
                     # A run item for a response whose end event never came: the
                     # response is over, so screen what it said before moving on.
-                    self._screen(texts)
-                    for released in held:
+                    self._screen(held.screenable())
+                    for released in held.events:
                         yield released
-                    held, texts = [], []
+                    held = _HeldResponse()
                 yield event
             if held:
-                self._screen(texts)
-                for released in held:
+                self._screen(held.screenable())
+                for released in held.events:
                     yield released
         except BaseException as exc:
             if isinstance(exc, (GeneratorExit, asyncio.CancelledError)):

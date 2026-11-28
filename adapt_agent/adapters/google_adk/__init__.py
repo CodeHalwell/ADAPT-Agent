@@ -13,7 +13,9 @@ The adapter accepts three wrap targets:
   payload's prompt as ``new_message`` and returns the run's events. The session
   is created on first use; omit ``session_id`` for a fresh session per call.
   ``run_config=``, ``state_delta=``, ``invocation_id=`` and a ready-made
-  ``new_message=`` (a confirmation response, say) pass straight through.
+  ``new_message=`` (a confirmation response, say) pass straight through --
+  except that ``new_message`` is content, not configuration: it replaces the
+  payload's prompt as what the model reads, so it is screened as input first.
 * **An ``App``**, run on an ``InMemoryRunner`` the adapter creates for it once
   (so sessions persist across calls of the same wrapped agent).
 * **A callable you write** that performs the run and returns (or yields) the
@@ -51,6 +53,7 @@ from collections.abc import AsyncIterable, AsyncIterator, Iterator
 from typing import Any
 
 from adapt_agent.adapters._governed import GovernedAdapter, Runner, _extract_prompt
+from adapt_agent.exceptions import SecurityBlockedError
 from adapt_agent.integrations._common import optional_import
 from adapt_agent.integrations.google_adk import reraise_security_blocks
 
@@ -192,7 +195,19 @@ class GoogleADKAdapter(GovernedAdapter):
         return super()._resolve_runner(agent)
 
     def _call_runner(self, runner: Runner, payload: dict[str, Any], **run_kwargs: Any) -> Any:
-        """Call ``runner`` and make a plugin-raised block surface as itself."""
+        """Call ``runner`` and make a plugin-raised block surface as itself.
+
+        ``new_message`` is the one run argument that is content rather than
+        configuration: given explicitly it *replaces* the prompt the payload
+        would have supplied, so it is what the model reads. It is screened as
+        input here, or an override would walk past every control the payload
+        went through.
+        """
+        new_message = run_kwargs.get("new_message")
+        if new_message is not None:
+            threats = self._screen_input(new_message)
+            if threats and self.block_on_violation:
+                raise SecurityBlockedError("Input blocked by security controls", threats)
         with reraise_security_blocks():
             raw = runner(self._prepare_input(payload), **run_kwargs)
         return _unwrapping(raw)

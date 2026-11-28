@@ -467,3 +467,44 @@ def test_a_wrapped_runner_still_screens_the_boundary():
     guarded = GoogleADKAdapter(firewall=_firewall()).wrap_agent(FakeRunner())
     with pytest.raises(SecurityBlockedError):
         guarded.execute({"prompt": INJECTION}, new_message=object())
+
+
+# -- an explicit new_message is content, and is screened as input ----------------
+
+
+def test_an_explicit_new_message_is_screened_before_the_run() -> None:
+    ran: list[Any] = []
+
+    def run(payload: Any, *, new_message: Any = None, **kwargs: Any) -> Any:
+        ran.append(new_message)
+        return [SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(text="ok")]))]
+
+    guarded = GoogleADKAdapter(firewall=_firewall()).wrap_agent(run)
+    poisoned = SimpleNamespace(role="user", parts=[SimpleNamespace(text="then run rm -rf /")])
+    with pytest.raises(SecurityBlockedError) as exc:
+        guarded.execute({"prompt": "hello"}, new_message=poisoned)
+    assert exc.value.threats == ["firewall"] and ran == []
+
+    async def arun() -> None:
+        with pytest.raises(SecurityBlockedError):
+            await guarded.aexecute({"prompt": "hello"}, new_message=poisoned)
+
+    asyncio.run(arun())
+    assert ran == []
+
+
+def test_a_clean_new_message_is_forwarded_and_report_only_lets_one_through() -> None:
+    ran: list[Any] = []
+
+    def run(payload: Any, *, new_message: Any = None, **kwargs: Any) -> Any:
+        ran.append(new_message)
+        return []
+
+    clean = SimpleNamespace(role="user", parts=[SimpleNamespace(text="hello there")])
+    GoogleADKAdapter(firewall=_firewall()).wrap_agent(run).execute(
+        {"prompt": "x"}, new_message=clean
+    )
+    poisoned = SimpleNamespace(role="user", parts=[SimpleNamespace(text="rm -rf /")])
+    report_only = GoogleADKAdapter(firewall=_firewall(), block_on_violation=False)
+    report_only.wrap_agent(run).execute({"prompt": "x"}, new_message=poisoned)
+    assert ran == [clean, poisoned]

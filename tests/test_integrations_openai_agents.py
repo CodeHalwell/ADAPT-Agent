@@ -758,3 +758,46 @@ def test_the_adapter_surfaces_interruptions_on_the_async_path():
 
     out = asyncio.run(OpenAIAgentsAdapter().wrap_agent(run).aexecute({"prompt": "x"}))
     assert out["interruptions"] == [pending]
+
+
+def _unfinished(*deltas: str, end: str | None = "response.failed") -> list[Any]:
+    """A response whose text never gets its full-text ``done`` event."""
+    item = types.SimpleNamespace(type="message")
+    events = [_raw("response.created"), _raw("response.output_item.added", item=item)]
+    events += [
+        _raw("response.output_text.delta", delta=delta, item_id="m1", content_index=0)
+        for delta in deltas
+    ]
+    if end is not None:
+        events.append(_raw(end))
+    return events
+
+
+@pytest.mark.parametrize("end", ["response.failed", "response.incomplete", None])
+def test_a_response_that_never_completes_is_screened_assembled(oa, end):
+    """Without the full-text event there are only deltas; they are joined first."""
+    source = _FakeStream(_unfinished("FORB", "IDDEN", end=end))
+    got, error = _drain(oa.govern_stream(source, firewall=_firewall()))
+    assert isinstance(error, SecurityBlockedError)
+    assert [e.data.type for e in got] == ["response.created"]
+    assert source.cancelled is True
+
+
+def test_an_unfinished_clean_response_is_still_released(oa):
+    events = _unfinished("hel", "lo")
+    got, error = _drain(oa.govern_stream(_FakeStream(events), firewall=_firewall()))
+    assert error is None and [e.data.type for e in got] == [e.data.type for e in events]
+
+
+def test_deltas_of_different_parts_are_not_joined_to_each_other(oa):
+    """Two content parts are two texts; gluing them would invent a match."""
+    item = types.SimpleNamespace(type="message")
+    events = [
+        _raw("response.created"),
+        _raw("response.output_item.added", item=item),
+        _raw("response.output_text.delta", delta="FORB", item_id="m1", content_index=0),
+        _raw("response.output_text.delta", delta="IDDEN", item_id="m1", content_index=1),
+        _raw("response.completed"),
+    ]
+    got, error = _drain(oa.govern_stream(_FakeStream(events), firewall=_firewall()))
+    assert error is None and len(got) == len(events)
