@@ -207,6 +207,37 @@ def tool_called(name: str | None = None, *, min_times: int = 1) -> Metric:
     return Metric("tool_called", _fn, needs_example=True)
 
 
+def _matched_expectations(
+    wanted: Sequence[dict[str, Any]],
+    calls: Sequence[ToolCall],
+    ok: Callable[[dict[str, Any], ToolCall], bool],
+) -> int:
+    """The most expectations that can each be given a different satisfying call.
+
+    Taking the first call that satisfies each expectation in turn is wrong when
+    expectations overlap: for calls ``search(q="Paris")`` and
+    ``search(q="Rome")``, an unconstrained ``search`` expectation listed first
+    takes the Paris call and leaves the ``q="Paris"`` expectation with nothing,
+    though assigning them the other way round satisfies both. This finds a
+    maximum matching instead (augmenting paths), so a valid trajectory is never
+    marked down for the order its expectations were written in.
+    """
+    compatible = [[i for i, call in enumerate(calls) if ok(spec, call)] for spec in wanted]
+    owner: dict[int, int] = {}  # call index -> expectation index holding it
+
+    def assign(spec_index: int, seen: set[int]) -> bool:
+        for call_index in compatible[spec_index]:
+            if call_index in seen:
+                continue
+            seen.add(call_index)
+            if call_index not in owner or assign(owner[call_index], seen):
+                owner[call_index] = spec_index
+                return True
+        return False
+
+    return sum(1 for spec_index in range(len(wanted)) if assign(spec_index, set()))
+
+
 def tool_call_args_match(
     expected_tools: Sequence[Any] | None = None, *, check: str = "exact_match"
 ) -> Metric:
@@ -226,17 +257,13 @@ def tool_call_args_match(
         if not wanted:
             return 1.0
         calls = list(trajectory_of(output).tool_calls)
-        used: set[int] = set()
-        matched = 0
-        for spec in wanted:
-            for i, call in enumerate(calls):
-                if i in used or call.name != spec["name"]:
-                    continue
-                if _args_subset(spec["args"], call.arguments, text_check):
-                    used.add(i)
-                    matched += 1
-                    break
-        return matched / len(wanted)
+
+        def ok(spec: dict[str, Any], call: ToolCall) -> bool:
+            return call.name == spec["name"] and _args_subset(
+                spec["args"], call.arguments, text_check
+            )
+
+        return _matched_expectations(wanted, calls, ok) / len(wanted)
 
     return Metric("tool_call_args_match", _fn, needs_example=True)
 
@@ -289,12 +316,8 @@ def tool_sequence(
                 if position < len(wanted) and ok(wanted[position], call):
                     position += 1
             return 1.0 if position == len(wanted) else 0.0
-        used: set[int] = set()
-        for spec in wanted:
-            hit = next((i for i, c in enumerate(calls) if i not in used and ok(spec, c)), None)
-            if hit is None:
-                return 0.0
-            used.add(hit)
+        if _matched_expectations(wanted, calls, ok) < len(wanted):
+            return 0.0
         if mode == "no_extra":
             allowed = {s["name"] for s in wanted}
             if any(c.name not in allowed for c in calls):

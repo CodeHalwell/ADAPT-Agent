@@ -433,3 +433,48 @@ def test_claude_agent_sdk_trajectory() -> None:
     assert trajectory.tool_calls[0].result == "contents"
     assert trajectory.steps == 2
     assert extract_usage(stream) == {"input_tokens": 5.0, "output_tokens": 2.0, "cost_usd": 0.01}
+
+
+# -- overlapping expectations are matched as a whole, not first-come ------------
+
+_TWO_SEARCHES = Trajectory(
+    tool_calls=[ToolCall("search", {"q": "Paris"}), ToolCall("search", {"q": "Rome"})]
+)
+
+
+def test_an_unconstrained_expectation_does_not_take_the_call_another_one_needs() -> None:
+    """Listed first, a bare `search` used to consume the Paris call and score 0.5."""
+    loose_first = [{"name": "search"}, {"name": "search", "args": {"q": "Paris"}}]
+    strict_first = list(reversed(loose_first))
+    for expected in (loose_first, strict_first):
+        row = _row(expected_tools=expected)
+        assert tool_call_args_match()(_TWO_SEARCHES, None, row) == 1.0
+        assert tool_sequence(mode="any_order", check_args=True)(_TWO_SEARCHES, None, row) == 1.0
+        assert tool_sequence(mode="no_extra", check_args=True)(_TWO_SEARCHES, None, row) == 1.0
+
+
+def test_matching_still_needs_one_real_call_per_expectation() -> None:
+    twice = _row(expected_tools=[{"name": "search", "args": {"q": "Paris"}}] * 2)
+    assert tool_call_args_match()(_TWO_SEARCHES, None, twice) == 0.5
+    assert tool_sequence(mode="any_order", check_args=True)(_TWO_SEARCHES, None, twice) == 0.0
+    three = _row(expected_tools=["search", "search", "search"])
+    assert tool_sequence(mode="any_order")(_TWO_SEARCHES, None, three) == 0.0
+
+
+def test_a_chain_of_overlapping_expectations_is_fully_assigned() -> None:
+    """Each expectation's first choice is taken; all three still fit by reassignment."""
+    run = Trajectory(
+        tool_calls=[
+            ToolCall("t", {"a": 1, "b": 1, "c": 1}),
+            ToolCall("t", {"a": 1, "b": 1}),
+            ToolCall("t", {"a": 1}),
+        ]
+    )
+    row = _row(
+        expected_tools=[
+            {"name": "t", "args": {"a": 1}},
+            {"name": "t", "args": {"a": 1, "b": 1}},
+            {"name": "t", "args": {"a": 1, "b": 1, "c": 1}},
+        ]
+    )
+    assert tool_call_args_match()(run, None, row) == 1.0

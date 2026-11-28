@@ -691,6 +691,43 @@ def test_the_adapter_passes_a_run_state_through_instead_of_stringifying_it():
     assert OpenAIAgentsAdapter()._prepare_input(state) is state
 
 
+def test_the_adapter_passes_a_bare_list_of_input_items_through_whole():
+    """Given directly, a conversation used to be reduced to its latest user text."""
+    from adapt_agent.adapters import OpenAIAgentsAdapter
+
+    seen: list[Any] = []
+
+    def run(prompt: Any, **kwargs: Any) -> Any:
+        seen.append(prompt)
+        return types.SimpleNamespace(final_output="ok", interruptions=[])
+
+    items = [
+        {"role": "user", "content": "My name is Ada."},
+        {"role": "assistant", "content": "Hello Ada."},
+        {"role": "user", "content": "What is my name?"},
+    ]
+    guarded = OpenAIAgentsAdapter().wrap_agent(run)
+    guarded.execute(items)
+    guarded.execute({"input": items})
+    assert seen == [items, items]
+
+
+def test_a_bare_list_of_input_items_is_still_screened():
+    from adapt_agent.adapters import OpenAIAgentsAdapter
+    from adapt_agent.exceptions import SecurityBlockedError
+    from adapt_agent.security import Firewall
+
+    firewall = Firewall()
+    firewall.add_blocked_pattern("SECRET-7")
+    ran: list[Any] = []
+    guarded = OpenAIAgentsAdapter(firewall=firewall).wrap_agent(
+        lambda prompt, **kw: ran.append(prompt)
+    )
+    with pytest.raises(SecurityBlockedError):
+        guarded.execute([{"role": "user", "content": "the code is SECRET-7"}])
+    assert ran == []
+
+
 def test_the_adapter_surfaces_interruptions_only_when_there_are_some():
     from adapt_agent.adapters import OpenAIAgentsAdapter
 

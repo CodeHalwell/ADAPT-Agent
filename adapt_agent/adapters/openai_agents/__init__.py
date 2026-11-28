@@ -165,7 +165,7 @@ class OpenAIAgentsAdapter(GovernedAdapter):
         state's repr, and the approved tool never ran. Everything else becomes
         the latest user prompt, as before.
         """
-        if _is_run_state(payload):
+        if _is_run_state(payload) or _is_input_items(payload):
             return payload
         if isinstance(payload, Mapping):
             inner = payload.get("input")
