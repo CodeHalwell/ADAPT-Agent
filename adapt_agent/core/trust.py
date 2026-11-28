@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+import math
+import threading
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
 
 from adapt_agent.core.types import AgentState, TrustScore
+
+logger = logging.getLogger(__name__)
 
 
 class TrustManager:
@@ -22,6 +27,13 @@ class TrustManager:
     ``distrust_floor`` is preferentially retained: a more-recently-used but
     higher-scored candidate is evicted instead, so a distrusted agent cannot be
     cheaply flushed.
+
+    "Distrusted" means *below what an unknown agent would get*: an entry scoring
+    under ``max(distrust_floor, initial_trust)`` is never evicted while any other
+    entry could be, because dropping it would hand the agent a fresh
+    ``initial_trust`` -- a trust *increase* on demand. Only when every slot holds
+    such an entry does the cap win (the least-distrusted one goes, and a warning
+    is logged): the memory bound is a hard guarantee, distrust retention is not.
     """
 
     def __init__(
@@ -51,6 +63,7 @@ class TrustManager:
         self.max_history = max_history
         self.max_agents = max_agents
         self.distrust_floor = distrust_floor
+        self._lock = threading.RLock()
         # OrderedDict gives O(1) LRU ordering via move_to_end.
         self._trust_scores: OrderedDict[str, float] = OrderedDict()
         self._trust_history: dict[str, deque[TrustScore]] = {}
@@ -66,10 +79,11 @@ class TrustManager:
         Returns:
             Current trust score (between min_trust and max_trust)
         """
-        if agent_id in self._trust_scores:
-            self._trust_scores.move_to_end(agent_id)
-            return self._trust_scores[agent_id]
-        return self.initial_trust
+        with self._lock:
+            if agent_id in self._trust_scores:
+                self._trust_scores.move_to_end(agent_id)
+                return self._trust_scores[agent_id]
+            return self.initial_trust
 
     def update_trust_score(
         self,
@@ -88,52 +102,76 @@ class TrustManager:
 
         Returns:
             Updated trust score
+
+        Raises:
+            ValueError: if ``delta`` is not a finite number. ``min(1.0, nan)``
+                is ``1.0``, so a NaN delta used to pin any agent at full trust.
         """
-        current_score = self.get_trust_score(agent_id)
-        new_score = max(self.min_trust, min(self.max_trust, current_score + delta))
+        if isinstance(delta, bool) or not isinstance(delta, (int, float)):
+            raise ValueError(f"Trust delta must be a number, got {type(delta).__name__}")
+        if not math.isfinite(delta):
+            raise ValueError(f"Trust delta must be finite, got {delta!r}")
+        with self._lock:
+            current_score = self.get_trust_score(agent_id)
+            new_score = max(self.min_trust, min(self.max_trust, current_score + delta))
 
-        # Insert/update and mark as most-recently-used.
-        self._trust_scores[agent_id] = new_score
-        self._trust_scores.move_to_end(agent_id)
+            # Insert/update and mark as most-recently-used.
+            self._trust_scores[agent_id] = new_score
+            self._trust_scores.move_to_end(agent_id)
 
-        # Record trust score history
-        trust_record: TrustScore = {
-            "score": new_score,
-            "confidence": 1.0,
-            "factors": factors or {},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+            # Record trust score history
+            trust_record: TrustScore = {
+                "score": new_score,
+                "confidence": 1.0,
+                "factors": factors or {},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
-        # deque(maxlen) bounds history in O(1) without list.pop(0).
-        history = self._trust_history.get(agent_id)
-        if history is None:
-            history = deque(maxlen=self.max_history)
-            self._trust_history[agent_id] = history
-        history.append(trust_record)
+            # deque(maxlen) bounds history in O(1) without list.pop(0).
+            history = self._trust_history.get(agent_id)
+            if history is None:
+                history = deque(maxlen=self.max_history)
+                self._trust_history[agent_id] = history
+            history.append(trust_record)
 
-        # SECURITY: Prevent memory exhaustion from unbounded unique agents.
-        if len(self._trust_scores) > self.max_agents:
-            self._evict_one()
+            # SECURITY: Prevent memory exhaustion from unbounded unique agents.
+            if len(self._trust_scores) > self.max_agents:
+                self._evict_one(protect=agent_id)
 
-        return new_score
+            return new_score
 
-    def _evict_one(self) -> None:
+    def _evict_one(self, protect: str | None = None) -> None:
         """Evict a single agent using LRU, protecting distrusted agents.
 
         Scans candidates from least- to most-recently-used and evicts the first
-        one whose score is at or above ``distrust_floor``. Only if every tracked
-        agent is below the floor does it fall back to evicting the strict LRU
-        entry (so eviction always makes progress and stays bounded).
+        one that is not distrusted, i.e. scores at least
+        ``max(distrust_floor, initial_trust)`` (an evicted agent restarts at
+        ``initial_trust``, so evicting anything lower would *raise* its trust).
+        ``protect`` -- the agent being updated -- is never the victim: losing it
+        would discard the very update that triggered the eviction. Only if every
+        other agent is distrusted does it evict the least-distrusted one, so
+        the bound on memory always holds.
         """
+        threshold = max(self.distrust_floor, self.initial_trust)
         victim: str | None = None
         for agent_id, score in self._trust_scores.items():
-            if score >= self.distrust_floor:
+            if agent_id != protect and score >= threshold:
                 victim = agent_id
                 break
 
         if victim is None:
-            # Every agent is distrusted; fall back to strict LRU to stay bounded.
-            victim = next(iter(self._trust_scores))
+            candidates = [(s, a) for a, s in self._trust_scores.items() if a != protect]
+            if not candidates:
+                return
+            # Every other agent is distrusted; the cap still has to hold.
+            victim = max(candidates, key=lambda c: c[0])[1]
+            logger.warning(
+                "TrustManager is full of distrusted agents; evicting %r (score %.3f) "
+                "returns it to the initial trust of %.3f",
+                victim,
+                self._trust_scores[victim],
+                self.initial_trust,
+            )
 
         del self._trust_scores[victim]
         self._trust_history.pop(victim, None)
@@ -194,7 +232,8 @@ class TrustManager:
         Returns:
             List of historical trust scores
         """
-        history = self._trust_history.get(agent_id)
-        if history is None:
-            return []
-        return list(history)
+        with self._lock:
+            history = self._trust_history.get(agent_id)
+            if history is None:
+                return []
+            return list(history)

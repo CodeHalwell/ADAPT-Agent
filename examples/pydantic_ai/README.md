@@ -8,7 +8,7 @@ optimization).
 Every example runs **fully offline** -- they use Pydantic AI's `FunctionModel`
 test double for the LLM and a deterministic stub for the LLM-as-judge, so no API
 key or network is required. Each example also guards the `pydantic_ai` import and
-prints a friendly install hint if it is missing.
+prints a friendly install hint (exiting 0) if it is missing.
 
 ## Install
 
@@ -25,6 +25,7 @@ pip install 'adapt-agent[pydantic-ai]'
 | 2 | [`02_policy_observability_trust.py`](02_policy_observability_trust.py) | The full guard stack: `PolicyEnforcer` (a blocking rule), `AdversarialDefense`, `AgentObserver` traces, `Middleware` (pre/post hooks), and `TrustManager`. Shows `block_on_violation=False` recording threats without blocking. |
 | 3 | [`03_evaluate_and_optimize.py`](03_evaluate_and_optimize.py) | Wrap one `Agent` in `OptimizableAgent`, build a `GoldenDataset`, score with `EvaluationHarness` (a metric + an offline `LLMJudge`), run `CoordinateAscentOptimizer`, and print the discovered knobs and the baseline -> best improvement. |
 | 4 | [`04_multi_agent_and_training.py`](04_multi_agent_and_training.py) | A multi-agent **orchestrator function** driving two specialist `Agent`s. Guarded as one unit, then optimized whole-system + per-agent with `make_default_optimizer` (tool/skill ablation + judge `recommendations`), and a parallel YAML path via `run_training` + [`pydantic_ai.train.yaml`](pydantic_ai.train.yaml). |
+| 5 | [`05_tool_governance.py`](05_tool_governance.py) | `governance_capability`: governance *inside* the run. A denied tool never runs (raise / refuse), a poisoned tool result never reaches the model, an approval pauses the run and resumes it, a policy rule reads `deps`, a blocked streamed answer is never delivered, and an MCP tool is governed like a local one. |
 
 ## Run them
 
@@ -33,14 +34,22 @@ python examples/pydantic_ai/01_basic_guarded.py
 python examples/pydantic_ai/02_policy_observability_trust.py
 python examples/pydantic_ai/03_evaluate_and_optimize.py
 python examples/pydantic_ai/04_multi_agent_and_training.py
+python examples/pydantic_ai/05_tool_governance.py
 ```
+
+Each script prints what it ran, what passed, what
+was blocked and why (the `SecurityBlockedError` threat labels), and exits 0. The
+optimization examples print an `OptimizationResult` line such as
+`baseline=0.200, best=0.900, ..., significant=False (p=0.0625, n=4)`: the gain is
+applied, but on a handful of rows no outcome can pass the paired significance
+test, so `improved` stays `False` -- use a larger golden set for a real verdict.
 
 ## Going from offline to real
 
 Each example notes the one-line swap from the offline `FunctionModel` to a hosted
-model (e.g. `Agent("openai:gpt-4o")` or `Agent("anthropic:claude-opus-4-8")`) and
+model (e.g. `Agent("openai:gpt-5.6-luna")` or `Agent("anthropic:claude-opus-5-5")`) and
 from the deterministic judge stub to a real provider
-(`LLMJudge(ClaudeJudge(model="claude-opus-4-8"))`). Export the relevant API key
+(`ClaudeJudge(model="claude-opus-5-5")`). Export the relevant API key
 first.
 
 See the full guide: [`docs/frameworks/pydantic_ai.md`](../../docs/frameworks/pydantic_ai.md).

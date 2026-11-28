@@ -22,9 +22,11 @@ from adapt_agent.security import Firewall
 
 
 class _HookMatcher:
-    def __init__(self, matcher=None, hooks=None):
+    def __init__(self, matcher=None, hooks=None, timeout=None, on_failure=None):
         self.matcher = matcher
         self.hooks = hooks or []
+        self.timeout = timeout
+        self.on_failure = on_failure
 
 
 @pytest.fixture
@@ -63,7 +65,8 @@ def test_hook_blocks_a_flagged_prompt_and_passes_a_clean_one(ca):
 def test_hook_blocks_a_flagged_tool_input(ca):
     hooks = ca.governance_hooks(firewall=_firewall())
     tool_call = {"tool_name": "Bash", "tool_input": {"command": "echo FORBIDDEN"}}
-    assert _call(hooks, "PreToolUse", tool_call)["decision"] == "block"
+    denied = _call(hooks, "PreToolUse", tool_call)
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
 
     clean = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
     assert _call(hooks, "PreToolUse", clean) == {}
@@ -76,13 +79,13 @@ def test_hook_blocks_adversarial_input(ca):
     assert _call(hooks, "UserPromptSubmit", {"prompt": "what is the weather"}) == {}
 
 
-def test_hook_blocks_on_policy_evaluated_against_the_hook_input(ca):
+def test_hook_blocks_on_a_tool_scoped_policy_rule(ca):
     policy = PolicyEnforcer()
-    policy.add_rule("no_bash", "d", "state['tool_name'] == 'Bash'", action="block")
+    policy.add_rule("no_bash", "d", "tool['name'] == 'Bash'", action="block")
     hooks = ca.governance_hooks(policy_enforcer=policy)
 
     blocked = _call(hooks, "PreToolUse", {"tool_name": "Bash", "tool_input": {}})
-    assert blocked["decision"] == "block"
+    assert blocked["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "policy:no_bash" in blocked["reason"]
 
     assert _call(hooks, "PreToolUse", {"tool_name": "Read", "tool_input": {}}) == {}

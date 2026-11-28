@@ -1,6 +1,7 @@
 """Patches and fixes for LLM agent frameworks."""
 
 import logging
+import threading
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ class PatchManager:
         self._patches: dict[str, dict[str, Any]] = {}
         # ⚡ Bolt: Use a set instead of a list to optimize membership checks from O(N) to O(1)
         self._applied_patches: set[str] = set()
+        self._lock = threading.RLock()
 
     def register_patch(
         self,
@@ -36,12 +38,16 @@ class PatchManager:
             patch_func: Function that applies the patch
             version_requirement: Optional version requirement
         """
-        self._patches[patch_id] = {
-            "framework": framework,
-            "description": description,
-            "patch_func": patch_func,
-            "version_requirement": version_requirement,
-        }
+        with self._lock:
+            self._patches[patch_id] = {
+                "framework": framework,
+                "description": description,
+                "patch_func": patch_func,
+                "version_requirement": version_requirement,
+            }
+            # A re-registered id is a different patch: reporting it as already
+            # applied would mean the new function never runs.
+            self._applied_patches.discard(patch_id)
 
     def apply_patch(self, patch_id: str, target: Any) -> bool:
         """Apply a patch to a target.
@@ -53,22 +59,24 @@ class PatchManager:
         Returns:
             True if patch applied successfully, False otherwise
         """
-        if patch_id not in self._patches:
-            return False
+        # Held across the call so two threads cannot both apply the same patch.
+        with self._lock:
+            if patch_id not in self._patches:
+                return False
 
-        if patch_id in self._applied_patches:
-            # Already applied
-            return True
+            if patch_id in self._applied_patches:
+                # Already applied
+                return True
 
-        patch = self._patches[patch_id]
+            patch = self._patches[patch_id]
 
-        try:
-            patch["patch_func"](target)
-            self._applied_patches.add(patch_id)
-            return True
-        except Exception as e:
-            logger.error(f"Error applying patch {patch_id}: {e}")
-            return False
+            try:
+                patch["patch_func"](target)
+                self._applied_patches.add(patch_id)
+                return True
+            except Exception as e:
+                logger.error(f"Error applying patch {patch_id}: {e}")
+                return False
 
     def list_patches(
         self,
@@ -84,7 +92,11 @@ class PatchManager:
         """
         patches = []
 
-        for patch_id, patch_data in self._patches.items():
+        with self._lock:
+            snapshot = list(self._patches.items())
+            applied = set(self._applied_patches)
+
+        for patch_id, patch_data in snapshot:
             if framework and patch_data["framework"] != framework:
                 continue
 
@@ -93,7 +105,7 @@ class PatchManager:
                     "patch_id": patch_id,
                     "framework": patch_data["framework"],
                     "description": patch_data["description"],
-                    "applied": patch_id in self._applied_patches,
+                    "applied": patch_id in applied,
                 }
             )
 

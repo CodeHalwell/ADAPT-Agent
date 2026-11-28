@@ -36,8 +36,11 @@ GOOD_PROMPT = "GOOD"
 #: The temperature that makes the agent answer correctly.
 GOOD_TEMP = 1.0
 
-QUESTIONS = ["q0", "q1", "q2", "q3"]
-ANSWERS = {"q0": "a0", "q1": "a1", "q2": "a2", "q3": "a3"}
+#: Eight rows: the smallest dataset size at which a sweep of improvements is
+#: significant at the default alpha is five (0.5 ** 5 < 0.05), so a toy that
+#: must report ``improved=True`` needs more rows than that.
+QUESTIONS = [f"q{i}" for i in range(8)]
+ANSWERS = {q: f"a{q[1:]}" for q in QUESTIONS}
 
 
 def build_toy(*, prompt="BAD", temp=0.0, few_shot="", prompt_candidates=None, gate="prompt"):
@@ -47,7 +50,10 @@ def build_toy(*, prompt="BAD", temp=0.0, few_shot="", prompt_candidates=None, ga
 
     * gate="prompt": prompt must equal GOOD_PROMPT (or contain it).
     * gate="temp":   temp must equal GOOD_TEMP.
-    * gate="few_shot": few_shot block must mention the question's answer.
+    * gate="few_shot": few_shot block must mention the question's answer (an
+      agent that can only *copy* its demonstrations -- nothing generalises).
+    * gate="demos":  any demonstration block at all makes it answer correctly
+      (an agent that learns the format from examples -- this generalises).
 
     Otherwise it returns a wrong answer, so the baseline scores 0 and the
     optimizer must discover the right configuration to score 1.
@@ -61,6 +67,8 @@ def build_toy(*, prompt="BAD", temp=0.0, few_shot="", prompt_candidates=None, ga
             ok = state["temp"] == GOOD_TEMP
         elif gate == "few_shot":
             ok = ANSWERS.get(question, "") in str(state["few_shot"])
+        elif gate == "demos":
+            ok = "Output:" in str(state["few_shot"])
         else:  # pragma: no cover - defensive
             ok = False
         return ANSWERS[question] if ok else "WRONG"
@@ -425,18 +433,29 @@ def test_bootstrap_few_shot_restricted_to_few_shot_kind():
 
 
 def test_bootstrap_few_shot_improves_few_shot_block():
-    # The agent answers correctly only when the few_shot block contains the
-    # answer. FewShotProposer falls back to all labeled rows (baseline 0
-    # correct), building a block containing every answer -> score 1.
-    state, agent = build_toy(prompt="BAD", few_shot="", gate="few_shot")
-    ds = small_dataset()
-    res = BootstrapFewShotOptimizer(harness(), seed=0).optimize(agent, ds)
+    # The agent answers correctly once it has seen any demonstrations, so a
+    # block helps on rows it was NOT built from. FewShotProposer falls back to
+    # all labeled rows (baseline 0 correct); each block is scored on the five
+    # rows outside its three demonstrations, all of which flip to correct.
+    state, agent = build_toy(prompt="BAD", few_shot="", gate="demos")
+    res = BootstrapFewShotOptimizer(harness(), seed=0).optimize(agent, dataset())
     assert res.improved
     assert res.best_score == 1.0
     # Only the few_shot parameter was touched.
     assert set(res.best_config) == {"few_shot"}
-    for q in ("q0", "q1", "q2"):
-        assert ANSWERS[q] in str(state["few_shot"])
+    assert "Output:" in str(state["few_shot"])
+
+
+def test_bootstrap_few_shot_does_not_reward_a_block_for_its_own_rows():
+    # An agent that can only copy its demonstrations answers exactly the rows a
+    # block was built from. Scored on those rows the block looked like a gain;
+    # scored on the others it is none.
+    state, agent = build_toy(prompt="BAD", few_shot="", gate="few_shot")
+    res = BootstrapFewShotOptimizer(harness(), seed=0).optimize(agent, dataset())
+    assert res.best_config == {}
+    assert res.improved is False
+    assert state["few_shot"] == ""
+    assert all(not t.accepted for t in res.history) and res.history
 
 
 # -- EvolutionaryOptimizer ----------------------------------------------------
@@ -497,13 +516,13 @@ def test_pipeline_requires_stages():
 
 
 def test_pipeline_threads_best_across_stages():
-    # Stage 1 fixes few_shot; gate on few_shot. Combine two coordinate stages.
-    state, agent = build_toy(prompt="BAD", few_shot="", gate="few_shot")
+    # Stage 1 fixes few_shot; gate on demonstrations. Combine two coordinate stages.
+    state, agent = build_toy(prompt="BAD", few_shot="", gate="demos")
     stages = [
         BootstrapFewShotOptimizer(harness(), seed=0),
         CoordinateAscentOptimizer(harness(), seed=0, kinds=(ParameterKind.PROMPT,)),
     ]
-    res = PipelineOptimizer(harness(), stages, seed=0).optimize(agent, small_dataset())
+    res = PipelineOptimizer(harness(), stages, seed=0).optimize(agent, dataset())
     assert res.best_score == 1.0
     assert "few_shot" in res.best_config
     # Live agent carries the accumulated best.
@@ -770,12 +789,14 @@ def test_pipeline_cache_skips_redundant_full_dataset_passes():
     assert result_cached.best_config == result_uncached.best_config
     assert [t.score for t in result_cached.history] == [t.score for t in result_uncached.history]
 
-    # Uncached: baseline runs for the pipeline and both stages, plus both grid
-    # candidates per stage = 7 full-dataset passes. Cached: only the pipeline
-    # baseline and the single novel configuration are ever run.
+    # Uncached: baseline runs for the pipeline and both stages, the pipeline's
+    # one non-determinism check (a second baseline run), plus both grid
+    # candidates per stage = 8 full-dataset passes. Cached: the pipeline
+    # baseline, its non-determinism check (always a real re-run) and the single
+    # novel configuration.
     n = len(dataset())
-    assert runs_uncached == 7 * n
-    assert runs_cached == 2 * n
+    assert runs_uncached == 8 * n
+    assert runs_cached == 3 * n
 
 
 def test_stage_level_cache_opt_out_is_respected():
@@ -783,7 +804,7 @@ def test_stage_level_cache_opt_out_is_respected():
     # cache entirely (they re-measure), even though the pipeline itself caches.
     runs, result = _run_two_stage_pipeline(cache=True, stage_cache=False)
     assert result.best_score == 1.0
-    assert runs == 7 * len(dataset())
+    assert runs == 8 * len(dataset())
 
 
 def test_eval_config_reuses_the_baseline_report_for_identical_state():
@@ -875,8 +896,9 @@ def test_cache_is_scoped_to_the_harness():
     # no-op grid candidate), measuring only the improved config. Stage 2's
     # harness differs, so nothing from stage 1 is reusable: its baseline and
     # the non-baseline candidate are measured fresh (its other candidate
-    # matches its own baseline measurement). 1 + 1 + 2 full-dataset passes.
-    assert counter["runs"] == 4 * len(dataset())
+    # matches its own baseline measurement). Plus the pipeline's one
+    # non-determinism check: 1 + 1 + 1 + 2 full-dataset passes.
+    assert counter["runs"] == 5 * len(dataset())
 
 
 def test_pipeline_cache_opt_out_reaches_default_stages():
@@ -884,7 +906,7 @@ def test_pipeline_cache_opt_out_reaches_default_stages():
     # their default True) from quietly building private per-stage caches.
     runs, result = _run_two_stage_pipeline(cache=False, stage_cache=True)
     assert result.best_score == 1.0
-    assert runs == 7 * len(dataset())
+    assert runs == 8 * len(dataset())
 
 
 def test_pipeline_tolerates_stage_that_skipped_optimizer_init():
@@ -916,10 +938,11 @@ _TRAIN_QS = ["t0", "t1", "t2"]
 _HELD_OUT_QS = ["h0", "h1"]
 
 
-def _overfitting_toy(candidates=("SAFE", "OVERFIT", "BETTER")):
+def _overfitting_toy(candidates=("SAFE", "OVERFIT", "BETTER"), *, safe_held_out=_HELD_OUT_QS):
     """An agent with one honest prompt and one that only memorised training.
 
-    * ``SAFE``    (baseline): right on held-out rows, and on one training row.
+    * ``SAFE``    (baseline): right on the ``safe_held_out`` rows (every
+      held-out row by default), and on one training row.
     * ``OVERFIT``: right on every training row, wrong on every held-out row.
     * ``BETTER`` : right everywhere.
     """
@@ -931,7 +954,7 @@ def _overfitting_toy(candidates=("SAFE", "OVERFIT", "BETTER")):
             return f"ans-{question}"
         if prompt == "OVERFIT":
             return f"ans-{question}" if question in _TRAIN_QS else "WRONG"
-        return f"ans-{question}" if question in (*_HELD_OUT_QS, "t0") else "WRONG"
+        return f"ans-{question}" if question in (*safe_held_out, "t0") else "WRONG"
 
     params = [
         Parameter(
@@ -980,7 +1003,11 @@ def test_gate_refuses_a_config_that_wins_on_training_but_loses_on_held_out(name)
 
 @pytest.mark.parametrize("name", ["grid", "pipeline"])
 def test_gate_applies_a_config_that_also_holds_up_on_held_out(name):
-    state, agent, train, held_out = _overfitting_toy(candidates=("SAFE", "BETTER"))
+    # The gate needs a held-out *gain*, so the untuned agent must leave room
+    # for one: SAFE gets one of the two held-out rows wrong, BETTER neither.
+    state, agent, train, held_out = _overfitting_toy(
+        candidates=("SAFE", "BETTER"), safe_held_out=("h0",)
+    )
     res = _gate_optimizers()[name]().optimize(agent, train, val_dataset=held_out)
 
     assert state["prompt"] == "BETTER"
@@ -988,7 +1015,7 @@ def test_gate_applies_a_config_that_also_holds_up_on_held_out(name):
     assert res.rejected_config == {}
     assert res.best_config == {"prompt": "BETTER"}
     assert res.validation_score == 1.0
-    assert res.validation_baseline_score == 1.0
+    assert res.validation_baseline_score == 0.5
 
 
 @pytest.mark.parametrize("name", ["grid", "pipeline"])
@@ -1005,15 +1032,18 @@ def test_gate_can_be_switched_off(name):
     assert res.validation_score == 0.0
 
 
-def test_gate_tolerance_allows_a_drop_inside_the_noise_band():
+def test_validation_tolerance_is_refused_loudly_and_no_longer_waves_a_drop_through():
+    # The gate used to accept anything within `validation_tolerance` of the
+    # baseline. It now requires a held-out gain, so the option would be a knob
+    # that silently does nothing: passing it warns, and the drop is rejected.
     state, agent, train, held_out = _overfitting_toy(candidates=("SAFE", "OVERFIT"))
-    opt = GridSearchOptimizer(harness(), seed=0, validation_tolerance=1.0)
+    with pytest.warns(FutureWarning, match="validation_tolerance"):
+        opt = GridSearchOptimizer(harness(), seed=0, validation_tolerance=1.0)
     res = opt.optimize(agent, train, val_dataset=held_out)
 
-    assert state["prompt"] == "OVERFIT"
-    assert res.validation_rejected is False
+    assert state["prompt"] == "SAFE"
+    assert res.validation_rejected is True
     assert res.validation_baseline_score == 1.0
-    assert res.validation_score == 0.0
 
 
 def test_without_a_held_out_set_the_training_winner_is_applied_as_before():
@@ -1042,28 +1072,30 @@ def test_gate_measures_the_baseline_once_when_nothing_was_tuned():
     assert calls.count(len(held_out)) == 1
 
 
-def test_gate_does_not_reject_on_a_held_out_pass_it_could_not_complete():
-    """Two partial means are not over the same rows, so they are not compared.
+def test_a_partial_held_out_pass_is_compared_only_on_rows_both_passes_scored():
+    """Two partial means are not over the same rows; paired rows are.
 
-    When throttling costs the held-out pass a row, the outcome is reported as
-    incomplete -- as it was before the gate existed -- rather than acted on.
+    The tuned configuration is throttled on one held-out row. That row's
+    placeholder zero is not a measurement, so it drops out of *both* sides and
+    the gate decides on the row both passes actually scored -- where the tuned
+    configuration wins. Counting the placeholder would erase that gain.
     """
     from adapt_agent.optimization.retry import RetryPolicy
 
     state = {"prompt": "SAFE"}
 
     def runner(question):
-        if question == "h_throttled":
-            raise RuntimeError("429 Too Many Requests")
-        if state["prompt"] == "OVERFIT":
-            return f"ans-{question}" if question in _TRAIN_QS else "WRONG"
-        return f"ans-{question}" if question in ("h0", "t0") else "WRONG"
+        if state["prompt"] == "BETTER":
+            if question == "h_throttled":
+                raise RuntimeError("429 Too Many Requests")
+            return f"ans-{question}"
+        return f"ans-{question}" if question in ("h_throttled", "t0") else "WRONG"
 
     params = [
         Parameter(
             name="prompt",
             kind=ParameterKind.PROMPT,
-            candidates=["SAFE", "OVERFIT"],
+            candidates=["SAFE", "BETTER"],
             getter=lambda: state["prompt"],
             setter=lambda v: state.__setitem__("prompt", v),
         )
@@ -1077,10 +1109,12 @@ def test_gate_does_not_reject_on_a_held_out_pass_it_could_not_complete():
 
     res = GridSearchOptimizer(h, seed=0).optimize(agent, train, val_dataset=held_out)
 
-    assert res.validation_complete is False
+    assert res.validation_complete is False, "a partial pass is still reported as partial"
     assert res.validation_rejected is False
-    assert state["prompt"] == "OVERFIT"
-    assert res.validation_baseline_score is None, "a partial baseline is not a baseline"
+    assert state["prompt"] == "BETTER"
+    assert res.n_rows == 1 and res.delta == 1.0
+    assert res.significant is False  # one row proves nothing, and the result says so
+    assert res.validation_baseline_score == 0.5
 
 
 # -- independent proposer judge -----------------------------------------------

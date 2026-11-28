@@ -12,9 +12,14 @@ ticket-triage agent and runs each strategy against it.
 5.  ``BootstrapFewShotOptimizer``-- build demonstrations from rows it gets right.
 6.  ``EvolutionaryOptimizer``    -- mutate and select a population.
 7.  ``make_default_optimizer``   -- a staged pipeline that does all of it.
-8.  The validation gate refusing a configuration that only memorised training.
+8.  The validation gate refusing a configuration that only memorised training,
+    and a noisy agent whose lucky draws are not mistaken for an improvement.
 9.  ``to_config`` / ``load_tuned_config`` -- review the result, then reload it.
 10. ``AgentOptimizer`` -- runtime performance hints (a different thing entirely).
+
+Every optimizer accepts a change only when its per-row gain over the current
+best is statistically significant (a paired test), so the dataset has to be
+large enough for a real gain to show -- see ``TRAIN_TICKETS``.
 
 Everything is deterministic and offline: no API key, no network.
 
@@ -22,6 +27,7 @@ Everything is deterministic and offline: no API key, no network.
 """
 
 import logging
+import random
 import tempfile
 from pathlib import Path
 
@@ -44,19 +50,45 @@ from adapt_agent.optimization import (
 
 logging.getLogger("adapt_agent").setLevel(logging.ERROR)
 
-TICKETS = {
+#: Eighteen training tickets and nine held out, three labels each. The size is
+#: not decoration: every optimizer accepts a change only when its per-row gain
+#: is statistically significant, and a knob that fixes one label fixes a third
+#: of the rows -- two rows out of six is a coin-flip-sized gain (p=0.25), six
+#: out of eighteen is not (p=0.016).
+TRAIN_TICKETS = {
     "I was charged twice this month": "billing",
     "Refund has not arrived": "billing",
     "Where is my parcel?": "shipping",
     "The tracking link is dead": "shipping",
     "App crashes when I log in": "technical",
     "Password reset email never comes": "technical",
-    "Invoice shows the wrong VAT": "billing",
-    "Courier left it with a neighbour": "shipping",
-    "Two-factor code is rejected": "technical",
+    "My card was declined at checkout": "billing",
+    "I was billed after cancelling": "billing",
+    "The coupon was not applied to my order": "billing",
+    "Billing address cannot be updated": "billing",
+    "The parcel arrived damaged": "shipping",
+    "Delivery is a week late": "shipping",
+    "Wrong item in the box": "shipping",
+    "Can I change the delivery address?": "shipping",
+    "The page is blank after the update": "technical",
+    "Notifications stopped working": "technical",
+    "Export to CSV throws an error": "technical",
+    "The app will not install on my phone": "technical",
 }
-TRAIN = list(TICKETS)[:6]
-HELD_OUT = list(TICKETS)[6:]
+HELD_OUT_TICKETS = {
+    "Invoice shows the wrong VAT": "billing",
+    "I need a receipt for my last payment": "billing",
+    "Why did the price go up?": "billing",
+    "Courier left it with a neighbour": "shipping",
+    "The parcel says delivered but it is not here": "shipping",
+    "Do you ship to Norway?": "shipping",
+    "Two-factor code is rejected": "technical",
+    "Search returns nothing": "technical",
+    "Dark mode resets every time": "technical",
+}
+TICKETS = {**TRAIN_TICKETS, **HELD_OUT_TICKETS}
+TRAIN = list(TRAIN_TICKETS)
+HELD_OUT = list(HELD_OUT_TICKETS)
 
 BASELINE = {
     "prompt": "Help the customer.",
@@ -212,6 +244,32 @@ def validation_gate() -> None:
     print(f"  what was refused : {result.rejected_config}")
 
 
+def noise_is_not_an_improvement() -> None:
+    print("\n== 8b. A knob that does nothing, on an agent that is right 70% of the time ==")
+    rng = random.Random(7)
+    state = {"temperature": 0.0}
+    agent = OptimizableAgent.from_callable(
+        lambda ticket: TICKETS[ticket] if rng.random() < 0.7 else "billing",
+        parameters=[
+            Parameter(
+                name="triage.temperature",
+                kind=ParameterKind.HYPERPARAM,
+                candidates=[0.0, 0.25, 0.5, 0.75, 1.0],
+                getter=lambda: state["temperature"],
+                setter=lambda value: state.__setitem__("temperature", value),
+            )
+        ],
+    )
+    # The optimizer re-runs the baseline, sees rows change, and measures every
+    # comparison three times. Whatever the scores wobble to, nothing is applied.
+    result = GridSearchOptimizer(harness(), seed=0).optimize(agent, dataset(TRAIN))
+    print(f"  non-deterministic target detected : {result.nondeterministic}")
+    print(f"  measurements per comparison       : {result.repeats}")
+    print(
+        f"  improved={result.improved}  significant={result.significant}  applied={result.best_config}"
+    )
+
+
 def export_and_reload() -> None:
     print("\n== 9. Export for review, reload elsewhere ==")
     state, agent = build_agent()
@@ -247,6 +305,7 @@ def main() -> None:
     search_space()
     strategies()
     validation_gate()
+    noise_is_not_an_improvement()
     export_and_reload()
     runtime_performance()
 

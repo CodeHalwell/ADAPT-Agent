@@ -16,12 +16,21 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import math
 import re
+import unicodedata
 from collections.abc import Callable, Sequence
 from typing import Any
 
 from .extractors import extract_output_text
 from .retry import note_declared_fallback
+
+try:  # Python 3.11+ moved the regex parser; the old name warns there.
+    import re._constants as _sre_constants  # type: ignore[import-not-found,unused-ignore]
+    import re._parser as _sre_parse  # type: ignore[import-not-found,unused-ignore]
+except ImportError:  # pragma: no cover - Python 3.10
+    import sre_constants as _sre_constants  # type: ignore[no-redef,unused-ignore]
+    import sre_parse as _sre_parse  # type: ignore[no-redef,unused-ignore]
 
 #: A bare metric function. Either ``(output, expected)`` or, for example-aware
 #: metrics wrapped in :class:`Metric`, ``(output, expected, example)``.
@@ -80,6 +89,11 @@ class Metric:
                 raw = self.fn(output, expected, example)
             else:
                 raw = self.fn(output, expected)
+            # NaN compares false against both clamp bounds, so `max(0, min(1,
+            # nan))` used to come back as 1.0 -- a metric that returned NaN on
+            # every row gave the run a perfect score. A non-finite value is a
+            # defect in the metric, so it fails the row loudly instead.
+            _require_finite(self.name, raw)
         except Exception as exc:
             # The fallback belongs to the failure, so it travels with it. A
             # metric can dispatch to another -- `checks` routes each row to the
@@ -129,23 +143,96 @@ def coerce_metric(metric: Metric | MetricFn, *, default_name: str = "metric") ->
 
 # -- text normalisation -------------------------------------------------------
 
+#: Punctuation peeled off the *start* of a token: opening quotes and brackets.
+_LEADING_PUNCT = "\"'“‘«‹([{¿¡「『"
+#: Punctuation peeled off the *end* of a token: sentence punctuation, closing
+#: quotes and brackets. Deliberately an explicit list, not a Unicode category:
+#: ``%`` is category ``Po`` and ``-`` is ``Pd``, and stripping either changes
+#: what an answer *means* (``100%`` vs ``$100``, ``-5`` vs ``5``).
+_TRAILING_PUNCT = ".,;:!?\"'”’»›)]}…。、，！？：；」』"
+
+#: Characters of scripts written without spaces between words. Each becomes its
+#: own token, so token metrics measure *something* on Japanese or Chinese text
+#: instead of comparing one giant "word" per sentence.
+_UNSEGMENTED_CHAR = re.compile("[぀-ヿ㐀-䶿一-鿿豈-﫿฀-๿຀-໿က-႟]")
+
+_PUNCT_MODES = ("edge", "all", "none")
+
 
 def _to_text(value: Any) -> str:
     return value if isinstance(value, str) else ("" if value is None else str(value))
 
 
-def normalize_text(text: Any, *, lower: bool = True, strip_punct: bool = True) -> str:
-    """Canonicalise text for robust comparison (whitespace/case/punctuation)."""
+def _punct_mode(strip_punct: bool | str) -> str:
+    if strip_punct is True:
+        return "edge"
+    if strip_punct is False:
+        return "none"
+    if strip_punct not in _PUNCT_MODES:
+        raise ValueError(
+            f"strip_punct must be a bool or one of {_PUNCT_MODES}, got {strip_punct!r}"
+        )
+    return str(strip_punct)
+
+
+def _strip_edge_punct(token: str) -> str:
+    return token.lstrip(_LEADING_PUNCT).rstrip(_TRAILING_PUNCT)
+
+
+def normalize_text(
+    text: Any,
+    *,
+    lower: bool = True,
+    strip_punct: bool | str = True,
+    unicode: bool = True,
+) -> str:
+    """Canonicalise text for robust comparison.
+
+    Args:
+        text: Value to normalise (non-strings are ``str()``-ed; ``None`` is ``""``).
+        lower: Case-fold (``"STRASSE"`` and ``"straße"`` compare equal).
+        strip_punct: How punctuation is handled. ``True`` / ``"edge"`` (the
+            default) strips sentence punctuation and quotes/brackets from the
+            *edges of each token* -- ``"Paris."`` equals ``"paris"`` -- but
+            keeps symbols that carry meaning: ``-5`` is not ``5``, ``<=`` is
+            not ``>=``, ``C++`` is not ``C``, ``$100`` is not ``100%``.
+            ``"all"`` replaces every non-word character with a space (the
+            pre-0.6 behaviour, which made all of those pairs equal); ``False`` /
+            ``"none"`` keeps punctuation untouched.
+        unicode: Apply NFKC normalisation first, so composed and decomposed
+            ``café``, and full-width and ASCII letters, compare equal.
+    """
     s = _to_text(text)
+    if unicode:
+        s = unicodedata.normalize("NFKC", s)
     if lower:
-        s = s.lower()
-    if strip_punct:
+        s = s.casefold()
+    mode = _punct_mode(strip_punct)
+    if mode == "all":
         s = re.sub(r"[^\w\s]", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
+        return re.sub(r"\s+", " ", s).strip()
+    tokens = s.split()
+    if mode == "edge":
+        tokens = [t for t in (_strip_edge_punct(tok) for tok in tokens) if t]
+    return " ".join(tokens)
 
 
-def _tokens(text: Any) -> list[str]:
-    return normalize_text(text).split()
+def _tokens(text: Any, *, strip_punct: bool | str = True) -> list[str]:
+    tokens: list[str] = []
+    for token in normalize_text(text, strip_punct=strip_punct).split():
+        if _UNSEGMENTED_CHAR.search(token):
+            # Split unsegmented script runs into single characters; keep any
+            # embedded Latin/number run whole.
+            tokens.extend(
+                piece
+                for piece in re.findall(
+                    f"{_UNSEGMENTED_CHAR.pattern}|[^{_UNSEGMENTED_CHAR.pattern[1:-1]}]+", token
+                )
+                if piece
+            )
+        else:
+            tokens.append(token)
+    return tokens
 
 
 def _clamp(value: Any) -> float:
@@ -153,34 +240,151 @@ def _clamp(value: Any) -> float:
         f = float(value)
     except (TypeError, ValueError):
         return 0.0
+    if not math.isfinite(f):
+        # NaN slips through `max`/`min` (every comparison with it is False),
+        # which turned NaN into 1.0. A value with no meaning is no score.
+        return 0.0
     return max(0.0, min(1.0, f))
+
+
+class NonFiniteScoreError(ValueError):
+    """A metric returned NaN or infinity, which is a defect in the metric."""
+
+
+def _require_finite(name: str, raw: Any) -> None:
+    if isinstance(raw, bool) or raw is None:
+        return
+    try:
+        f = float(raw)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(f):
+        raise NonFiniteScoreError(f"metric {name!r} returned a non-finite score ({raw!r})")
+
+
+# -- untrusted regular expressions --------------------------------------------
+
+#: Longest pattern accepted from a dataset row. Patterns written in code
+#: (``regex_match(pattern=...)``) are the author's and are not limited.
+MAX_ROW_PATTERN_LENGTH = 512
+
+
+def check_untrusted_pattern(pattern: str) -> None:
+    """Refuse a regex from untrusted input that could backtrack catastrophically.
+
+    Python's ``re`` has no timeout, so a dataset row carrying ``(a+)+$`` hangs
+    the whole evaluation on a modest input. This is a static screen, not a
+    proof of safety: it rejects patterns over :data:`MAX_ROW_PATTERN_LENGTH`
+    and any *quantified* sub-pattern that itself contains a quantifier or an
+    alternation -- ``(a+)+``, ``(a*)*``, ``(a|aa)+`` -- which are the shapes
+    behind exponential backtracking. Bounded repeats such as ``(ab){2}`` and
+    plain quantifiers such as ``\\d+`` pass.
+
+    Raises:
+        ValueError: If the pattern is too long, does not compile, or is
+            rejected as potentially catastrophic.
+    """
+    if len(pattern) > MAX_ROW_PATTERN_LENGTH:
+        raise ValueError(
+            f"row-supplied regex is {len(pattern)} characters, over the "
+            f"{MAX_ROW_PATTERN_LENGTH}-character limit"
+        )
+    try:
+        parsed = _sre_parse.parse(pattern)
+    except re.error as exc:
+        raise ValueError(f"row-supplied regex does not compile: {exc}") from exc
+    if _has_nested_repeat(parsed, inside_repeat=False):
+        raise ValueError(
+            f"row-supplied regex {pattern!r} nests a quantifier or alternation inside a "
+            "quantified group, which can backtrack catastrophically; rewrite it "
+            "without the nesting, or pass the pattern in code via regex_match(pattern=...)"
+        )
+
+
+def _has_nested_repeat(subpattern: Any, *, inside_repeat: bool) -> bool:
+    repeat_ops = {_sre_constants.MAX_REPEAT, _sre_constants.MIN_REPEAT}
+    possessive = getattr(_sre_constants, "POSSESSIVE_REPEAT", None)
+    if possessive is not None:
+        repeat_ops.add(possessive)
+    for op, av in subpattern:
+        if op in repeat_ops:
+            _low, high, body = av
+            unbounded = high is _sre_constants.MAXREPEAT or high > 1
+            if unbounded and inside_repeat:
+                return True
+            if _has_nested_repeat(body, inside_repeat=inside_repeat or unbounded):
+                return True
+        elif op is _sre_constants.SUBPATTERN:
+            if _has_nested_repeat(av[-1], inside_repeat=inside_repeat):
+                return True
+        elif op is _sre_constants.BRANCH:
+            if inside_repeat:
+                return True
+            if any(_has_nested_repeat(b, inside_repeat=False) for b in av[1]):
+                return True
+        elif op in (_sre_constants.ASSERT, _sre_constants.ASSERT_NOT):
+            if _has_nested_repeat(av[1], inside_repeat=inside_repeat):
+                return True
+        elif getattr(_sre_constants, "ATOMIC_GROUP", None) is op:
+            if _has_nested_repeat(av, inside_repeat=inside_repeat):
+                return True
+    return False
 
 
 # -- built-in metric factories ------------------------------------------------
 
 
-def exact_match(*, normalize: bool = True) -> Metric:
-    """1.0 iff output equals expected (optionally after normalisation)."""
+def exact_match(*, normalize: bool = True, punctuation: bool | str = "edge") -> Metric:
+    """1.0 iff output equals expected (optionally after normalisation).
+
+    Normalisation (the default) applies NFKC, case-folding, whitespace
+    collapsing and *edge* punctuation stripping -- see :func:`normalize_text`.
+    ``punctuation="all"`` restores the older rule that erased every symbol
+    (``"-5"`` equal to ``"5"``); ``normalize=False`` compares raw values.
+    """
+    mode = _punct_mode(punctuation)
 
     def _fn(output: Any, expected: Any) -> float:
         if normalize:
-            return 1.0 if normalize_text(output) == normalize_text(expected) else 0.0
+            same = normalize_text(output, strip_punct=mode) == normalize_text(
+                expected, strip_punct=mode
+            )
+            return 1.0 if same else 0.0
         return 1.0 if output == expected else 0.0
 
     return Metric("exact_match", _fn)
 
 
-def contains(*, normalize: bool = True) -> Metric:
-    """1.0 iff the expected reference appears as a substring of the output."""
+def contains(*, normalize: bool = True, word_boundary: bool | None = None) -> Metric:
+    """1.0 iff the expected reference appears in the output.
+
+    With ``word_boundary=True`` (the default when normalising) the match must
+    start and end on a
+    word boundary, so ``"no"`` is not found inside ``"know"`` and ``"safe"`` is
+    not found inside ``"unsafe"``. A boundary next to a character of an
+    unsegmented script (Japanese, Chinese, Thai) is not required, since those
+    scripts have no spaces to bound on. ``word_boundary=False`` is a plain
+    substring test, and is the default with ``normalize=False``, which asks for
+    the raw comparison.
+    """
+    bounded = normalize if word_boundary is None else word_boundary
 
     def _fn(output: Any, expected: Any) -> float:
         out = normalize_text(output) if normalize else _to_text(output)
         exp = normalize_text(expected) if normalize else _to_text(expected)
         if not exp:
             return 0.0
-        return 1.0 if exp in out else 0.0
+        if not bounded:
+            return 1.0 if exp in out else 0.0
+        before = "" if _UNSEGMENTED_CHAR.match(exp[0]) or not _is_word(exp[0]) else r"(?<!\w)"
+        after = "" if _UNSEGMENTED_CHAR.match(exp[-1]) or not _is_word(exp[-1]) else r"(?!\w)"
+        return 1.0 if re.search(before + re.escape(exp) + after, out) else 0.0
 
     return Metric("contains", _fn)
+
+
+def _is_word(char: str) -> bool:
+    return bool(re.match(r"\w", char))
 
 
 def regex_match(pattern: str | None = None, *, flags: int = re.IGNORECASE) -> Metric:
@@ -189,18 +393,43 @@ def regex_match(pattern: str | None = None, *, flags: int = re.IGNORECASE) -> Me
     With an explicit ``pattern`` the expected value is ignored. Without one, the
     per-example ``expected`` value is compiled as the pattern (handy for datasets
     that carry a different acceptance regex per row).
+
+    A row-supplied pattern is untrusted input: it is screened by
+    :func:`check_untrusted_pattern` (length cap, no nested quantifiers) before
+    it is compiled. A row with no pattern -- ``expected`` is ``None`` or empty
+    -- is an error for that row, not a pass: the empty pattern matches every
+    output, so scoring it 1.0 would hide an unlabeled row as a success.
     """
     compiled = re.compile(pattern, flags) if pattern is not None else None
+    cache: dict[str, re.Pattern[str]] = {}
 
     def _fn(output: Any, expected: Any) -> float:
-        rx = compiled if compiled is not None else re.compile(_to_text(expected), flags)
+        rx = compiled
+        if rx is None:
+            source = _to_text(expected)
+            if not source:
+                raise ValueError(
+                    "regex_match has no pattern for this row: expected is empty and no "
+                    "pattern= was given"
+                )
+            rx = cache.get(source)
+            if rx is None:
+                check_untrusted_pattern(source)
+                rx = re.compile(source, flags)
+                if len(cache) < 1024:
+                    cache[source] = rx
         return 1.0 if rx.search(_to_text(output)) else 0.0
 
     return Metric("regex_match", _fn)
 
 
 def token_f1() -> Metric:
-    """Token-overlap F1 between output and expected (SQuAD-style)."""
+    """Token-overlap F1 between output and expected (SQuAD-style).
+
+    Text in scripts written without spaces (Japanese, Chinese, Thai) is
+    tokenised per character, so a reordered Japanese sentence scores on its
+    overlap instead of 0.0.
+    """
 
     def _fn(output: Any, expected: Any) -> float:
         pred, gold = _tokens(output), _tokens(expected)
@@ -208,7 +437,6 @@ def token_f1() -> Metric:
             return 1.0
         if not pred or not gold:
             return 0.0
-        common: dict[str, int] = {}
         gold_counts: dict[str, int] = {}
         for t in gold:
             gold_counts[t] = gold_counts.get(t, 0) + 1
@@ -222,7 +450,6 @@ def token_f1() -> Metric:
             return 0.0
         precision = overlap / len(pred)
         recall = overlap / len(gold)
-        common.clear()
         return 2 * precision * recall / (precision + recall)
 
     return Metric("token_f1", _fn)
@@ -241,32 +468,81 @@ def jaccard() -> Metric:
     return Metric("jaccard", _fn)
 
 
-def numeric_close(*, tolerance: float = 1e-6, relative: bool = False) -> Metric:
-    """1.0 iff the first number in output is within tolerance of expected's."""
+_NUMBER_PICKS = ("auto", "first", "last", "any")
+
+
+def numeric_close(
+    *, tolerance: float = 1e-6, relative: bool = False, which: str = "auto"
+) -> Metric:
+    """1.0 iff a number in the output is within tolerance of expected's.
+
+    Numbers are read in the forms models write them: ``42``, ``-3.5``, ``.5``,
+    ``1e3``, ``1,000`` (thousands separator) and ``3,14`` (decimal comma),
+    including full-width and other Unicode digits.
+
+    Args:
+        tolerance: Absolute bound (or relative, with ``relative=True``).
+        relative: Scale ``tolerance`` by ``|expected|``.
+        which: Which number in the *output* is the answer. ``"auto"`` (the
+            default) takes the number after the last answer marker (``answer``,
+            ``result``, ``total``, ``=``) when there is one, else the last
+            number -- so ``"Step 1: the answer is 42"`` reads 42, not 1.
+            ``"first"`` and ``"last"`` do what they say (``"first"`` was the
+            only behaviour before 0.6); ``"any"`` passes if any number matches
+            (lenient -- an output listing many numbers can pass by accident).
+    """
+    if which not in _NUMBER_PICKS:
+        raise ValueError(f"which must be one of {_NUMBER_PICKS}, got {which!r}")
 
     def _fn(output: Any, expected: Any) -> float:
-        out_num, exp_num = _extract_number(output), _extract_number(expected)
-        if out_num is None or exp_num is None:
+        exp_num = _extract_number(expected)
+        if exp_num is None or not math.isfinite(exp_num):
             return 0.0
-        diff = abs(out_num - exp_num)
         bound = tolerance * (abs(exp_num) if relative else 1.0)
-        return 1.0 if diff <= bound else 0.0
+        candidates = _output_numbers(output, which)
+        return 1.0 if any(abs(n - exp_num) <= bound for n in candidates) else 0.0
 
     return Metric("numeric_close", _fn)
 
 
-def json_subset() -> Metric:
-    """1.0 iff every key/value in expected (a dict) is present in the output dict."""
+def json_subset(*, strict_types: bool = True) -> Metric:
+    """Fraction of the expected mapping's top-level keys matched in the output.
+
+    Matching is *recursive*: a nested expected mapping matches when it is a
+    subset of the output's value at that key (``{"a": {"b": 1}}`` is matched by
+    ``{"a": {"b": 1, "c": 2}}``); lists must have equal length with each element
+    matching in turn. With ``strict_types=True`` (the default) ``True`` does
+    not match ``1``. A JSON string output is parsed, including one in a
+    ```` ```json ```` fence or embedded in surrounding prose.
+    """
 
     def _fn(output: Any, expected: Any) -> float:
         out = _as_mapping(output)
         exp = _as_mapping(expected)
         if out is None or exp is None or not exp:
             return 0.0
-        matched = sum(1 for k, v in exp.items() if out.get(k) == v)
+        matched = sum(
+            1 for k, v in exp.items() if k in out and _subset_match(v, out[k], strict_types)
+        )
         return matched / len(exp)
 
     return Metric("json_subset", _fn, structural=True)
+
+
+def _subset_match(expected: Any, actual: Any, strict_types: bool) -> bool:
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return False
+        return all(
+            k in actual and _subset_match(v, actual[k], strict_types) for k, v in expected.items()
+        )
+    if isinstance(expected, (list, tuple)):
+        if not isinstance(actual, (list, tuple)) or len(actual) != len(expected):
+            return False
+        return all(_subset_match(e, a, strict_types) for e, a in zip(expected, actual, strict=True))
+    if strict_types and (isinstance(expected, bool) != isinstance(actual, bool)):
+        return False
+    return bool(expected == actual)
 
 
 def field_match(
@@ -473,9 +749,9 @@ def _resolve_check(spec: Any, judge_metric: Metric | None, cache: dict[Any, Metr
 
     if key is not None and key in cache:
         return cache[key]
-    factory = BUILTIN_METRICS.get(spec)
+    factory = metric_factory(spec)
     if factory is None:
-        raise KeyError(f"Unknown check {spec!r}. Available: {sorted(BUILTIN_METRICS)}")
+        raise KeyError(f"Unknown check {spec!r}. Available: {available_metric_names()}")
     metric = factory(**params)
     if key is not None:
         cache[key] = metric
@@ -502,6 +778,30 @@ BUILTIN_METRICS: dict[str, Callable[..., Metric]] = {
 }
 
 
+#: Metric families registered by other modules (trajectory metrics live in
+#: :mod:`adapt_agent.optimization.trajectory`). Kept apart from
+#: :data:`BUILTIN_METRICS`, whose keys are the text/structure built-ins, so a
+#: lookup by name -- :func:`get_metric`, a row's ``"check"`` -- finds both.
+EXTENSION_METRICS: dict[str, Callable[..., Metric]] = {}
+
+
+def register_metric(name: str, factory: Callable[..., Metric]) -> None:
+    """Make ``factory`` reachable by ``name`` from :func:`get_metric` and per-row checks."""
+    if name in BUILTIN_METRICS:
+        raise ValueError(f"{name!r} is a built-in metric name")
+    EXTENSION_METRICS[name] = factory
+
+
+def metric_factory(name: str) -> Callable[..., Metric] | None:
+    """The factory registered under ``name`` (built-in or extension), else ``None``."""
+    return BUILTIN_METRICS.get(name) or EXTENSION_METRICS.get(name)
+
+
+def available_metric_names() -> list[str]:
+    """Every metric name a dataset row, config or ``get_metric`` may use."""
+    return sorted({*BUILTIN_METRICS, *EXTENSION_METRICS})
+
+
 def get_metric(name: str) -> Metric:
     """Look up a built-in metric by name using default settings.
 
@@ -511,9 +811,9 @@ def get_metric(name: str) -> Metric:
             ``field_match`` needs a ``field``, so it is only reachable through a
             mapping spec such as ``{"name": "field_match", "field": "lane"}``.
     """
-    factory = BUILTIN_METRICS.get(name)
+    factory = metric_factory(name)
     if factory is None:
-        raise KeyError(f"Unknown built-in metric {name!r}. Available: {sorted(BUILTIN_METRICS)}")
+        raise KeyError(f"Unknown built-in metric {name!r}. Available: {available_metric_names()}")
     try:
         return factory()
     except TypeError as exc:
@@ -526,16 +826,101 @@ def get_metric(name: str) -> Metric:
 
 # -- low-level helpers --------------------------------------------------------
 
-_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+#: A number as written in prose. The sign only counts when it is not glued to
+#: a preceding word or digit, so the ``-01`` inside ``2024-01-05`` is not read
+#: as minus one. Separators are captured raw and resolved by `_parse_number`.
+_NUMBER_RE = re.compile(
+    r"(?<![\w.])[-+−]?(?:\d+(?:[.,]\d+)*|[.,]\d+)(?:[eE][-+]?\d+)?|\d+(?:[.,]\d+)*"
+)
+
+#: Words after which the next number is the answer (``which="auto"``).
+_ANSWER_MARKER = re.compile(r"(?:answer|result|total|final|=|≈|is\s*:)", re.IGNORECASE)
+
+
+def _parse_number(token: str) -> float | None:
+    """Resolve one regex match into a float, deciding what each separator means.
+
+    A comma followed by exactly three digits is a thousands separator
+    (``1,000``); otherwise, with no dot present, it is a decimal comma
+    (``3,14``). With both present, whichever comes last is the decimal mark
+    (``1,000.5`` and ``1.000,5``).
+    """
+    t = token.replace("−", "-")
+    match = re.match(r"^(.*?)([eE][-+]?\d+)?$", t)
+    if match is None:  # pragma: no cover - the pattern always matches
+        return None
+    mantissa, exponent = match.group(1), match.group(2) or ""
+    sign = ""
+    if mantissa[:1] in "+-":
+        sign, mantissa = mantissa[0], mantissa[1:]
+    has_dot, has_comma = "." in mantissa, "," in mantissa
+    if has_dot and has_comma:
+        if mantissa.rfind(",") > mantissa.rfind("."):
+            mantissa = mantissa.replace(".", "").replace(",", ".")
+        else:
+            mantissa = mantissa.replace(",", "")
+    elif has_comma:
+        groups = mantissa.split(",")
+        if len(groups) > 1 and all(len(g) == 3 for g in groups[1:]) and groups[0]:
+            mantissa = "".join(groups)
+        elif len(groups) == 2:
+            mantissa = groups[0] + "." + groups[1]
+        else:
+            return None
+    elif mantissa.count(".") > 1:
+        groups = mantissa.split(".")
+        if all(len(g) == 3 for g in groups[1:]) and groups[0]:
+            mantissa = "".join(groups)  # 1.000.000 (dot as thousands separator)
+        else:
+            return None
+    try:
+        return float(sign + mantissa + exponent)
+    except ValueError:
+        return None
+
+
+def _numbers_in(text: str) -> list[tuple[int, float]]:
+    found: list[tuple[int, float]] = []
+    for match in _NUMBER_RE.finditer(text):
+        value = _parse_number(match.group(0))
+        if value is not None and math.isfinite(value):
+            found.append((match.start(), value))
+    return found
 
 
 def _extract_number(value: Any) -> float | None:
+    """The reference number: the value itself, or the first number in its text."""
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    match = _NUMBER_RE.search(_to_text(value).replace(",", ""))
-    return float(match.group(0)) if match else None
+    numbers = _numbers_in(unicodedata.normalize("NFKC", _to_text(value)))
+    return numbers[0][1] if numbers else None
+
+
+def _output_numbers(value: Any, which: str) -> list[float]:
+    """The candidate answer number(s) in an output, per ``which``."""
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, (int, float)):
+        return [float(value)] if math.isfinite(float(value)) else []
+    text = unicodedata.normalize("NFKC", _to_text(value))
+    numbers = _numbers_in(text)
+    if not numbers:
+        return []
+    if which == "any":
+        return [n for _, n in numbers]
+    if which == "first":
+        return [numbers[0][1]]
+    if which == "last":
+        return [numbers[-1][1]]
+    markers = list(_ANSWER_MARKER.finditer(text))
+    if markers:
+        cut = markers[-1].end()
+        after = [n for pos, n in numbers if pos >= cut]
+        if after:
+            return [after[0]]
+    return [numbers[-1][1]]
 
 
 def _as_mapping(value: Any) -> dict[str, Any] | None:
@@ -550,13 +935,7 @@ def _as_mapping(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
-        import json
-
-        try:
-            obj = json.loads(value)
-            return obj if isinstance(obj, dict) else None
-        except Exception:
-            return None
+        return _mapping_from_text(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         try:
             return {f.name: getattr(value, f.name, None) for f in dataclasses.fields(value)}
@@ -576,6 +955,30 @@ def _as_mapping(value: Any) -> dict[str, Any] | None:
                 continue
             if isinstance(dumped, dict):
                 return dumped
+    return None
+
+
+def _mapping_from_text(text: str) -> dict[str, Any] | None:
+    """Parse a JSON object out of model text: bare, fenced, or embedded in prose.
+
+    Models wrap structured answers in a ```` ```json ```` fence or a sentence
+    ("Result: {...}") far more often than they emit bare JSON, and scoring that
+    0.0 measures the formatting, not the answer.
+    """
+    import json
+
+    from .extractors import _parse_json
+
+    parsed = _parse_json(text)
+    if isinstance(parsed, dict):
+        return parsed
+    start, end = text.find("{"), text.rfind("}")
+    if 0 <= start < end:
+        try:
+            obj = json.loads(text[start : end + 1])
+        except ValueError:
+            return None
+        return obj if isinstance(obj, dict) else None
     return None
 
 
@@ -616,5 +1019,12 @@ __all__ = [
     "field_metrics",
     "checks",
     "BUILTIN_METRICS",
+    "EXTENSION_METRICS",
+    "available_metric_names",
+    "metric_factory",
+    "register_metric",
+    "NonFiniteScoreError",
+    "check_untrusted_pattern",
+    "MAX_ROW_PATTERN_LENGTH",
     "get_metric",
 ]

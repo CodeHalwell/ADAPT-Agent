@@ -1,5 +1,13 @@
 """Core functionality for ADAPT-Agent."""
 
+from adapt_agent.core.governance import (
+    UNSCANNABLE,
+    GovernanceGate,
+    TextExtraction,
+    ToolDecision,
+    ToolPolicy,
+    walk_texts,
+)
 from adapt_agent.core.memory import MemorySystem
 from adapt_agent.core.middleware import Middleware
 from adapt_agent.core.policy import PolicyEnforcer
@@ -10,4 +18,10 @@ __all__ = [
     "PolicyEnforcer",
     "MemorySystem",
     "Middleware",
+    "GovernanceGate",
+    "ToolPolicy",
+    "ToolDecision",
+    "TextExtraction",
+    "UNSCANNABLE",
+    "walk_texts",
 ]

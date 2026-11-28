@@ -23,6 +23,7 @@ Run it with:
 from __future__ import annotations
 
 import re
+import sys
 
 # --- Friendly skip if Pydantic AI is not installed ------------------------- #
 try:
@@ -30,10 +31,12 @@ try:
     from pydantic_ai.messages import ModelResponse, TextPart
     from pydantic_ai.models.function import AgentInfo, FunctionModel
 except ImportError:
-    raise SystemExit(
+    # Exit 0: a missing optional framework is a skip, not a failure.
+    print(
         "This example needs Pydantic AI: pip install 'adapt-agent[pydantic-ai]'\n"
         "(or: pip install pydantic-ai)"
-    ) from None
+    )
+    sys.exit(0)
 
 from adapt_agent import AdversarialDefense, AgentObserver, Firewall
 from adapt_agent.adapters import PydanticAIAdapter

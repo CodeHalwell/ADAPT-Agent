@@ -10,13 +10,13 @@ installed.
 
 | Framework | Class | Extra | Wrap target |
 |-----------|-------|-------|-------------|
-| LangGraph | `LangGraphAdapter` | `adapt-agent[langgraph]` | compiled graph (`.invoke`) |
-| Microsoft Agent Framework | `MicrosoftAgentFrameworkAdapter` | `adapt-agent[microsoft-agent-framework]` | `ChatAgent` (`.run`) |
-| Google ADK | `GoogleADKAdapter` | `adapt-agent[google-adk]` | callable driving a `Runner` |
+| LangGraph | `LangGraphAdapter` | `adapt-agent[langgraph]` | compiled graph (`.invoke`; governed `stream` / `astream`) |
+| Microsoft Agent Framework | `MicrosoftAgentFrameworkAdapter` | `adapt-agent[microsoft-agent-framework]` | `Agent` (`.run`; called `ChatAgent` before 1.0), or a workflow's `as_agent()` |
+| Google ADK | `GoogleADKAdapter` | `adapt-agent[google-adk]` | a `Runner`, an `App`, or a callable driving a `Runner` |
 | Pydantic AI | `PydanticAIAdapter` | `adapt-agent[pydantic-ai]` | `Agent` (`.run_sync` / `.run`) |
-| CrewAI | `CrewAIAdapter` | `adapt-agent[crewai]` | `Crew` (`.kickoff`) |
-| OpenAI Agents SDK | `OpenAIAgentsAdapter` | `adapt-agent[openai-agents]` | `Agent` (driven via `Runner`) |
-| Claude Agent SDK | `ClaudeAgentSDKAdapter` | `adapt-agent[claude-agent]` | `query` function |
+| CrewAI | `CrewAIAdapter` | `adapt-agent[crewai]` | `Crew` or `Flow` (`.kickoff` / `.akickoff`), or a standalone `Agent` |
+| OpenAI Agents SDK | `OpenAIAgentsAdapter` | `adapt-agent[openai-agents]` | `Agent` (driven via `Runner`; also `run_streamed`) |
+| Claude Agent SDK | `ClaudeAgentSDKAdapter` | `adapt-agent[claude-agent]` | the `query` function, or a connected `ClaudeSDKClient` |
 
 ```python
 from adapt_agent.adapters import (
@@ -45,17 +45,31 @@ list, so `execute` stays synchronous and the firewall can scan every result.
 ## The unified pipeline
 
 All adapters extend `GovernedAdapter`, which applies the same six steps on every
-`execute` call, regardless of framework:
+`execute` / `aexecute` call, regardless of framework:
 
 1. **Input screening** — `Firewall` + `AdversarialDefense` scan every string in
-   the payload.
+   the payload. A payload too deep or too large to read in full is blocked as
+   `unscannable` / `payload_too_large` (see [Security](security.md)).
 2. **Policy enforcement** — `PolicyEnforcer` is evaluated against the extracted
-   `AgentState`; only `action == "block"` rules block.
+   `AgentState`; only `action == "block"` rules block. Policy is evaluated (and
+   violations recorded) even in report-only mode.
 3. **Pre-middleware** — an optional `Middleware` pipeline may rewrite the input.
+   Whatever it *added* (retrieved context, a template, a rewritten prompt) is
+   screened again before the agent sees it.
 4. **Traced execution** — the framework agent runs, optionally traced by an
    `AgentObserver`.
 5. **Post-middleware** — the pipeline may rewrite the result.
 6. **Output screening** — the firewall scans every string in the result.
+
+A request refused at step 1 or 2 never starts a run, so it opens no trace; it is
+reported to the observer with `record_refusal` instead (`observer.get_refusals()`
+lists it with its `stage` and threats). A request refused at step 6 closes its
+trace as an error. Either way, `get_state()` keeps describing the last request
+that was actually served.
+
+An adapter governs the run's **boundary**. By the time it screens the result
+every tool has run; to govern the tool calls themselves, add the framework's
+[native binding](integrations.md).
 
 The constructor is identical for every adapter and all controls are optional and
 keyword-only:
@@ -72,20 +86,58 @@ adapter = PydanticAIAdapter(
     middleware=None,              # can be added later via inject_middleware
     agent_id="support-bot",       # defaults to "<framework>-agent"
     block_on_violation=True,      # default
+    tool_policy=None,             # carried on adapter.gate, for a native binding
+    max_payload_chars=4_000_000,  # per-payload screening budget; None disables it
 )
 ```
 
+`tool_policy` does nothing at the boundary on its own — the adapter never sees an
+individual tool call. It is carried on `adapter.gate`, so one adapter object can
+configure both the boundary and a native binding built from that gate
+(`governance_capability(gate=adapter.gate)`, `adapter.gate.check_tool_call(...)`).
+`CrewAIAdapter` is the exception: with `hooks=True` it runs CrewAI's tool hooks
+itself (below), and it does not take `max_payload_chars`.
+
+## Running: `execute(input, **run_kwargs)`
+
+```python
+out = guarded.execute(payload, **run_kwargs)          # sync
+out = await guarded.aexecute(payload, **run_kwargs)   # async; same governance
+```
+
+**Extra keyword arguments are forwarded** to the framework's run method
+unchanged: a LangGraph `config={"configurable": {"thread_id": ...}}`, a Pydantic
+AI `deps=` / `message_history=`, an OpenAI Agents `session=` / `context=` /
+`run_config=`, a MAF `session=` / `stream=True` / `middleware=[...]`, ADK
+`user_id=` / `session_id=` / `run_config=`, Claude `options=`, CrewAI
+`input_files=` / `from_checkpoint=`. They configure the run and are not screened
+as content.
+
+**The input need not be a dict.** A string, a framework object (a LangGraph
+`Command(resume=...)`, an OpenAI Agents `RunState`) or a message list is
+screened like any payload and handed to the adapter unchanged. Pre-middleware
+processes dicts only, so an adapter with pre-middleware configured refuses a
+non-dict input with `AdapterError` rather than skip the stage silently.
+
+A non-dict framework result comes back as `{"result": <result>}`; a dict result
+is returned as-is.
+
 ### Per-framework wrap targets
 
+The Microsoft Agent Framework extra installs `agent-framework-core`, which is all
+the adapter needs. Install one framework extra per environment: the frameworks
+constrain each other's dependencies (CrewAI pins `openai<3`, which holds the OpenAI
+Agents SDK and Pydantic AI back), which is why `adapt-agent[all]` leaves CrewAI out.
+
 The only thing that differs between frameworks is the object you pass to
-`wrap_agent` and how the input is shaped:
+`wrap_agent`, how the input is shaped, and what a framework adds on top:
 
 ```python
 # LangGraph — wrap a compiled graph; the payload dict is passed to .invoke()
 LangGraphAdapter().wrap_agent(compiled_graph)
 
-# Microsoft Agent Framework — wrap a ChatAgent; .run() is awaited
-MicrosoftAgentFrameworkAdapter().wrap_agent(chat_agent)
+# Microsoft Agent Framework — wrap an Agent (or workflow.as_agent()); .run() is awaited
+MicrosoftAgentFrameworkAdapter().wrap_agent(maf_agent)
 
 # Pydantic AI — wrap an Agent; .run_sync()/.run() receive a prompt string
 PydanticAIAdapter().wrap_agent(pydantic_agent)
@@ -100,13 +152,59 @@ OpenAIAgentsAdapter().wrap_agent(openai_agent)
 from claude_agent_sdk import query
 ClaudeAgentSDKAdapter().wrap_agent(query)
 
-# Google ADK — wrap a callable that drives a Runner (needs session/user args)
-GoogleADKAdapter().wrap_agent(lambda payload: runner.run(user_id="u", session_id="s", new_message=...))
+# Google ADK — wrap a Runner (or an App); execute() takes user_id= / session_id=
+GoogleADKAdapter().wrap_agent(runner)
 ```
 
 For prompt-based frameworks (Microsoft Agent Framework, Pydantic AI, OpenAI
-Agents, Claude Agent SDK) the adapter derives the prompt from the payload's
-latest user message, so the same `{"messages": [...]}` shape works everywhere.
+Agents, Claude Agent SDK, and Google ADK when wrapping a `Runner` or `App`) the
+adapter derives the prompt from the payload's latest user message, so the same
+`{"messages": [...]}` shape works everywhere.
+
+What each adapter adds:
+
+- **LangGraph.** `guarded.stream(...)` / `guarded.astream(...)` take the graph's
+  own arguments; the input is screened before the graph starts and every item is
+  screened **before it is yielded** (in `stream_mode="messages"` the token chunks
+  of one message are held and released together, so a pattern split across
+  tokens is still caught). An interrupted run returns its `"__interrupt__"`, and
+  `guarded.execute(Command(resume=...), config=config)` resumes it: the `Command`
+  is screened as input and policy is evaluated against the thread's
+  checkpointed state plus the `Command`'s `update`.
+- **OpenAI Agents SDK.** A run paused for approval comes back with
+  `out["interruptions"]`; approve or reject on `out["result"].to_state()` and
+  pass the state back as `guarded.execute({"input": state})` (a bare `RunState`
+  works too). `{"input": [...]}` passes SDK input items through.
+  `adapter.run_streamed(agent, payload, **run_kwargs)` runs the input pipeline
+  and returns a governed stream that holds each response's text until screened.
+- **CrewAI.** `CrewAIAdapter(hooks=True, tool_policy=..., on_tool_violation=..., approve=...)`
+  runs each execution inside CrewAI's interception hooks
+  ([`governance_hooks`](integrations.md#crewai), CrewAI 1.15+), scoped to that run:
+  tool calls and results, model calls and steps are governed too. `tool_policy`,
+  `on_tool_violation` and `approve` without `hooks=True` raise `ValueError`
+  rather than being accepted and ignored. A standalone `Agent` is asked the
+  payload's messages (`kickoff(messages)`); `aexecute` uses the native
+  `akickoff`. A `Crew(stream=True)` is drained inside governance and the final
+  `CrewOutput` returned only after screening.
+- **Google ADK.** Wrapping a `Runner` sends the prompt as `new_message`; the
+  session is created on first use (omit `session_id` for a fresh one per call),
+  and `run_config=`, `state_delta=` and a ready-made `new_message=` pass through.
+  An `App` runs on an `InMemoryRunner` the adapter keeps for it. A
+  `SecurityBlockedError` raised by the governance plugin inside the run reaches
+  you as itself, not wrapped in ADK's `RuntimeError`. A callable gets the full
+  payload and every keyword argument.
+- **Microsoft Agent Framework.** A payload whose `messages` hold MAF
+  `Message` / `Content` objects is passed to `run` as a message list (plain
+  `{"role", "content"}` dicts are still reduced to the latest user prompt). A
+  run paused on a tool approval returns `{"result": ..., "user_input_requests": [...]}`;
+  resume by passing the approval responses back as messages on the same
+  `session=`. A streamed run (`stream=True`) is drained, screened and returned
+  as `{"result": <final response>, "updates": [...]}`.
+- **Claude Agent SDK.** Besides `query`, a *connected* `ClaudeSDKClient` can be
+  wrapped: the adapter sends the prompt and screens everything
+  `receive_response()` yields. Use `aexecute` for a client (its connection is
+  bound to the loop it was opened in). The stream is drained before anything is
+  returned, so a blocked answer is never delivered.
 
 ---
 

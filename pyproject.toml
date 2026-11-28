@@ -61,34 +61,60 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0",
     "build>=1.0",
+    # In-memory span exporter for the OpenTelemetry bridge tests.
+    "opentelemetry-sdk>=1.27",
 ]
 docs = [
     "mkdocs>=1.5",
     "mkdocs-material>=9.0",
 ]
+
+# Framework extras. The floors are the current major line of each framework: the
+# native bindings in adapt_agent.integrations target those APIs, and older lines
+# either lack the extension seam or have a different one. The floors are
+# *validated* by the `frameworks` / `frameworks-floor` jobs in
+# .github/workflows/ci.yml (a floor nobody installs is only a guess), so raise
+# or lower one only together with a green run of that job.
+#
+# Install ONE framework per environment. They are mutually constraining (see
+# `all` below), and the test suite's per-framework tests are written to run
+# against exactly one.
 langgraph = [
-    "langgraph>=0.2.0",
+    "langgraph>=1.0",
+    # The LangGraph binding is a LangChain `create_agent` middleware.
+    "langchain>=1.0",
 ]
+# `agent-framework-core` is all the adapter and the native middleware need. The
+# `agent-framework` meta-package drags in ~200 packages (and a pre-release pin
+# that `uv` refuses to resolve without --prerelease=allow).
 microsoft-agent-framework = [
-    "agent-framework>=1.0.0",
+    "agent-framework-core>=1.0",
 ]
 google-adk = [
-    "google-adk>=0.1.0",
+    "google-adk>=2.0",
 ]
 pydantic-ai = [
-    "pydantic-ai>=0.0.14",
+    "pydantic-ai>=2.0",
 ]
 crewai = [
-    "crewai>=0.40.0",
+    "crewai>=1.0",
 ]
 openai-agents = [
-    "openai-agents>=0.0.1",
+    "openai-agents>=0.20",
 ]
 claude-agent = [
-    "claude-agent-sdk>=0.0.1",
+    "claude-agent-sdk>=0.2",
 ]
+# Optional OpenTelemetry bridge for AgentObserver.
+otel = [
+    "opentelemetry-api>=1.27",
+]
+# Every framework EXCEPT CrewAI. CrewAI pins `openai<3`, which forces
+# openai-agents back to 0.20 and pydantic-ai back to 2.31 (and, left to itself,
+# a resolver settles on an ancient CrewAI instead). So `all` cannot honestly
+# include it: install `adapt-agent[crewai]` in its own environment.
 all = [
-    "adapt-agent[langgraph,microsoft-agent-framework,google-adk,pydantic-ai,crewai,openai-agents,claude-agent]",
+    "adapt-agent[langgraph,microsoft-agent-framework,google-adk,pydantic-ai,openai-agents,claude-agent]",
 ]
 
 [project.urls]
@@ -131,7 +157,7 @@ explicit = true
 
 [tool.black]
 line-length = 100
-target-version = ['py310', 'py311', 'py312', 'py313']
+target-version = ['py310', 'py311', 'py312', 'py313', 'py314']
 include = '\.pyi?$'
 
 [tool.ruff]
@@ -174,34 +200,27 @@ warn_unused_ignores = true
 warn_no_return = true
 
 [[tool.mypy.overrides]]
+# `pkg.*` matches `pkg` and every submodule, so one entry per top-level package.
 module = [
     "langgraph.*",
+    "langchain.*",
+    "langchain_core.*",
     "agent_framework.*",
-    "google.adk.*",
-    "google.genai.*",
     "pydantic_ai.*",
     "crewai.*",
     "agents.*",
     "claude_agent_sdk.*",
-    # Optional LLM-provider SDKs (imported lazily by adapt_agent.optimization.providers)
-    "anthropic",
-    "anthropic.*",
-    "openai",
-    "openai.*",
-    "google",
+    "opentelemetry.*",
+    # Covers google.adk, google.genai and google.generativeai.
     "google.*",
-    "google.generativeai",
-    "google.generativeai.*",
-    "mistralai",
+    # Optional LLM-provider SDKs (imported lazily by adapt_agent.optimization.providers)
+    "anthropic.*",
+    "openai.*",
     "mistralai.*",
-    "cohere",
     "cohere.*",
-    "boto3",
     "boto3.*",
-    "huggingface_hub",
     "huggingface_hub.*",
     # PyYAML ships no type stubs in this project's pinned set
-    "yaml",
     "yaml.*",
 ]
 ignore_missing_imports = true

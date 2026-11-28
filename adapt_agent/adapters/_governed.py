@@ -13,7 +13,8 @@ The :class:`GovernedAdapter` applies, in order, on every ``execute`` call:
 2. **Policy enforcement** -- a :class:`~adapt_agent.core.PolicyEnforcer` is
    evaluated against the extracted :class:`~adapt_agent.core.types.AgentState`.
 3. **Pre-middleware** -- a :class:`~adapt_agent.core.Middleware` pipeline may
-   rewrite the payload.
+   rewrite the payload. Text it adds or changes is screened again before the
+   agent sees it.
 4. **Traced execution** -- the framework agent runs, optionally traced by an
    :class:`~adapt_agent.observability.AgentObserver`.
 5. **Post-middleware** -- the pipeline may rewrite the result.
@@ -50,18 +51,24 @@ policy sandbox, middleware -- so there is no async variant of them to write.
 import asyncio
 import inspect
 import uuid
-from collections.abc import AsyncIterable, Callable
+from collections.abc import AsyncIterable, Callable, Iterable, Mapping
 from typing import Any, cast
 
 from adapt_agent.adapters.base import BaseAdapter
 from adapt_agent.adversarial import AdversarialDefense
-from adapt_agent.core.governance import GovernanceGate
+from adapt_agent.core.governance import (
+    DEFAULT_MAX_PAYLOAD_CHARS,
+    GovernanceGate,
+    ToolPolicy,
+    walk_texts,
+)
 from adapt_agent.core.governance import extract_prompt as _extract_prompt
 from adapt_agent.core.governance import extract_texts as _extract_texts
 from adapt_agent.core.middleware import Middleware
 from adapt_agent.core.policy import PolicyEnforcer
 from adapt_agent.core.types import Agent, AgentState
 from adapt_agent.exceptions import AdapterError, SecurityBlockedError
+from adapt_agent.integrations._common import _end_trace_error, record_refusal
 from adapt_agent.observability import AgentObserver
 from adapt_agent.security.firewall import Firewall
 
@@ -74,7 +81,8 @@ def _resolve_result(value: Any) -> Any:
     """Materialise a sync/async framework result into a concrete value.
 
     * Coroutines are run to completion.
-    * Async generators / async iterators are drained into a list.
+    * Async generators / async iterators are drained into a list -- unless the
+      object is also a sync iterable, which is then iterated instead.
     * Sync generators are materialised into a list.
 
     Raises:
@@ -84,6 +92,13 @@ def _resolve_result(value: Any) -> Any:
     # ``AsyncIterable`` covers both ``async def`` generators and custom async
     # iterators (``__aiter__``/``__anext__``), which streaming SDKs often return.
     if isinstance(value, AsyncIterable):
+        # An object offering both protocols is a sync stream when a sync run
+        # method returned it: CrewAI's `CrewStreamingOutput` from `kickoff`
+        # has no async iterator behind `__aiter__`, which raises "Async
+        # iterator not available". Iterating synchronously is also simply the
+        # right reading of a sync call, so `__iter__` wins here.
+        if isinstance(value, Iterable):
+            return list(value)
         return _run_coro(_drain_async_gen(value), value)
     if inspect.isawaitable(value):
         # Through the async resolver rather than a bare await, for two reasons.
@@ -230,6 +245,15 @@ class GovernedAdapter(BaseAdapter):
         block_on_violation: When ``True`` (default), a firewall/defense hit or a
             ``block`` policy action raises :class:`SecurityBlockedError`. When
             ``False`` the execution proceeds but threats are still recorded.
+        tool_policy: Optional :class:`~adapt_agent.core.governance.ToolPolicy`
+            carried on :attr:`gate`. The outer adapter never sees an individual
+            tool call -- it governs the run's boundary, and by the time it
+            screens the result every tool has already run -- so this does
+            nothing on its own. It exists so one adapter object can configure
+            both the boundary and a native tool-call binding built from its
+            gate (``adapter.gate.check_tool_call(...)``).
+        max_payload_chars: Per-payload text budget for screening; see
+            :class:`~adapt_agent.core.governance.GovernanceGate`.
     """
 
     framework_name: str = "Governed"
@@ -254,6 +278,8 @@ class GovernedAdapter(BaseAdapter):
         middleware: Middleware | None = None,
         agent_id: str | None = None,
         block_on_violation: bool = True,
+        tool_policy: ToolPolicy | None = None,
+        max_payload_chars: int | None = DEFAULT_MAX_PAYLOAD_CHARS,
     ):
         super().__init__(config)
         self.firewall = firewall
@@ -263,6 +289,11 @@ class GovernedAdapter(BaseAdapter):
         self.middleware = middleware
         self.agent_id = agent_id or f"{self.framework_name.lower().replace(' ', '-')}-agent"
         self.block_on_violation = block_on_violation
+        self.tool_policy = tool_policy
+        self.max_payload_chars = max_payload_chars
+        # Built once now for its validation: a bad option should fail at
+        # construction, not on the first request.
+        self.gate  # noqa: B018
 
     # -- framework-specific hooks ---------------------------------------------
 
@@ -294,18 +325,28 @@ class GovernedAdapter(BaseAdapter):
                 return cast(Runner, candidate)
         return self._resolve_runner(agent)
 
-    def _prepare_input(self, payload: dict[str, Any]) -> Any:
+    def _prepare_input(self, payload: Any) -> Any:
         """Transform the (post-middleware) payload into the runner's argument.
 
         The default passes the payload through unchanged (state-dict frameworks
         such as LangGraph). Prompt-based frameworks override this to return a
         string via :func:`_extract_prompt`.
+
+        ``payload`` is usually a dict, but not always: a run is resumed with a
+        framework object (a LangGraph ``Command(resume=...)``, an OpenAI Agents
+        ``RunState``), which reaches this hook unchanged after screening.
         """
         return payload
 
-    def _call_runner(self, runner: Runner, payload: dict[str, Any]) -> Any:
-        """Invoke ``runner`` with the prepared input and return the raw result."""
-        return runner(self._prepare_input(payload))
+    def _call_runner(self, runner: Runner, payload: Any, **run_kwargs: Any) -> Any:
+        """Invoke ``runner`` with the prepared input and return the raw result.
+
+        ``run_kwargs`` are the extra keyword arguments the caller gave
+        ``execute``/``aexecute`` -- a LangGraph ``config``, a Pydantic AI
+        ``deps``, an OpenAI Agents ``session`` -- forwarded to the framework
+        untouched. They configure the run; they are not screened as content.
+        """
+        return runner(self._prepare_input(payload), **run_kwargs)
 
     # -- BaseAdapter contract --------------------------------------------------
 
@@ -398,6 +439,8 @@ class GovernedAdapter(BaseAdapter):
             policy_enforcer=self.policy_enforcer,
             block_on_violation=self.block_on_violation,
             agent_id=self.agent_id,
+            tool_policy=self.tool_policy,
+            max_payload_chars=self.max_payload_chars,
         )
 
     def _screen_input(self, payload: Any) -> list[str]:
@@ -426,11 +469,25 @@ class _GovernedAgent:
         self._arunner: Runner = cast(Runner, adapter._resolve_async_runner(agent))
         self._last_state: AgentState = {"messages": [], "context": {}}
 
-    def execute(self, input_data: dict[str, Any]) -> dict[str, Any]:
+    def execute(self, input_data: Any, **run_kwargs: Any) -> dict[str, Any]:
         """Run the wrapped agent with governance applied, synchronously.
 
         Order of operations: input screening -> policy check -> pre-middleware
-        -> traced run -> post-middleware -> output screening.
+        (and re-screening of what it changed) -> traced run -> post-middleware
+        -> output screening.
+
+        ``input_data`` is normally a state dict. A framework object -- the
+        ``Command(resume=...)`` that resumes a LangGraph run, an OpenAI Agents
+        ``RunState`` -- is screened like any payload and handed to the adapter
+        unchanged. Pre-middleware works on dicts and cannot run on it, so a
+        configured pre-middleware makes such an input an :class:`AdapterError`
+        rather than a silently skipped stage.
+
+        Extra keyword arguments are forwarded to the framework's run method
+        unchanged, which is how run-scoped configuration reaches it: a
+        LangGraph ``config={"configurable": {"thread_id": ...}}``, a Pydantic
+        AI ``deps=``/``message_history=``, an OpenAI Agents ``session=``. They
+        are configuration, not content, and are not screened.
 
         An async-native framework is driven by running its coroutine to
         completion, which is impossible from inside a running event loop. In an
@@ -445,14 +502,14 @@ class _GovernedAgent:
         """
         trace_id, payload = self._before(input_data)
         try:
-            raw = self._adapter._call_runner(self._runner, payload)
+            raw = self._adapter._call_runner(self._runner, payload, **run_kwargs)
             result = _resolve_result(raw)
         except BaseException as exc:  # close the span on KeyboardInterrupt too
             self._trace_error(trace_id, exc)
             raise
         return self._after(trace_id, result)
 
-    async def aexecute(self, input_data: dict[str, Any]) -> dict[str, Any]:
+    async def aexecute(self, input_data: Any, **run_kwargs: Any) -> dict[str, Any]:
         """Run the wrapped agent with governance applied, asynchronously.
 
         The async twin of :meth:`execute`, and the right entry point for an
@@ -472,7 +529,7 @@ class _GovernedAgent:
         """
         trace_id, payload = self._before(input_data)
         try:
-            raw = await self._acall_runner(payload)
+            raw = await self._acall_runner(payload, **run_kwargs)
             result = await _aresolve_result(raw)
         except BaseException as exc:
             # BaseException, not Exception: `asyncio.CancelledError` derives from
@@ -482,7 +539,7 @@ class _GovernedAgent:
             raise
         return self._after(trace_id, result)
 
-    async def _acall_runner(self, payload: dict[str, Any]) -> Any:
+    async def _acall_runner(self, payload: Any, **run_kwargs: Any) -> Any:
         """Invoke the async-preferred runner without blocking the caller's loop.
 
         A framework with no async entry point still reaches `aexecute` -- the
@@ -502,22 +559,34 @@ class _GovernedAgent:
         """
         runner = self._arunner
         if inspect.iscoroutinefunction(runner) or inspect.isasyncgenfunction(runner):
-            return self._adapter._call_runner(runner, payload)
-        return await asyncio.to_thread(self._adapter._call_runner, runner, payload)
+            return self._adapter._call_runner(runner, payload, **run_kwargs)
+        return await asyncio.to_thread(self._adapter._call_runner, runner, payload, **run_kwargs)
 
     # -- shared governance stages ---------------------------------------------
     # execute() and aexecute() differ only in how the framework result is
     # materialised; keeping the stages here means governance can never drift
     # between the two call styles.
 
-    def _before(self, input_data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def _before(self, input_data: Any) -> tuple[str, Any]:
         """Stages 1-3: input screening, policy, pre-middleware. Opens the trace."""
         adapter = self._adapter
         trace_id = uuid.uuid4().hex
+        middleware = adapter.middleware
+        rewrites = middleware is not None and middleware.has_input_stages
+        if rewrites and not isinstance(input_data, dict):
+            # Refused before anything runs: skipping a configured stage would
+            # be a control that is accepted and silently does nothing.
+            raise AdapterError(
+                f"{type(adapter).__name__} has pre-middleware configured, which "
+                f"processes dict payloads, but execute() received a "
+                f"{type(input_data).__name__}. Pass a dict, or run this input "
+                f"through an adapter without pre-middleware."
+            )
 
         # 1. Input screening.
         in_threats = adapter._screen_input(input_data)
         if in_threats and adapter.block_on_violation:
+            self._refused(in_threats, stage="input")
             raise SecurityBlockedError("Input blocked by security controls", in_threats)
 
         # 2. Policy enforcement against the extracted state.
@@ -533,24 +602,71 @@ class _GovernedAgent:
         # committing first meant `get_state()` returned the very payload policy
         # had just blocked, and an output block left the request's input there
         # as if it had been served. `_after` commits, on success only.
-        candidate_state = adapter.extract_state(input_data)
+        if isinstance(input_data, dict):
+            candidate_state = adapter.extract_state(input_data)
+        else:
+            candidate_state = self._foreign_state(input_data)
         blocking = adapter.gate.policy_violations(candidate_state)
         if blocking and adapter.block_on_violation:
-            raise SecurityBlockedError("Input blocked by policy", [f"policy:{v}" for v in blocking])
+            policy_threats = [f"policy:{v}" for v in blocking]
+            self._refused(policy_threats, stage="policy")
+            raise SecurityBlockedError("Input blocked by policy", policy_threats)
 
-        # 3. Pre-middleware.
+        # 3. Pre-middleware, then screening of whatever it changed. Stage 1
+        # saw the caller's payload, not the one the agent will get: text a
+        # middleware adds (retrieved context, a template, a rewritten prompt)
+        # would otherwise reach the agent unscreened.
         payload = input_data
-        if adapter.middleware is not None:
-            payload = adapter.middleware.process_input(input_data)
+        if middleware is not None and rewrites:
+            scanning = adapter.firewall is not None or adapter.defense is not None
+            # Snapshot first: a middleware may mutate nested objects in place,
+            # which the shallow copy `process_input` makes does not isolate.
+            before = set(walk_texts(input_data).texts) if scanning else set()
+            payload = middleware.process_input(input_data)
+            if scanning:
+                after = walk_texts(payload)
+                if after.incomplete or not before.issuperset(after.texts):
+                    rewritten_threats = adapter._screen_input(payload)
+                    if rewritten_threats and adapter.block_on_violation:
+                        self._refused(rewritten_threats, stage="middleware")
+                        raise SecurityBlockedError(
+                            "Input blocked by security controls after pre-middleware",
+                            rewritten_threats,
+                        )
 
         # 4. Traced execution begins (the run itself is the caller's job).
         if adapter.observer is not None:
             adapter.observer.start_trace(trace_id, adapter.agent_id, adapter.operation)
         return trace_id, payload
 
+    def _foreign_state(self, input_data: Any) -> AgentState:
+        """Best-effort state for policy when the input is not a dict.
+
+        A resume object or other mapping may be something this adapter's
+        ``extract_state`` does not understand. A failure there must not turn a
+        resume into a crash, so it falls back to an empty state -- which policy
+        then judges like any other.
+        """
+        try:
+            if isinstance(input_data, Mapping):
+                return self._adapter.extract_state(dict(input_data))
+            return self._adapter.extract_state(input_data)
+        except Exception:
+            return {"messages": [], "context": {}}
+
     def _trace_error(self, trace_id: str, exc: BaseException) -> None:
         if self._adapter.observer is not None:
-            self._adapter.observer.end_trace(trace_id, status="error", result=str(exc))
+            _end_trace_error(self._adapter.observer, trace_id, exc)
+
+    def _refused(self, threats: list[str], *, stage: str) -> None:
+        """Tell the observer about a refusal made before any span was opened.
+
+        An input or policy block happens before the run starts, so there is no
+        span to close as failed -- without this the refusal, the very event
+        monitoring exists to surface, leaves nothing in the observer at all.
+        """
+        adapter = self._adapter
+        record_refusal(adapter.observer, adapter.agent_id, adapter.operation, threats, stage=stage)
 
     def _after(self, trace_id: str, result: Any) -> dict[str, Any]:
         """Stages 5-6: post-middleware, output screening, then close the trace.

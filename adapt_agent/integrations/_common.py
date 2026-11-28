@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import uuid
 from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
-from adapt_agent.core.governance import GovernanceGate
+from adapt_agent.core.governance import GovernanceGate, ToolPolicy
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from adapt_agent.adversarial import AdversarialDefense
@@ -28,13 +29,16 @@ def build_gate(
     policy_enforcer: PolicyEnforcer | None = None,
     block_on_violation: bool = True,
     agent_id: str = _DEFAULT_AGENT_ID,
+    tool_policy: ToolPolicy | None = None,
 ) -> GovernanceGate:
     """Return the supplied gate, or build one from individual controls.
 
     Every integration factory accepts both forms: pass ``gate=`` to share one
     configured gate across several agents, or pass the controls directly for a
-    one-off. Passing ``gate=`` alongside controls ignores the controls -- the
-    gate already carries its own.
+    one-off. Passing ``gate=`` together with a control is refused: the gate
+    already carries its own, so the extra one could only be dropped, and a
+    ``firewall=`` or ``tool_policy=`` that is accepted and then never consulted
+    looks exactly like one that is working.
 
     ``agent_id`` is the exception, because it identifies the *binding* rather
     than the controls. Sharing one gate across a graph is exactly the case where
@@ -43,6 +47,22 @@ def build_gate(
     binding's id, so one violation was attributed two different ways.
     """
     if gate is not None:
+        dropped = [
+            name
+            for name, value in (
+                ("firewall", firewall),
+                ("defense", defense),
+                ("policy_enforcer", policy_enforcer),
+                ("tool_policy", tool_policy),
+            )
+            if value is not None
+        ]
+        if dropped:
+            raise ValueError(
+                f"gate= was passed together with {', '.join(dropped)}, which would be "
+                "ignored: a shared gate carries its own controls. Configure them on the "
+                "GovernanceGate, or drop gate= and pass the controls directly."
+            )
         if agent_id == _DEFAULT_AGENT_ID or agent_id == gate.agent_id:
             return gate
         return GovernanceGate(
@@ -51,6 +71,8 @@ def build_gate(
             policy_enforcer=gate.policy_enforcer,
             block_on_violation=gate.block_on_violation,
             agent_id=agent_id,
+            tool_policy=gate.tool_policy,
+            max_payload_chars=gate.max_payload_chars,
         )
     return GovernanceGate(
         firewall=firewall,
@@ -58,6 +80,7 @@ def build_gate(
         policy_enforcer=policy_enforcer,
         block_on_violation=block_on_violation,
         agent_id=agent_id,
+        tool_policy=tool_policy,
     )
 
 
@@ -80,9 +103,65 @@ def traced(observer: Any, agent_id: str, operation: str) -> Iterator[None]:
     except BaseException as exc:
         # BaseException, not Exception: `asyncio.CancelledError` derives from it,
         # so a cancelled request would otherwise leave the span open forever.
-        observer.end_trace(trace_id, status="error", result=str(exc))
+        _end_trace_error(observer, trace_id, exc)
         raise
     observer.end_trace(trace_id, status="completed")
+
+
+def _end_trace_error(observer: Any, trace_id: str, exc: BaseException) -> None:
+    """Close a span as failed, handing the exception over when the observer takes it.
+
+    :class:`~adapt_agent.observability.AgentObserver` reads the threat labels
+    and the exception class from ``error=``, which is what makes a blocked run
+    distinguishable from a crashed one in a trace. A third-party observer
+    written against the original two-argument contract is still supported: it
+    is called without the keyword rather than failing inside an ``except``.
+    """
+    if _accepts_keyword(observer.end_trace, "error"):
+        observer.end_trace(trace_id, status="error", result=str(exc), error=exc)
+    else:
+        observer.end_trace(trace_id, status="error", result=str(exc))
+
+
+def _accepts_keyword(func: Any, name: str) -> bool:
+    """Whether ``func`` can be called with keyword ``name``; ``False`` if unknowable."""
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD
+        or (p.name == name and p.kind is not inspect.Parameter.POSITIONAL_ONLY)
+        for p in parameters
+    )
+
+
+def record_tool_decision(observer: Any, agent_id: str, decision: Any, *, phase: str) -> None:
+    """Report a tool-call verdict to the observer, if it can record one.
+
+    ``phase`` is ``"call"`` (before the tool runs) or ``"result"`` (before its
+    result returns to the model). A no-op for ``observer=None`` and for an
+    observer without ``record_tool_decision``, so a binding can call this
+    unconditionally.
+    """
+    record = getattr(observer, "record_tool_decision", None)
+    if callable(record):
+        record(agent_id, decision, phase=phase)
+
+
+def record_refusal(
+    observer: Any, agent_id: str, operation: str, threats: list[str], *, stage: str
+) -> None:
+    """Report a refusal that happened before any span was opened.
+
+    Without this an input block leaves no trace at all in the observer: the
+    request was refused before the run began, so there is no span to mark as
+    failed. A no-op for ``observer=None`` and for an observer without
+    ``record_refusal``.
+    """
+    record = getattr(observer, "record_refusal", None)
+    if callable(record):
+        record(agent_id, operation, list(threats), stage=stage)
 
 
 def optional_import(module: str, extra: str, needed_for: str) -> Any:
@@ -110,13 +189,13 @@ def context_state(context: Any) -> dict[str, Any]:
     rule never fires and nothing says so.
     """
     # ADK: `Context.state`; some versions expose it via the session instead.
-    state = getattr(context, "state", None)
-    if isinstance(state, Mapping):
-        return dict(state)
+    state = _as_mapping(getattr(context, "state", None))
+    if state is not None:
+        return state
     session = getattr(context, "session", None)
-    session_state = getattr(session, "state", None)
-    if isinstance(session_state, Mapping):
-        return dict(session_state)
+    session_state = _as_mapping(getattr(session, "state", None))
+    if session_state is not None:
+        return session_state
     # OpenAI Agents: `RunContextWrapper.context` is whatever the caller passed to
     # `Runner.run(..., context=...)` -- the conventional home for authorization
     # data a policy rule gates on.
@@ -124,6 +203,27 @@ def context_state(context: Any) -> dict[str, Any]:
     if isinstance(runtime, Mapping):
         return dict(runtime)
     return {}
+
+
+def _as_mapping(state: Any) -> dict[str, Any] | None:
+    """A state object as a plain dict, or ``None`` if it is not one.
+
+    ADK's ``State`` is not a :class:`~collections.abc.Mapping` -- it exposes
+    ``to_dict()`` instead -- so an ``isinstance`` check alone reads it as "no
+    state", and every policy rule that gates on session data then fails closed
+    on every request.
+    """
+    if isinstance(state, Mapping):
+        return dict(state)
+    to_dict = getattr(state, "to_dict", None)
+    if callable(to_dict):
+        try:
+            converted = to_dict()
+        except Exception:
+            return None
+        if isinstance(converted, Mapping):
+            return dict(converted)
+    return None
 
 
 def as_state(messages: Any, /, **extra: Any) -> dict[str, Any]:
@@ -160,4 +260,12 @@ def as_state(messages: Any, /, **extra: Any) -> dict[str, Any]:
     return state
 
 
-__all__ = ["as_state", "build_gate", "context_state", "optional_import", "traced"]
+__all__ = [
+    "as_state",
+    "build_gate",
+    "context_state",
+    "optional_import",
+    "record_refusal",
+    "record_tool_decision",
+    "traced",
+]

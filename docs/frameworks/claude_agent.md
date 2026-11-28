@@ -24,6 +24,184 @@ agents — has two halves, both framework-agnostic and import-safe:
 
 ---
 
+## Start here: governing the agent's tool calls
+
+The SDK runs the Claude Code CLI as a subprocess, and everything the agent *does*
+-- `Bash`, `Write`, `WebFetch`, MCP tools (`mcp__<server>__<tool>`), tools run by
+Task-spawned sub-agents -- happens on the CLI side. An outer wrapper around
+`query()` sees only the prompt and the final messages. The binding that governs
+the actions is therefore on `ClaudeAgentOptions`:
+
+```python
+from claude_agent_sdk import ClaudeAgentOptions, query
+from adapt_agent.core import ToolPolicy
+from adapt_agent.integrations.claude_agent import governance_hooks, native_tool_options
+
+policy = ToolPolicy(allow=["Read", "Grep", "mcp__docs__search"], deny=["mcp__*"],
+                    require_approval=["Write"])
+
+options = ClaudeAgentOptions(
+    hooks=governance_hooks(
+        firewall=firewall,
+        tool_policy=policy,
+        agent_id="assistant",
+        state=lambda: {"trust_score": session.trust},   # what your policy rules read
+        observer=observer,
+    ),
+    **native_tool_options(policy, mcp_servers=[]),       # the CLI enforces the list too
+)
+async for message in query(prompt="...", options=options):
+    ...
+```
+
+> **Not verified end to end.** The CLI cannot run offline, so the test-suite
+> (`tests/test_real_claude_agent.py`) drives the hook callables directly with
+> inputs shaped like the SDK's `*HookInput` TypedDicts and validates every output
+> against the SDK's output TypedDicts. How the CLI *acts* on those outputs rests
+> on the SDK's own documentation strings, quoted below.
+
+### What `governance_hooks` registers
+
+| Event | Default | What it does |
+|---|---|---|
+| `UserPromptSubmit` | yes | Screens the prompt; **state rules** run here. Block: `{"decision": "block", "reason": ...}`. |
+| `PreToolUse` | yes | `gate.check_tool_call`: `ToolPolicy`, firewall/defense over the arguments, tool-scoped policy rules. |
+| `PostToolUse` | yes | `gate.check_tool_result`: indirect injection in what a tool returned. |
+| `PostToolUseFailure`, `SubagentStart`, `SubagentStop`, `PermissionRequest` | opt-in via `events=` | Audit and attribution only (spans on `observer`, sub-agent ids). They never refuse: the SDK's output type for them cannot withhold anything. |
+
+Hooks are registered on `ClaudeAgentOptions`, so they cover the main agent **and
+every sub-agent**; each tool-lifecycle hook input carries `agent_id` /
+`agent_type` inside a sub-agent, and refusals and spans are labelled
+`<agent_id>/<sub-agent id>`. There is nothing to attach per agent.
+
+### Output shapes (read from `claude_agent_sdk.types`)
+
+- **Block a tool call:** `hookSpecificOutput = {"hookEventName": "PreToolUse",
+  "permissionDecision": "deny", "permissionDecisionReason": ...}`. The legacy
+  top-level `decision: "block"` / `reason` pair is included on a deny only, so a
+  CLI that predates `permissionDecision` still refuses instead of ignoring an
+  output it does not understand.
+- **Ask:** `permissionDecision: "ask"` is the SDK's own human-approval path: your
+  `can_use_tool` callback (it receives the reason in
+  `ToolPermissionContext.decision_reason`) or the CLI prompt. With nobody to ask
+  (headless runs), pass `approvals=False` and every ask becomes a deny.
+- **Allow:** the hook returns **nothing**, never `permissionDecision: "allow"`.
+  The SDK says an allow from a hook skips `can_use_tool`, and an allow bypasses
+  the user's normal permission prompts; returning `{}` leaves their permission
+  settings in force.
+- **Block a tool result:** `decision: "block"` only feeds a reason to the model;
+  the poisoned result still reaches it. The hook therefore also sets
+  `hookSpecificOutput.updatedToolOutput` ("Replaces the tool output before it is
+  sent to the model", all tool kinds, MCP included) to the original response with
+  each flagged string replaced by a refusal placeholder -- same keys, same types,
+  because the SDK documents that a built-in tool's replacement that does not match
+  its output schema "is rejected and the original output is kept". **Residual
+  gap:** that rule means a built-in tool whose schema constrains a flagged field
+  could keep its original output, and a CLI that ignores `updatedToolOutput` keeps
+  it too. Where that is not acceptable, deny the tool in `ToolPolicy` so it never
+  runs. `PostToolUseFailure` text cannot be replaced at all; a flagged error gets
+  an `additionalContext` warning and a span.
+- **Failure:** the SDK counts a hook that raises or times out as *no decision*
+  unless the matcher sets `on_failure="block"`. The governance matchers set it,
+  carry an explicit `timeout` (default 30 s, `timeout=`), and the callbacks also
+  catch their own exceptions and return the block decision. (A CLI that cannot
+  honour `on_failure` makes the SDK raise `CLIConnectionError` when it connects.)
+
+### Policy state: which keys exist, per event
+
+A fail-closed `PolicyEnforcer` treats a rule it cannot evaluate as violated, so
+the hook builds a real state instead of passing the raw hook dict. `S` is what
+`state=` returned (merged first; the hook's own facts override it on a clash).
+
+| Event | Keys a rule can rely on |
+|---|---|
+| `UserPromptSubmit` | `S`, `messages` (`[{"role": "user", "content": prompt}]`), `context` (`{}`), `event`, `session_id`, `permission_mode`, `cwd` |
+| tool events (`PreToolUse`, ...) | `S`, `messages` (`[]`), `context`, `event`, `session_id`, `permission_mode`, `cwd`, `tool_name`, `tool_input`, `tool_use_id`, and `agent_id` / `agent_type` inside a sub-agent |
+| `can_use_tool` | `S`, `messages` (`[]`), `context`, `event` (`"can_use_tool"`), `tool_name`, `tool_input`, `tool_use_id`, `agent_id` |
+
+Plain **state** rules (`state['trust_score'] < 0.5`) are evaluated on
+`UserPromptSubmit` only. A tool call goes through the gate's tool API, where
+**tool-scoped** rules (conditions naming `tool`) apply and may also read `state`:
+
+```python
+enforcer.add_rule("untrusted_bash", "No shell for low-trust sessions",
+                  "tool['name'] == 'Bash' and state['trust_score'] < 0.5", action="block")
+enforcer.add_rule("edit_etc", "A human signs off edits under /etc",
+                  "tool['name'] == 'Write' and tool['arguments']['file_path'] == '/etc/hosts'",
+                  action="require_approval")
+```
+
+A tool-scoped rule that reads a `state` key your `state=` does not supply cannot
+be evaluated and, under the default fail-closed enforcer, blocks -- supply the key.
+
+### MCP tools
+
+MCP tools surface through the same hooks, named `mcp__<server>__<tool>`; verified
+at the hook level (a denied `mcp__...` name is refused by `PreToolUse` and by
+`can_use_tool`, and a poisoned MCP-style `content` list is replaced by
+`PostToolUse`). The allow-list is a `ToolPolicy`:
+
+```python
+ToolPolicy(allow=["Read", "mcp__docs__search"], deny=["mcp__*"])   # deny wins
+```
+
+`native_tool_options(policy, mcp_servers=[...])` derives the matching
+`ClaudeAgentOptions` values so the CLI removes denied tools from the model's
+context as well: `deny` -> `disallowed_tools`; `allow` -> `tools` (built-ins) and
+`strict_mcp_config=True` (only the servers you pass in `mcp_servers` load, so the
+MCP allow-list is per server natively and per tool in the hooks). It **never**
+sets `allowed_tools`, which *auto-approves* tools. Patterns the CLI cannot express
+(`"Bash*"`) raise `ValueError` rather than being dropped; `"mcp__*"` needs
+`mcp_servers=` to expand. `require_approval` has no native option; the hooks'
+`"ask"` enforces it.
+
+### `can_use_tool`, and how the two bindings compose
+
+```python
+from adapt_agent.integrations.claude_agent import governance_can_use_tool
+
+options = ClaudeAgentOptions(
+    hooks=governance_hooks(gate=gate),
+    can_use_tool=governance_can_use_tool(gate=gate, inner=my_human_approval),
+)
+```
+
+The SDK calls `can_use_tool` only for a call the CLI would otherwise *prompt* for.
+It is **not** called for tools in `allowed_tools` (whole-tool entries such as
+`"Read"`), under `permission_mode="bypassPermissions"`, for settings-file allow
+rules, or after a `PreToolUse` hook allows the call. The order is `PreToolUse`
+hook -> permission rules/mode -> `can_use_tool`.
+
+**Prefer the hooks**: they see every call in every mode. Use `can_use_tool` for
+what only it does -- be the approver. Mapping: block -> `PermissionResultDeny(
+message=decision.reason)`; **ask** -> the SDK is already asking, so the call goes
+to `inner` (your approval UI), or is denied if there is none -- an ask never
+becomes an allow; allow -> `inner`'s answer, or `PermissionResultAllow()` when
+there is no `inner` (this callback then *is* the permission policy). Rewritten
+`updated_input` from `inner` is re-screened. Any error is a deny. `interrupt=True`
+stops the turn on a block instead of letting the model adapt.
+
+### Block modes
+
+A block is always a refusal the model sees; the run continues and the tool does
+not execute. There is no `"raise"` mode: an exception in a hook is reported to
+the CLI as a failed hook, not an aborted run. `on_tool_violation="raise"` is
+therefore **refused with an error** instead of being accepted and ignored.
+`block_on_violation=False` makes everything report-only: nothing is refused and
+each would-be block is recorded on `observer` as
+`claude_agent.<event>.<tool>.report_only`.
+
+### Streaming
+
+Tool governance does not depend on streaming. Model *output* reaches the consumer
+as `query()` / `ClaudeSDKClient` yield it, and the SDK has no seam that holds
+text back: nothing in the hooks can stop an assistant message already streamed.
+The adapter (below) is the output screen: it **drains the whole stream, screens
+it, and only then returns**, so a blocked answer is never delivered -- at the
+price that no partial output reaches the caller early.
+
+---
+
 ## 1. What the Claude Agent SDK is
 
 The Claude Agent SDK is driven by a single async function, `query`:
@@ -35,11 +213,11 @@ async for message in query(
     prompt="What is the capital of France?",
     options=ClaudeAgentOptions(
         system_prompt="Answer with only the city name.",
-        model="claude-opus-4-8",
+        model="claude-opus-5-5",
         allowed_tools=[],            # permission allow-list (auto-approved tools)
         disallowed_tools=[],         # tools to block
         max_turns=1,                 # cap the agent's turn budget
-        permission_mode="default",   # default | acceptEdits | plan | bypassPermissions
+        permission_mode="default",   # the SDK's permission mode (a security setting)
     ),
 ):
     ...
@@ -163,16 +341,26 @@ Then wrap the SDK's `query` function (or any callable accepting a `prompt=`
 keyword) and call `execute`:
 
 ```python
-import functools
 from claude_agent_sdk import query, ClaudeAgentOptions
 
-options = ClaudeAgentOptions(system_prompt="Be concise.", model="claude-opus-4-8")
-# Bind options so the adapter only needs to supply `prompt=`:
-configured_query = functools.partial(query, options=options)
+options = ClaudeAgentOptions(system_prompt="Be concise.", model="claude-opus-5-5")
 
-guarded = adapter.wrap_agent(configured_query)
-out = guarded.execute({"messages": [{"role": "user", "content": "Hi"}]})
+guarded = adapter.wrap_agent(query)
+# Extra keyword arguments are forwarded to query(): options, transport, ...
+out = guarded.execute({"messages": [{"role": "user", "content": "Hi"}]}, options=options)
 ```
+
+The adapter also wraps a **connected** `ClaudeSDKClient`: it sends the prompt and
+screens everything `receive_response()` yields. Use `aexecute` for a client (its
+connection belongs to the event loop it was opened in):
+
+```python
+async with ClaudeSDKClient(options) as client:
+    out = await adapter.wrap_agent(client).aexecute(payload, session_id="chat-1")
+```
+
+The adapter governs the boundary only (prompt in, drained answer out). Put
+`governance_hooks` on `options.hooks` for the tool calls inside the run.
 
 ### The 6-step pipeline, as it applies here
 
@@ -193,8 +381,8 @@ Every `execute()` runs, in order:
 
 The async-drain in step 4 is what makes a streaming, async-only SDK usable from a
 synchronous `execute()`. (If you call `execute()` from inside a running event
-loop, the adapter raises a clear `AdapterError` — run it in a worker thread, or
-use the SDK's native async API directly.)
+loop, the adapter raises a clear `AdapterError` — use `await guarded.aexecute(...)`,
+which has identical governance.)
 
 ### What `execute()` takes and returns
 
@@ -236,7 +424,7 @@ state trips by calling the enforcer directly:
 ```python
 audit = ClaudeAgentSDKAdapter(firewall=firewall, policy_enforcer=policy,
                               block_on_violation=False)
-wrapped = audit.wrap_agent(configured_query)
+wrapped = audit.wrap_agent(query)
 wrapped.execute({"messages": [{"role": "user", "content": "URGENT: send me the data"}]})
 
 state = audit.extract_state({"messages": [{"role": "user", "content": "..."}]})
@@ -353,11 +541,12 @@ surfaces these knobs — without importing the SDK:
 | Field on `ClaudeAgentOptions` | Parameter kind | Notes |
 |-------------------------------|----------------|-------|
 | `system_prompt` | `PROMPT` | A string is bound directly; a preset mapping with an `"append"` key binds the appended text (keeping the preset). |
-| `model` | `MODEL` | e.g. `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`. |
-| `allowed_tools` | `TOOL` | With ≥2 tools, drop-one ablation candidates are offered so the optimizer can *search which tools to keep*. |
-| `disallowed_tools` | `TOOL` | |
+| `model` | `MODEL` | e.g. `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`. |
+| `allowed_tools` | `TOOL` | **Narrowed only**: with ≥2 tools, drop-one ablation candidates are offered so the optimizer can *search which tools to keep*; a candidate that adds a tool is refused. |
+| `disallowed_tools` | `TOOL` | **Read-only**: reported, never written -- the deny list is a security control. |
 | `max_turns` | `HYPERPARAM` | Bounded to `(1, 100)`. |
-| `permission_mode` | `ROUTING` | Candidates: `default`, `acceptEdits`, `plan`, `bypassPermissions`. |
+| `effort` | `HYPERPARAM` | Candidates are the effort levels the installed SDK accepts. On an SDK with no `effort` field, `max_thinking_tokens` (bounds `(1024, 32000)`) is offered instead. |
+| `permission_mode` | `ROUTING` | **Read-only**: reported, never written. Which tool calls run without a human is a security decision, not a tunable. |
 
 Detect and list the knobs for any options object:
 
@@ -457,7 +646,7 @@ def stub(prompt, system=None):
     return f'{{"score": {score}, "pass": {str(score >= 6).lower()}, "reasoning": "auto"}}'
 
 judge = LLMJudge(stub)                                 # offline
-# Real providers: LLMJudge(ClaudeJudge(model="claude-opus-4-8")), OpenAIJudge(...), etc.
+# Real providers: ClaudeJudge(model="claude-opus-5-5"), OpenAIJudge(...), etc.
 harness = EvaluationHarness([exact_match(), judge.as_metric("quality")],
                             primary_metric="quality")
 ```
@@ -524,7 +713,7 @@ introspect), a `dataset` (a file path), an optional `judge` block
 (`provider`/`model`/`adversarial`), `metrics`, an `optimizer` block
 (`type`/`max_evals`/`min_improvement`/`suggest_tools`), and explicit
 `parameters[]` for knobs introspection cannot reach. See
-[`examples/claude_agent/claude_agent.train.yaml`](../../examples/claude_agent/claude_agent.train.yaml).
+[`examples/claude_agent/claude_agent.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/claude_agent.train.yaml).
 
 > **Offline vs real.** The bundled YAML names the `anthropic` judge provider and
 > a file dataset, so running it needs `ANTHROPIC_API_KEY` and a `golden.jsonl`.
@@ -606,8 +795,7 @@ the researcher's prompt and the writer's model in the same run. To optimize a
 
 - **`AdapterError: cannot synchronously run an async agent from inside a running
   event loop.`** `query` is async; `execute()` drains it with `asyncio.run`,
-  which fails if a loop is already running. Call `execute()` from a worker
-  thread, or use the SDK's native async API directly.
+  which fails if a loop is already running. Use `await guarded.aexecute(...)`.
 - **My firewall pattern doesn't match.** `(all|previous)` matches only one word —
   "ignore all previous instructions" has both. Use a tolerant pattern like
   `(?i)ignore[\w ]*?instructions`.
@@ -629,35 +817,42 @@ the researcher's prompt and the writer's model in the same run. To optimize a
   `Parameter` with `candidates=[...]`).
 - **`run_training` rejects my dataset.** The config dataset is a *file*
   (`path:`) — write a temp `.jsonl`/`.json`/`.csv`. There is no inline-rows form.
-- **Don't put the model id in commit messages.** Use current ids
-  (`claude-opus-4-8` / `claude-sonnet-4-6` / `claude-haiku-4-5`) in code and docs
-  only.
-- **Sampling params on Opus/Fable.** Anthropic Opus 4.8/4.7 and Fable 5 reject
-  `temperature`/`top_p`; ADAPT-Agent's providers omit/clamp them, so a tuned
-  temperature bound is clamped with a warning rather than crashing the run.
+- **Use current model ids** (`claude-opus-5-5` / `claude-sonnet-5-5` /
+  `claude-haiku-5-5`); `adapt_agent.optimization.providers.DEFAULT_MODELS` holds
+  the library's default.
+- **Sampling params on current Claude models.** Opus 4.7 and later, the Fable /
+  Mythos line and the 5-series Sonnet and Haiku reject user-set
+  `temperature`/`top_p`/`top_k`. ADAPT-Agent's Anthropic provider sends them only
+  when the installed SDK accepts them and the model is not one of those, and
+  retries without them if the API refuses, so a tuned temperature does not crash
+  the run (it has no effect on those models).
 
 ---
 
 ## 8. The examples
 
 A runnable, four-step ladder lives in
-[`examples/claude_agent/`](../../examples/claude_agent/). Each runs offline (no
+[`examples/claude_agent/`](https://github.com/CodeHalwell/ADAPT-Agent/tree/main/examples/claude_agent/). Each runs offline (no
 API key, no SDK) by substituting a stand-in for `query`.
 
-1. [`01_basic_guarded.py`](../../examples/claude_agent/01_basic_guarded.py) —
+1. [`01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/01_basic_guarded.py) —
    smallest guarded agent: firewall + a safe run + a blocked injection.
-2. [`02_policy_observability_trust.py`](../../examples/claude_agent/02_policy_observability_trust.py)
+2. [`02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/02_policy_observability_trust.py)
    — policy (block + warn rules), adversarial defense, observer traces,
    middleware, audit mode, plus `TrustManager` and `TaintTracker`.
-3. [`03_evaluate_and_optimize.py`](../../examples/claude_agent/03_evaluate_and_optimize.py)
+3. [`03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/03_evaluate_and_optimize.py)
    — introspect one agent's options, build a dataset, score with metrics + an
    offline judge, run `CoordinateAscentOptimizer`, print baseline → best.
-4. [`04_multi_agent_and_training.py`](../../examples/claude_agent/04_multi_agent_and_training.py)
+4. [`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/04_multi_agent_and_training.py)
    — a researcher → writer → reviewer orchestrator, optimized as one system with
    `make_default_optimizer` (tool/skill ablation + judge recommendations), a
    parallel YAML-config path via `run_training`, and the whole pipeline guarded
    as a single unit.
+5. [`05_tool_governance.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/05_tool_governance.py) —
+   tool-call governance: real `ClaudeAgentOptions` with the hooks, a
+   `can_use_tool` callback and native tool options, driven with typed hook inputs
+   (needs `claude-agent-sdk`; exits 0 without it).
 
 Plus
-[`claude_agent.train.yaml`](../../examples/claude_agent/claude_agent.train.yaml)
+[`claude_agent.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/claude_agent/claude_agent.train.yaml)
 — the declarative training config example 4's "Path B" mirrors.

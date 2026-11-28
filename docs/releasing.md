@@ -25,7 +25,7 @@ repository and nothing to rotate. That does require a one-time setup on PyPI —
 see below.
 
 The workflow installs uv with `astral-sh/setup-uv`, pinned to a full version
-(`@v10.0.1`). That pin is deliberate: setup-uv stopped publishing floating major
+(`@v10.3.3`). That pin is deliberate: setup-uv stopped publishing floating major
 tags after v7, so `@v8`, `@v9` and `@v10` do not resolve and a workflow using one
 fails at *Prepare all required actions*, before any step runs. Bump it to another
 full `vX.Y.Z` tag, never to a bare major.
@@ -154,8 +154,10 @@ git tag -d v0.3.0 && git push origin :refs/tags/v0.3.0
 **`File already exists` on upload.** That version was already published; PyPI
 never allows reuse. Bump to the next patch version and tag again.
 
-**The run published nothing.** Check that the tag matched `v*` — the workflow
-only triggers on tags with a leading `v`.
+**The run published nothing.** After a merge to `main`, check that
+`__version__` was bumped: a version already on PyPI is skipped by design. For a
+hand-pushed tag, check that it matched `v*` — the workflow only triggers on tags
+with a leading `v`.
 
 ## Publishing manually
 

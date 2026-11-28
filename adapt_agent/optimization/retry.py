@@ -22,6 +22,10 @@ a false negative silently biases every score the run produces.
 
 from __future__ import annotations
 
+import datetime
+import email.utils
+import logging
+import math
 import random
 import re
 import threading
@@ -30,6 +34,8 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
+
+logger = logging.getLogger(__name__)
 
 #: Non-5xx status codes worth retrying: throttling, request timeouts, a
 #: conflict worth a second attempt, and Early Hints replay.
@@ -281,40 +287,97 @@ def _link_is_transient(exc: BaseException) -> bool:
     return bool(_STATUS_WORD.search(message))
 
 
+#: Longest server-requested wait taken at face value. Anything longer is not a
+#: retry hint but a misreading (or an outage notice), and is ignored.
+_MAX_SANE_RETRY_AFTER = 86_400.0
+
+
+def _header(headers: Any, name: str) -> Any:
+    """``headers[name]`` case-insensitively, tolerating odd header objects."""
+    try:
+        value = headers.get(name)
+        if value is None:
+            value = headers.get(name.title())
+        return value
+    except Exception:  # a headers object that does not behave like a mapping
+        return None
+
+
+def _parse_retry_after(value: Any, *, milliseconds: bool = False) -> float | None:
+    """Seconds from a delay-seconds value, a millisecond value, or an HTTP-date."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        if not isinstance(value, str):
+            return None
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        # A date already past means "now", not "never".
+        seconds = max(0.0, (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+    else:
+        if milliseconds:
+            seconds /= 1000.0
+    if not math.isfinite(seconds) or seconds < 0.0 or seconds > _MAX_SANE_RETRY_AFTER:
+        return None
+    return seconds
+
+
 def retry_after_seconds(exc: BaseException) -> float | None:
     """Return the server's requested wait, if it supplied one.
 
-    Reads a ``retry_after`` attribute or a ``Retry-After`` header off an
-    attached response. Only the delay-seconds form is understood; the HTTP-date
-    form returns ``None`` so the caller falls back to its own backoff. Negative
-    or absurd values are rejected rather than trusted.
+    Reads, from every link of the exception chain: a ``retry_after``
+    attribute, then the attached response's ``retry-after-ms`` header
+    (milliseconds; the more precise one, sent by the Anthropic and OpenAI
+    APIs), then ``retry-after`` in either of its RFC 9110 forms -- delay
+    seconds or an HTTP-date. Negative, non-finite or absurd (over a day)
+    values are rejected rather than trusted.
+
+    Long waits are *returned*, not capped: deciding whether a wait fits the
+    budget is :meth:`RetryPolicy.should_retry`'s job, and capping here made a
+    caller retry before the server said it would accept the request.
     """
-    candidates: list[Any] = []
     # The whole chain, for the reason `is_transient_error` reads it: the
     # server's requested wait rides on the provider error, and the wrapper an
     # SDK raises from it carries neither the attribute nor the response. Losing
     # it is quieter than losing the classification -- the backoff falls back to
     # its own guess and retries sooner than asked -- but it is the same bug.
     for link in _exception_chain(exc):
-        candidates.append(getattr(link, "retry_after", None))
-        response = getattr(link, "response", None)
-        headers = getattr(response, "headers", None)
-        if headers is not None:
-            try:
-                candidates.append(headers.get("retry-after", headers.get("Retry-After")))
-            except Exception:  # a headers object that does not behave like a mapping
-                pass
-
-    for value in candidates:
-        if isinstance(value, bool) or value is None:
+        found = _parse_retry_after(getattr(link, "retry_after", None))
+        if found is not None:
+            return found
+        headers = getattr(getattr(link, "response", None), "headers", None)
+        if headers is None:
             continue
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
-            continue
-        if 0.0 <= seconds <= 300.0:
-            return seconds
+        found = _parse_retry_after(_header(headers, "retry-after-ms"), milliseconds=True)
+        if found is None:
+            found = _parse_retry_after(_header(headers, "retry-after"))
+        if found is not None:
+            return found
     return None
+
+
+def server_says_do_not_retry(exc: BaseException) -> bool:
+    """Whether a response in the chain carries ``x-should-retry: false``.
+
+    The Anthropic and OpenAI APIs send it when a retry cannot succeed, and their
+    SDKs obey it; a retry layer above them should too.
+    """
+    for link in _exception_chain(exc):
+        headers = getattr(getattr(link, "response", None), "headers", None)
+        if headers is None:
+            continue
+        value = _header(headers, "x-should-retry")
+        if isinstance(value, str) and value.strip().lower() == "false":
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -336,6 +399,14 @@ class RetryPolicy:
             :func:`is_transient_error`; supply your own to widen or narrow it.
         respect_retry_after: Prefer a server-supplied ``Retry-After`` over the
             computed backoff when one is present.
+        max_retry_after: Longest server-requested wait the policy will sleep
+            for. A longer request is not shortened -- retrying before the
+            server asked earns another rejection -- and is not slept through
+            either: the retry is abandoned at once with a warning, and the
+            failure is reported as a transient one that outlived its retries.
+
+    A server ``x-should-retry: false`` header also ends retrying (the failure
+    is still *classified* as transient or not by ``is_transient``).
 
     Frozen on purpose. :data:`DEFAULT_RETRY_POLICY` is shared by every
     default-constructed harness, so a mutable policy would let
@@ -352,22 +423,50 @@ class RetryPolicy:
     jitter: float = 0.25
     is_transient: Callable[[BaseException], bool] = field(default=is_transient_error)
     respect_retry_after: bool = True
+    max_retry_after: float = 120.0
 
     def should_retry(self, exc: BaseException, attempt: int) -> bool:
-        """Whether a failure on 1-based ``attempt`` earns another try."""
+        """Whether a failure on 1-based ``attempt`` earns another try.
+
+        ``attempt=0`` asks only whether ``exc`` is transient -- callers use it
+        to classify a failure after its retries are spent -- so the server's
+        retry directives, which say whether *another attempt now* is worth it,
+        are consulted for ``attempt >= 1`` only.
+        """
         if attempt >= max(1, self.attempts):
             return False
         try:
-            return bool(self.is_transient(exc))
+            transient = bool(self.is_transient(exc))
         except Exception:  # a broken custom classifier must not abort the run
             return False
+        if not transient or attempt < 1:
+            return transient
+        if server_says_do_not_retry(exc):
+            logger.warning("Not retrying: the server sent x-should-retry: false (%s).", exc)
+            return False
+        if self.respect_retry_after:
+            requested = retry_after_seconds(exc)
+            if requested is not None and requested > self.max_retry_after:
+                logger.warning(
+                    "Not retrying: the server asked for a %.0fs wait, over this policy's "
+                    "max_retry_after of %.0fs (%s).",
+                    requested,
+                    self.max_retry_after,
+                    exc,
+                )
+                return False
+        return True
 
     def delay_for(self, exc: BaseException, attempt: int) -> float:
-        """Seconds to wait before retry number ``attempt`` (1-based)."""
+        """Seconds to wait before retry number ``attempt`` (1-based).
+
+        A server-requested wait is used as given, up to ``max_retry_after``
+        (beyond which :meth:`should_retry` refuses the retry instead).
+        """
         if self.respect_retry_after:
             requested = retry_after_seconds(exc)
             if requested is not None:
-                return min(requested, self.max_backoff)
+                return min(requested, self.max_retry_after)
         delay = min(self.initial_backoff * (self.multiplier ** (attempt - 1)), self.max_backoff)
         if self.jitter > 0.0:
             spread = delay * min(self.jitter, 1.0)
@@ -699,4 +798,5 @@ __all__ = [
     "DEFAULT_RETRY_POLICY",
     "is_transient_error",
     "retry_after_seconds",
+    "server_says_do_not_retry",
 ]

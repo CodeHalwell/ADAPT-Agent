@@ -199,7 +199,7 @@ class OptimizableAgent:
     def _infer_runner(components: dict[str, Any]) -> Callable[[Any], Any]:
         runnable = [obj for obj in components.values() if _is_runnable(obj)]
         if len(runnable) == 1:
-            return resolve_runner(runnable[0])
+            return _default_agent_runner(runnable[0])
         raise ValueError(
             "Could not infer a runner: supply `runner=` explicitly. A runner is "
             "only inferred when exactly one component is directly runnable "
@@ -353,24 +353,22 @@ class OptimizableAgent:
 def _default_agent_runner(agent: Any) -> Callable[[Any], Any]:
     """Resolve how to drive ``agent`` when the caller supplied no runner.
 
-    A framework-native run method (or bare callable / governed ``execute``)
-    wins, preserving framework-native outputs exactly as before. Only when
-    nothing is directly runnable does this fall back to
-    :func:`~adapt_agent.optimization.runners.framework_runner`, which delegates
-    by detected framework (OpenAI Agents ``Runner``, Claude Agent SDK
-    ``query``, a Google ADK ``Runner``) and extracts final response text --
-    previously these agents raised ``TypeError`` here and forced every caller
-    to hand-write the driving lambda the SDK documents anyway.
+    Frameworks whose agent objects are only drivable through separate machinery
+    (OpenAI Agents ``Runner``, Claude Agent SDK ``query``, a Google ADK
+    ``Runner``) are recognised *first* and driven through
+    :func:`~adapt_agent.optimization.runners.framework_runner`, which extracts
+    final response text. Checking the generic run methods first would grab
+    look-alikes -- a Google ADK 2.x ``LlmAgent`` inherits ``BaseNode.run(*, ctx,
+    node_input)``, which fails on the first call. Everything else keeps the
+    framework-native run method (or bare callable / governed ``execute``) and its
+    native outputs exactly as before.
     """
-    try:
-        return resolve_runner(agent)
-    except TypeError:
-        # Imported lazily to keep this module import-light; framework_runner
-        # re-raises the same TypeError when the object is not a recognisable
-        # framework either, so the error surface is unchanged for junk inputs.
-        from adapt_agent.optimization.runners import framework_runner
+    # Imported lazily to keep this module import-light.
+    from adapt_agent.optimization.runners import delegated_framework, framework_runner
 
+    if delegated_framework(agent) is not None:
         return framework_runner(agent)
+    return resolve_runner(agent)
 
 
 def _is_runnable(obj: Any) -> bool:

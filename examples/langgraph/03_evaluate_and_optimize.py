@@ -33,10 +33,9 @@ from typing import Any
 try:
     from langgraph.graph import END, START, StateGraph
 except ImportError:
-    raise SystemExit(
-        "This example needs LangGraph: pip install 'adapt-agent[langgraph]'  "
-        "(or: pip install langgraph)"
-    ) from None
+    # Exit 0: a missing optional extra is not a failure of this example.
+    print("This example needs LangGraph: pip install 'adapt-agent[langgraph]'  (skipped)")
+    raise SystemExit(0) from None
 
 from adapt_agent.optimization import (
     CoordinateAscentOptimizer,
@@ -85,7 +84,7 @@ def _extract_fence(prompt: str, label: str) -> str:
     return prompt[start + len(label) + 2 : end].strip()
 
 
-def deterministic_judge_stub(prompt: str) -> str:
+def deterministic_judge_stub(prompt: str, system: str | None = None) -> str:
     """Offline LLM-judge stand-in (no network, no key).
 
     The judge sends this callable its *user* prompt. A rewrite prompt contains

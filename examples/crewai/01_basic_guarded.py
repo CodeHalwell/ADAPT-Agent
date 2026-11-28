@@ -32,18 +32,17 @@ from typing import Any
 # --- Guard the optional framework import ----------------------------------- #
 # Running WITHOUT crewai installed prints a friendly hint and exits cleanly.
 try:
-    from crewai import LLM, Agent, Crew, Process, Task
+    from crewai import Agent, BaseLLM, Crew, Process, Task
 except ImportError:
-    raise SystemExit(
-        "This example needs CrewAI: pip install 'adapt-agent[crewai]'\n" "(or: pip install crewai)"
-    )
+    print("This example needs CrewAI: pip install 'adapt-agent[crewai]'  (or: pip install crewai)")
+    raise SystemExit(0)
 
 from adapt_agent import Firewall
 from adapt_agent.adapters import CrewAIAdapter
 from adapt_agent.exceptions import SecurityBlockedError
 
 
-class OfflineLLM(LLM):
+class OfflineLLM(BaseLLM):
     """A deterministic, network-free LLM so the example runs without API keys.
 
     CrewAI's ``LLM`` normally calls a hosted model. We subclass it and override
@@ -118,7 +117,7 @@ def main() -> None:
     }
     result = guarded.execute(safe)
     # CrewAI returns a ``CrewOutput``; its final text is on ``.raw``.
-    print("  crew output:", getattr(result, "raw", result))
+    print("  crew output:", result["result"].raw)
 
     print("\n=== Malicious input (prompt injection, should be blocked) ===")
     bad = {

@@ -201,3 +201,92 @@ def test_predicate_rejects_foreign_frameworks():
         kickoff = lambda self: None  # noqa: E731
 
     assert adk._predicate(CrewishAgent()) is False
+
+
+# -- real ADK objects ----------------------------------------------------------
+#
+# The fakes above pin the attribute shape; these drive the installed framework
+# so a release that moves a field, or deprecates a knob, fails here.
+
+
+def _real_adk():
+    import warnings
+
+    import pytest
+
+    pytest.importorskip("google.adk")
+    pytest.importorskip("google.genai")
+    from google.adk.agents import LlmAgent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    class RecordingLlm(BaseLlm):
+        """An offline model that records the system instruction it was sent."""
+
+        seen: list = []
+
+        async def generate_content_async(self, llm_request, stream=False):
+            self.seen.append(str(llm_request.config.system_instruction))
+            yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text="ok")]))
+
+    warnings.simplefilter("ignore", DeprecationWarning)
+    return LlmAgent, RecordingLlm
+
+
+def test_real_global_instruction_is_not_offered_where_the_framework_deprecates_it():
+    LlmAgent, Llm = _real_adk()
+    from adapt_agent.optimization.introspection.google_adk import _global_instruction_deprecated
+
+    agent = LlmAgent(name="root", model=Llm(model="fake"), instruction="i", global_instruction="G")
+    names = {p.name for p in introspect(agent)}
+    assert "root.instruction" in names
+    assert _global_instruction_deprecated(agent)
+    assert "root.global_instruction" not in names
+
+
+def test_global_instruction_is_kept_where_the_framework_does_not_deprecate_it():
+    # The fake carries no deprecation warning in its resolver, like older releases.
+    agent = FakeLlmAgent(name="root", instruction="i", global_instruction="G")
+    assert "root.global_instruction" in {p.name for p in introspect(agent)}
+
+
+def test_real_workflow_agents_and_workflow_are_detected_and_their_children_introspected():
+    LlmAgent, Llm = _real_adk()
+    from google.adk.agents import LoopAgent, ParallelAgent, SequentialAgent
+    from google.adk.workflow import Workflow
+
+    def child() -> object:  # an ADK agent can have only one parent
+        return LlmAgent(name="first", model=Llm(model="fake"), instruction="one")
+
+    first = child()
+    second = LlmAgent(name="second", model=Llm(model="fake"), instruction="two")
+    for shell in (
+        SequentialAgent(name="seq", sub_agents=[child()]),
+        ParallelAgent(name="par", sub_agents=[child()]),
+        LoopAgent(name="loop", sub_agents=[child()], max_iterations=1),
+    ):
+        assert detect(shell) == "google_adk"
+        assert f"{shell.name}.first.instruction" in {p.name for p in introspect(shell)}
+
+    flow = Workflow(name="flow", edges=[("START", first), (first, second)])
+    assert detect(flow) == "google_adk"
+    names = {p.name for p in introspect(flow)}
+    assert {"flow.first.instruction", "flow.second.instruction"} <= names
+
+
+def test_real_agent_instruction_write_reaches_the_model_on_the_next_run():
+    LlmAgent, Llm = _real_adk()
+    from adapt_agent.optimization.runners import framework_runner
+
+    model = Llm(model="fake")
+    model.seen = []
+    agent = LlmAgent(name="root", model=model, instruction="Be terse.")
+    run = framework_runner(agent)
+    run("hi")
+    assert model.seen[-1].startswith("Be terse.")
+
+    prompt = next(p for p in introspect(agent) if p.name == "root.instruction")
+    prompt.write("Be verbose.")
+    run("hi")
+    assert model.seen[-1].startswith("Be verbose.")

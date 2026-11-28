@@ -14,10 +14,14 @@ This module turns a live ``Agent`` into tunable
 :class:`~adapt_agent.optimization.parameters.Parameter` objects bound to the agent
 in place, recursing into handed-off sub-agents so multi-agent topologies are fully
 covered. A handoff entry may also be a ``Handoff`` *wrapper* (built with
-``handoff(...)``) rather than a bare agent; the wrapped agent lives inside an
-``on_invoke_handoff`` closure and cannot be reached structurally, but the
-wrapper's ``tool_description`` -- the text the routing LLM actually reads -- is
-bound as a PROMPT so the routing surface stays tunable. It never imports
+``handoff(...)``) rather than a bare agent. The wrapper's ``tool_description`` --
+the text the routing LLM actually reads -- is bound as a PROMPT, and the wrapped
+agent is reached through the private weak reference the SDK keeps on it
+(``Handoff._agent_ref``); an agent exposed to another as a *tool*
+(``agent.as_tool()``) is reached the same way through
+``FunctionTool._agent_instance``. Both are private attributes, so they are read
+defensively: a missing attribute or a collected weak reference just means that
+agent is not introspected. It never imports
 ``agents``; everything is duck-typed via ``getattr`` / ``hasattr`` so importing
 this module is safe with nothing installed.
 """
@@ -44,9 +48,9 @@ def _slugify(name: Any) -> str:
 
 #: Markers that belong to *other* frameworks. An object carrying any of these is
 #: not an OpenAI Agents ``Agent`` -- ``chat_client`` is the Microsoft Agent
-#: Framework ``ChatAgent`` signal, ``kickoff`` is CrewAI, ``sub_agents`` is Google
+#: Framework ``Agent`` (formerly ``ChatAgent``) signal, ``kickoff`` is CrewAI, ``sub_agents`` is Google
 #: ADK. Rejecting them stops this introspector (registered *before* Microsoft)
-#: from hijacking a Microsoft ChatAgent / magentic orchestrator.
+#: from hijacking a Microsoft Agent / magentic orchestrator.
 _FOREIGN_MARKERS = ("chat_client", "kickoff", "sub_agents")
 
 
@@ -56,7 +60,7 @@ def _predicate(obj: Any) -> bool:
     An ``Agent`` has ``instructions``, ``tools`` and -- distinctively -- a
     ``handoffs`` *list/tuple*, which separates it from the other frameworks.
     Objects carrying foreign markers (``chat_client``/``kickoff``/``sub_agents``)
-    are rejected outright so a Microsoft ``ChatAgent`` or magentic orchestrator is
+    are rejected outright so a Microsoft ``Agent`` or magentic orchestrator is
     never misrouted here. Wrapped so it never raises.
     """
     try:
@@ -162,6 +166,20 @@ def _introspect_model_settings(obj: Any, component: str, params: list[Parameter]
         params.append(max_tokens)
 
 
+def _linked_agent(link: Any) -> Any:
+    """The agent behind a private reference attribute, or ``None``.
+
+    The value is a weak reference (``Handoff._agent_ref``) or the agent itself
+    (``FunctionTool._agent_instance``); a dead reference or anything that does
+    not look like an agent yields ``None``.
+    """
+    try:
+        target = link() if callable(link) and not hasattr(link, "instructions") else link
+        return target if target is not None and _looks_like_agent(target) else None
+    except Exception:
+        return None
+
+
 def _introspect_agent(obj: Any, params: list[Parameter], visited: set[int]) -> None:
     """Walk a single ``Agent`` (and its handoffs), appending parameters.
 
@@ -248,6 +266,18 @@ def _introspect_agent(obj: Any, params: list[Parameter], visited: set[int]) -> N
                 _introspect_agent(child, params, visited)
             elif _looks_like_handoff(child):
                 _introspect_handoff(child, params, visited)
+                wrapped = _linked_agent(getattr(child, "_agent_ref", None))
+                if wrapped is not None:
+                    _introspect_agent(wrapped, params, visited)
+
+    # Agents exposed to this one as tools (``agent.as_tool()``) hold their agent
+    # on the tool; each is a full agent with knobs of its own.
+    tools = getattr(obj, "tools", None)
+    if isinstance(tools, (list, tuple)):
+        for tool in tools:
+            as_tool = _linked_agent(getattr(tool, "_agent_instance", None))
+            if as_tool is not None:
+                _introspect_agent(as_tool, params, visited)
 
 
 def _introspect_handoff(wrapper: Any, params: list[Parameter], visited: set[int]) -> None:

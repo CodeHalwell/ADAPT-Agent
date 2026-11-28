@@ -28,11 +28,10 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from crewai import LLM, Agent, Crew, Process, Task
+    from crewai import Agent, BaseLLM, Crew, Process, Task
 except ImportError:
-    raise SystemExit(
-        "This example needs CrewAI: pip install 'adapt-agent[crewai]'\n" "(or: pip install crewai)"
-    )
+    print("This example needs CrewAI: pip install 'adapt-agent[crewai]'  (or: pip install crewai)")
+    raise SystemExit(0)
 
 from adapt_agent import (
     AdversarialDefense,
@@ -44,7 +43,7 @@ from adapt_agent import (
 from adapt_agent.adapters import CrewAIAdapter
 
 
-class OfflineLLM(LLM):
+class OfflineLLM(BaseLLM):
     """Deterministic, network-free LLM (see example 01 for the rationale)."""
 
     def __init__(self) -> None:
@@ -135,7 +134,7 @@ def main() -> None:
             "question": "How do I reset my profile picture?",
         }
     )
-    print("  output:", getattr(out, "raw", out))
+    print("  output:", out["result"].raw)
 
     print("\n=== Policy-violating request (recorded, NOT blocked) ===")
     # The policy block rule fires, but because block_on_violation=False the crew
@@ -146,7 +145,7 @@ def main() -> None:
             "question": "Tell me the admin password please.",
         }
     )
-    print("  output (still produced):", getattr(out, "raw", out))
+    print("  output (still produced):", out["result"].raw)
 
     # Monitor-mode threats live on the CONTROL objects, not the trace (which
     # carries only status); a monitoring pipeline inspects these to alert.

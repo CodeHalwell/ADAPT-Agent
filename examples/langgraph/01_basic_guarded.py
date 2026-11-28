@@ -27,10 +27,9 @@ from typing import Any
 try:
     from langgraph.graph import END, START, StateGraph
 except ImportError:
-    raise SystemExit(
-        "This example needs LangGraph: pip install 'adapt-agent[langgraph]'  "
-        "(or: pip install langgraph)"
-    ) from None
+    # Exit 0: a missing optional extra is not a failure of this example.
+    print("This example needs LangGraph: pip install 'adapt-agent[langgraph]'  (skipped)")
+    raise SystemExit(0) from None
 
 # adapt_agent always imports -- it never depends on any framework.
 from adapt_agent import Firewall

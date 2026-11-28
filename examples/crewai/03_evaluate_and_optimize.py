@@ -27,11 +27,10 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from crewai import LLM, Agent, Crew, Process, Task
+    from crewai import Agent, BaseLLM, Crew, Process, Task
 except ImportError:
-    raise SystemExit(
-        "This example needs CrewAI: pip install 'adapt-agent[crewai]'\n" "(or: pip install crewai)"
-    )
+    print("This example needs CrewAI: pip install 'adapt-agent[crewai]'  (or: pip install crewai)")
+    raise SystemExit(0)
 
 from adapt_agent.optimization import (
     CoordinateAscentOptimizer,
@@ -46,7 +45,7 @@ from adapt_agent.optimization.introspection import detect, introspect
 _CAPITALS = {"France": "Paris", "Japan": "Tokyo", "Italy": "Rome", "Egypt": "Cairo"}
 
 
-class PromptSensitiveLLM(LLM):
+class PromptSensitiveLLM(BaseLLM):
     """A deterministic LLM whose output quality depends on the agent's prompt.
 
     This stands in for a real model so the optimizer has a measurable signal: it
@@ -110,7 +109,7 @@ def _extract_fence(text: str, label: str) -> str:
     return "" if start == -1 or end == -1 else text[start + len(label) + 2 : end].strip()
 
 
-def deterministic_judge_stub(prompt: str) -> str:
+def deterministic_judge_stub(prompt: str, system: str | None = None, **_: Any) -> str:
     """Offline judge matching LLMJudge's prompt format (no network, no key).
 
     LLMJudge's prompt-rewrite request puts ``CURRENT INSTRUCTION:`` in the user

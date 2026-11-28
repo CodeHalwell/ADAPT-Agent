@@ -13,9 +13,12 @@ from adapt_agent.adapters import BaseAdapter
 # Adversarial defense
 from adapt_agent.adversarial import AdversarialDefense
 from adapt_agent.core import (
+    GovernanceGate,
     MemorySystem,
     Middleware,
     PolicyEnforcer,
+    ToolDecision,
+    ToolPolicy,
     TrustManager,
 )
 from adapt_agent.core.types import (
@@ -64,6 +67,10 @@ __all__ = [
     "PolicyEnforcer",
     "MemorySystem",
     "Middleware",
+    # Governance gate and tool-call governance
+    "GovernanceGate",
+    "ToolPolicy",
+    "ToolDecision",
     # Types
     "Agent",
     "Adapter",

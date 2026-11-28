@@ -42,6 +42,17 @@ class Middleware:
         self._post_middleware: list[MiddlewareFunc] = []
         self._middleware_metadata: dict[str, dict[str, Any]] = {}
 
+    @property
+    def has_input_stages(self) -> bool:
+        """Whether :meth:`process_input` would run anything.
+
+        A caller that must treat a rewritten input differently from the one it
+        was given -- screening it again, or refusing an input the pipeline
+        cannot process -- needs to know whether any pre-middleware is
+        registered, without running the pipeline to find out.
+        """
+        return bool(self._pre_middleware)
+
     def add_pre_middleware(
         self,
         middleware: MiddlewareFunc,

@@ -1,7 +1,7 @@
 """Example 02: Policy, adversarial defense, observability, middleware & trust.
 
 Builds on example 01 by turning on the rest of ADAPT-Agent's runtime controls
-around a Microsoft Agent Framework ``ChatAgent``:
+around a real Microsoft Agent Framework ``Agent`` (``ChatAgent`` before 1.0):
 
 * :class:`PolicyEnforcer` -- a SAFE expression language (no ``eval``) that
   evaluates rules. Inside the adapter pipeline the rule sees a normalized
@@ -22,7 +22,12 @@ The key teaching point is ``block_on_violation=False``: the pipeline still
 adjust the trust score accordingly), but it does NOT raise -- useful for a
 shadow/audit rollout before you flip enforcement on.
 
-Runs fully offline (no API key). Run it with:
+The last section moves the same policy inside the agent with
+``governance_bundle``, where a rule can read the run's ``AgentSession.state`` --
+here a trust score kept in the session gates every run.
+
+Runs fully offline (no API key): the agent is real, the model is an offline
+function (see ``_offline.py``). Run it with:
 
     python examples/microsoft_agent_framework/02_policy_observability_trust.py
 """
@@ -30,10 +35,15 @@ Runs fully offline (no API key). Run it with:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from typing import Any
 
-from adapt_agent import (
+from _offline import last_user_text, offline_client, require_framework, run_sync
+
+require_framework()
+
+from agent_framework import Agent  # noqa: E402
+
+from adapt_agent import (  # noqa: E402
     AdversarialDefense,
     AgentObserver,
     Firewall,
@@ -41,25 +51,15 @@ from adapt_agent import (
     PolicyEnforcer,
     TrustManager,
 )
-from adapt_agent.adapters import MicrosoftAgentFrameworkAdapter
-from adapt_agent.exceptions import SecurityBlockedError
-from adapt_agent.security import TaintTracker
+from adapt_agent.adapters import MicrosoftAgentFrameworkAdapter  # noqa: E402
+from adapt_agent.exceptions import SecurityBlockedError  # noqa: E402
+from adapt_agent.integrations.agent_framework import governance_bundle  # noqa: E402
+from adapt_agent.security import TaintTracker  # noqa: E402
 
 
-@dataclass
-class AgentRunResponse:
-    text: str
-
-
-class OfflineChatAgent:
-    """Offline stand-in for a Microsoft ``ChatAgent`` (see example 01)."""
-
-    def __init__(self, *, instructions: str, name: str = "support") -> None:
-        self.instructions = instructions
-        self.name = name
-
-    async def run(self, prompt: str) -> AgentRunResponse:
-        return AgentRunResponse(text=f"[{self.name}] Handling request: {prompt}")
+def support_model(messages: list[Any], options: dict[str, Any]) -> str:
+    """The offline 'model' behind the real Agent."""
+    return f"[support] Handling request: {last_user_text(messages)}"
 
 
 def build_policy() -> PolicyEnforcer:
@@ -123,7 +123,9 @@ def main() -> None:
     )
 
     policy = adapter.policy_enforcer
-    agent = OfflineChatAgent(instructions="You are a customer support agent.")
+    agent = Agent(
+        offline_client(support_model), "You are a customer support agent.", name="support"
+    )
     guarded = adapter.wrap_agent(agent)
 
     # Register the external user input as a taint source so any downstream data
@@ -150,7 +152,7 @@ def main() -> None:
 
         try:
             result = guarded.execute(payload)
-            print("  -> ran. result:", result)
+            print("  -> ran. answer:", repr(result["result"].text))
         except SecurityBlockedError as exc:
             # With block_on_violation=False this should NOT fire for firewall /
             # defense hits; kept so the same loop works if you flip enforcement on.
@@ -177,6 +179,29 @@ def main() -> None:
     print(f"  is_trusted(threshold=0.6) = {trust.is_trusted(agent_id, threshold=0.6)}")
     sources = taint.get_taint_sources("req:injection")
     print(f"  taint sources for the injection request = {[s.source_id for s in sources]}")
+
+    print("\n=== Inside the agent: a policy on the session's trust score ===")
+    gate_policy = PolicyEnforcer()
+    gate_policy.add_rule(
+        name="low_trust",
+        description="Untrusted sessions may not run the agent.",
+        condition="state['trust_score'] < 0.5",
+        action="block",
+    )
+    governed = Agent(
+        offline_client(support_model),
+        "You are a customer support agent.",
+        name="support",
+        middleware=[governance_bundle(policy_enforcer=gate_policy, agent_id=agent_id)],
+    )
+    for score in (0.9, 0.2):
+        session = governed.create_session()
+        session.state["trust_score"] = score  # a rule reads any session.state key
+        try:
+            run_sync(governed.run("Where is my order?", session=session))
+            print(f"  trust_score={score}: allowed")
+        except SecurityBlockedError as exc:
+            print(f"  trust_score={score}: BLOCKED {exc.threats}")
 
     # ----------------------------------------------------------------------
     # Flip the switch: with block_on_violation=True the password rule (action=

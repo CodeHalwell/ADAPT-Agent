@@ -8,9 +8,12 @@ appears.
 ADAPT-Agent (**A**dversarial **D**efense & **P**olicy **T**raining for LLM
 agents) has two independent, framework-agnostic halves:
 
-- **Guard (runtime).** Wrap any agent so every call runs a 6-step security and
-  observability pipeline. Nothing about your Pydantic AI code changes; you wrap
-  the `Agent` and call `execute(...)` instead of `run_sync(...)`.
+- **Guard (runtime).** Two bindings that compose. A Pydantic AI **capability**
+  (`governance_capability`, §3) governs the run from inside: every model
+  request, every tool call and result (MCP tools included), approvals and
+  streamed output. The **adapter** (`PydanticAIAdapter`, §4) wraps the run's
+  boundary in a 6-step security and observability pipeline: you call
+  `execute(...)` instead of `run_sync(...)`.
 - **Train (offline).** Turn any agent or multi-agent system into a tunable search
   space, score it against a golden dataset with metrics or an LLM-as-judge, and
   let an optimizer search for a better configuration of prompts, models,
@@ -47,7 +50,7 @@ from pydantic_ai import Agent
 from pydantic_ai.settings import ModelSettings
 
 agent = Agent(
-    "openai:gpt-4o",                       # "provider:model" identifier
+    "openai:gpt-5.6-luna",                 # "provider:model" identifier
     system_prompt="You are a concise geography assistant.",
     model_settings=ModelSettings(temperature=0.2),
 )
@@ -83,8 +86,8 @@ print(agent.run_sync("capital of France?").output)   # -> "Paris", no network
 ```
 
 Every example on this page uses `FunctionModel` so it runs with no API key. The
-swap to a real model is a single line: `Agent("openai:gpt-4o", ...)` or
-`Agent("anthropic:claude-opus-4-8", ...)`.
+swap to a real model is a single line: `Agent("openai:gpt-5.6-luna", ...)` or
+`Agent("anthropic:claude-opus-5-5", ...)`.
 
 ---
 
@@ -109,7 +112,234 @@ except ImportError:
 
 ---
 
-## 3. Guarding a Pydantic AI agent
+## 3. Governing the run from inside: `governance_capability`
+
+The adapter in §4 sees a run's **boundary**: the prompt going in, the answer
+coming out. By the time the answer is screened every tool has already run, and
+a tool result carrying an injected instruction has already been read by the
+model. Pydantic AI (v2, verified against 2.76) exposes the run itself through
+**capabilities** -- `pydantic_ai.capabilities.AbstractCapability` objects whose
+hooks fire around every model request, tool call and output validation.
+`governance_capability(...)` returns one that binds every ADAPT-Agent control
+to those hooks. **This is the binding to use**; the adapter composes with it.
+
+```python
+from adapt_agent import AdversarialDefense, Firewall, PolicyEnforcer
+from adapt_agent.core import ToolPolicy
+from adapt_agent.integrations.pydantic_ai import governance_capability
+
+governance = governance_capability(
+    firewall=firewall,
+    defense=AdversarialDefense(),
+    policy_enforcer=policy,
+    tool_policy=ToolPolicy(deny=["delete_*"], require_approval=["send_email"]),
+    on_tool_violation="raise",          # or "refuse"
+    agent_id="support-bot",
+)
+
+# Per agent, at construction ...
+agent = Agent("openai:gpt-5.6-luna", deps_type=Deps, tools=[...], capabilities=[governance])
+# ... or per run, for an agent you did not construct:
+result = await other_agent.run(prompt, deps=deps, capabilities=[governance])
+```
+
+`governance_capability` takes the same keywords as every integration factory
+(`gate`, `firewall`, `defense`, `policy_enforcer`, `block_on_violation`,
+`agent_id`, `tool_policy`) plus `on_tool_violation`, `approvals`,
+`buffer_streams`, `observer` and `policy_state`. The class itself is
+`adapt_agent.integrations.pydantic_ai.GovernanceCapability` (built on first
+access, so importing the module never imports `pydantic_ai`).
+
+### What each hook does
+
+| Pydantic AI hook | What ADAPT-Agent does there |
+|---|---|
+| `before_model_request` | Screens everything about to reach the model as **input** (firewall, adversarial defense, state policy): the user prompt, any `message_history`, every tool result, `ModelRetry` text and externally supplied deferred result. Each message part is screened once per run. |
+| `before_tool_execute` | `gate.check_tool_call(name, args, state=...)` on the validated arguments, **before the tool function runs**: `ToolPolicy` lists, firewall/defense over the arguments, tool-scoped policy rules. |
+| `after_tool_execute` | `gate.check_tool_result(...)` -- the indirect-injection seam. A blocked result never reaches the next model call. |
+| `after_model_request` | Firewall over the model's text. |
+| `after_output_validate` | Firewall over a structured `output_type`, field by field. |
+| `get_wrapper_model` | With `buffer_streams=True`, holds a *streamed* response until it is screened (see *Streaming*). |
+| `wrap_model_request` / `wrap_tool_execute` | One `AgentObserver` span per model request (`pydantic_ai.model_request`) and per tool call (`pydantic_ai.tool:<name>`). |
+
+### Tool verdicts: allow, block, ask
+
+**Block.** `on_tool_violation` picks what a blocked call or result does:
+
+- `"raise"` (default) -- the run aborts with `SecurityBlockedError`; read
+  `exc.threats` (`["tool:denied:delete_db"]`, `["firewall"]`,
+  `["policy:<rule>"]`). Pydantic AI propagates an exception raised in a tool
+  hook unchanged -- it is not converted to a tool failure, and parallel tool
+  calls do not wrap it in an `ExceptionGroup` -- so the abort is real. It is the
+  default because a refused call lets the model carry on and try another route
+  to the same end, and the caller learns nothing unless it reads the transcript.
+- `"refuse"` -- raises Pydantic AI's `ToolFailed` with a content-free reason
+  (`Tool call 'delete_db' refused by ADAPT-Agent [support-bot]:
+  tool:denied:delete_db.`), which the model receives as the tool's failed
+  result. The tool does not run. For a blocked *result* the tool has run, but
+  its output is discarded: the model sees only the reason.
+
+**Ask.** A tool in `ToolPolicy(require_approval=[...])`, or a policy rule with
+`action="require_approval"`, maps to Pydantic AI's **deferred approval**. The
+hook raises `ApprovalRequired` *before* the tool runs, so the agent must be
+able to return a `DeferredToolRequests`:
+
+```python
+from pydantic_ai import DeferredToolRequests, DeferredToolResults
+
+agent = Agent(model, tools=[send_email], output_type=[str, DeferredToolRequests],
+              capabilities=[governance])
+
+paused = agent.run_sync("email bob", deps=deps)
+requests = paused.output                         # DeferredToolRequests
+call = requests.approvals[0]
+print(requests.metadata[call.tool_call_id]["adapt_agent"])
+# {'reason': "Tool call 'send_email' needs approval [support-bot]: ...", 'threats': [...], ...}
+
+resumed = agent.run_sync(
+    message_history=paused.all_messages(),
+    deferred_tool_results=DeferredToolResults(approvals={call.tool_call_id: True}),  # or False
+    deps=deps,
+)
+```
+
+On resume the call is **screened again**: an approval satisfies the *ask* and
+nothing else, so arguments that would be blocked (including ones the approver
+substituted with `ToolApproved(override_args=...)`) are still blocked. A denial
+(`False` or `ToolDenied(...)`) never executes the tool; the model is told it was
+denied. A `HandleDeferredToolCalls` capability resolving approvals inline works
+the same way.
+
+If the run **cannot pause** -- `DeferredToolRequests` is not among the output
+types and nothing resolves the call inline -- Pydantic AI aborts before the
+tool runs, and the capability re-raises that as `SecurityBlockedError` with the
+ask's threats. `approvals=False` turns every ask into a block up front
+(`ToolDecision.resolve(approvals_supported=False)`), handled per
+`on_tool_violation`.
+
+**Report-only.** With `block_on_violation=False` every call runs and every
+result passes; each decision that found something is logged to the `observer`
+(`observer.get_logs()`, with `metadata["report_only"] = True` and the threats),
+and policy violations are recorded on the enforcer as usual.
+
+### Policy state: what a rule can rely on
+
+A `PolicyEnforcer` is fail-closed by default -- a rule naming a key the state
+lacks counts as **violated** -- so the state each hook builds is fixed:
+
+| `deps` passed to the run | Keys a rule can read |
+|---|---|
+| a mapping | its string keys |
+| a dataclass instance | its fields (read shallowly with `getattr`; no deep copy, so clients and connections in `deps` are fine) |
+| a Pydantic model | its declared `model_fields` (shallow) |
+| `None` or any other object | nothing -- a rule reading `state[...]` will block |
+
+plus `state['messages']` -- the message parts being screened at
+`before_model_request` (on the first step the prompt and any history, later
+the new tool results), as `{"role": "user" | "tool", "content": ...}` dicts,
+the same shape the adapter uses; **empty at the tool hooks**, so a tool-scoped
+rule must not index it -- and `state['context']` (`{}` unless `deps` has one).
+Tool-scoped rules -- conditions that name `tool` -- also see
+`tool['name']` and `tool['arguments']`:
+
+```python
+@dataclass
+class Deps:
+    user: str
+    trust_score: float
+
+policy.add_rule("low_trust", "Low-trust sessions are refused",
+                "state['trust_score'] < 0.5", action="block")
+policy.add_rule("untrusted_email", "No email from low-trust sessions",
+                "tool['name'] == 'send_email' and state['trust_score'] < 0.8",
+                action="block")
+```
+
+State policy is re-evaluated at **every** model request, so a tool that lowers
+`deps.trust_score` mid-run is seen by the next step. For any other state shape,
+pass `policy_state=lambda ctx: {...}` -- it replaces the `deps` extraction
+(`ctx` is Pydantic AI's `RunContext`). The helper
+`adapt_agent.integrations.pydantic_ai.deps_state(deps)` shows exactly what a
+given `deps` contributes.
+
+### MCP tools
+
+MCP servers attached with `capabilities.MCP(...)` or `toolsets=[MCPToolset(...)]`
+surface through the **same** `before_tool_execute` / `after_tool_execute` hooks
+as local tools (verified with an in-process MCP server), so a `ToolPolicy`
+deny-list, argument screening and result screening apply to them unchanged.
+Name patterns match the tool name as the model sees it (`delete_files`, or with
+any prefix you configured on the toolset).
+
+### Streaming
+
+Under `run_stream`, `run_stream_events`, `iter` (with `node.stream()`) or an
+`event_stream_handler`, model text is delivered **as it arrives** -- before
+`after_model_request` can screen the complete response. Unbuffered, a blocked
+answer is therefore partly delivered before the run aborts.
+
+`buffer_streams=True` (the default) closes that gap: the capability wraps the
+serving model so each streamed response is drained, screened (its text and the
+arguments of any structured-output tool) and only then replayed, event for
+event, to the consumer. A blocked response is **never delivered**; nothing is
+duplicated or reordered for a clean one.
+
+The trade-off is **latency**: the consumer receives each model response in one
+burst when it completes, rather than token by token. Non-streamed runs
+(`run` / `run_sync`) are unaffected. `buffer_streams=False` restores live
+tokens and accepts that a blocked response may be partly shown first; the run
+still aborts and the final output is never returned.
+
+(Why not `wrap_run_event_stream`? Overriding it switches every `agent.run()` to
+streamed requests, and holding events there leaves Pydantic AI's
+`stream_text()` -- which also reads the accumulated raw response -- out of step
+with the event stream, so held text is readable early and delivered twice.
+Buffering at the model avoids both.)
+
+### Sub-agents and run-level coverage
+
+A capability given to `agent.run(capabilities=[...])` governs **that run**.
+Pydantic AI's multi-agent delegation is a tool that calls another agent's
+`run`; that inner run does **not** inherit the parent's capabilities. Give the
+delegate the capability too -- at construction, or in the call:
+
+```python
+@parent.tool
+async def ask_specialist(ctx: RunContext[Deps], question: str) -> str:
+    r = await specialist.run(question, deps=ctx.deps, usage=ctx.usage,
+                             capabilities=[governance])
+    return r.output
+```
+
+Either way the parent's hooks screen the delegation call's arguments, and the
+specialist's answer as a tool result.
+
+### What is and is not covered
+
+- **Covered:** user prompt, message history, tool results (local, MCP,
+  delegated, externally supplied deferred results), tool arguments, tool names,
+  model text, structured output, streamed output (buffered), policy on `deps`.
+- **Not screened:** system prompts and instructions (developer-authored; they
+  are not input), and the arguments of a tool call as the model *proposed* them
+  in the message history (they are screened when the call executes).
+- **Durable execution** (Temporal/DBOS/Prefect wrappers) is untested: those
+  integrations restrict capabilities added per run.
+
+### The older seam: `install_governance` / `governance_output_validator`
+
+These register an `@agent.output_validator` -- the final output only. They
+remain for existing code. Pydantic AI has no public way to add a capability to
+an agent that already exists (`Agent.override(...)` is a scoped context
+manager), so `install_governance(agent, ...)` stays output-only; pass the
+capability per run instead. Both refuse `policy_enforcer`, `defense` and
+`tool_policy` with a `ValueError` naming `governance_capability`, because an
+output validator never sees state, input or tool calls.
+
+See [`examples/pydantic_ai/05_tool_governance.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/05_tool_governance.py).
+
+---
+
+## 4. Guarding the run's boundary: `PydanticAIAdapter`
 
 ### Build the adapter
 
@@ -141,10 +371,10 @@ in):
 - **`defense`** (`AdversarialDefense`) -- heuristics that detect prompt-injection
   and jailbreak patterns (e.g. "ignore previous instructions", role-play
   break-outs), reported as `prompt_injection` threats.
-- **`policy_enforcer`** (`PolicyEnforcer`) -- rule engine, see §4.
+- **`policy_enforcer`** (`PolicyEnforcer`) -- rule engine, see §5.
 - **`observer`** (`AgentObserver`) -- records a trace per run; read them back with
   `observer.get_traces()`.
-- **`middleware`** (`Middleware`) -- pre/post hooks, see §4.
+- **`middleware`** (`Middleware`) -- pre/post hooks, see §5.
 - **`agent_id`** (`str`) -- label attached to traces and errors.
 - **`block_on_violation`** (`bool`, default `True`) -- when `True` a detected
   threat or a `block` policy rule raises `SecurityBlockedError`; when `False` the
@@ -170,6 +400,24 @@ out = guarded.execute({"messages": [{"role": "user", "content": "capital of Fran
 - **Output:** a dict. A non-dict framework result (Pydantic AI returns an
   `AgentRunResult`) is wrapped as `{"result": <AgentRunResult>}`; read the text
   off `out["result"].output`.
+- **Run arguments:** any other keyword argument is forwarded to the run method
+  (`run_sync` for `execute`, `run` for `aexecute`): `deps=`,
+  `message_history=`, `model_settings=`, `usage_limits=`,
+  `deferred_tool_results=`, `capabilities=`, ...
+
+  ```python
+  out = guarded.execute(payload, deps=Deps(user="ada", trust_score=0.9))
+  out = await guarded.aexecute(payload, deps=deps, capabilities=[governance])
+  ```
+
+  `message_history` is **content**, not configuration -- it is the conversation
+  the model reads next -- so the adapter screens it as input before the run.
+  `deferred_tool_results` is screened the same way: it carries tool output
+  produced outside the run, and approvals that may replace a call's arguments. A
+  payload with no prompt of its own (`{}`) plus a `message_history` runs with
+  `user_prompt=None`, which is how Pydantic AI continues a conversation (for
+  example to resume deferred tool calls), instead of sending the payload's
+  `repr` as a new user turn.
 
 ### The 6-step pipeline, as it applies to Pydantic AI
 
@@ -202,14 +450,14 @@ policy violations are recorded (inspect them on `observer.get_traces()` and
 `policy_enforcer.get_violations()`) but the run completes normally. This is the
 right setting when rolling a new rule out to production before enforcing it.
 
-See [`examples/pydantic_ai/01_basic_guarded.py`](../../examples/pydantic_ai/01_basic_guarded.py).
+See [`examples/pydantic_ai/01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/01_basic_guarded.py).
 
 ---
 
-## 4. Policy, adversarial defense, observability, trust & taint
+## 5. Policy, adversarial defense, observability, trust & taint
 
 These compose on the same adapter. The full example is
-[`examples/pydantic_ai/02_policy_observability_trust.py`](../../examples/pydantic_ai/02_policy_observability_trust.py).
+[`examples/pydantic_ai/02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/02_policy_observability_trust.py).
 
 ### PolicyEnforcer
 
@@ -228,7 +476,7 @@ policy.add_rule(                               # condition counts as a violation
     action="block",                            # "block" aborts; "warn" only records
     severity="high",
 )
-adapter = PydanticAIAdapter(policy_enforcer=policy, block_on_violation=True, ...)
+adapter = PydanticAIAdapter(policy_enforcer=policy, block_on_violation=True)
 ```
 
 > **Gotcha.** The safe evaluator supports subscripting (`state['messages'][0]`)
@@ -282,7 +530,7 @@ reason about provenance. Both are optional and independent of the adapter.
 
 ---
 
-## 5. Optimization (the Train half)
+## 6. Optimization (the Train half)
 
 ADAPT-Agent can tune a Pydantic AI agent against a golden dataset and apply the
 winning configuration **in place**.
@@ -388,7 +636,7 @@ def stub(prompt: str) -> str:
 judge = LLMJudge(stub)
 ```
 
-For real runs, swap in `ClaudeJudge(model="claude-opus-4-8")`,
+For real runs, swap in `ClaudeJudge(model="claude-opus-5-5")`,
 `OpenAIJudge(...)`, etc. Set **`adversarial=True`** to make the judge grade as a
 harsh critic that hunts for missing requirements and unsafe behaviour -- a
 reward-hack-resistant signal.
@@ -429,17 +677,17 @@ result = run_training("examples/pydantic_ai/pydantic_ai.train.yaml")
 
 The schema (`target.entrypoint`/`components`, `dataset`, `judge`, `metrics`,
 `optimizer`, `parameters[]`) is documented in
-[`pydantic_ai.train.yaml`](../../examples/pydantic_ai/pydantic_ai.train.yaml).
+[`pydantic_ai.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/pydantic_ai.train.yaml).
 Temperature bounds that exceed a provider's maximum are **clamped with a warning**
 rather than crashing. Note that a YAML `parameter` binds to an *attribute* on a
 resolved component (`component` + `attr_path`); knobs that live in a free-standing
 dict must instead be declared in Python with explicit getters/setters.
 
-See [`examples/pydantic_ai/03_evaluate_and_optimize.py`](../../examples/pydantic_ai/03_evaluate_and_optimize.py).
+See [`examples/pydantic_ai/03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/03_evaluate_and_optimize.py).
 
 ---
 
-## 6. Multi-agent / orchestration with Pydantic AI
+## 7. Multi-agent / orchestration with Pydantic AI
 
 Pydantic AI has **no built-in orchestrator**. The framework documents several
 patterns; the two you will reach for most are:
@@ -473,7 +721,10 @@ guarded.execute({"messages": [{"role": "user", "content": "capital of France?"}]
 ```
 
 Now the entire pipeline (route -> researcher -> writer) is screened and traced as
-one governed call.
+one governed call -- at its boundary. To govern each specialist's tool calls
+and model requests too, give each one the capability (§3); for delegation
+inside a tool, pass it to the inner `run(..., capabilities=[governance])`,
+since a delegate's run does not inherit the parent's capabilities.
 
 ### Optimize the whole system *and* each agent
 
@@ -493,7 +744,7 @@ result = make_default_optimizer(harness, judge=judge, max_evals=40, seed=0).opti
 
 The full example -- guard + whole-system/per-agent optimization + tool ablation +
 recommendations + the YAML path -- is
-[`examples/pydantic_ai/04_multi_agent_and_training.py`](../../examples/pydantic_ai/04_multi_agent_and_training.py).
+[`examples/pydantic_ai/04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/04_multi_agent_and_training.py).
 
 > **Note on other frameworks' orchestrators.** Frameworks with a built-in
 > orchestrator (e.g. Microsoft Agent Framework's *magentic* workflow, or OpenAI's
@@ -505,7 +756,7 @@ recommendations + the YAML path -- is
 
 ---
 
-## 7. Common pitfalls / FAQ
+## 8. Common pitfalls / FAQ
 
 - **`result.output` vs `result.data`.** Pydantic AI v2 uses `.output`; older code
   used `.data`. The introspector and examples use v2.
@@ -522,23 +773,35 @@ recommendations + the YAML path -- is
   list; the Python example uses a judge.
 - **Offline runs.** Always available via `FunctionModel`/`TestModel` for the agent
   and a deterministic `Callable[[str], str]` for the judge -- no API key needed.
-- **Async.** `run` (async) is also supported; the adapter drives Pydantic AI
-  synchronously for you, so you can hand it either a sync or async agent.
+- **Async.** `execute` drives `run_sync`; `await guarded.aexecute(...)` awaits
+  `run` in your own event loop. Calling `execute` from inside a running loop
+  raises -- use `aexecute` there.
+- **An "ask" raised `SecurityBlockedError`, not a pause.** The agent cannot
+  return `DeferredToolRequests`: add it to `output_type` (or use a
+  `HandleDeferredToolCalls` capability). Until then the call fails closed.
+- **`run_stream` output arrives all at once.** That is `buffer_streams=True`
+  holding each response until it is screened; see §3 *Streaming*.
+- **`install_governance` did not stop a tool.** It is output-only. Use
+  `governance_capability` (§3).
 
 ---
 
-## 8. The examples
+## 9. The examples
 
 A ladder from a tiny guarded agent to a governed, optimizable multi-agent system:
 
-1. [`examples/pydantic_ai/01_basic_guarded.py`](../../examples/pydantic_ai/01_basic_guarded.py)
+1. [`examples/pydantic_ai/01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/01_basic_guarded.py)
    -- smallest guarded `Agent`; safe input vs. a blocked injection.
-2. [`examples/pydantic_ai/02_policy_observability_trust.py`](../../examples/pydantic_ai/02_policy_observability_trust.py)
+2. [`examples/pydantic_ai/02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/02_policy_observability_trust.py)
    -- policy, defense, observer, middleware, trust; blocking vs. monitor-only.
-3. [`examples/pydantic_ai/03_evaluate_and_optimize.py`](../../examples/pydantic_ai/03_evaluate_and_optimize.py)
+3. [`examples/pydantic_ai/03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/03_evaluate_and_optimize.py)
    -- introspect, evaluate, and optimize one agent with a judge.
-4. [`examples/pydantic_ai/04_multi_agent_and_training.py`](../../examples/pydantic_ai/04_multi_agent_and_training.py)
+4. [`examples/pydantic_ai/04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/04_multi_agent_and_training.py)
    -- a multi-agent orchestrator: guarded as one unit, optimized whole-system +
    per-agent with `make_default_optimizer`, plus a YAML
-   [`pydantic_ai.train.yaml`](../../examples/pydantic_ai/pydantic_ai.train.yaml)
+   [`pydantic_ai.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/pydantic_ai.train.yaml)
    path via `run_training`.
+5. [`examples/pydantic_ai/05_tool_governance.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/pydantic_ai/05_tool_governance.py)
+   -- `governance_capability`: denied tools (raise / refuse), a poisoned tool
+   result, the approval round trip, policy on `deps`, buffered vs. unbuffered
+   streaming, and an MCP tool.

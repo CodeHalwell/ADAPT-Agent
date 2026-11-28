@@ -14,8 +14,9 @@ This shows the full ADAPT-Agent optimization loop end to end:
     network**. Swap in ``LLMJudge("anthropic")`` / ``LLMJudge("openai")`` (two
     different providers) for the real thing.
 4.  A **CoordinateAscentOptimizer** that searches for a better prompt against
-    the training rows, and applies the winner to the live agent only if it does
-    not score worse than the untuned agent on **held-out** rows.
+    the training rows, and counts the winner as an improvement only if the gain
+    is statistically significant and holds up on **held-out** rows. With a
+    handful of rows it cannot be, and the result says so.
 
 Run it with:
 
@@ -135,8 +136,8 @@ def main() -> None:
     print("Baseline answer for France:", orchestrator("What is the capital of France?"))
 
     # 4. Optimize. The writing judge proposes prompt rewrites from failures;
-    #    the winner is applied only if it does not score worse than the untuned
-    #    agent on the held-out rows (the validation gate).
+    #    the winner counts as an improvement only on a significant gain that
+    #    also shows on the held-out rows (the validation gate).
     optimizer = CoordinateAscentOptimizer(
         harness, judge=scorer, proposer_judge=writer, seed=0, verbose=False
     )

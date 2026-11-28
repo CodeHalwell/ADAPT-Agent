@@ -51,11 +51,12 @@ from adapt_agent.optimization.evaluation import EvaluationHarness, EvaluationRep
 from adapt_agent.optimization.extractors import extract_output_payload, extract_output_text
 from adapt_agent.optimization.judge import LLMJudge
 from adapt_agent.optimization.metrics import (
-    BUILTIN_METRICS,
     Metric,
+    available_metric_names,
     checks,
     coerce_metric,
     get_metric,
+    metric_factory,
 )
 from adapt_agent.optimization.runners import AUTO, framework_runner
 
@@ -83,12 +84,13 @@ def evaluate_agent(
     max_results: int = 10_000,
     failure_threshold: float = 1.0,
     concurrency: int = 1,
+    conversation_input: str | Callable[[list[dict[str, Any]], Any], Any] = "messages",
 ) -> EvaluationReport:
     """Evaluate any agent against a golden dataset and return the report.
 
     Args:
         agent: The system under test: a framework object (LangGraph compiled
-            graph, Microsoft Agent Framework ``ChatAgent``, Pydantic AI
+            graph, Microsoft Agent Framework ``Agent``, Pydantic AI
             ``Agent``, CrewAI ``Crew``, ...), a governed adapter, an
             :class:`~adapt_agent.optimization.target.OptimizableAgent`, or any
             callable -- including the callable built by
@@ -140,6 +142,11 @@ def evaluate_agent(
             :meth:`EvaluationHarness.aevaluate
             <adapt_agent.optimization.evaluation.EvaluationHarness.aevaluate>`,
             which needs no threads.
+        conversation_input: How a multi-turn row (one with ``"turns"``)
+            reaches the agent each turn: ``"messages"`` (default; the history
+            so far as a role/content list ending with the new user turn),
+            ``"text"`` (the new turn only, for an agent with its own memory),
+            or a callable ``(history, turn_input) -> payload``.
 
     Returns:
         The :class:`~adapt_agent.optimization.evaluation.EvaluationReport`.
@@ -164,6 +171,7 @@ def evaluate_agent(
         max_results=max_results,
         failure_threshold=failure_threshold,
         output_extractor=extractor,
+        conversation_input=conversation_input,
     )
     runner = framework_runner(agent, input_adapter=input_adapter, output_extractor=None)
     return harness.evaluate(runner, dataset, concurrency=concurrency)
@@ -245,10 +253,10 @@ def _resolve_metrics(
                 return _judge_metric()
             if spec == "checks":
                 return checks(judge=judge_obj)
-            if spec in BUILTIN_METRICS:
+            if metric_factory(spec) is not None:
                 return get_metric(spec)
             raise KeyError(
-                f"Unknown metric {spec!r}. Available: {sorted(BUILTIN_METRICS)} "
+                f"Unknown metric {spec!r}. Available: {available_metric_names()} "
                 f"plus {list(_JUDGE_NAMES)}"
             )
         if callable(spec):

@@ -36,7 +36,7 @@ def _predicate(obj: Any) -> bool:
     A ``Crew`` has an ``agents`` list/tuple and a callable ``kickoff``. We
     explicitly reject objects belonging to other frameworks (those carrying
     ``handoffs``/``sub_agents``/``system_prompt``/``chat_client``) to avoid false
-    positives -- in particular a Microsoft Agent Framework ``ChatAgent`` (which
+    positives -- in particular a Microsoft Agent Framework ``Agent`` (formerly ``ChatAgent``) (which
     carries ``chat_client``) must never be hijacked here.
     """
     try:
@@ -100,21 +100,66 @@ def _introspect_llm(llm: Any, component: str) -> list[Parameter]:
     return params
 
 
+def _template_prompt(obj: Any, field: str, name: str, component: str) -> Parameter | None:
+    """Bind a prompt field CrewAI re-renders from a remembered template.
+
+    ``Crew.kickoff(inputs=...)`` interpolates ``{variables}`` into ``role`` /
+    ``goal`` / ``backstory`` (and a task's ``description`` / ``expected_output``)
+    *in place*, after stashing the original template in ``_original_<field>``;
+    every later kickoff renders from that stash, not from the public field. So a
+    plain ``setattr`` on the field is overwritten at the next kickoff and the
+    tuned text never reaches the model -- while reading the field after a run
+    returns the rendered text rather than the template.
+
+    The parameter therefore reads the stashed template when there is one and
+    writes the public field *and* every stash that would otherwise win over it
+    (``_original_<field>``, plus a task's ``_input_description``, which seeds
+    ``_original_description`` when that is unset). Before the first kickoff
+    there is no stash and this is an ordinary attribute write.
+    """
+    if not hasattr(obj, field):
+        return None
+    stashes = [f"_original_{field}"]
+    if field == "description":
+        stashes.append("_input_description")
+
+    def _live_stashes() -> list[str]:
+        # "" marks an unknown caller text (see Task._input_description), not a template.
+        return [n for n in stashes if getattr(obj, n, None) not in (None, "")]
+
+    def _getter() -> Any:
+        for stash in _live_stashes():
+            return getattr(obj, stash)
+        return getattr(obj, field, None)
+
+    def _setter(value: Any) -> None:
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be a str, got {type(value).__name__}")
+        setattr(obj, field, value)
+        for stash in _live_stashes():
+            setattr(obj, stash, value)
+        if _getter() != value:
+            raise RuntimeError(f"writing {name} did not change what the next kickoff renders")
+
+    return Parameter(
+        name=name,
+        kind=ParameterKind.PROMPT,
+        value=_getter(),
+        getter=_getter,
+        setter=_setter,
+        component=component,
+        metadata={"source": f"attr:{field}"},
+    )
+
+
 def _introspect_agent(agent: Any, index: int) -> list[Parameter]:
     """Introspect a single CrewAI ``Agent``."""
     component = _slug(getattr(agent, "role", None)) or f"agent_{index}"
     params: list[Parameter] = []
 
     prompts = [
-        bind_attr(agent, "role", f"{component}.role", ParameterKind.PROMPT, component=component),
-        bind_attr(agent, "goal", f"{component}.goal", ParameterKind.PROMPT, component=component),
-        bind_attr(
-            agent,
-            "backstory",
-            f"{component}.backstory",
-            ParameterKind.PROMPT,
-            component=component,
-        ),
+        _template_prompt(agent, field, f"{component}.{field}", component)
+        for field in ("role", "goal", "backstory")
     ]
     params.extend(p for p in prompts if p is not None)
 
@@ -205,20 +250,8 @@ def _introspect_task(task: Any, index: int, used: set[str]) -> list[Parameter]:
         _slug(getattr(task, "name", None)) or f"task_{index}", index, used
     )
     candidates = [
-        bind_attr(
-            task,
-            "description",
-            f"{component}.description",
-            ParameterKind.PROMPT,
-            component=component,
-        ),
-        bind_attr(
-            task,
-            "expected_output",
-            f"{component}.expected_output",
-            ParameterKind.PROMPT,
-            component=component,
-        ),
+        _template_prompt(task, field, f"{component}.{field}", component)
+        for field in ("description", "expected_output")
     ]
     return [p for p in candidates if p is not None]
 

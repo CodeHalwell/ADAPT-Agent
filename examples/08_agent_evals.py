@@ -33,7 +33,12 @@ from __future__ import annotations
 
 import json
 
-from adapt_agent.evaluation import adk_runner, evaluate_agent
+from adapt_agent.evaluation import (
+    adk_runner,
+    evaluate_agent,
+    no_forbidden_tools,
+    tool_call_args_match,
+)
 
 # --------------------------------------------------------------------------- #
 # A tiny "model" shared by every stub agent below.
@@ -212,9 +217,52 @@ def main() -> None:
     )
     print("\nJudge-only:", judged)
 
-    # The same eval is available from the CLI:
+    # Trajectory evals: score what the agent *did*. Any framework result works
+    # (LangGraph state, Pydantic AI result, ADK events, ...); a custom agent can
+    # return {"output": ..., "tool_calls": [...]}. Rows declare expectations.
+    def tool_agent(question: str) -> dict:
+        city = question.rsplit(" ", 1)[-1].strip("?")
+        return {
+            "output": f"Sunny in {city}",
+            "tool_calls": [{"name": "get_weather", "arguments": {"city": city}}],
+        }
+
+    trajectory_report = evaluate_agent(
+        tool_agent,
+        [
+            {
+                "input": "Weather in Paris?",
+                "expected": "Sunny in Paris",
+                "expected_tools": [{"name": "get_weather", "args": {"city": "paris"}}],
+                "forbidden_tools": ["delete_*"],
+            }
+        ],
+        metrics=["exact_match", tool_call_args_match(), no_forbidden_tools()],
+    )
+    print("\nTrajectory:", trajectory_report.aggregate)
+
+    # Multi-turn: a row is a scripted conversation; history is carried for you.
+    def chat(messages: list) -> str:
+        return "Hi!" if len(messages) == 1 else f"You said: {messages[-1]['content']}"
+
+    conversation = evaluate_agent(
+        chat,
+        [
+            {
+                "turns": [
+                    {"input": "hello", "expected": "Hi!"},
+                    {"input": "ping", "expected": "You said: ping"},
+                ]
+            }
+        ],
+        metrics=["exact_match"],
+    )
+    print("Multi-turn:", conversation.score, [t["scores"] for t in conversation.results[0].turns])
+
+    # The same eval is available from the CLI, and gates CI with exit codes:
     #   adapt-agent evaluate myapp.agents:agent --data golden.jsonl \
-    #       --metric checks --judge claude --extract-output
+    #       --metric checks --judge claude --extract-output \
+    #       --fail-under 0.9 --fail-on-error --junit results.xml
 
 
 if __name__ == "__main__":

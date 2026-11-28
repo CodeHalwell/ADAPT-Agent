@@ -304,3 +304,15 @@ def test_wrap_function_fast_path_no_middleware():
     assert wrapped(3, y=4) == 7
     # __name__ preserved via functools.wraps
     assert wrapped.__name__ == "fn"
+
+
+def test_has_input_stages_tracks_pre_middleware_only():
+    """Lets an adapter know whether the input it screened is the one that runs."""
+    mw = Middleware()
+    assert mw.has_input_stages is False
+    mw.add_post_middleware(lambda data: data, name="post")
+    assert mw.has_input_stages is False
+    mw.add_pre_middleware(lambda data: data, name="pre")
+    assert mw.has_input_stages is True
+    mw.remove_middleware("pre")
+    assert mw.has_input_stages is False

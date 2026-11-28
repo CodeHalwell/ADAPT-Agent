@@ -2,7 +2,7 @@
 
 This package is how ADAPT-Agent "goes deep" into each agent framework. Given a
 framework object -- a LangGraph compiled graph, a CrewAI ``Crew``, a Pydantic AI
-``Agent``, an OpenAI Agents ``Agent``, a Microsoft Agent Framework ``ChatAgent``,
+``Agent``, an OpenAI Agents ``Agent``, a Microsoft Agent Framework ``Agent`` (formerly ``ChatAgent``),
 a Google ADK agent, or a Claude Agent SDK options object -- an *introspector*
 walks its structure and returns a flat list of
 :class:`~adapt_agent.optimization.parameters.Parameter` objects, each bound to a

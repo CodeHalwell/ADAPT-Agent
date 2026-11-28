@@ -360,3 +360,64 @@ def test_real_agent_framework_agent_is_introspectable() -> None:
     params["triage_bot.temperature"].write(0.9)
     assert agent.default_options["instructions"] == "Be terse."
     assert agent.default_options["temperature"] == 0.9
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("agent_framework") is None,
+    reason="agent-framework is not installed",
+)
+def test_real_agent_tuned_instructions_and_options_reach_the_client_on_the_next_run() -> None:
+    """A write must change what the chat client is asked, not just a stored option."""
+    from agent_framework import (  # type: ignore[import-not-found]
+        Agent,
+        BaseChatClient,
+        ChatMiddlewareLayer,
+        ChatResponse,
+        Content,
+        FunctionInvocationLayer,
+        Message,
+    )
+
+    from adapt_agent.optimization.runners import framework_runner
+
+    class _Client(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatClient):  # type: ignore[misc]
+        model_id = "gpt-4o-mini"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.requests: list[tuple[list[str], dict]] = []
+
+        def _inner_get_response(self, *, messages, stream, options, **kwargs):  # type: ignore[no-untyped-def]
+            self.requests.append(([m.text for m in messages], dict(options)))
+
+            async def _reply():  # type: ignore[no-untyped-def]
+                return ChatResponse(
+                    messages=[Message(role="assistant", contents=[Content.from_text("ok")])]
+                )
+
+            return _reply()
+
+    def sent() -> list[str]:
+        """Everything the client was given that could carry the instruction."""
+        texts, options = client.requests[-1]
+        return [*texts, str(options.get("instructions"))]
+
+    client = _Client()
+    agent = Agent(
+        client=client,
+        instructions="You are terse.",
+        name="Bot",
+        default_options={"temperature": 0.3},
+    )
+    run = framework_runner(agent)
+    assert run("hi") == "ok"
+    assert any("You are terse." in t for t in sent())
+
+    params = {p.name: p for p in introspect(agent)}
+    params["bot.instructions"].write("Be verbose.")
+    params["bot.temperature"].write(0.9)
+    assert run("hi") == "ok"
+
+    assert any("Be verbose." in t for t in sent())
+    assert not any("You are terse." in t for t in sent())
+    assert client.requests[-1][1]["temperature"] == 0.9

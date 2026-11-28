@@ -20,7 +20,7 @@ target:
   # e.g. a `run` that builds the Magentic workflow and calls
   # `workflow.as_agent(...).run(question)`.
   entrypoint: "myapp.team:run"
-  # The five live ChatAgents to introspect for tunable knobs (prompts/models/
+  # The five live agent_framework.Agent objects to introspect for tunable knobs (prompts/models/
   # tools/skills). They are the SAME objects the entrypoint runs, so applying a
   # candidate config changes the next run.
   components:

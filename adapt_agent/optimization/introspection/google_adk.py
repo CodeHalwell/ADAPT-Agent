@@ -11,12 +11,17 @@ importing ``google.adk``: everything is discovered by duck-typing with
 ``getattr``.
 
 For each agent we expose its ``instruction`` and ``global_instruction`` prompts
-(only when they are plain strings), its model (a string identifier, or an
+(only when they are plain strings; ``global_instruction`` only on releases
+that do not deprecate it), its model (a string identifier, or an
 introspected model object's ``model``/``model_name``), the
 ``temperature``/``top_p``/``top_k``/``max_output_tokens`` hyperparameters from
 its ``generate_content_config``, its ``tools`` allow-list, and its
 ``sub_agents`` routing list. Nested ``sub_agents`` are introspected recursively and namespaced
 under their own component names; an ``id()`` visited set guards against cycles.
+
+Workflow agents (``SequentialAgent`` / ``ParallelAgent`` / ``LoopAgent``) and the
+graph-based ``Workflow`` have no prompt of their own; they are recognised so
+their sub-agents (or the agent nodes of the graph) are introspected.
 
 Importing this module registers the introspector under the ``"google_adk"`` key.
 """
@@ -32,24 +37,81 @@ from adapt_agent.optimization.introspection import (
 )
 from adapt_agent.optimization.parameters import Parameter, ParameterKind
 
+#: Class names, defined in ``google.adk``, whose instances are ADK agents. A
+#: workflow agent (``SequentialAgent`` / ``ParallelAgent`` / ``LoopAgent``) has
+#: sub-agents but no ``instruction``, and a ``Workflow`` is a graph of nodes
+#: rather than an agent at all, so neither can be told apart by attribute shape.
+_ADK_BASE_NAMES = frozenset({"BaseAgent", "Workflow"})
+
+
+def _is_adk_class_instance(obj: Any) -> bool:
+    """Whether ``obj``'s class derives from an ADK agent / workflow base class.
+
+    Judged by class name and module along the MRO, so the framework is never
+    imported; a user subclass of ``BaseAgent`` still matches.
+    """
+    for cls in type(obj).__mro__:
+        if cls.__name__ in _ADK_BASE_NAMES and cls.__module__.startswith("google.adk"):
+            return True
+    return False
+
 
 def _predicate(obj: Any) -> bool:
-    """Return ``True`` when ``obj`` looks like a Google ADK ``LlmAgent``.
+    """Return ``True`` when ``obj`` looks like a Google ADK agent or ``Workflow``.
 
-    An ADK agent is distinguished by having both ``sub_agents`` and an
-    ``instruction`` attribute. We explicitly reject objects belonging to other
+    An ``LlmAgent`` is distinguished by having both ``sub_agents`` and an
+    ``instruction`` attribute; workflow agents and ``Workflow`` by deriving from
+    the ADK base classes. We explicitly reject objects belonging to other
     frameworks (those carrying ``handoffs``/``kickoff``/``allowed_tools``) to
     avoid false positives.
     """
     try:
-        if not hasattr(obj, "sub_agents") or not hasattr(obj, "instruction"):
-            return False
         for foreign in ("handoffs", "kickoff", "allowed_tools"):
             if hasattr(obj, foreign):
                 return False
-        return True
+        if _is_adk_class_instance(obj):
+            return True
+        return hasattr(obj, "sub_agents") and hasattr(obj, "instruction")
     except Exception:
         return False
+
+
+def _global_instruction_deprecated(agent: Any) -> bool:
+    """Whether this ADK release marks ``global_instruction`` as deprecated.
+
+    The framework signals it only by warning when the field is resolved (the
+    field itself carries no pydantic ``deprecated`` marker), so the check looks
+    for that warning in the resolving method. Tuning a knob the framework is
+    about to remove -- and warns about on every run -- wastes the search, so the
+    knob is withheld where the marker is present and kept on older releases
+    (or when the source cannot be inspected, which reads as "not deprecated").
+    """
+    import inspect
+
+    resolver = getattr(type(agent), "canonical_global_instruction", None)
+    if resolver is None:
+        return False
+    try:
+        return "DeprecationWarning" in inspect.getsource(resolver)
+    except (OSError, TypeError):
+        return False
+
+
+def _child_agents(agent: Any) -> list[Any]:
+    """The agents nested under ``agent``: ``sub_agents``, or a workflow's graph nodes.
+
+    A ``Workflow`` keeps its steps in ``graph.nodes`` mixed with function nodes
+    and the start marker; only the steps that are themselves agents or nested
+    workflows carry anything tunable.
+    """
+    children = list(getattr(agent, "sub_agents", None) or [])
+    graph = getattr(agent, "graph", None)
+    nodes = getattr(graph, "nodes", None)
+    if isinstance(nodes, (list, tuple)):
+        children.extend(
+            node for node in nodes if node is not agent and _is_adk_class_instance(node)
+        )
+    return children
 
 
 def _slug(text: Any) -> str | None:
@@ -142,7 +204,7 @@ def _introspect_agent(agent: Any, index: int, visited: set[int]) -> list[Paramet
             params.append(prompt)
 
     global_instruction = getattr(agent, "global_instruction", None)
-    if isinstance(global_instruction, str):
+    if isinstance(global_instruction, str) and not _global_instruction_deprecated(agent):
         global_prompt = bind_attr(
             agent,
             "global_instruction",
@@ -201,8 +263,7 @@ def _introspect_agent(agent: Any, index: int, visited: set[int]) -> list[Paramet
     # names: re-prefixing nested parameters can otherwise collide, and a
     # duplicate name would make ``SearchSpace.add`` raise downstream.
     seen = {p.name for p in params}
-    sub_agents = getattr(agent, "sub_agents", None) or []
-    for i, sub in enumerate(sub_agents):
+    for i, sub in enumerate(_child_agents(agent)):
         for param in _introspect_agent(sub, i, visited):
             if not param.name.startswith(f"{component}."):
                 param.name = f"{component}.{param.name}"

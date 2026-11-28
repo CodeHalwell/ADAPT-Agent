@@ -8,16 +8,18 @@ researchers and users who responsibly disclose issues.
 
 ## Supported versions
 
-Security fixes are provided for the following versions:
+Security fixes are provided for the **latest minor release line** only; every
+earlier line is unsupported.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.2.x   | :white_check_mark: |
-| 0.1.x   | :x:                |
-| < 0.1   | :x:                |
+| 0.5.x   | :white_check_mark: |
+| < 0.5   | :x:                |
 
-We strongly recommend always running the latest released version. Once a newer
-minor release is published, the previous minor series typically stops receiving
+The row above names the current line (the minor of `adapt_agent.__version__`);
+it moves forward with each new minor release, and a test fails if it is left
+behind. We strongly recommend always running the latest released version. Once a
+newer minor release is published, the previous minor series stops receiving
 security updates.
 
 ## Reporting a vulnerability
@@ -63,12 +65,21 @@ In scope:
 - Vulnerabilities in ADAPT-Agent's own code that allow security controls to be
   bypassed — for example, defeating policy enforcement, the firewall, taint
   tracking, or trust evaluation.
-- Issues in the framework adapters (LangGraph, Microsoft Agent Framework, Google
-  ADK, Pydantic AI, CrewAI, OpenAI Agents SDK, Claude Agent SDK) where ADAPT-Agent
-  fails to apply its protections.
+- Issues in the framework adapters (`adapt_agent.adapters`) or the native framework
+  bindings (`adapt_agent.integrations`: middleware, hooks, plugins, guardrails and
+  tool-call governance for LangGraph, Microsoft Agent Framework, Google ADK,
+  Pydantic AI, CrewAI, OpenAI Agents SDK, Claude Agent SDK) where ADAPT-Agent fails
+  to apply its protections -- for example a denied tool call that still runs, or a
+  blocked result that still reaches the model. Gaps a binding documents as a known
+  limitation of the framework's seams are not vulnerabilities, but a binding that
+  behaves differently from its documentation is.
 - Supply-chain or packaging issues in the distributed wheel/sdist.
 - Code-execution, injection, or path-traversal issues reachable through the public
-  API or the `adapt-agent` CLI (`info`, `validate`, `monitor`).
+  API or the `adapt-agent` CLI. Note that `evaluate`, `optimize` and `train`
+  import and run the `module:attribute` targets they are given, and a training
+  config is code by design (see `docs/cli.md`); running a config or target you
+  supplied is not a vulnerability, but a config key that leaks a credential or
+  redirects graded output to another host would be.
 
 Out of scope:
 

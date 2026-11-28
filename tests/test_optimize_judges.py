@@ -254,10 +254,10 @@ def test_azure_judge_scores_offline():
 @pytest.mark.parametrize(
     "judge_cls,expected_model",
     [
-        (ClaudeJudge, "claude-opus-4-8"),
-        (OpenAIJudge, "gpt-4o-mini"),
+        (ClaudeJudge, "claude-opus-5-5"),
+        (OpenAIJudge, "gpt-5.6-luna"),
         (AzureOpenAIJudge, "gpt-4o-mini"),
-        (GeminiJudge, "gemini-2.0-flash"),
+        (GeminiJudge, "gemini-3.5-flash"),
         (MistralJudge, "mistral-large-latest"),
         (CohereJudge, "command-r-plus"),
         (GroqJudge, "llama-3.3-70b-versatile"),
@@ -274,7 +274,7 @@ def test_default_model_attribute(judge_cls, expected_model):
 
 def test_default_model_applied_to_provider():
     judge = ClaudeJudge(client=FakeAnthropicClient(SCORE_JSON))
-    assert judge.provider.model == "claude-opus-4-8"
+    assert judge.provider.model == "claude-opus-5-5"
 
 
 def test_explicit_model_overrides_default():
@@ -470,7 +470,7 @@ def test_new_kwargs_are_judge_kwargs_not_provider_kwargs():
 def test_positional_model_used_over_default():
     # The positional ``model`` arg must beat the class default_model.
     via_default = ClaudeJudge(client=FakeAnthropicClient(SCORE_JSON))
-    assert via_default.provider.model == "claude-opus-4-8"
+    assert via_default.provider.model == "claude-opus-5-5"
     via_positional = ClaudeJudge("pos-model", client=FakeAnthropicClient(SCORE_JSON))
     assert via_positional.provider.model == "pos-model"
 

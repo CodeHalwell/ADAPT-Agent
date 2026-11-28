@@ -26,12 +26,23 @@ The bundled skill is laid out as:
 
 ```
 adapt-agent/
-├── SKILL.md                      # when to use it + the core recipes
+├── SKILL.md                      # when to use it, which control to reach for, core recipes
 └── references/
-    ├── evals.md                  # the full eval surface
-    ├── guardrails.md             # firewall / policy / trust / taint
-    └── optimization.md           # tunable knobs, optimizers, training config
+    ├── evals.md                  # evaluate_agent, metrics and their semantics, trajectory and
+    │                             #   multi-turn evals, CI gating and exit codes, judges
+    ├── guardrails.md             # tool-call governance (ToolPolicy, approvals), the native
+    │                             #   binding per framework, adapters, firewall / policy /
+    │                             #   detector / trust / taint, observer and OpenTelemetry
+    └── optimization.md           # tunable knobs, optimizers, what "improved" means
+                                  #   (significance, held-out gain), training config
 ```
+
+The skill teaches the library as it is now, including the parts that are easy to
+get wrong from memory: tool calls are governed at each framework's native seam
+rather than by wrapping the agent, an optimizer's `improved` is a significance
+verdict, and `adapt evaluate` can fail a CI job with distinct exit codes. Because
+it ships in the wheel, re-run `adapt install skill --force` after upgrading so the
+copy an agent reads matches the library you run.
 
 ## Installing
 

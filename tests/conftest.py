@@ -2,6 +2,11 @@
 
 import os
 
+# The OpenAI Agents SDK exports traces to the network unless told otherwise, and
+# prints a notice about the missing API key when it cannot. Tests are offline:
+# switch the exporter off before any test module imports the SDK.
+os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
+
 try:
     from hypothesis import HealthCheck, settings
 except ImportError:  # pragma: no cover - hypothesis is a dev dependency

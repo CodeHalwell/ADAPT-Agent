@@ -171,7 +171,12 @@ def test_optional_attrs_present_when_set() -> None:
     assert by_name["agent.permission_mode"].kind is ParameterKind.ROUTING
 
 
-def test_permission_mode_has_real_candidates() -> None:
+def test_permission_mode_is_reported_but_never_searchable() -> None:
+    """An optimizer scored on task quality must not pick how permissions are enforced.
+
+    The old knob offered ``bypassPermissions`` as a candidate, so a sweep could
+    switch permission checks off because the agent scored better without them.
+    """
     opts = types.SimpleNamespace(
         system_prompt="hi",
         model="claude-sonnet-4-5",
@@ -181,10 +186,59 @@ def test_permission_mode_has_real_candidates() -> None:
     )
     by_name = {p.name: p for p in introspect(opts)}
     pm = by_name["agent.permission_mode"]
-    assert pm.candidates == ["default", "acceptEdits", "plan", "bypassPermissions"]
-    # With candidates the knob is actually optimizable/searchable.
-    assert pm.optimizable
-    assert pm.enumerate_candidates() == ["default", "acceptEdits", "plan", "bypassPermissions"]
+    assert pm.read() == "default"
+    assert not pm.optimizable
+    assert pm.candidates is None
+    with pytest.raises(ValueError, match="read-only"):
+        pm.write("bypassPermissions")
+    assert opts.permission_mode == "default"
+
+
+def test_disallowed_tools_are_reported_but_never_written() -> None:
+    opts = types.SimpleNamespace(
+        system_prompt="hi", allowed_tools=["Read"], disallowed_tools=["Bash"], max_turns=3
+    )
+    deny = {p.name: p for p in introspect(opts)}["agent.disallowed_tools"]
+    assert deny.read() == ["Bash"]
+    assert not deny.optimizable
+
+
+def test_allowed_tools_can_be_narrowed_but_not_widened() -> None:
+    opts = types.SimpleNamespace(system_prompt="hi", allowed_tools=["Read", "Grep"], max_turns=3)
+    tools = {p.name: p for p in introspect(opts)}["agent.allowed_tools"]
+    tools.write(["Read"])
+    assert opts.allowed_tools == ["Read"]
+
+    assert tools.setter is not None
+    with pytest.raises(ValueError, match="narrowed"):
+        tools.setter(["Read", "Bash"])
+    assert opts.allowed_tools == ["Read"]
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("claude_agent_sdk") is None,
+    reason="claude-agent-sdk is not installed",
+)
+def test_real_options_expose_effort_from_the_sdk_and_no_dead_thinking_knob() -> None:
+    import typing
+
+    import claude_agent_sdk  # type: ignore[import-not-found]
+    from claude_agent_sdk.types import EffortLevel  # type: ignore[import-not-found]
+
+    options = claude_agent_sdk.ClaudeAgentOptions(
+        system_prompt="You are helpful.",
+        allowed_tools=["Read", "Grep"],
+        permission_mode="default",
+        effort="high",
+    )
+    params = {p.name: p for p in introspect(options)}
+    assert "agent.max_thinking_tokens" not in params
+    effort = params["agent.effort"]
+    assert effort.candidates == list(typing.get_args(EffortLevel))
+    effort.write("low")
+    assert options.effort == "low"
+    assert not params["agent.permission_mode"].optimizable
+    assert options.permission_mode == "default"
 
 
 def test_allowed_tools_optimizable_with_drop_one_candidates() -> None:

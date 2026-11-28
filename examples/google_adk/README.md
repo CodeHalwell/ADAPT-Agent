@@ -1,6 +1,6 @@
 # Google ADK + ADAPT-Agent examples
 
-A four-step ladder from a single guarded [Google ADK](https://google.github.io/adk-docs)
+A five-step ladder from a single guarded [Google ADK](https://google.github.io/adk-docs)
 agent to a governed, optimized multi-agent system. Each script is self-contained.
 
 ADAPT-Agent has two halves, both framework-agnostic:
@@ -12,65 +12,62 @@ ADAPT-Agent has two halves, both framework-agnostic:
 
 ## The core ADK shape
 
-ADK does not run an agent by calling a method on the agent object. You build a
-`Runner` (bound to a session service), open a session, and feed it a message:
+ADK does not run an agent by calling a method on it. You put the agent in an
+`App`, build a `Runner`, open a session, and feed it a message. ADAPT-Agent
+plugs in at two places:
 
 ```python
+from google.adk.apps import App
 from google.adk.runners import InMemoryRunner
-from google.genai import types
-
-runner = InMemoryRunner(agent=my_agent, app_name="app")
-msg = types.Content(role="user", parts=[types.Part(text="hi")])
-for event in runner.run(user_id="u", session_id="s", new_message=msg):
-    if event.is_final_response():
-        print(event.content.parts[0].text)
-```
-
-Because that call needs `user_id` / `session_id` / `new_message` arguments the
-adapter does not know about, the wrap target for `GoogleADKAdapter` is a
-**callable you write** that performs the run and returns its events:
-
-```python
-from adapt_agent.adapters import GoogleADKAdapter
 from adapt_agent import Firewall
+from adapt_agent.adapters import GoogleADKAdapter
+from adapt_agent.integrations.google_adk import governance_plugin
 
-def run(payload):
-    text = payload["messages"][-1]["content"]
-    msg = types.Content(role="user", parts=[types.Part(text=text)])
-    return runner.run(user_id="u", session_id="s", new_message=msg)
+fw = Firewall()
+app = App(name="app", root_agent=my_agent,
+          plugins=[governance_plugin(firewall=fw)])   # every model + tool call
+runner = InMemoryRunner(app=app)
 
-guarded = GoogleADKAdapter(firewall=Firewall()).wrap_agent(run)
-guarded.execute({"messages": [{"role": "user", "content": "hi"}]})
+guarded = GoogleADKAdapter(firewall=fw).wrap_agent(runner)   # the boundary
+guarded.execute({"prompt": "hi"}, user_id="u", session_id="s")
 ```
 
-The adapter drains the events (sync generator, async generator, or list) and
-screens the text inside each event's `content.parts`.
+The plugin covers every agent and tool in the tree (sub-agents, `AgentTool`s,
+`Workflow` nodes, MCP tools). The adapter accepts a `Runner`, an `App`, or a
+callable you write; `user_id` / `session_id` / `run_config` passed to `execute`
+reach the run, and a block raised inside it surfaces as `SecurityBlockedError`.
 
 ## Running
 
 ```bash
-# 1 & 2 need the framework installed (they build a real LlmAgent/Runner):
 pip install 'adapt-agent[google-adk]'
 python examples/google_adk/01_basic_guarded.py
 python examples/google_adk/02_policy_observability_trust.py
-
-# 3 & 4 are fully offline (no API key, no network, no extra needed):
 python examples/google_adk/03_evaluate_and_optimize.py
 python examples/google_adk/04_multi_agent_and_training.py
+python examples/google_adk/05_tools_approvals_streaming.py
 ```
 
-> Examples 2-4 use a small ADK-*shaped* stand-in object so they run without a
-> live model. ADAPT-Agent's introspection recognises an ADK `LlmAgent` purely by
-> duck typing (it never imports `google.adk`), so the stand-in is faithful and a
-> real agent is a drop-in replacement.
+Each script prints what it ran, what passed, what
+was blocked and why (the `SecurityBlockedError` threat labels), and exits 0. The
+optimization examples print an `OptimizationResult` line such as
+`baseline=0.200, best=0.900, ..., significant=False (p=0.0625, n=4)`: the gain is
+applied, but on a handful of rows no outcome can pass the paired significance
+test, so `improved` stays `False` -- use a larger golden set for a real verdict.
+
+Every example runs offline (no API key, no network): 01 and 05 drive a real ADK
+`Runner` with a scripted `BaseLlm` stand-in, and print a skip message (exit 0)
+when the extra is missing; 02-04 use a small ADK-*shaped* stand-in object, which
+ADAPT-Agent's introspection recognises by duck typing, so a real agent is a
+drop-in replacement.
 
 ## The ladder
 
 ### `01_basic_guarded.py`
-The smallest guarded ADK agent. Builds a real `LlmAgent` + `InMemoryRunner`
-(behind an import guard), wraps the run-callable with a `Firewall`, blocks a
-prompt-injection input with `SecurityBlockedError`, then tries a safe input
-against the live model.
+The smallest guarded ADK agent: `governance_plugin` on the `App`, the
+`GoogleADKAdapter` around the `Runner`. A safe question is answered; a
+prompt-injection input is blocked with `SecurityBlockedError` before the model
+is called.
 
 ### `02_policy_observability_trust.py`
 Adds the full control stack on a Google ADK agent: `PolicyEnforcer` (a block
@@ -92,11 +89,18 @@ judge proposing new tools on `result.recommendations`. Also shows the parallel
 **YAML training** path (`run_training`) mirroring
 [`google_adk.train.yaml`](./google_adk.train.yaml). Fully offline.
 
+### `05_tools_approvals_streaming.py`
+Tool governance under one plugin: a sub-agent with no callbacks of its own is
+refused a denied tool (the run continues), a poisoned tool result is replaced
+before the next model call, a `require_approval` tool pauses for ADK's
+confirmation flow and runs once approved, and a secret split across SSE chunks
+is caught on the aggregate with `buffer_stream=True` -- nothing of it delivered.
+
 ## What gets introspected for a Google ADK agent
 
 | Attribute | Kind | Notes |
 |---|---|---|
-| `instruction`, `global_instruction` | PROMPT | only when plain strings (not instruction-provider callables) |
+| `instruction`, `global_instruction` | PROMPT | only when plain strings (not instruction-provider callables); `global_instruction` only on releases that do not deprecate it (ADK 2.x does) |
 | `model` | MODEL | a string id, or a model object's `model` / `model_name` |
 | `generate_content_config.temperature` / `top_p` / `max_output_tokens` | HYPERPARAM | bounds clamped to provider max with a warning |
 | `tools` | TOOL | drop-one ablation candidates when 2+ tools |

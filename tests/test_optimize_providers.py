@@ -332,7 +332,7 @@ def test_anthropic_provider_with_injected_client():
     p = AnthropicProvider(client=client)
     assert p.complete("prompt") == "hello from claude"
     kw = client.messages.last_kwargs
-    assert kw["model"] == "claude-opus-4-8"
+    assert kw["model"] == "claude-opus-5-5"
     assert kw["messages"] == [{"role": "user", "content": "prompt"}]
     assert "system" not in kw  # no system by default
 
@@ -346,7 +346,7 @@ def test_anthropic_provider_includes_system():
 
 def test_anthropic_provider_default_model():
     p = AnthropicProvider(client=FakeAnthropicClient())
-    assert p.model == "claude-opus-4-8"
+    assert p.model == "claude-opus-5-5"
 
 
 def test_anthropic_opus_4_8_omits_sampling_params():
@@ -457,7 +457,7 @@ def test_openai_provider_with_injected_client():
     p = OpenAIProvider(client=client)
     assert p.complete("prompt") == "hello gpt"
     kw = client.chat.completions.last_kwargs
-    assert kw["model"] == "gpt-4o-mini"
+    assert kw["model"] == "gpt-5.6-luna"
     assert kw["messages"] == [{"role": "user", "content": "prompt"}]
 
 
@@ -470,10 +470,15 @@ def test_openai_provider_with_system():
     assert msgs[1] == {"role": "user", "content": "prompt"}
 
 
-def test_openai_provider_none_content_returns_empty():
+def test_openai_provider_none_content_raises_empty_response():
+    # `content=None` is not an answer; returning "" let the judge score it
+    # 0.0 "unparseable" with no error recorded.
+    from adapt_agent.optimization.providers import EmptyResponseError
+
     client = FakeOpenAIClient(None)
     p = OpenAIProvider(client=client)
-    assert p.complete("prompt") == ""
+    with pytest.raises(EmptyResponseError):
+        p.complete("prompt")
 
 
 def test_openai_defaults():
@@ -565,22 +570,28 @@ def test_gemini_provider_with_injected_client():
     client = FakeGeminiClient("hello gemini")
     p = GeminiProvider(client=client)
     assert p.complete("prompt") == "hello gemini"
-    assert client.models.last["model"] == "gemini-2.0-flash"
+    assert client.models.last["model"] == "gemini-3.5-flash"
     assert client.models.last["contents"] == "prompt"
     assert client.models.last["config"]["temperature"] == 0.0
 
 
-def test_gemini_provider_prepends_system():
+def test_gemini_provider_sends_system_as_system_instruction():
+    # The system text must not be concatenated into `contents`, or the judge's
+    # rubric and the untrusted text it grades share one channel.
     client = FakeGeminiClient("x")
     p = GeminiProvider(client=client, system="SYS")
     p.complete("prompt")
-    assert client.models.last["contents"] == "SYS\n\nprompt"
+    assert client.models.last["contents"] == "prompt"
+    assert client.models.last["config"]["system_instruction"] == "SYS"
 
 
-def test_gemini_provider_none_text_returns_empty():
+def test_gemini_provider_none_text_raises_empty_response():
+    from adapt_agent.optimization.providers import EmptyResponseError
+
     client = FakeGeminiClient(None)
     p = GeminiProvider(client=client)
-    assert p.complete("p") == ""
+    with pytest.raises(EmptyResponseError):
+        p.complete("p")
 
 
 # Mistral ---------------------------------------------------------------------
@@ -825,3 +836,248 @@ def test_get_provider_constructs_all_vendor_classes():
         else:
             p = get_provider(name)
         assert isinstance(p, ModelProvider)
+
+
+# -- SDK feature detection, stop reasons, usage, retries ------------------------
+
+
+class _Block:
+    def __init__(self, type_, **fields):
+        self.type = type_
+        for key, value in fields.items():
+            setattr(self, key, value)
+
+
+class _Usage:
+    def __init__(self, i, o):
+        self.input_tokens = i
+        self.output_tokens = o
+
+
+class _Msg:
+    def __init__(self, content, stop_reason="end_turn", usage=(3, 2), stop_details=None):
+        self.content = content
+        self.stop_reason = stop_reason
+        self.stop_details = stop_details
+        self.usage = _Usage(*usage)
+
+
+class _StrictMessages:
+    """`create` with an explicit signature, like the real SDK: no **kwargs."""
+
+    def __init__(self, response, *, with_temperature=False):
+        self.calls = []
+        self._response = response
+        if with_temperature:
+            self.create = self._create_with_temperature
+
+    def create(self, *, model, max_tokens, messages, system=None, output_config=None):
+        self.calls.append({"model": model, "system": system, "output_config": output_config})
+        return self._response
+
+    def _create_with_temperature(
+        self, *, model, max_tokens, messages, system=None, temperature=None
+    ):
+        self.calls.append({"model": model, "temperature": temperature})
+        return self._response
+
+
+class _StrictAnthropic:
+    def __init__(self, response=None, **kw):
+        self.messages = _StrictMessages(response or _Msg([_Block("text", text="ok")]), **kw)
+
+
+@pytest.mark.parametrize(
+    "model", ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5", "claude-sonnet-4-6"]
+)
+def test_anthropic_never_sends_a_keyword_the_sdk_does_not_accept(model):
+    # The installed SDK's `create` has no `temperature`: sending it raised a
+    # local TypeError for every model outside a hand-kept marker list.
+    client = _StrictAnthropic()
+    assert AnthropicProvider(model, client=client, temperature=0.5).complete("q") == "ok"
+    assert len(client.messages.calls) == 1
+
+
+def test_anthropic_sends_temperature_when_the_sdk_takes_it_and_the_model_allows_it():
+    client = _StrictAnthropic(with_temperature=True)
+    AnthropicProvider("claude-sonnet-4-6", client=client, temperature=0.5).complete("q")
+    assert client.messages.calls[-1]["temperature"] == 0.5
+    client = _StrictAnthropic(with_temperature=True)
+    AnthropicProvider("claude-sonnet-5-5", client=client, temperature=0.5).complete("q")
+    assert client.messages.calls[-1]["temperature"] is None  # omitted
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-opus-5-5",
+        "claude-opus-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-fable-5-2",
+    ],
+)
+def test_current_anthropic_family_omits_sampling_even_with_a_permissive_sdk(model):
+    client = FakeAnthropicClient()
+    AnthropicProvider(model, client=client, temperature=0.7).complete("q")
+    assert "temperature" not in client.messages.last_kwargs
+
+
+def test_sampling_rejection_is_remembered_per_instance():
+    client = _SamplingRejectAnthropicClient("ok")
+    p = AnthropicProvider(client=client, model="claude-3-5-sonnet-20241022", temperature=0.5)
+    p.complete("a")
+    p.complete("b")
+    # 2 calls for the first completion, 1 for the second -- not 2 every time.
+    assert len(client.messages.calls) == 3
+    assert "temperature" not in client.messages.calls[2]
+
+
+def test_anthropic_refusal_and_truncation_are_typed_failures():
+    refused = _Msg([], stop_reason="refusal", stop_details=_Block("refusal", category="cyber"))
+    with pytest.raises(P.RefusedResponseError) as info:
+        AnthropicProvider(client=_StrictAnthropic(refused)).complete("q")
+    assert info.value.kind == "refused"
+    cut = _Msg([_Block("text", text='{"score": 9, "reas')], stop_reason="max_tokens")
+    with pytest.raises(P.TruncatedResponseError) as info:
+        AnthropicProvider(client=_StrictAnthropic(cut)).complete("q")
+    assert info.value.partial_text == '{"score": 9, "reas'
+    # The message must not quote model text (a retry classifier reads it).
+    assert "score" not in str(info.value)
+
+
+def test_join_text_blocks_skips_thinking_and_tool_blocks():
+    blocks = [
+        _Block("thinking", thinking="x", text="not me"),
+        _Block("tool_use", name="t"),
+        {"type": "web_search_tool_result", "text": "nor me"},
+        _Block("text", text="answer"),
+    ]
+    assert _join_text_blocks(blocks) == "answer"
+
+
+def test_usage_is_recorded_and_accumulated():
+    p = AnthropicProvider(client=_StrictAnthropic(_Msg([_Block("text", text="ok")], usage=(10, 4))))
+    p.complete("a")
+    p.complete("b")
+    assert (p.last_usage.input_tokens, p.last_usage.output_tokens, p.last_usage.calls) == (10, 4, 1)
+    assert (p.usage.input_tokens, p.usage.output_tokens, p.usage.calls) == (20, 8, 2)
+
+
+def test_acomplete_runs_complete():
+    import asyncio
+
+    assert asyncio.run(CallableProvider(lambda prompt: "x" + prompt).acomplete("y")) == "xy"
+
+
+class _RetryClient:
+    def __init__(self, max_retries=2):
+        self.max_retries = max_retries
+        self.messages = FakeAnthropicMessages("ok")
+
+    def with_options(self, *, max_retries):
+        return _RetryClient(max_retries)
+
+
+def test_injected_sdk_client_has_its_own_retries_turned_off():
+    # SDK default retries under the judge's and the harness's policies made one
+    # throttled row cost nine HTTP calls.
+    assert AnthropicProvider(client=_RetryClient())._get_client().max_retries == 0
+    assert OpenAIProvider(client=_RetryClient())._get_client().max_retries == 0
+    kept = _RetryClient()
+    assert AnthropicProvider(client=kept, sdk_max_retries=None)._get_client() is kept
+
+
+class _RejectingCompletions:
+    """Rejects a named parameter with an OpenAI-shaped 400."""
+
+    def __init__(self, rejected):
+        self.rejected = rejected
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        if self.rejected in kwargs:
+            err = RuntimeError(f"Error code: 400 - Unsupported parameter: '{self.rejected}'")
+            err.param = self.rejected
+            raise err
+        return FakeOpenAIResponse("hello")
+
+
+def _rejecting_openai(rejected):
+    client = FakeOpenAIClient()
+    client.chat.completions = _RejectingCompletions(rejected)
+    return client
+
+
+def test_openai_prefers_max_completion_tokens_and_gateways_keep_max_tokens():
+    client = FakeOpenAIClient()
+    OpenAIProvider(client=client).complete("q")
+    assert "max_completion_tokens" in client.chat.completions.last_kwargs
+    assert "max_tokens" not in client.chat.completions.last_kwargs
+    client = FakeOpenAIClient()
+    GroqProvider(client=client).complete("q")
+    assert "max_tokens" in client.chat.completions.last_kwargs
+
+
+@pytest.mark.parametrize("rejected", ["max_completion_tokens", "max_tokens"])
+def test_openai_token_param_rejection_is_recovered_and_remembered(rejected):
+    client = _rejecting_openai(rejected)
+    cls = OpenAIProvider if rejected == "max_completion_tokens" else GroqProvider
+    p = cls(client=client)
+    assert p.complete("a") == "hello"
+    assert p.complete("b") == "hello"
+    calls = client.chat.completions.calls
+    assert len(calls) == 3  # one failed request in total, not one per completion
+    assert rejected not in calls[2]
+
+
+def test_openai_temperature_rejection_is_remembered():
+    client = _rejecting_openai("temperature")
+    p = OpenAIProvider(client=client)
+    p.complete("a")
+    p.complete("b")
+    assert len(client.chat.completions.calls) == 3
+
+
+def test_openai_length_and_refusal_are_typed_failures():
+    client = FakeOpenAIClient()
+    cut = FakeOpenAIResponse("partial")
+    cut.choices[0].finish_reason = "length"
+    client.chat.completions.create = lambda **kw: cut
+    with pytest.raises(P.TruncatedResponseError):
+        OpenAIProvider(client=client).complete("q")
+    refused = FakeOpenAIResponse(None)
+    refused.choices[0].message.refusal = "no"
+    client.chat.completions.create = lambda **kw: refused
+    with pytest.raises(P.RefusedResponseError):
+        OpenAIProvider(client=client).complete("q")
+
+
+def test_azure_has_no_stale_default_api_version(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_VERSION", raising=False)
+    p = AzureOpenAIProvider(client=FakeOpenAIClient(), azure_endpoint="https://x")
+    assert p._api_version is None
+    monkeypatch.setenv("OPENAI_API_VERSION", "from-env")
+    assert AzureOpenAIProvider(client=FakeOpenAIClient())._api_version == "from-env"
+
+
+def test_callable_provider_typeerror_inside_fn_propagates_and_runs_once():
+    calls = []
+
+    def fn(prompt, system=None):
+        calls.append(prompt)
+        raise TypeError("unsupported operand type(s) for +: 'int' and 'str'")
+
+    with pytest.raises(TypeError, match="unsupported operand"):
+        CallableProvider(fn)("hi", system="rubric")
+    assert calls == ["hi"]
+
+
+def test_judges_take_their_defaults_from_the_provider_table():
+    from adapt_agent.optimization.judges import JUDGE_REGISTRY
+
+    for judge_cls in set(JUDGE_REGISTRY.values()):
+        name = judge_cls.provider_cls.name
+        assert judge_cls.default_model == P.DEFAULT_MODELS[name], name
+        assert judge_cls.provider_cls().model == P.DEFAULT_MODELS[name], name

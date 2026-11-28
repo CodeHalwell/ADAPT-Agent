@@ -144,6 +144,12 @@ def main() -> None:
             "--metric", "exact_match", "--json", show=0,
         )  # fmt: skip
         print(f"    score before: {json.loads(before.stdout)['score']:.2f}")
+        # The same command as a CI gate: exit 3 because the score misses the bar
+        # (4 = rows errored, 5 = rows dropped as transient, 6 = regression).
+        cli(
+            root, "evaluate", "myagent:agent", "--data", "train.jsonl",
+            "--metric", "exact_match", "--fail-under", "0.9", show=0,
+        )  # fmt: skip
 
         tuned = cli(
             root, "optimize", "myagent:agent", "--data", "train.jsonl",

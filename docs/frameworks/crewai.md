@@ -21,6 +21,145 @@ the crew you hand to the adapter.
 
 ---
 
+## Start here: governing tools, models and runs
+
+ADAPT-Agent binds to CrewAI's interception layer (`crewai.hooks`, CrewAI 1.15+),
+which fires around every model call, every tool call, every task / flow step and
+the start and end of every crew or flow run.
+
+```python
+from adapt_agent import Firewall
+from adapt_agent.core.governance import ToolPolicy
+from adapt_agent.integrations.crewai import governance_hooks
+
+hooks = governance_hooks(
+    firewall=Firewall(),                              # screens everything below
+    tool_policy=ToolPolicy(deny=["delete_*"], require_approval=["send_email"]),
+    on_tool_violation="refuse",                       # or "raise"
+    approve=lambda decision, ctx: ask_a_human(decision),   # or True, or None
+)
+
+with hooks:                       # scoped to this block, leaks nowhere else
+    crew.kickoff(inputs={"topic": "AI"})
+```
+
+Every crew, agent and flow that runs inside the block is covered -- delegation
+targets and the second agent of a crew included, which attaching a hook per agent
+would silently skip. Prefer the `with` form: it uses CrewAI's execution-scoped
+registry (worker threads and `asyncio.to_thread` inherit it) and removes itself.
+`hooks.install()` / `hooks.uninstall()` register process-wide instead -- which
+governs every crew in the process, including unrelated ones; `install_hooks(...)`
+is the one-liner. `agents=["Researcher"]` limits governance to named roles.
+
+### What each hook does
+
+| CrewAI point | What ADAPT-Agent checks |
+|---|---|
+| `pre_tool_call` | `gate.check_tool_call`: the `ToolPolicy`, the arguments (firewall + defense), tool-scoped policy rules. A denied call never executes. |
+| `post_tool_call` | `gate.check_tool_result`: the result is screened *as input* before the model sees it. A poisoned result is replaced (or aborts the run). |
+| `pre_model_call` / `post_model_call` | The messages going to the model (the model's own earlier answers are not re-scanned) and the response coming back. |
+| `execution_start` / `input` / `output` | The kickoff inputs and the final output of a crew **or a Flow**. |
+| `pre_step` / `post_step` | A task's output, and a Flow method's input and output -- the only seam that sees a flow step that never calls a model. |
+
+MCP tools (`Agent(mcps=[...])`) are `BaseTool` subclasses and run through the same
+tool hook, so a `ToolPolicy` deny such as `"srv_*"` governs them with no extra
+step (pinned by a test that builds an `MCPNativeTool` offline). **A2A delegation**
+(`Agent(a2a=...)`) emits events only and has no hook, so it is *not* governed by
+this binding; treat the remote agent as an untrusted tool and gate the delegation
+at your own boundary.
+
+### Blocks: `refuse` or `raise`
+
+`on_tool_violation="refuse"` (default) skips the tool and tells the model why
+(`Tool call 'delete_db' refused by ADAPT-Agent [id]: tool:denied:delete_db.`); the
+crew carries on, and an agent may pick another route. It is the default because a
+refused call is an ordinary event in an agent loop and is how CrewAI models a
+hook-blocked tool. `"raise"` aborts the run and the caller of `kickoff` gets
+`SecurityBlockedError` with the threats; use it where one block means the run is
+compromised. A blocked model input or output and a blocked run boundary always
+raise.
+
+> **Why the binding does not simply raise `SecurityBlockedError`.** CrewAI
+> swallows every exception a hook raises except `crewai.hooks.HookAborted`; a
+> hook raising `SecurityBlockedError` let `delete_db` run (pinned by a test). The
+> binding raises `GovernanceBlocked`, a subclass of *both* `HookAborted` and
+> `SecurityBlockedError`, so CrewAI honours it and your `except SecurityBlockedError`
+> catches it. An unexpected error inside the binding also fails closed (a
+> report-only gate records it and carries on instead).
+
+### Approvals
+
+A decision of `"ask"` (a `ToolPolicy(require_approval=[...])` match, or a
+`require_approval` policy rule) goes to `approve`: `True` uses CrewAI's
+`ctx.request_human_input` console prompt (type `approve`), a callable
+`(decision, ctx) -> bool` decides programmatically, and `None` (default) fails
+closed to a block. No terminal (`EOFError`) or a crashing approver also denies.
+The prompt blocks the calling thread, so do not use `approve=True` in a server.
+
+### Policy state
+
+A `PolicyEnforcer` rule can rely on: `messages` and `context` (always), `agent_role`,
+`task` (the task description), `iterations` (model hooks), and every key of the
+kickoff `inputs` as a top-level key -- so `state['trust_score']` works if you pass
+`inputs={"trust_score": 0.2}`. Tool-scoped rules (those naming `tool`) see
+`tool['name']` and `tool['arguments']`.
+
+### Report-only, observer, audit trail
+
+`block_on_violation=False` lets everything through and records it:
+`hooks.events` holds a bounded list of `GovernanceEvent(point, action, name,
+threats, report_only)`. `observer=AgentObserver()` opens a span per governed model
+call and tool call.
+
+### Streaming
+
+CrewAI streams model chunks while the model is still answering and its hooks fire
+only when a call completes, so **no hook can hold back a streamed chunk**: a
+blocked response is aborted, but chunks already emitted were delivered. If a
+blocked answer must never be seen, run the crew through `CrewAIAdapter`, which
+drains a `stream=True` crew inside governance and returns the `CrewOutput` only
+after it was screened (the latency benefit of streaming is given up).
+
+### Kickoff callbacks and task guardrails
+
+The lighter bindings still work and need no CrewAI 1.15:
+
+```python
+from adapt_agent.integrations.crewai import governance_callbacks, governance_guardrail
+
+crew = Crew(agents=[...], tasks=[...], **governance_callbacks(firewall=fw, agent_id="research-crew"))
+task = Task(..., guardrail=governance_guardrail(gate))   # (ok, value_or_message), retried
+```
+
+`governance_callbacks` screens the kickoff inputs and the crew output once per
+kickoff (no tool or model coverage). `governance_guardrail` screens one task's
+*answer* -- not the transcript of earlier attempts, which would re-flag the
+rejected draft on every retry.
+
+### Checkpoints and restore
+
+`governance_callbacks(...)` is written into a CrewAI checkpoint and
+rebuilt on restore; a plain closure would be *dropped* with the control silently
+gone. The mechanism, and what you must do:
+
+1. CrewAI saves a callback as `module.qualname` and, on restore, imports that
+   path. Closures, bound methods and callable instances have none and come back
+   as `None`. The callbacks returned here are instances that advertise the path
+   `adapt_agent.integrations.crewai.checkpoint_<before|after>_<agent_id>`, which the
+   module resolves back to the gate registered under that `agent_id`.
+2. In a new process, restore needs `CREWAI_DESERIALIZE_CALLBACKS=1` (CrewAI
+   refuses to import callback paths otherwise -- a loud `ValidationError`) and
+   you must call `governance_callbacks(..., agent_id=<same id>)` with the same
+   controls **before** `Crew.from_checkpoint(...)`. If you forget, the restored
+   callback raises `SecurityBlockedError` (`governance:gate_not_registered`) on
+   the first kickoff instead of running ungoverned.
+3. **Hooks and task guardrails are not in the checkpoint.** Hooks are process
+   state: enter `governance_hooks(...)` again around the resumed `kickoff()`.
+   CrewAI never serialises a callable `Task(guardrail=...)`, so
+   `governance_guardrail` cannot survive a restore; rely on hooks or callbacks.
+
+---
+
 ## 1. What CrewAI is
 
 CrewAI orchestrates a **crew** of role-playing agents that collaborate on a list
@@ -44,7 +183,7 @@ template variables substituted into task descriptions. The return value is a
 ```python
 from crewai import LLM, Agent, Crew, Process, Task
 
-llm = LLM(model="openai/gpt-4o", temperature=0.2)   # "provider/model" id
+llm = LLM(model="openai/gpt-5.6-luna", temperature=0.2)   # "provider/model" id
 
 geographer = Agent(
     role="Geographer",
@@ -83,18 +222,22 @@ needs the dependency. The examples make this concrete by guarding the import:
 
 ```python
 try:
-    from crewai import LLM, Agent, Crew, Process, Task
+    from crewai import Agent, BaseLLM, Crew, Process, Task
 except ImportError:
-    raise SystemExit("This example needs CrewAI: pip install 'adapt-agent[crewai]'")
+    print("This example needs CrewAI: pip install 'adapt-agent[crewai]'")
+    raise SystemExit(0)
 ```
 
-Run an example without CrewAI installed and it prints that hint and exits
-cleanly -- no traceback.
+Run an example without CrewAI installed and it prints that hint and exits 0 --
+no traceback. The tool-governance hooks need CrewAI 1.15+ (`crewai.hooks`); the
+callbacks, guardrail and adapter work on older releases.
 
 > **Running offline.** Every example here uses a deterministic, network-free LLM
-> by subclassing CrewAI's `LLM` and overriding `call(...)`, so they run with no
-> API key. In real use you pass a normal `LLM(model="openai/gpt-4o")` (or a
-> `"provider/model"` string) instead -- nothing else changes.
+> by subclassing **`crewai.BaseLLM`** (only `call(...)` is abstract), so they run
+> with no API key. Do *not* subclass `crewai.LLM`: on current CrewAI `LLM.__new__`
+> is a provider-routing factory and `class X(LLM)` fails with `TypeError:
+> LLM.__new__() missing 1 required positional argument: 'model'`. In real use you
+> pass a normal `LLM(model="openai/gpt-5.6-luna")` (or a `"provider/model"` string).
 
 ---
 
@@ -108,6 +251,7 @@ from adapt_agent import (
     AdversarialDefense, AgentObserver, Firewall, Middleware, PolicyEnforcer,
 )
 from adapt_agent.adapters import CrewAIAdapter
+from adapt_agent.core.governance import ToolPolicy
 from adapt_agent.exceptions import SecurityBlockedError
 
 firewall = Firewall(max_content_length=10_000)
@@ -121,6 +265,8 @@ adapter = CrewAIAdapter(
     middleware=Middleware(),           # pre/post payload hooks
     agent_id="my-crew",               # stable id used in traces & policy checks
     block_on_violation=True,           # raise on a threat (default)
+    hooks=True,                        # ALSO govern tools/models inside the run (opt-in)
+    tool_policy=ToolPolicy(deny=["delete_*"]),   # needs hooks=True
 )
 
 guarded = adapter.wrap_agent(crew)     # wrap the live Crew
@@ -138,10 +284,15 @@ controls you want; omit the rest. What each does:
 | `middleware` | `Middleware` | A pipeline that can inspect/rewrite the payload before the run and the result after. |
 | `agent_id` | `str` | Stable identifier in traces and policy checks. Defaults to `"crewai-agent"`. |
 | `block_on_violation` | `bool` | `True` (default): a firewall/defense hit or a `block` policy action raises `SecurityBlockedError`. `False`: the run proceeds, but threats are still recorded. |
+| `hooks` | `bool` | `False` (default). `True` runs every `execute` / `aexecute` inside `governance_hooks(...)`, scoped to that run. A block raised inside the run comes out as `SecurityBlockedError` with its threats. |
+| `tool_policy`, `on_tool_violation`, `approve` | see above | Configure the hooks. **Refused with `ValueError` unless `hooks=True`** -- they act only through the hooks, and accepting them silently would govern nothing. |
 
-`wrap_agent(crew)` accepts a real `Crew` (or anything exposing a callable
-`kickoff` / `kickoff_async` / `run`) and returns a governed object with an
-`execute(payload)` method.
+`wrap_agent(crew)` accepts a real `Crew`, a `Flow`, a standalone `Agent` (or
+anything exposing a callable `kickoff` / `akickoff` / `kickoff_async` / `run`) and
+returns a governed object with `execute(payload, **run_kwargs)` and
+`aexecute(payload, **run_kwargs)`. `aexecute` drives CrewAI's native `akickoff`
+coroutine (falling back to `kickoff_async` on older releases); extra keyword
+arguments (`input_files=`, `from_checkpoint=`) reach `kickoff` untouched.
 
 ### What `execute()` takes and returns
 
@@ -150,7 +301,7 @@ result = guarded.execute({
     "messages": [{"role": "user", "content": "What is the capital of France?"}],
     "question": "What is the capital of France?",
 })
-print(result.raw)   # CrewOutput.raw holds the final text
+print(result["result"].raw)   # the CrewOutput is under "result"; .raw is the final text
 ```
 
 The payload is a dict. The adapter handles two parts of it differently:
@@ -161,13 +312,18 @@ The payload is a dict. The adapter handles two parts of it differently:
 - **Everything else** -- forwarded to `kickoff(inputs=...)` as CrewAI template
   variables. So `question` above fills `{question}` in the task description.
 
+A **standalone `Agent`** has no template inputs: its `kickoff` takes messages. For
+one, the adapter sends the payload's `messages` (or, with none, its prompt) rather
+than an empty inputs dict. A `Crew(stream=True)` is drained inside governance and
+the final `CrewOutput` is returned once screened.
+
 This means you can run a guarded crew with just template variables, just a
 `messages` transcript, or both. Including both (as the examples do) gives the
 screeners clean text to inspect while still feeding the crew its real inputs.
 
-The return value is whatever `kickoff` returns -- a `CrewOutput`. ADAPT-Agent
-extracts text from it (via `.raw`, `.tasks_output`, etc.) for output screening,
-then hands the object back to you unchanged.
+The result is `{"result": <whatever kickoff returned>}` -- a `CrewOutput`.
+ADAPT-Agent extracts text from it (via `.raw`, `.tasks_output`, etc.) for output
+screening, then hands the object back unchanged.
 
 ### The 6-step pipeline, as it applies to CrewAI
 
@@ -220,8 +376,8 @@ out = guarded.execute(bad_payload)   # still returns a CrewOutput
 # Inspect observer.get_traces() to see what fired.
 ```
 
-Full runnable versions: [`01_basic_guarded.py`](../../examples/crewai/01_basic_guarded.py)
-and [`02_policy_observability_trust.py`](../../examples/crewai/02_policy_observability_trust.py).
+Full runnable versions: [`01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/01_basic_guarded.py)
+and [`02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/02_policy_observability_trust.py).
 
 ---
 
@@ -259,7 +415,7 @@ firewall at step 1.
 
 ```python
 observer = AgentObserver()
-adapter = CrewAIAdapter(observer=observer, ...)
+adapter = CrewAIAdapter(observer=observer, agent_id="research-crew")
 # ... after some runs ...
 for trace in observer.get_traces():
     print(trace["trace_id"][:8], trace["operation"], trace["status"])
@@ -421,7 +577,7 @@ Built-in metrics include `exact_match`, `token_f1`, `contains`, `regex_match`,
 `jaccard`, `numeric_close`, `json_subset`, and `levenshtein_ratio`.
 
 **The judge** (`LLMJudge`) is provider-agnostic -- back it with any
-`Callable[[str], str]`. For real runs use `ClaudeJudge(model="claude-opus-4-8")`,
+`Callable[[str], str]`. For real runs use `ClaudeJudge(model="claude-opus-5-5")`,
 `OpenAIJudge(...)`, etc. **For offline, no-key runs, pass a deterministic stub**:
 
 ```python
@@ -485,8 +641,8 @@ call**: register `components={"crew": crew}` (or several named agents) and the
 optimizer searches across all of their knobs at once. To tune a single agent in
 isolation, wrap just that agent's runner and register only that component.
 
-Runnable: [`03_evaluate_and_optimize.py`](../../examples/crewai/03_evaluate_and_optimize.py)
-(one crew) and [`04_multi_agent_and_training.py`](../../examples/crewai/04_multi_agent_and_training.py)
+Runnable: [`03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/03_evaluate_and_optimize.py)
+(one crew) and [`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/04_multi_agent_and_training.py)
 (two-agent crew, full pipeline, recommendations).
 
 ### The YAML config path
@@ -508,7 +664,7 @@ dataset:
   path: "golden.jsonl"                  # jsonl / json / csv
 judge:
   provider: anthropic                   # or openai / gemini / a registered custom provider
-  model: claude-opus-4-8
+  model: claude-opus-5-5
   adversarial: true
   metric_name: quality
 metrics: [exact_match, token_f1]
@@ -541,8 +697,8 @@ a dotted `attr_path` that resolves through attribute access).
 > Register it **before** `run_training` -- the judge is built before the target
 > module is imported, so top-level registration in the script that calls
 > `run_training` is the reliable place. See
-> [`crewai.train.yaml`](../../examples/crewai/crewai.train.yaml) and
-> [`04_multi_agent_and_training.py`](../../examples/crewai/04_multi_agent_and_training.py).
+> [`crewai.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/crewai.train.yaml) and
+> [`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/04_multi_agent_and_training.py).
 
 ---
 
@@ -577,10 +733,10 @@ manager delegates tasks to the workers. Either way:
   per-agent tool ablation.
 
 This is the capstone example,
-[`04_multi_agent_and_training.py`](../../examples/crewai/04_multi_agent_and_training.py),
+[`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/04_multi_agent_and_training.py),
 which governs a researcher+writer crew, optimizes it end to end with an
 adversarial judge (printing `result.recommendations`), and also runs the same job
-from [`crewai.train.yaml`](../../examples/crewai/crewai.train.yaml).
+from [`crewai.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/crewai.train.yaml).
 
 ---
 
@@ -591,10 +747,23 @@ payload key *except* `messages` to `kickoff(inputs=...)`. Put your task-template
 variables at the top level of the payload (e.g. `{"question": "..."}`), and use
 `messages` only for the screened chat transcript.
 
-**The firewall didn't catch text inside my crew's tools.** The firewall screens
-the input *payload* (and the *result*), not arbitrary network calls a tool makes
-mid-run. Treat tool I/O with `TaintTracker` / tool-level policy, not the
-input/output firewall.
+**The firewall didn't catch text inside my crew's tools.** The adapter alone
+screens the input *payload* and the *result*. Tool arguments and results are
+screened by the interception hooks: use `CrewAIAdapter(hooks=True)` or
+`governance_hooks(...)` (CrewAI 1.15+). A tool's own network calls are never
+inspected -- only what goes in and what comes back.
+
+**My hook raised and the dangerous tool ran anyway.** CrewAI swallows every
+exception a hook raises except `crewai.hooks.HookAborted`. Raise `HookAborted`
+(or use `governance_hooks`, which does) -- never a plain exception.
+
+**`Task(guardrail=governance_guardrail(gate))` raised `ValidationError`.** Fixed:
+the returned function no longer carries a (string) return annotation that
+CrewAI's `Tuple[bool, Any]` check rejects.
+
+**A restored crew no longer screens its inputs.** See *Checkpoints and restore*
+above: the callbacks survive only if you set `CREWAI_DESERIALIZE_CALLBACKS=1` and
+re-register the gate under the same `agent_id` before restoring.
 
 **`tools` shows no candidates in introspection.** Drop-one ablation needs **two
 or more** tools on an agent. With one tool there's nothing meaningful to ablate.
@@ -619,21 +788,23 @@ bounds above a provider's max are clamped with a warning.
 
 **Calling from inside a running event loop.** `execute` drives async crews
 synchronously (awaiting coroutines, draining async streams). If you call it from
-within an already-running event loop, use CrewAI's native async API
-(`kickoff_async`) instead.
+within an already-running event loop, use `await guarded.aexecute(...)` (it
+drives CrewAI's native `akickoff` in your loop).
 
 ---
 
 ## 8. The examples
 
-- [`01_basic_guarded.py`](../../examples/crewai/01_basic_guarded.py) -- smallest
+- [`05_tool_governance.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/05_tool_governance.py) -- the
+  interception hooks: denied tool, aborting run, poisoned tool result, approvals.
+- [`01_basic_guarded.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/01_basic_guarded.py) -- smallest
   real crew, wrapped with a `Firewall`; safe input vs. blocked injection.
-- [`02_policy_observability_trust.py`](../../examples/crewai/02_policy_observability_trust.py)
+- [`02_policy_observability_trust.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/02_policy_observability_trust.py)
   -- policy block rule, adversarial defense, observer traces, middleware,
   `block_on_violation=False`.
-- [`03_evaluate_and_optimize.py`](../../examples/crewai/03_evaluate_and_optimize.py)
+- [`03_evaluate_and_optimize.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/03_evaluate_and_optimize.py)
   -- introspect + evaluate + `CoordinateAscentOptimizer` on one crew.
-- [`04_multi_agent_and_training.py`](../../examples/crewai/04_multi_agent_and_training.py)
-  + [`crewai.train.yaml`](../../examples/crewai/crewai.train.yaml) -- two-agent
+- [`04_multi_agent_and_training.py`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/04_multi_agent_and_training.py)
+  + [`crewai.train.yaml`](https://github.com/CodeHalwell/ADAPT-Agent/blob/main/examples/crewai/crewai.train.yaml) -- two-agent
   crew governed as one unit, optimized with `make_default_optimizer` (tool
   ablation + adversarial recommendations), plus the YAML `run_training` path.

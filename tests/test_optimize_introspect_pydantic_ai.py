@@ -194,7 +194,16 @@ def test_a_real_agent_binds_whichever_prompt_field_it_was_built_with(kwarg: str)
     prompt.write("Be brief.")
     assert prompt.read() == "Be brief."
     populated = "_instructions" if kwarg == "instructions" else "_system_prompts"
-    assert list(getattr(agent, populated)) == ["Be brief."]
+    assert _texts(getattr(agent, populated)) == ["Be brief."]
+
+
+def _text_or_callable(item: object) -> object:
+    """An entry's text (or callable), looking through a ``SourcedInstruction``."""
+    return getattr(item, "instruction", item)
+
+
+def _texts(entries: object) -> list[object]:
+    return [_text_or_callable(item) for item in entries]  # type: ignore[attr-defined]
 
 
 # -- a prompt field may hold callables as well as strings ----------------------
@@ -279,7 +288,7 @@ def test_a_real_agent_with_a_dynamic_instruction_binds_its_static_text(kwarg: st
 
     prompts[0].write("Be brief.")
     populated = "_instructions" if kwarg == "instructions" else "_system_prompts"
-    assert list(getattr(agent, populated)) == ["Be brief.", _dynamic]
+    assert [_text_or_callable(i) for i in getattr(agent, populated)] == ["Be brief.", _dynamic]
 
 
 # -- static text can sit on both sides of a callable ---------------------------
@@ -372,9 +381,9 @@ def test_a_real_round_trip_leaves_the_rendered_prompt_identical(
     """The property that matters is the text the model receives, not the list.
 
     An adjacent pair does collapse into one element -- two strings cannot be
-    recovered from their join -- and that is safe only because `\n` is the
-    separator Pydantic AI puts between them, which this asserts rather than
-    assumes.
+    recovered from their join -- and that is safe only because the separator the
+    getter joins with is the one Pydantic AI renders them with, which this
+    asserts rather than assumes.
     """
     import pydantic_ai  # type: ignore[import-not-found]
     from pydantic_ai.models.test import TestModel  # type: ignore[import-not-found]
@@ -396,3 +405,114 @@ def test_a_real_round_trip_leaves_the_rendered_prompt_identical(
     prompt = next(p for p in introspect(agent) if p.kind is ParameterKind.PROMPT)
     prompt.write(prompt.value)
     assert rendered(agent) == before
+
+
+# -- a written value reaches the model on the next run --------------------------
+
+
+def _requests(agent: object) -> list[list[str]]:
+    """Run ``agent`` offline and return the instructions each request carried."""
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart  # type: ignore[import-not-found]
+    from pydantic_ai.models.function import AgentInfo, FunctionModel  # type: ignore[import-not-found]
+
+    seen: list[list[str]] = []
+
+    def respond(messages: list[object], info: AgentInfo) -> ModelResponse:
+        seen.append(
+            [m.instructions for m in messages if isinstance(m, ModelRequest) and m.instructions]
+        )
+        return ModelResponse(parts=[TextPart("ok")])
+
+    agent.model = FunctionModel(respond)  # type: ignore[attr-defined]
+    agent.run_sync("hi")  # type: ignore[attr-defined]
+    return seen
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("pydantic_ai") is None,
+    reason="pydantic-ai is not installed",
+)
+def test_a_tuned_instruction_is_what_the_model_receives_on_the_next_run() -> None:
+    """A write that leaves the agent unable to run is worse than no write.
+
+    Entries of `_instructions` are wrapped objects on current releases; a bare
+    string written into the list made the next run raise `AttributeError`.
+    """
+    import pydantic_ai  # type: ignore[import-not-found]
+
+    agent = pydantic_ai.Agent("test", instructions=["You are terse.", _dynamic])
+    prompt = next(p for p in introspect(agent) if p.kind is ParameterKind.PROMPT)
+    assert _requests(agent) == [["You are terse.\n\nand be British"]]
+
+    prompt.write("Be verbose.")
+    assert prompt.read() == "Be verbose."
+    assert _requests(agent) == [["Be verbose.\n\nand be British"]]
+    assert not prompt._write_failed
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("pydantic_ai") is None,
+    reason="pydantic-ai is not installed",
+)
+def test_introducing_a_prompt_on_a_callable_only_agent_runs() -> None:
+    import pydantic_ai  # type: ignore[import-not-found]
+
+    agent = pydantic_ai.Agent("test", instructions=[_dynamic])
+    prompt = next(p for p in introspect(agent) if p.kind is ParameterKind.PROMPT)
+    prompt.write("Be brief.")
+    assert _requests(agent) == [["Be brief.\n\nand be British"]]
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("pydantic_ai") is None,
+    reason="pydantic-ai is not installed",
+)
+def test_a_failed_prompt_write_raises_and_leaves_the_agent_runnable() -> None:
+    import pydantic_ai  # type: ignore[import-not-found]
+
+    agent = pydantic_ai.Agent("test", instructions="You are terse.")
+    setter = next(p for p in introspect(agent) if p.kind is ParameterKind.PROMPT).setter
+    assert setter is not None
+    with pytest.raises(TypeError):
+        setter(None)
+    assert _requests(agent) == [["You are terse."]]
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("pydantic_ai") is None,
+    reason="pydantic-ai is not installed",
+)
+def test_a_real_agents_tools_are_a_searchable_knob_that_reaches_the_run() -> None:
+    import pydantic_ai  # type: ignore[import-not-found]
+    from pydantic_ai.messages import ModelResponse, TextPart  # type: ignore[import-not-found]
+    from pydantic_ai.models.function import AgentInfo, FunctionModel  # type: ignore[import-not-found]
+
+    def search(q: str) -> str:
+        """Search."""
+        return q
+
+    def calc(x: int) -> int:
+        """Calculate."""
+        return x
+
+    agent = pydantic_ai.Agent("test", tools=[search, calc])
+    tools = next(p for p in introspect(agent) if p.name == "agent.tools")
+    assert tools.kind is ParameterKind.TOOL
+    assert [t.name for t in tools.read()] == ["search", "calc"]
+    assert len(tools.candidates) == 3
+
+    offered: list[list[str]] = []
+
+    def respond(messages: list[object], info: AgentInfo) -> ModelResponse:
+        offered.append([t.name for t in info.function_tools])
+        return ModelResponse(parts=[TextPart("ok")])
+
+    agent.model = FunctionModel(respond)
+    tools.write(tools.candidates[2])  # drop `calc`
+    agent.run_sync("hi")
+    assert offered == [["search"]]
+
+    with pytest.raises(TypeError):
+        assert tools.setter is not None
+        tools.setter(["not a tool"])
+    assert [t.name for t in tools.read()] == ["search"]

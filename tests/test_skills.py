@@ -386,6 +386,9 @@ _EXAMPLE_OBJECTS = {
     "skill": "adapt_agent.skills:Skill",
     "exc": "adapt_agent.exceptions:SecurityBlockedError",
     "source": "adapt_agent.security:TaintSource",
+    "gate": "adapt_agent.core:GovernanceGate",
+    "decision": "adapt_agent.core:ToolDecision",
+    "diff": "adapt_agent.evaluation:RunComparison",
 }
 
 #: Names that legitimately are not first-party objects (user code, stdlib,
@@ -404,6 +407,10 @@ _NON_FIRST_PARTY = {
     "config",  # a dict loaded from a JSON config file
     "fw_config",  # the "firewall" sub-dict of that config
     "chat_client",  # the MAF client the user built (agent_framework)
+    "crew",  # the user's CrewAI Crew
+    "other_agent",  # a second framework agent the user built
+    "run_result",  # an OpenAI Agents RunResult (framework object, not ours)
+    "state",  # an OpenAI Agents RunState handed back for approval
 }
 
 

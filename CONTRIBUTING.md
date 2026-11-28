@@ -28,6 +28,52 @@ pip install -e ".[dev]"
 If you are working on a specific framework adapter, install its extra as well, for
 example `pip install -e ".[dev,langgraph]"`.
 
+### Testing against a real framework
+
+A plain `.[dev]` install has no agent framework -- and no `pydantic` either, since
+the core package does not depend on it -- so framework tests there run against
+stubs, which cannot notice when a framework release changes its API. To run the
+suite against the real thing, install **one** framework extra per virtualenv:
+
+```bash
+python -m venv .venv-crewai && source .venv-crewai/bin/activate
+pip install -e ".[dev,crewai]"
+pytest -o addopts=""
+```
+
+Use a separate environment per framework (`langgraph`, `pydantic-ai`, `crewai`,
+`openai-agents`, `claude-agent`, `google-adk`, `microsoft-agent-framework`). They
+constrain each other's dependencies: CrewAI pins `openai<3`, which holds the OpenAI
+Agents SDK and Pydantic AI back, and a resolver given both quietly picks an old
+CrewAI. That is also why `adapt-agent[all]` leaves CrewAI out. The per-framework
+tests are written to run against exactly one framework, so a single environment
+with several frameworks is not a supported way to run the suite either.
+
+Tests that need a framework (`tests/test_real_<framework>.py`) -- or `pydantic`,
+which most frameworks pull in but the dev-only environment does not have -- must
+call `pytest.importorskip(...)`, so they skip in the dev-only environment and run
+in the matching one. A test module that imports either at module level breaks
+collection of the whole main CI job. `tests/conftest.py` sets
+`OPENAI_AGENTS_DISABLE_TRACING=1` before any test imports the OpenAI Agents SDK,
+so the suite never exports traces over the network; keep tests offline (no API
+keys exist in CI).
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main`, every pull request, a
+weekly schedule (Mondays, 05:17 UTC -- so an upstream framework release that
+breaks the library is noticed without a commit), and as the gate of a release:
+
+| Job | What it runs |
+| --- | --- |
+| `lint` | `ruff check .`, `black --check .`, `mypy adapt_agent`, and `scripts/check_action_refs.py` (every workflow action ref resolves). |
+| `test` | `pip install -e ".[dev]"` -- **no framework, no pydantic** -- and the whole suite with `--cov-fail-under=85`, on Python 3.10, 3.11, 3.12, 3.13 and 3.14. |
+| `frameworks` | One job per framework extra (`langgraph`, `pydantic-ai`, `crewai`, `openai-agents`, `claude-agent`, `google-adk`, `microsoft-agent-framework`), each `.[dev,<extra>]` at its latest release on Python 3.12, running the whole suite so the `test_real_*` files execute. |
+| `frameworks-floor` | The same, with each framework pinned to the minimum its extra declares. It is `continue-on-error` (non-blocking) until it has been seen green; if you change a floor in `pyproject.toml`, this job is what validates it. |
+| `mutation` | `scripts/mutation_check.py` (below). |
+| `held-out` | The base branch's tests against your change (below). |
+| `build` | Builds the sdist and wheel, installs the wheel and smoke-tests the import. |
+
 ### Pre-commit hooks
 
 We use [pre-commit](https://pre-commit.com/) to run formatting and linting before
@@ -93,8 +139,9 @@ counter-example; pin it with `@example(...)` once fixed.
 ### Held-out check
 
 On a pull request CI also runs the **base branch's** tests against your code
-(`scripts/heldout_check.py`). It fails when your change alters behaviour that an
-existing test pinned — including when you updated that test to match. That is
+(`scripts/heldout_check.py`), and requires every base-branch mutant to still
+exist, so a mutant cannot be deleted to make a change pass. It fails when your
+change alters behaviour that an existing test pinned — including when you updated that test to match. That is
 often exactly right; it means the change amends the specification, and a
 maintainer confirms it by applying the `spec-amendment` label. Say in the PR
 description which existing tests you changed and why. To run it locally:
@@ -109,9 +156,9 @@ python scripts/heldout_check.py --base /tmp/base
 Before opening a pull request, make sure the following all pass:
 
 ```bash
-ruff check .        # Lint
-black .             # Format
-mypy adapt_agent    # Static type checking
+ruff check adapt_agent tests examples scripts   # Lint
+black adapt_agent tests examples scripts        # Format (CI runs black --check)
+mypy adapt_agent                                # Static type checking
 ```
 
 ADAPT-Agent ships a PEP 561 `py.typed` marker, so the public API is expected to be
@@ -127,7 +174,12 @@ Contributions are welcome across the library, including:
 - **Adapters** (`adapt_agent/adapters`) — all adapters share the
   `GovernedAdapter` base; adding support for a new framework is usually a thin
   subclass. New framework integrations are a great place to help.
-- **CLI** (`adapt_agent/cli`) — `info`, `validate`, and `monitor` commands.
+- **Framework bindings** (`adapt_agent/integrations`) — governance bound to each
+  framework's own seams (middleware, hooks, plugins, guardrails), all deciding
+  through `GovernanceGate`. A change here needs a `tests/test_real_<framework>.py`
+  test run against the real SDK in that framework's own environment.
+- **CLI** (`adapt_agent/cli`) — `info`, `validate`, `monitor`, `evaluate`,
+  `optimize`, `train`, `install` and `skills` (see [docs/cli.md](docs/cli.md)).
 - **Optimization, adversarial defense, evaluation, observability, and patches.**
 
 For security-relevant changes, please also read [SECURITY.md](SECURITY.md). Do not

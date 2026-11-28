@@ -20,14 +20,22 @@ policy.add_rule(
     name="no_passwords",
     description="Block messages that mention a password",
     condition="'password' in message['content']",
-    action="block",      # one of: warn (default), block, modify
+    action="block",      # one of: warn (default), block, modify, require_approval
     severity="high",     # one of: low, medium, high, critical
 )
 ```
 
+Both sets are closed and spelled exactly (`VALID_ACTIONS` /
+`VALID_SEVERITIES` in the `adapt_agent.core.policy` module). `add_rule` raises
+`ValueError`, naming the valid values, for anything else -- `"Block"`, `"deny"`
+and `"blok"` used to be accepted and then enforced nothing, because the gate
+compares `action == "block"`. `register_handler` validates its action the same
+way, since a handler for an unknown action could never run.
+
 `add_rule` enforces a **1024-character limit** on the condition string and raises
 `ValueError` if exceeded (CPU-exhaustion DoS protection — long strings are
-expensive to parse into ASTs):
+expensive to parse into ASTs), and a limit of **200 AST nodes** on the parsed
+condition:
 
 ```python
 policy.add_rule("big", "too long", condition="x" * 2000)
@@ -77,7 +85,7 @@ policy.add_rule(
     policy.add_rule("long", "too long", condition="len(state['context']) > 0")
     # ValueError: Unsupported construct in condition: Call (...)
     policy.add_rule("typo", "typo", condition="stat['trust_score'] < 0.5")
-    # ValueError: Unknown name 'stat' in condition; only ['message', 'state'] are available
+    # ValueError: Unknown name 'stat' in condition; only ['message', 'state', 'tool'] are available
     ```
 
 ---
@@ -93,24 +101,36 @@ supported:
 | Category | Supported forms |
 |----------|-----------------|
 | Literals | numbers, strings, `True`/`False`/`None` (`ast.Constant`) |
-| Names | variables in the evaluation context (`message`, `state`) |
+| Names | variables in the evaluation context (`message`, `state`, and `tool` for [tool-scoped rules](#tool-scoped-rules-and-check_tool)) |
 | Collections | list `[...]`, tuple `(...)`, set `{...}`, dict `{k: v}` |
 | Comparisons | `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `not in` (chained allowed) |
 | Boolean ops | `and`, `or` |
-| Arithmetic | `+`, `-`, `*`, `/` (binary) |
+| Arithmetic | `+`, `-`, `/` (binary); `*` between **numbers** only; negative numeric literals |
 | Subscripts | `obj[key]` / `obj[index]` (single index only) |
 
 Chained comparisons work as in Python (`0 < x < 10`). Subscript failures
 (`KeyError`/`IndexError`/`TypeError`) return `None` rather than raising.
 
+`*` refuses sequences (`'a' * 400000000`, `[0] * n`): repetition allocates
+without bound, so a condition could exhaust memory on one check. It is an
+evaluation error, so the usual fail-closed rule applies. `**` is not available
+at all.
+
+A **non-finite number is never compared**: `NaN > 100` is `False`, which would
+make a threshold rule a quiet pass for exactly the value that should worry you,
+so a comparison with `NaN` or an infinity is an evaluation error (fail-closed
+under the default).
+
 ### Not supported (rejected)
 
 - **Function calls** — `len(...)`, `str(...)`, `any(...)`, etc.
 - **Attribute access** — `message.content`, `obj.attr`.
-- **Slices** — `seq[1:2]` raises `"Slices are not supported"`.
-- **Unary not / bitwise / power / modulo** and any other operator not listed.
-- **Unknown variables** — referencing a name not in the context raises
-  `"Unknown variable: ..."`.
+- **Slices** — `seq[1:2]` (`"Slices are not supported in conditions"`).
+- **Unary `not` / `~` / unary minus on an expression / bitwise / power / modulo**
+  and any other operator not listed. (A negative *literal* such as `-1` or
+  `-0.5` is supported, including as an index: `state['messages'][-1]`.)
+- **Unknown names** — any name other than `message`, `state` and `tool`
+  (`"Unknown name 'x' in condition; ..."`).
 
 Every item above is detectable from the condition text alone, so `add_rule`
 (and `adapt validate`) rejects it with a `ValueError` at registration. What
@@ -133,9 +153,10 @@ was a rule that looked installed and never fired.
     `check_state` puts only `state` in scope and `check_message` only
     `message`. A rule naming the other one cannot be evaluated, so under the
     default it is reported as violated on every call. Keep `message` rules and
-    `state` rules on **separate** `PolicyEnforcer` instances. A governed
-    adapter only ever calls `check_state`, so the enforcer you give it should
-    hold `state` rules only.
+    `state` rules on **separate** `PolicyEnforcer` instances. The governance
+    gate (every adapter and framework binding) calls only `check_state` and
+    `check_tool`, so the enforcer you give it should hold `state` rules and
+    [tool-scoped rules](#tool-scoped-rules-and-check_tool) only.
 
 !!! note "Changed in 0.5.0"
     The default was `fail_closed=False`. Pass it explicitly to keep the old
@@ -196,9 +217,10 @@ rather than a silent verdict.
 
 ### Depth limit
 
-Evaluation is bounded to a recursion depth of **50**; deeper expressions raise
-`"Maximum evaluation depth exceeded (DoS protection)"`, also caught and treated
-as no violation.
+Evaluation is bounded to a recursion depth of **50**. A condition deeper than
+that could only ever error, so `add_rule` / `validate_condition` refuse it at
+registration; the run-time check (`"Maximum evaluation depth exceeded"`) remains
+as a backstop.
 
 ### Examples that work
 
@@ -238,20 +260,113 @@ policy.check_message({"role": "user", "content": "password: hunter2"})
 # prints: BLOCKED by rule no_passwords (severity=high)
 ```
 
-The LangGraph adapter inspects rule actions directly: a fired rule whose
-`action == "block"` causes a `SecurityBlockedError` when
-`block_on_violation=True`. See [Framework Adapters](adapters.md).
+The governance gate behind every adapter and framework binding inspects rule
+actions directly: a fired state rule whose `action == "block"` refuses the
+request (a `SecurityBlockedError`, reported with the threat label
+`policy:<rule name>`) when `block_on_violation=True`; `warn` and `modify` rules
+are recorded but do not block. See [Framework Adapters](adapters.md).
+
+**A handler cannot weaken a verdict.** The violation is counted and recorded
+*before* the handler runs. If the handler raises, the failure is logged
+(`logger.exception`), the remaining rules are still evaluated, and the violation
+stands -- so a buggy handler cannot hide a later `block` rule or turn a
+violation into a pass. The one exception is `SecurityBlockedError`: a handler
+may raise that on purpose to refuse the request, and it propagates.
+
+---
+
+## Tool-scoped rules and `check_tool`
+
+A rule whose condition names `tool` is **tool-scoped**. It is evaluated only by
+`check_tool`, and skipped by `check_state` / `check_message`, so tool rules can
+share an enforcer with ordinary ones without tripping the fail-closed "name not
+in scope" violation. `tool` is `{"name": str, "arguments": ...}`, and `state` is
+also in scope when the caller passes one:
+
+```python
+policy.add_rule(
+    "no_wire_when_untrusted", "Wire transfers need a trusted session",
+    "tool['name'] == 'wire_transfer' and state['trust_score'] < 0.8", action="block",
+)
+policy.add_rule(
+    "approve_large_refunds", "A human signs off refunds over 500",
+    "tool['name'] == 'refund' and tool['arguments']['amount'] > 500",
+    action="require_approval",
+)
+violated = policy.check_tool({"name": "refund", "arguments": {"amount": 900}}, state=session)
+```
+
+`check_tool` returns the violated rule names; look each up with `get_rule` to act
+on its `action`. `require_approval` asks for a human decision instead of
+refusing: a framework that can pause a tool call surfaces it, and
+`ToolDecision.resolve(approvals_supported=False)` turns it into a block. It is
+**only valid on a tool-scoped rule** -- a message or state that already arrived
+cannot be paused, so `add_rule` raises `ValueError` rather than install a rule
+nothing could act on. Everything above applies unchanged: an unevaluable tool
+rule (say it reads `state[...]` and the caller passed no state) is a violation
+under the default fail-closed setting.
 
 ---
 
 ## Inspecting violations
 
-Violations are recorded with the rule name, type (`"message"` or `"state"`),
-severity, timestamp, and the offending data. The store is bounded by
-`max_violations` (oldest dropped first).
+Violations are recorded with the rule name, type (`"message"`, `"state"` or
+`"tool"`), severity, timestamp, and a **bounded summary** of the offending data.
+The store is bounded by `max_violations` (oldest dropped first).
+
+The summary is not the object. It holds the type, the size, up to 20 key names
+(each cut to 64 characters) and the `role` / `name` string if there is one --
+never the values. The live state keeps changing after a violation, and keeping a
+reference to it would both show later conversation turns under an earlier
+violation and pin arbitrary user content in memory.
 
 ```python
 policy.get_violations()                              # all
 policy.get_violations(severity="high")               # filter by severity
 policy.get_violations(severity="high", limit=10)     # most recent 10 high
 ```
+
+---
+
+## Concurrency
+
+`check_state`, `check_message` and `check_tool` evaluate a snapshot of the rule
+set, so rules may be added or removed from another thread while checks run, and
+the per-rule counters (`get_rule_stats`, `vacuous_rules`) are updated under a
+lock.
+
+---
+
+## Trust and taint guarantees
+
+These are the companions the policy engine is normally run with.
+
+**`TrustManager`**
+
+- `update_trust_score` rejects a non-finite or non-numeric delta with
+  `ValueError` (`min(1.0, nan)` is `1.0`: a NaN delta would pin any agent at full
+  trust).
+- Eviction cannot launder distrust. An agent scoring below
+  `max(distrust_floor, initial_trust)` is never evicted while another entry could
+  be, because eviction resets an agent to `initial_trust` -- a trust *increase*.
+  Churning throwaway ids therefore cannot flush a distrusted agent. The memory
+  cap is still a hard bound: if every slot holds a distrusted agent, the
+  least-distrusted one is dropped and a warning is logged.
+
+**`TaintTracker`** (fail-closed, and levels only go up)
+
+- A tainted item evicted from the bounded data map is not forgotten: its level is
+  kept in a second bounded map, so it still reads as tainted at that level, and
+  taint propagated from it carries the same floor.
+- If that map overflows too, the tracker is *saturated*
+  (`get_stats()["saturated"]`): any id it has no record of reads as tainted at the
+  highest level it had to forget. This is the trade-off -- a flood of junk ids can
+  degrade a long-lived tracker to "unknown means tainted", an availability cost,
+  but can no longer make real taint read clean. `reset()` clears it.
+- `mark_tainted(x, [])` is a no-op, so empty marks cannot push real taint out.
+- `register_source` raises `ValueError` if the id is already registered at a
+  higher level (or was evicted while referenced at a higher level): re-registering
+  at `LOW` would silently downgrade everything it had tainted.
+
+`MemorySystem` and `PatchManager` take a lock around their shared state; a
+re-registered patch id is no longer reported as already applied.

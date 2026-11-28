@@ -7,6 +7,483 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**Upgrading from 0.5.1:** this release adds tool-call governance to every
+framework binding and tightens a long list of controls that were accepted and
+did nothing, or reported success on failure. Read *Behaviour changes to check
+before upgrading* first: several of them can make a request, an eval or an
+optimisation run fail where it used to pass.
+
+### Behaviour changes to check before upgrading
+
+Things that can change a result, or raise where nothing raised before. Where
+the old behaviour is still available, the option is named.
+
+**Governance and detection**
+
+- **`PolicyEnforcer.add_rule` rejects an unknown `action` or `severity`**
+  (`ValueError`), and `register_handler` rejects an unknown action. The closed
+  sets are `adapt_agent.core.policy.VALID_ACTIONS` (`warn`, `block`, `modify`,
+  `require_approval`) and `VALID_SEVERITIES` (`low`, `medium`, `high`,
+  `critical`). A typo such as `"Block"` or `"deny"` used to register, never
+  match the adapters' `== "block"` check, and so never block. **A config that
+  contains one now fails to load.** `require_approval` is valid only on a
+  tool-scoped rule.
+- **`*` in a condition is numeric-only, and a comparison with NaN or an
+  infinity is an evaluation error.** `'a' * 400000000` and `[0] * n` used to
+  allocate without bound; `NaN > 100` used to be `False`, a quiet pass for the
+  value a threshold rule exists to catch. Both now follow `fail_closed`: a
+  violation under the default. Negative numeric literals (`state['m'][-1]`,
+  `x > -1`) are now *accepted* where they used to be rejected.
+- **A violation's `data` in the history is a bounded summary, not the live
+  state object.** Code that read mutable state back out of the violation
+  history now gets a summary.
+- **`AdversarialDefense` flags input over 100,000 characters** as
+  `content_too_long`, unscanned (`max_content_length=None` removes the cap), and
+  **catches much more than before**: soft-hyphen and other invisible-character
+  obfuscation, Unicode tag characters, base64 / hex / percent-encoded payloads,
+  rot13 / reversed / leetspeak spellings, Cyrillic and Greek look-alikes, and
+  forged role markers. Existing traffic will see more detections, and a new
+  **`role_spoofing`** threat label appears beside `prompt_injection` and
+  `jailbreak`. The over-broad bare `act as`, `you are now` and `developer mode`
+  rules were narrowed, so some previous hits no longer fire. Roll out in
+  report-only mode (`block_on_violation=False`) first.
+- **The gate scans content it used to skip and reports content it cannot read.**
+  `extract_texts` now reaches mappings, sets, bytes, attrs / msgspec /
+  `__slots__` objects, tool arguments and results, reasoning blocks and
+  Microsoft Agent Framework message contents. A payload it cannot read in full
+  (nested too deep, over the node budget, a one-shot iterator, a container that
+  raises) now yields an **`unscannable`** threat, and a payload over
+  `GovernanceGate(max_payload_chars=4_000_000)` yields **`payload_too_large`**;
+  both block like any other finding. **Inputs that used to pass may now block.**
+- **Output a pre-middleware changed is screened again**, and a non-dict input
+  combined with pre-middleware (a LangGraph `Command` included) raises
+  `AdapterError` instead of bypassing it.
+- **`Firewall(normalize=True)` is opt-in and off by default**, so existing
+  deployments' patterns match what they did. Turn it on for new ones.
+- **A shared `gate=` combined with a control raises `ValueError`.** A binding
+  factory given `gate=` together with `firewall=`, `defense=`,
+  `policy_enforcer=` or `tool_policy=` used to keep the gate and drop the
+  control without a word, so a tool policy could be configured and never
+  consulted. Put the control on the `GovernanceGate`, or drop `gate=`.
+
+**Observability**
+
+- **`AgentObserver.record_metric` rejects NaN and infinities** (`ValueError`),
+  stored error text is capped at `max_error_length` (200 characters by default),
+  and the getters return snapshots rather than live references.
+
+**Claude Agent SDK**
+
+- **Claude hooks no longer run plain state rules against tool calls.** The hook
+  used to hand the policy enforcer the raw hook dict, so under the default
+  fail-closed enforcer every state rule blocked every tool call. State rules now
+  run on `UserPromptSubmit`; tool calls go through the gate's tool API, where
+  tool-scoped rules apply. `PreToolUse` returns the typed `permissionDecision`
+  (`deny` or `ask`, never `allow`) instead of the legacy top-level `decision`.
+- **The Claude optimiser can no longer search `permission_mode`.**
+  `permission_mode` and `disallowed_tools` are read-only to introspection and
+  tool lists can only be narrowed; `bypassPermissions` used to be a search
+  candidate. The dead `max_thinking_tokens` knob is replaced by `effort`.
+
+**Evals and the CLI**
+
+- **Default metric semantics changed**, because the old ones scored wrong
+  answers as right. `exact_match` strips punctuation only at token edges (`-5`
+  no longer equals `5`) and normalises with NFKC and case-folding
+  (`exact_match(punctuation="all")` restores the old behaviour); `contains`
+  matches on word boundaries (`contains(word_boundary=False)`); `numeric_close`
+  reads the number after the last answer marker, else the last number
+  (`numeric_close(which="first")`); `regex_match` with an empty pattern is a row
+  error rather than a pass of 1.0, and refuses catastrophic patterns;
+  `json_subset` is recursive and type-strict (`json_subset(strict_types=False)`);
+  a metric that returns NaN or raises is a row error, no longer clamped to 1.0.
+- **An exception raised by the agent under test counts as that row failing**,
+  unless it shows infrastructure provenance (a provider SDK or HTTP client in its
+  cause chain, an HTTP status attribute, or a status in its message). It used to
+  be dropped as transient, so a failing agent could print `1.0000`.
+- **`adapt evaluate` can exit non-zero.** `0` ran and every gate passed; `1`
+  could not run (bad arguments, the target, dataset or judge failed to load, an
+  empty dataset); `2` usage error; `3` `--fail-under` missed; `4` rows errored
+  with `--fail-on-error` -- **and always** when every row errored; `5` rows
+  dropped as transient with `--fail-on-incomplete` -- **and always** when every
+  row was; `6` regressed against `--baseline` with `--fail-on-regression`. A CI
+  step that ignored the exit status of an eval that scored 0% now fails.
+
+**Optimisers**
+
+- **`improved` means a statistically significant gain.** A candidate is accepted
+  only when it wins an exact paired sign-flip test (`alpha=0.05`, a minimum gain
+  of `min_improvement=1e-3`), and the final verdict needs a gain on held-out data
+  (a `val_dataset`, or an automatic split from 38 rows up). On a sample of fewer
+  than five rows the best guess is still applied, but `result.improved` and
+  `result.significant` are `False`; pass `allow_small_sample=False` to apply
+  nothing that is not significant. **A script that asserted `result.improved` on
+  a toy dataset will now fail.**
+- **`validation_tolerance` is inert** and warns (`FutureWarning`): the gate
+  requires a gain on held-out data, not a bounded loss.
+
+**Providers, the judge and retry**
+
+- **Judge scores outside the scale, NaN and infinity are errors**, routed to
+  `on_error`, not clamped to 1.0. **Provider configuration errors raise**
+  instead of being swallowed as a judge score of `0.0`. Truncated, refused and
+  empty responses raise typed errors (`TruncatedResponseError`,
+  `RefusedResponseError`, `EmptyResponseError`) that the judge records as errors
+  rather than grades. `LLMJudge.compare()` returns `"tie"` unless the model gave
+  an explicit verdict.
+- **Default model IDs changed.** Anthropic `claude-opus-4-8` is now
+  `claude-opus-5-5`; OpenAI `gpt-4o-mini` is now `gpt-5.6-luna`; Gemini
+  `gemini-2.0-flash` is now `gemini-3.5-flash`. Pass `model=` to pin one. The
+  defaults for Azure, Mistral, Cohere, Groq, Together, OpenRouter, Ollama,
+  Bedrock and Hugging Face are unchanged and **not re-verified** against those
+  vendors' current catalogues.
+- **SDK clients are built with `max_retries=0`**, so the library's own retry is
+  the only one and retries no longer multiply (SDK retries times library
+  retries). Code that relied on the SDK's built-in retries gets `RetryPolicy`'s
+  (three attempts) instead.
+- **Azure OpenAI needs an explicit API version** (`api_version=` or
+  `OPENAI_API_VERSION`); none is assumed.
+
+**Packaging and frameworks**
+
+- **Extras floors were raised** to each framework's current major line:
+  `langgraph>=1.0` (plus `langchain>=1.0`), `google-adk>=2.0`,
+  `pydantic-ai>=2.0`, `crewai>=1.0`, `openai-agents>=0.20` and
+  `claude-agent-sdk>=0.2`. The `microsoft-agent-framework` extra now installs
+  `agent-framework-core`, not the `agent-framework` meta-package. **`[all]` no
+  longer includes CrewAI** (it pins `openai<3`, which holds the other frameworks
+  back): install `adapt-agent[crewai]` in its own environment.
+- **LangGraph's `create_react_agent` hooks are deprecated upstream.**
+  `langgraph.prebuilt.create_react_agent` moved to `langchain.agents.create_agent`.
+  `governance_hooks` keeps working with it, but `create_agent` has no hook
+  parameters (`create_agent(..., **governance_hooks())` raises `TypeError`); use
+  `middleware=[governance_middleware(...)]`.
+
+### Added
+
+**Tool-call governance core**
+
+- **`GovernanceGate.check_tool_call(tool_name, arguments, *, state=None)` and
+  `check_tool_result(...)`** return a `ToolDecision` and never raise;
+  `review_tool_call` / `review_tool_result` do the same but raise
+  `SecurityBlockedError` on a block. The agent's boundary is the wrong place to
+  stop an agent doing something -- by the time the final answer is screened the
+  tool has run -- and every supported framework has a seam around the single
+  tool call.
+- **`ToolDecision`**: `action` (`"allow"`, `"block"` or `"ask"`), `tool_name`,
+  `threats`, `report_only`, `agent_id`, the properties `.allowed`, `.blocked`
+  and `.needs_approval`, a content-free one-line `.reason` safe to show the
+  model, and `.resolve(approvals_supported=...)`, which turns an `"ask"` into a
+  `"block"` where the framework cannot pause for a human (an ask never becomes
+  an allow).
+- **`ToolPolicy(allow=None, deny=(), require_approval=())`**: shell-style glob
+  lists matched against the tool name (`"mcp__*"`, `"delete_*"`). Deny beats the
+  allow-list, which beats approval, and a bare string is refused rather than
+  split into letters. Pass it as `GovernanceGate(tool_policy=...)`, to
+  `build_gate`, or to any binding.
+- **Tool-scoped policy rules and `PolicyEnforcer.check_tool(tool, state=None)`.**
+  A rule whose condition names `tool` (`{"name", "arguments"}`) is evaluated only
+  there and skipped by `check_state` / `check_message`, so tool rules can share
+  an enforcer with ordinary ones. A new action, **`require_approval`**, asks for
+  a human decision instead of refusing; `add_rule` raises on it for a rule that
+  is not tool-scoped, and `adapt validate` accepts it on tool-scoped rules.
+- **Adapters forward run keyword arguments.** `execute(input_data, **run_kwargs)`
+  and `aexecute(...)` pass extra keyword arguments to the framework's run method
+  (a LangGraph `config`, Pydantic AI `deps`, an OpenAI Agents `session`).
+- `GovernanceGate(max_payload_chars=)`; `walk_texts`, `TextExtraction` and
+  `UNSCANNABLE` in `adapt_agent.core.governance`; `GovernedAdapter(tool_policy=,
+  max_payload_chars=)`.
+
+**Per-framework bindings.** Each takes `tool_policy=` and `observer=`, and
+either a shared `gate=` or the individual `firewall=` / `defense=` /
+`policy_enforcer=` controls, with `block_on_violation=` and `agent_id=`.
+
+- **LangGraph / LangChain v1**: `governance_middleware()` (a `create_agent`
+  middleware: model input and output in `wrap_model_call`, tool calls and results
+  in `wrap_tool_call`; an ask raises a LangGraph `interrupt()` compatible with
+  `HumanInTheLoopMiddleware` and fails closed without a checkpointer),
+  `governance_tool_wrapper()` (for a hand-built `ToolNode`),
+  `governance_callback_handler()` (a run-level, abort-only net that reaches
+  sub-agents) and `screen_stream=True` (holds a model response until it has been
+  screened). The adapter gains governed `stream` / `astream`, keeps v2 interrupts
+  and policy-checks a `Command` resume against the checkpointed state.
+- **Pydantic AI**: `governance_capability()`, a capability that screens the
+  prompt, message history and tool results at `before_model_request`, governs
+  every tool call and result (MCP included), maps an ask to `ApprovalRequired` /
+  `DeferredToolRequests`, screens text and structured output, and holds streamed
+  output at the model until it is screened. It attaches per agent or per run. The
+  adapter forwards `deps`, `model_settings`, `usage_limits` and deferred tool
+  results, and screens `message_history` and `deferred_tool_results` as input.
+  `install_governance` and
+  `governance_output_validator` stay output-only (an existing agent cannot be
+  given a capability) and now refuse `tool_policy`.
+- **CrewAI**: `governance_hooks()` / `CrewAIGovernance` bind `crewai.hooks`
+  (CrewAI 1.15+) around every tool call and result (MCP included), model call,
+  task and flow step and run boundary, for every agent, scoped by a context
+  manager (`install_hooks()` registers process-wide). A block raises
+  `GovernanceBlocked`, both a `HookAborted` and a `SecurityBlockedError`. Asks go
+  to `approve=` and fail closed without one.
+  `CrewAIAdapter(hooks=True, tool_policy=, on_tool_violation=, approve=)`.
+- **OpenAI Agents SDK**: `govern_tools()` (tool input and output guardrails on
+  every function tool, following handoffs, agents-as-tools and MCP servers; an
+  ask becomes an SDK approval interruption), `governance_tool_guardrails()`,
+  `governance_run_hooks()` (every agent in a run, handoff targets included, which
+  input guardrails never reach), `governance_model_input_filter()` (screens or
+  redacts model input centrally), `govern_stream()` / `GovernedStream` (holds a
+  streamed response until it is screened) and `find_security_block()`. The
+  adapter resumes a `RunState`, forwards run kwargs, surfaces `interruptions` and
+  adds `run_streamed`. Shell, apply-patch and custom tools get approval
+  callbacks; tool kinds with no seam emit a `RuntimeWarning`.
+- **Claude Agent SDK**: `governance_hooks()` rebuilt on the gate (state rules on
+  `UserPromptSubmit`; `PreToolUse` / `PostToolUse` through the tool API;
+  `PostToolUse` replaces a flagged result through `updatedToolOutput`; matchers
+  set `on_failure="block"` and a timeout), `governance_can_use_tool()` (a
+  permission callback over the gate) and `native_tool_options()` (derives
+  `disallowed_tools` / `tools` / `strict_mcp_config` from a `ToolPolicy`, and
+  never `allowed_tools`, which auto-approves). The adapter can wrap a
+  `ClaudeSDKClient`.
+- **Google ADK**: `governance_plugin()`, a run-level `BasePlugin` that covers
+  every agent, sub-agent, `AgentTool`, `Workflow` node and MCP tool from one
+  registration on the `App`; asks use ADK's tool-confirmation flow. Also
+  `governance_callbacks()` (now with tool callbacks, and `govern_tools=False`),
+  `buffer_stream` / `stream_holdback` (screens the aggregate of streamed chunks,
+  so a match split across chunks is caught), `gate_confirmation()`,
+  `mcp_toolset_kwargs()`, and `find_security_error()` /
+  `reraise_security_blocks()` to recover the `SecurityBlockedError` ADK wraps in
+  a `RuntimeError`. The adapter accepts a `Runner` or `App`.
+- **Microsoft Agent Framework**: `governance_bundle()` returns agent, chat and
+  function middleware as one unit: the caller's input, every model call
+  (including context-provider content and session history, which agent
+  middleware never sees), and every tool call and result, MCP included. An ask
+  becomes a MAF approval request (it needs an `AgentSession`), and streams are
+  buffered behind stream gates. `governance_middleware()` keeps its signature and
+  installs the same layers; `governance_chat_middleware()`,
+  `governance_function_middleware()` and `mcp_tool_options()` are new. The
+  adapter forwards run kwargs and surfaces `user_input_requests`.
+
+**Detector and firewall**
+
+- **`role_spoofing`** threat label (chat-template tokens, role tags, forged JSON
+  roles, `END OF USER INPUT` banners, role markers other than `system:`),
+  `detect_role_spoofing()`, and a `details` field on `analyze_input` naming each
+  indicator and the view it was found in (`text`, `base64`, `tag_characters`, ...).
+- **`Firewall(normalize=True)`** also matches each blocked pattern against an
+  NFKC-normalised copy with invisible characters removed, look-alikes folded and
+  whitespace collapsed, and blocks if either form matches.
+
+**Observability**
+
+- **`AgentObserver(otel=...)`** bridges to OpenTelemetry (`otel=True` for the
+  global provider, a tracer, or an `OTelBridge`): governance spans nest under the
+  current context with GenAI semantic-convention attributes, and a blocked run is
+  an `ERROR` span. Without the package nothing changes. New `otel` extra.
+- Span ids, parent ids, timestamps and durations; structured threat labels and
+  the exception class on a failed run; `record_refusal` for refusals that happen
+  before any span opens; `record_tool_decision`, `tool_span` and
+  `get_tool_decisions` for tool-call verdicts; and a `redactor=` hook (with the
+  ready-made `redact_secrets`) that scrubs stored text.
+
+**Providers, the judge and retry**
+
+- `acomplete` and token-usage recording on providers; structured output where
+  the SDK offers it; SDK contract tests that bind each request to the real SDK
+  signature. Retry honours `retry-after-ms`, HTTP-date values and
+  `x-should-retry`, and a wait beyond `max_retry_after` fails fast.
+
+**Evals and the CLI**
+
+- **CI gating on `adapt evaluate`**: `--fail-under [METRIC=]SCORE`,
+  `--fail-on-error`, `--fail-on-incomplete`, `--baseline` with
+  `--fail-on-regression` (`--regression-tolerance`), `--output`, `--junit` and
+  `--concurrency`. Every run prints what the score covers (rows scored, errored,
+  dropped, with a metric error) and labels a partial aggregate `PARTIAL`;
+  `report.completeness()` returns the same.
+- **Trajectory metrics** `tool_called`, `tool_call_args_match`, `tool_sequence`,
+  `no_forbidden_tools` and `tool_call_budget`, with `extract_trajectory` for every
+  supported framework.
+- **Multi-turn rows** (`"turns": [...]`, `conversation_input=`), per-row latency
+  with `latency_p50` / `latency_p95`, and token usage and cost on `result.usage`.
+- **Result export and comparison** in `adapt_agent.evaluation`: `to_json`,
+  `to_junit`, `load_results` and `compare_runs`. `adapt train` gains
+  `--save-config`, and `token_f1` handles unsegmented scripts.
+
+**Optimisers**
+
+- `alpha`, `repeats`, `holdout_fraction`, `min_improvement` and
+  `allow_small_sample` on every optimiser and `make_default_optimizer`; the CLI
+  flags `--alpha`, `--repeats` and `--holdout-fraction` (also accepted under
+  `optimizer:` in a training config); and an exact sign-flip test in
+  `adapt_agent.optimization.significance`. A non-deterministic target is detected
+  (the baseline is measured twice) and each comparison is re-measured. A result
+  carries `significant`, `delta`, `p_value`, `ci_low`, `ci_high`, `n_rows`,
+  `repeats`, `alpha`, `significance_basis`, `nondeterministic`,
+  `untuned_parameters` and `rejected_reason`.
+
+**Packaging and CI**
+
+- An `otel` extra; per-framework CI jobs that install each extra and run the
+  suite against the real framework, a non-blocking job at the declared floor
+  versions, a weekly schedule and a concurrency group; packaging metadata tests.
+
+**Documentation**
+
+- Every page was checked against the code: each Python snippet parses and its
+  `adapt_agent` imports resolve, relative links and anchors resolve, every extra
+  named exists, and the docs site builds in strict mode.
+  `tests/test_docs_consistency.py` keeps it that way, including a short list of
+  retired names that must not reappear. `docs/integrations.md` and
+  `docs/frameworks/index.md` are rewritten around tool-call governance, with
+  each framework's stated gaps.
+
+### Changed
+
+- **Optimisers.** The grid no longer leaves knobs untried when the full product
+  exceeds the budget: it sweeps knob by knob, budget a stage leaves unused moves
+  to later stages, and any knob never tried is warned about and listed in
+  `untuned_parameters`. Few-shot bootstrap no longer scores demonstrations on the
+  rows they were copied from. Evolutionary survivors do not consume budget, the
+  RNG is re-seeded on every `optimize()` call, and budgets are validated up
+  front.
+- **Introspection.** Pydantic AI instructions read and write through
+  `SourcedInstruction` (a tuned prompt used to read as `''`), and the tool
+  registry binds at its current location. Google ADK is detected before probing
+  for a generic run method (which crashed on `LlmAgent`), workflow agents and
+  `Workflow` are recognised, and the deprecated `global_instruction` knob is no
+  longer offered. LangGraph binds prompt, model and tools for `create_react_agent`
+  and `create_agent` graphs, which previously yielded no parameters. OpenAI
+  Agents reaches agents behind `handoff()` and `as_tool()`, CrewAI prompt writes
+  survive kickoff re-rendering, and Microsoft Agent Framework uses the current
+  class names (`Agent`, not `ChatAgent`).
+- **Judge.** The prompt follows `score_is_normalized`, and every untrusted span
+  in `improve_prompt` and `suggest_tools` is fenced. A training config's `judge:`
+  section accepts a fixed list of keys and refuses `base_url` and `api_key`; a
+  config file is trusted code.
+- **Providers.** A keyword is sent only if the installed SDK accepts it. OpenAI
+  sends `max_completion_tokens` and remembers a rejected parameter per instance;
+  Gemini uses `system_instruction`.
+- **CrewAI examples** subclass `BaseLLM` (`LLM` is now a routing factory and they
+  all crashed), and `governance_guardrail` can be attached to a `Task` and screens
+  the answer rather than the retry transcript.
+- `examples/02_adversarial_defense.py` moves the cases that are now caught into
+  its *caught* section and lists five that still get through.
+
+### Fixed
+
+- **Detector.** The markup scanner and boundary split are linear (an
+  unterminated `<?` run of 10 KB took 3.5 s, inside the documented cap). All
+  format and combining characters, variation selectors and the tag block are
+  stripped before matching: only four code points were, so one soft hyphen
+  defeated every pattern. Phrase rules tolerate sentence-fragment punctuation. On
+  a hand-built set of 60 attacks recall rose from 11 to 55, and false positives
+  on a hard benign set fell from 28 of 43 to 9 of 43.
+- **Firewall.** The ReDoS guard parses the pattern and rejects ambiguous
+  repetition and alternation, and uses a match timeout when the `regex` module is
+  installed. Every event path stores the same redacted snippet, and log escaping
+  covers all control, line and paragraph separators.
+- **Text extraction.** A visited set and de-duplicated texts remove the repeated
+  walks that made one blocked output record thousands of events and let aliasing
+  cycles hang. A result offering both sync and async iteration is iterated
+  synchronously from `execute()`.
+- **Adapters.** A refusal made before the run starts is reported to the observer,
+  and a failed span carries the exception and its threat labels.
+- **Policy.** A handler that raises no longer stops later rules being evaluated
+  (a violation is recorded before its handler runs), and rules iterate from a
+  snapshot under a lock. `MemorySystem` and `PatchManager` iteration and
+  double-apply races are fixed.
+- **Microsoft Agent Framework** persisted a blocked response to the session
+  history, so the next model call read it. The chat layer now blocks first, and
+  output screening judges what the agent says and leaves function-call arguments
+  to the tool layer.
+- **Evals.** `exact_match` scored `-5` equal to `5`, and an agent raising its own
+  timeout had its rows dropped as transient. `optimize --save-config` no longer
+  writes `repr` strings for values that cannot round-trip; they are named under
+  `_provenance.unexportable` and not written.
+- **CrewAI.** The adapter drains and screens a streaming crew, sends a standalone
+  `Agent` its messages and prefers native `akickoff`; kickoff callbacks survive a
+  checkpoint restore instead of being silently dropped, and refuse loudly if
+  their gate is not re-registered.
+- **Google ADK.** `context_state` reads a state object that offers `to_dict()`
+  without being a `Mapping`, as ADK's `State` does; before, a policy rule gating
+  on session data saw no state and failed closed on every request.
+- **Providers.** The Anthropic SDK no longer takes `temperature` / `top_p` /
+  `top_k`, so every model outside a three-entry allow-list raised `TypeError`,
+  which the judge swallowed and scored `0.0`.
+- `SECURITY.md` lists the current release line, and the README gains a tool-call
+  governance section and an accurate project layout.
+
+### Security
+
+- **Taint cannot be laundered by eviction.** `TaintTracker` keeps a taint floor
+  for evicted data, a saturated tracker reads unknown ids as tainted, empty marks
+  are ignored, and a source level cannot be downgraded. `TrustManager` rejects
+  non-finite deltas, and eviction cannot return a distrusted agent to the initial
+  score.
+- **A hook failure no longer lets an action through.** Claude hook matchers set
+  `on_failure="block"` and an explicit timeout, and the callbacks catch their own
+  errors and return the block decision.
+- **CrewAI hooks fail closed.** A hook raising `SecurityBlockedError` let
+  `delete_db` run, because CrewAI swallows every exception except `HookAborted`;
+  a block now raises an error that is both.
+
+- **A streamed LangGraph message is screened whole even when messages
+  interleave.** `LangGraphAdapter.stream` / `astream` treated a change of message
+  id as the end of the previous message, so chunks of two messages interleaved
+  by parallel nodes or model calls were each screened in pieces and a pattern
+  split between them was delivered. Chunks are now held per message until it is
+  complete (its last chunk is marked, its node's `updates` event or a `values`
+  event arrives, or the stream ends) and released in arrival order. A streamed
+  tool call's argument fragments are assembled per call and screened whole too.
+
+### Known limitations
+
+- **Claude Agent SDK**: tool governance is **unverified against the real Claude
+  CLI**. The CLI cannot run offline, so the tests drive the hook callables with
+  inputs shaped like the SDK's `*HookInput` types and validate their outputs
+  against the SDK's output types. A built-in tool whose output schema constrains
+  a flagged field can keep its original output through `updatedToolOutput`; deny
+  such a tool in `ToolPolicy`. The SDK has no seam that holds streamed text back,
+  so the adapter drains the stream, screens it, then returns.
+- **LangGraph**: MCP tools (`langchain-mcp-adapters`) are ordinary `BaseTool`s run
+  by the same `ToolNode` and so are governed, but the package is **not in the test
+  matrix** and MCP is unverified for LangGraph. Token streaming is not screened
+  unless `screen_stream=True`, and middleware does not inherit into sub-agents.
+- **CrewAI**: A2A delegation (`Agent(a2a=...)`) emits events only and is **not
+  hooked**. A hook cannot hold back a streamed chunk (use
+  `CrewAIAdapter(hooks=True)`, which drains the stream). A task `guardrail` cannot
+  be checkpointed, and restoring `governance_callbacks` needs
+  `CREWAI_DESERIALIZE_CALLBACKS=1`.
+  `governance_hooks()` needs CrewAI's interception layer
+  (`crewai.hooks.InterceptionPoint`; verified on 1.15), which older releases
+  the `crewai` extra still admits do not have. There it raises a
+  `RuntimeError` naming the alternative (`governance_callbacks()` and
+  `governance_guardrail()`), and `tool_inspection_supported()` reports which
+  applies.
+- **OpenAI Agents SDK**: tools OpenAI runs server-side (hosted search, file
+  search, code interpreter, image generation, hosted shell) have no client-side
+  seam, and `ComputerTool` and `LocalShellTool` are governed by name only. SDK
+  tracing spans are not mirrored into `AgentObserver`. With any Pydantic plugin
+  installed (logfire) the SDK never calls a callable `needs_approval`, so every
+  call of that tool pauses.
+- **Google ADK**: live / bidi streaming (`run_live`) is not exercised by the tests
+  and cannot pause for approval, and non-text parts are not screened.
+- **Microsoft Agent Framework**: provider-hosted tools run outside the function
+  loop and are not seen, an ask needs an `AgentSession`, and the AGENT-HOOKS
+  interceptor, A2A and `as_mcp_server()` are untested.
+- **Pydantic AI**: durable-execution wrappers (Temporal, DBOS, Prefect) are
+  untested.
+- **Detector**: English-first. Six languages get a handful of translated override
+  phrases only; a payload split across strings, or assembled by the model, is not
+  joined; and text that quotes an attack, a pasted chat transcript and a question
+  about `[INST]` or `<system>` are still flagged. Base64 and data-URI payloads
+  inside tool arguments are not decoded by the gate. Treat a clean scan as
+  "nothing recognised", never as "safe".
+- **Gate**: taint and trust are not wired into the gate, and a policy is not
+  re-evaluated after a pre-middleware changes the payload.
+- **Providers**: native async clients and the Mistral, Cohere and Bedrock SDK
+  paths are not covered by contract tests, and the default model IDs of the
+  vendors named above (other than Anthropic, OpenAI and Gemini) were not
+  re-verified.
+
 ## [0.5.1] - 2026-11-15
 
 ### Added

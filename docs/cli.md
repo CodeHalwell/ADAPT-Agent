@@ -50,7 +50,7 @@ adapt-agent info
 ```
 
 ```text
-ADAPT-Agent v0.2.0
+ADAPT-Agent v0.5.1
 Adversarial Defense & Policy Training for LLM Agents
 ...
 Features:
@@ -60,6 +60,9 @@ Features:
   - Adapters: LangGraph, Microsoft Agent Framework, Google ADK,
     Pydantic AI, CrewAI, OpenAI Agents SDK, Claude Agent SDK
   - Performance optimization, evaluation and observability
+  - Golden-dataset evals: text/number checks and LLM-as-judge
+  - A bundled agent skill so coding agents can drive all of the above
+...
 ```
 
 ---
@@ -67,7 +70,10 @@ Features:
 ## `adapt-agent validate`
 
 Validates a JSON configuration file. Checks that policy-rule conditions parse,
-regex patterns compile, and action/severity values are valid.
+regex patterns compile, and action/severity values are valid. The
+`require_approval` action is accepted on **tool-scoped** rules only -- rules
+whose condition references `tool` -- because only a tool call can be paused for
+a human; on any other rule it is reported as an error.
 
 ```bash
 adapt-agent validate config.json
@@ -102,7 +108,7 @@ JSON output shape:
 {
   "status": "ready",
   "agent_id": "agent-007",
-  "version": "0.2.0",
+  "version": "0.5.1",
   "controls": {
     "policy_rules": 2,
     "firewall_blocked_patterns": 1,
@@ -131,7 +137,7 @@ adapt-agent evaluate myapp.agents:agent --data golden.jsonl --metric exact_match
 
 # Score with an LLM-as-judge (provider-agnostic) plus a built-in metric:
 adapt-agent evaluate "myapp.agents:build()" --data golden.jsonl \
-    --metric token_f1 --judge claude --judge-model claude-opus-4-8 --primary judge
+    --metric token_f1 --judge claude --judge-model claude-opus-5-5 --primary judge
 
 # Machine-readable:
 adapt-agent evaluate myapp.agents:agent --data golden.jsonl --metric exact_match --json
@@ -140,11 +146,80 @@ adapt-agent evaluate myapp.agents:agent --data golden.jsonl --metric exact_match
 Dataset files are dispatched by extension: `.json`, `.jsonl`, `.csv`. Metrics
 (`--metric`, repeatable) are any built-in: `exact_match`, `contains`,
 `regex_match`, `token_f1`, `jaccard`, `numeric_close`, `json_subset`,
-`levenshtein_ratio`. Adding `--judge PROVIDER` appends an LLM-judge metric named
-`judge` (providers include `claude`, `openai`, `gemini`, `mistral`, `cohere`,
-`groq`, `together`, `ollama`, `bedrock`, `huggingface`). `--primary` selects the
-headline metric (defaults to the first). Exit code is `0` on success, `1` on any
-error (printed as text, or `{"status": "error", ...}` with `--json`).
+`levenshtein_ratio`, `checks`, and the trajectory metrics `tool_called`,
+`tool_call_args_match`, `tool_sequence`, `no_forbidden_tools`,
+`tool_call_budget` (rows declare `expected_tools` etc. -- see
+[Running Evals](evals.md#trajectory-tool-call-evals)). Rows may also be
+multi-turn conversations (`"turns": [...]`). Adding `--judge PROVIDER` appends
+an LLM-judge metric named `judge` (providers: `claude` or `anthropic`,
+`openai`, `azure_openai`, `gemini` or `google`, `mistral`, `cohere`, `groq`, `together`,
+`openrouter`, `ollama`, `bedrock`, `huggingface`; each defaults to the model in
+`adapt_agent.optimization.providers.DEFAULT_MODELS` unless `--judge-model` is
+given). `--primary` selects the headline metric (defaults to the
+first). `--concurrency N` runs N rows at once (thread pool).
+
+Every run prints what the score covers -- rows total, scored, errored (scored
+0), dropped as transient, and with a metric error -- and any aggregate computed
+over a subset of the rows is labelled `PARTIAL` next to the number:
+
+```text
+Evaluated 'myapp.agents:agent' over 3 example(s):
+  rows: 3 total, 3 scored (2 errored, scored 0), 0 dropped as transient, 0 with a metric error
+  primary metric: exact_match = 0.3333  (over 3/3 rows)
+    - exact_match: 0.3333  (over 3/3 rows)
+  errors: 2   avg latency: 0.0003s   p50: 0.0002s   p95: 0.0009s
+    ! row 1 [ToolTimeout]: agent exceeded its step budget
+  GATE FAILED (exit 3): exact_match = 0.3333 < 0.9000 (--fail-under)
+```
+
+An exception raised by your agent counts as that row failing. Only an error
+that shows it came from a provider SDK, an HTTP client, or carries an HTTP
+status is treated as a transient infrastructure fault and dropped from the
+score ([details](evals.md#what-counts-as-transient)).
+
+### Gating CI
+
+| Option | Effect |
+|--------|--------|
+| `--fail-under [METRIC=]SCORE` | Exit `3` if the metric's aggregate is below `SCORE`. A bare number gates every metric; `METRIC=SCORE` gates one and overrides a bare value. Repeatable. An unknown metric is an error. |
+| `--fail-on-error` | Exit `4` if any row errored (the agent raised, or a metric failed). |
+| `--fail-on-incomplete` | Exit `5` if any row was dropped as transient, i.e. the score covers part of the dataset. |
+| `--baseline RESULTS.json` | Compare with a previous `--output` file: per-metric deltas, rows that regressed / improved / appeared / disappeared. |
+| `--fail-on-regression` | With `--baseline`: exit `6` if a metric's aggregate or any row's score dropped by more than `--regression-tolerance` (default `0`). |
+| `--output PATH` | Write full per-row results as JSON (the `--baseline` input). |
+| `--junit PATH` | Write JUnit XML: one testcase per row × metric; failures carry expected / actual / input (truncated; the document is size-capped). |
+
+Exit codes:
+
+| Exit | Meaning |
+|------|---------|
+| `0` | Ran; every gate passed. |
+| `1` | Could not run: the target, dataset or judge failed to load, bad option values, an empty dataset. Printed as `ERROR: ...` (or `{"status": "error", ...}` with `--json`). |
+| `2` | Command-line usage error (argparse). |
+| `3` | `--fail-under` missed. |
+| `4` | Rows errored with `--fail-on-error` -- **always** when every row errored. |
+| `5` | Rows dropped as transient with `--fail-on-incomplete` -- **always** when every row was. |
+| `6` | Regressed against `--baseline` with `--fail-on-regression`. |
+
+When several gates fail, the most severe code wins (`4`, `5`, `3`, `6`) and each
+failure is printed. With `--json`, stdout carries the summary, `completeness`,
+the per-row `rows`, a `gates` block (`passed`, `exit_code`, `failures`,
+`thresholds`) and, with `--baseline`, the comparison.
+
+Copy-paste CI step:
+
+```yaml
+- name: Agent evals
+  run: |
+    adapt evaluate "myapp.agents:build()" --data evals/golden.jsonl \
+      --metric checks --extract-output --concurrency 8 \
+      --fail-under 0.9 --fail-on-error --fail-on-incomplete \
+      --baseline evals/baseline.json --fail-on-regression \
+      --output eval-results.json --junit eval-junit.xml
+```
+
+Refresh the baseline by committing a new `--output` file from a run you accept.
+Give dataset rows an `id` so rows are matched by identity, not position.
 
 ---
 
@@ -175,20 +250,84 @@ Shares all of `evaluate`'s options, plus:
 | `--optimizer` | `default` (pipeline), `coordinate_ascent`, `bootstrap_few_shot`, `grid`, `random`, `evolutionary`. |
 | `--max-evals` | Evaluation budget (default 60). |
 | `--seed` | RNG seed for reproducible search (default 0). |
+| `--alpha` | Significance level a gain must meet to count as an improvement (default `0.05`). |
+| `--repeats` | Measure each comparison this many times, incumbent and challenger interleaved. Default: once, or three times when the agent is detected to be non-deterministic (a baseline re-run whose per-row results differ). |
+| `--holdout-fraction` | Share of the dataset held out for the final check when `--val-data` is not given (default `0.25`; the split happens only when both parts keep at least 10 rows; `0` disables it). |
 | `--component NAME=module:attr` | Register a framework component to introspect for tunable knobs (repeatable). With components, `target`/`--runner` is the system entrypoint. |
 | `--runner module:attr` | Explicit runner callable driving the whole system. |
-| `--val-data FILE` | Held-out dataset; its score is reported as `validation`, and a tuned config that scores worse on it than the untuned agent is not applied. |
-| `--save-config FILE` | Write the winning configuration to a JSON file. |
+| `--val-data FILE` | Held-out dataset; its score is reported as `validation`, and the tuned config is applied only if it shows a **gain** over the untuned agent on it (significant under the paired test, or a positive point estimate on a set too small for any outcome to be significant). Otherwise the agent is left unchanged and `validation_rejected` is set. |
+| `--save-config FILE` | Write the winning configuration where `load_tuned_config` reads it back: `.json` as flat `{"component.knob": value}`, `.yaml`/`.yml` nested by component via `OptimizationResult.to_config`. Values that cannot round-trip -- live tool lists, callables, SDK objects -- are **not** written (a stand-in string would break the agent when re-applied); they are named under `_provenance.unexportable` (JSON) or a comment header (YAML) and on the console. |
+| `--concurrency N` | Rows evaluated at once per trial. |
 | `--verbose` | Log each trial. |
 
-`--json` emits the `OptimizationResult` summary (`improved`, `baseline_score`,
-`best_score`, `improvement`, `validation_score`, `n_evals`, `best_config`).
+A candidate replaces the incumbent only on a paired statistical test over the
+per-row deltas, and every run prints the verdict next to the numbers:
 
-!!! note "The target executes"
-    `evaluate`/`optimize` import and run your agent code, which executes it.
-    Point them at your own modules. An LLM judge or a live framework agent will
-    make real model/API calls (and may require credentials), so start with a
-    small dataset.
+```text
+Optimized 'capitals:build()' with strategy 'coordinate_ascent':
+  baseline   : 0.0000
+  best       : 1.0000  (improvement +1.0000)
+  significant: yes (p=0.004, 8 rows)
+  evaluations: 10
+  best config:
+    - agent.prompt = 'Answer with ONLY the capital city name.'
+```
+
+On a toy dataset (fewer than five rows at `alpha=0.05`) no outcome can be
+significant: the line reads `significant: no (...)` with the reason, and
+`improved` is `False` even when `best` is higher. See
+[Optimization & Evaluation](optimization.md#what-improved-means).
+
+`--json` emits `OptimizationResult.to_dict()`: `improved`, `baseline_score`,
+`best_score`, `improvement`, `validation_score`, `validation_complete`,
+`validation_baseline_score`, `validation_rejected`, `n_evals`,
+`duration_seconds`, `best_config`, `recommendations`, and the significance
+fields `significant`, `delta`, `p_value`, `ci_low`, `ci_high`, `n_rows`,
+`repeats`, `alpha`, `significance_basis`, `nondeterministic`,
+`untuned_parameters`, `rejected_reason`.
+
+!!! warning "The target executes: configs and targets are code"
+    `module:attribute` **imports** that module -- running its top-level code --
+    and a trailing `()` **calls** the object. The current working directory is
+    appended to `sys.path`, so a module in the directory you run from is
+    importable (appended, not prepended, so it cannot shadow an installed
+    package). The same holds for `--component`, `--runner` and every `target:`
+    entry of an `adapt train` config. **Only run targets and configs you would
+    run as a script**; a config file from an untrusted source is untrusted
+    code. An LLM judge or a live framework agent will make real model/API calls
+    (and may require credentials), so start with a small dataset.
+
+---
+
+## `adapt-agent train`
+
+Runs a full optimization pass from a YAML/JSON training config (see
+`examples/train.example.yaml` and `adapt_agent.optimization.config`).
+
+```bash
+adapt-agent train train.yaml
+adapt-agent train train.yaml --save-config tuned.yaml   # or .json
+adapt-agent train train.yaml --json
+```
+
+`--save-config` writes exactly as `optimize --save-config` does. The config's
+`judge:` section accepts only `provider`, `model`, `adversarial`, `scale`,
+`pass_threshold`, `score_is_normalized`, `criteria`, `metric_name`, `rubric`,
+`max_failures`, `on_error`, `temperature`, `max_tokens` and `system`; anything
+else -- notably `base_url` and `api_key` -- is refused, so a config cannot send
+graded outputs to another host or carry a credential (use the provider's
+environment variable). `metrics:` entries are names or mappings for metrics
+that need options, e.g. `{name: field_match, field: lane}`.
+
+The `optimizer:` section takes `type`, `max_evals` (default 60), `seed`
+(default 0), `min_improvement`, `kinds`, `suggest_tools`, `verbose`, and the
+same acceptance settings as the `optimize` flags: `alpha`, `repeats`,
+`holdout_fraction`, plus `allow_small_sample` (default `true`: a comparison
+too small to be significant is decided on the point estimate but reported as
+not significant; `false` accepts nothing unproven) and
+`detect_nondeterminism` (default `true`). `detect_nondeterminism` is refused
+for `type: default`, whose pipeline has no such switch. The text output
+prints the same `significant:` line as `optimize`.
 
 ---
 
@@ -198,7 +337,7 @@ The config root must be a JSON **object**. All top-level keys are optional.
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `policy_rules` | array of objects | Each: `name` (required), `condition` (required string, ≤ 1024 chars, must parse), `description`, `action` (`warn`/`block`/`modify`, default `warn`), `severity` (`low`/`medium`/`high`/`critical`, default `medium`). |
+| `policy_rules` | array of objects | Each: `name` (required), `condition` (required string, ≤ 1024 chars, must parse), `description`, `action` (`warn`/`block`/`modify`, or `require_approval` on a rule whose condition references `tool`; default `warn`), `severity` (`low`/`medium`/`high`/`critical`, default `medium`). |
 | `firewall` | object | `blocked_patterns` (array of valid regex strings), `allowed_patterns` (array of valid regex strings), `max_content_length` (positive integer). |
 | `adversarial` | object | `attack_patterns` (array of strings). |
 
@@ -244,7 +383,7 @@ The config root must be a JSON **object**. All top-level keys are optional.
     `validate` applies the same check as `PolicyEnforcer.add_rule`: the
     condition must parse, be within the length limit, use only the supported
     safe nodes (comparisons, boolean ops, arithmetic, subscripts, literals — no
-    function calls or attribute access), and reference only `state` or
-    `message`. A config that validates is one whose rules will register. It
+    function calls or attribute access), and reference only `state`,
+    `message` or `tool`. A config that validates is one whose rules will register. It
     cannot check that the keys a rule reads exist in your data; see
     [Policy Enforcement](policy.md) for `evaluate_rules`.
