@@ -15,9 +15,11 @@ Keyword arguments given to ``execute`` / ``aexecute`` are forwarded to the run
 method: ``deps=``, ``message_history=``, ``model_settings=``,
 ``usage_limits=``, ``deferred_tool_results=``, ``output_type=``,
 ``capabilities=`` and the rest. They are configuration, not content -- with
-one exception. ``message_history`` *is* content: it reaches the model as the
+two exceptions. ``message_history`` *is* content: it reaches the model as the
 conversation so far, so a poisoned history is as dangerous as a poisoned
-prompt. It is screened as input, like the payload, before the agent runs.
+prompt. ``deferred_tool_results`` is too: it supplies tool output produced
+outside the run, and approvals that may replace a call's arguments. Both are
+screened as input, like the payload, before the agent runs.
 
 When a ``message_history`` is given and the payload carries no prompt (no
 message, no ``prompt``/``input``/``query``/``text`` key) the run gets
@@ -71,13 +73,17 @@ class PydanticAIAdapter(GovernedAdapter):
 
     def _call_runner(self, runner: Runner, payload: dict[str, Any], **run_kwargs: Any) -> Any:
         history = run_kwargs.get("message_history")
-        if history:
-            # Content, not configuration: it is what the model reads next.
-            threats = self._screen_input(history)
-            if threats and self.block_on_violation:
-                raise SecurityBlockedError("Input blocked by security controls", threats)
-            if not _has_prompt(payload):
-                return runner(None, **run_kwargs)
+        # Content, not configuration: both are what the model reads next. A
+        # history is the conversation so far; deferred tool results are tool
+        # output supplied from outside the run, and approvals that may carry
+        # replacement arguments.
+        for content in (history, run_kwargs.get("deferred_tool_results")):
+            if content:
+                threats = self._screen_input(content)
+                if threats and self.block_on_violation:
+                    raise SecurityBlockedError("Input blocked by security controls", threats)
+        if history and not _has_prompt(payload):
+            return runner(None, **run_kwargs)
         return runner(self._prepare_input(payload), **run_kwargs)
 
 

@@ -381,6 +381,46 @@ def test_a_pending_ask_is_not_refused_by_a_pre_approval_guardrail_pass(oa):
     assert _input(guards, _ToolContext("wire", call_id="c8")).behavior["type"] == "reject_content"
 
 
+def test_one_tools_cached_verdict_is_never_spent_on_another_tool(oa):
+    # One governor serves every tool on the agent. A paused `search` call left
+    # an "allow" behind; a `nuke` call reusing its id and arguments must still
+    # meet the deny rule rather than collect that verdict.
+    search, nuke = _FunctionTool("search", needs_approval=True), _FunctionTool("nuke")
+    oa.govern_tools([search, nuke], tool_policy=ToolPolicy(deny=["nuke"]))
+    guards = {"tool_input_guardrails": nuke.tool_input_guardrails}
+
+    assert asyncio.run(search.needs_approval(_ToolContext("search"), {}, "c1")) is True
+    assert _input(guards, _ToolContext("nuke", call_id="c1")).behavior["type"] == "reject_content"
+
+
+def test_a_pending_ask_for_one_tool_does_not_wave_another_through(oa):
+    wire, pay = _FunctionTool("wire"), _FunctionTool("pay")
+    oa.govern_tools([wire, pay], tool_policy=ToolPolicy(require_approval=["wire", "pay"]))
+    guards = {"tool_input_guardrails": pay.tool_input_guardrails}
+
+    assert asyncio.run(wire.needs_approval(_ToolContext("wire"), {}, "c1")) is True
+    assert _input(guards, _ToolContext("pay", call_id="c1")).behavior["type"] == "reject_content"
+
+
+def test_a_cached_verdict_is_not_reused_once_the_policy_state_has_changed(oa):
+    # An abandoned run leaves its verdict behind. A later run that reuses the
+    # call id under different session state is judged afresh.
+    policy = PolicyEnforcer()
+    policy.add_rule("low", "d", "tool['name'] == 'wire' and state['tier'] == 'low'", "block")
+    wire = _FunctionTool("wire", needs_approval=True)
+    oa.govern_tools([wire], policy_enforcer=policy)
+    guards = {"tool_input_guardrails": wire.tool_input_guardrails}
+
+    assert asyncio.run(wire.needs_approval(_ToolContext("wire", tier="high"), {}, "c1")) is True
+    refused = _input(guards, _ToolContext("wire", call_id="c1", approved=True, tier="low"))
+    assert refused.behavior["type"] == "reject_content"
+
+    # The same state, by contrast, reuses the verdict and lets the call run.
+    assert asyncio.run(wire.needs_approval(_ToolContext("wire", tier="high"), {}, "c2")) is True
+    allowed = _input(guards, _ToolContext("wire", call_id="c2", approved=True, tier="high"))
+    assert allowed.behavior == {"type": "allow"}
+
+
 def test_shell_tools_auto_reject_a_block_and_leave_an_ask_for_a_human(oa):
     shell = _ShellTool()
     oa.govern_tools(shell, firewall=_firewall(), tool_policy=ToolPolicy(require_approval=["shell"]))

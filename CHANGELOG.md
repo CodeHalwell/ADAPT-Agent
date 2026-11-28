@@ -213,7 +213,8 @@ either a shared `gate=` or the individual `firewall=` / `defense=` /
   `DeferredToolRequests`, screens text and structured output, and holds streamed
   output at the model until it is screened. It attaches per agent or per run. The
   adapter forwards `deps`, `model_settings`, `usage_limits` and deferred tool
-  results, and screens `message_history` as input. `install_governance` and
+  results, and screens `message_history` and `deferred_tool_results` as input.
+  `install_governance` and
   `governance_output_validator` stay output-only (an existing agent cannot be
   given a capability) and now refuse `tool_policy`.
 - **CrewAI**: `governance_hooks()` / `CrewAIGovernance` bind `crewai.hooks`

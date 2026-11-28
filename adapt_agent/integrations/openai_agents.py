@@ -238,17 +238,29 @@ def _call_id(context: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _call_key(call_id: str, arguments: Any) -> tuple[str, str]:
-    """Identify one call by its id *and* its arguments.
+def _call_key(tool_name: str, call_id: str, arguments: Any) -> tuple[str, str, str]:
+    """Identify one call by its tool, its id *and* its arguments.
 
-    A call id is model-generated and tools are shared across runs, so an id
-    alone could pair one call's verdict with another call's arguments.
+    A call id is model-generated and one governor serves every tool on an
+    agent, across runs. An id alone could pair one call's verdict with another
+    call's arguments; an id and arguments alone could hand one *tool's* verdict
+    to another -- a pending, allowed ``search`` call and a later ``nuke`` call
+    with the same id and arguments shared an entry, and the deny rule for
+    ``nuke`` was never evaluated.
     """
     try:
         rendered = json.dumps(_parse_arguments(arguments), sort_keys=True, default=repr)
     except (TypeError, ValueError):
         rendered = repr(arguments)
-    return call_id, rendered
+    return tool_name, call_id, rendered
+
+
+def _same_state(left: Any, right: Any) -> bool:
+    """Whether two policy states are equal, treating an uncomparable pair as not."""
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
 
 
 class _Bounded(OrderedDict[Any, Any]):
@@ -357,8 +369,12 @@ class _ToolGovernor:
         self.on_tool_violation = on_tool_violation
         self.approvals = approvals
         self.screen_results = screen_results
-        # call -> the decision `needs_approval` reached, reused by the guardrail
-        # so one call is evaluated (and its violations recorded) once.
+        # call -> (decision, the policy state it was reached under), set by
+        # `needs_approval` and reused by the guardrail so one call is evaluated
+        # (and its violations recorded) once. A verdict is a function of the
+        # tool, its arguments and that state, so it is reused only when all
+        # three match: an entry left behind by an abandoned run cannot answer
+        # for a later one whose session state has changed.
         self._decisions: _Bounded = _Bounded()
         # calls `needs_approval` sent for approval and not yet seen approved.
         self._asked: _Bounded = _Bounded()
@@ -398,8 +414,9 @@ class _ToolGovernor:
             ctx = data.context
             name = ctx.tool_name
             call_id = _call_id(ctx)
-            key = _call_key(call_id, ctx.tool_arguments) if call_id is not None else None
-            cached = self._decisions.pop(key, None) if key is not None else None
+            key = _call_key(name, call_id, ctx.tool_arguments) if call_id is not None else None
+            entry = self._decisions.pop(key, None) if key is not None else None
+            cached = entry[0] if entry and _same_state(entry[1], _tool_state(ctx)) else None
             if cached is not None:
                 decision = _traced_decision(
                     self.observer, self.gate.agent_id, _OP_TOOL_CALL, lambda: cached
@@ -467,9 +484,10 @@ class _ToolGovernor:
                 own = bool(await _maybe_await(original(run_context, params, call_id)))
             else:
                 own = bool(original)
-            decision = self.gate.check_tool_call(tool_name, params, state=_tool_state(run_context))
-            key = _call_key(call_id, params)
-            self._decisions[key] = decision
+            state = _tool_state(run_context)
+            decision = self.gate.check_tool_call(tool_name, params, state=state)
+            key = _call_key(tool_name, call_id, params)
+            self._decisions[key] = (decision, state)
             if decision.blocked:
                 return False  # the guardrail refuses it; a human could change nothing
             if own or (decision.needs_approval and self.approvals):
@@ -496,6 +514,11 @@ class _ToolGovernor:
         original_on_approval = getattr(
             original_on_approval, "__adapt_agent_original__", original_on_approval
         )
+        # This tool's own store, keyed by call id alone: the approval item
+        # handed to `on_approval` does not carry the action `needs_approval`
+        # judged, so there is nothing else to match on. The SDK always asks
+        # `needs_approval` before `on_approval` for a call, which overwrites
+        # whatever an earlier run left under the same id.
         decisions: _Bounded = _Bounded()
 
         async def needs_approval(run_context: Any, payload: Any, call_id: str) -> bool:

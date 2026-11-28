@@ -411,7 +411,9 @@ out = guarded.execute({"messages": [{"role": "user", "content": "capital of Fran
   ```
 
   `message_history` is **content**, not configuration -- it is the conversation
-  the model reads next -- so the adapter screens it as input before the run. A
+  the model reads next -- so the adapter screens it as input before the run.
+  `deferred_tool_results` is screened the same way: it carries tool output
+  produced outside the run, and approvals that may replace a call's arguments. A
   payload with no prompt of its own (`{}`) plus a `message_history` runs with
   `user_prompt=None`, which is how Pydantic AI continues a conversation (for
   example to resume deferred tool calls), instead of sending the payload's
