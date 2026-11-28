@@ -306,7 +306,10 @@ def _exact_tail(scaled: Sequence[int], observed: int) -> float | None:
             return None
         distribution = grown
     tail = sum(count for total, count in distribution.items() if total >= observed)
-    return tail / float(2 ** len(scaled))
+    # Integer over integer: Python divides exactly, whatever the size. Converting
+    # the denominator to a float first overflowed from 1,024 rows upwards.
+    denominator: int = 2 ** len(scaled)
+    return tail / denominator
 
 
 def _interval(deltas: Sequence[float], alpha: float, seed: int | None) -> tuple[float, float]:

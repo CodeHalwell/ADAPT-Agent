@@ -307,6 +307,12 @@ def test_an_encoded_payload_is_decoded_and_rescanned(view: str, text: str) -> No
     assert view in {d["view"] for d in result["details"]}
 
 
+def _token_shaped_value() -> str:
+    """Three dot-separated base64url segments, the shape of a signed token."""
+    segments = (b'{"alg":"none"}', b'{"sub":"example"}', bytes(range(32)))
+    return ".".join(base64.urlsafe_b64encode(s).rstrip(b"=").decode() for s in segments)
+
+
 def test_base64_of_base64_is_found_and_the_nesting_is_bounded() -> None:
     once = base64.b64encode(_PAYLOAD.encode())
     twice = base64.b64encode(b"inner: " + once).decode()
@@ -320,8 +326,9 @@ def test_base64_of_base64_is_found_and_the_nesting_is_bounded() -> None:
     "text",
     [
         "sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-        "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
-        "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+        # A token-shaped value, assembled here so that no credential-looking
+        # literal sits in the repository for a secret scanner to find.
+        "Authorization: Bearer " + _token_shaped_value(),
         "data:image/png;base64," + base64.b64encode(bytes(range(256)) * 4).decode(),
         "commit 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
         "id " + base64.b64encode(b"just an ordinary sentence with nothing in it").decode(),
@@ -697,7 +704,13 @@ def test_ambiguous_repetition_is_refused(pattern: str) -> None:
     "pattern",
     [r"(?i)ignore (all|previous) instructions", r"\b\d{16}\b", r"(?i)ignore[\w ]*?instructions",
      r"[\w.+-]+@[\w-]+\.[\w.-]+", r"(\d{1,3}\.){3}\d{1,3}", r"(?:\s*,\s*\w+)*", r"(?:\w+\s+){0,3}x",
-     r"(?:\s|,)+", r"(?>a+)+", r"(ab)+", r"^\[trusted\].*", r"(?:ab|ac)+"],  # fmt: skip
+     r"(?:\s|,)+", r"(ab)+", r"^\[trusted\].*", r"(?:ab|ac)+",
+     # An atomic group cannot backtrack, so repeating it is safe. `re` only
+     # understands the syntax from Python 3.11.
+     pytest.param(
+         r"(?>a+)+",
+         marks=pytest.mark.skipif(sys.version_info < (3, 11), reason="atomic groups need 3.11"),
+     )],  # fmt: skip
 )
 def test_ordinary_patterns_are_accepted(pattern: str) -> None:
     fw = Firewall()

@@ -424,6 +424,14 @@ either a shared `gate=` or the individual `firewall=` / `defense=` /
   `delete_db` run, because CrewAI swallows every exception except `HookAborted`;
   a block now raises an error that is both.
 
+- **A streamed LangGraph message is screened whole even when messages
+  interleave.** `LangGraphAdapter.stream` / `astream` treated a change of message
+  id as the end of the previous message, so chunks of two messages interleaved
+  by parallel nodes or model calls were each screened in pieces and a pattern
+  split between them was delivered. Chunks are now held per message until it is
+  complete (its last chunk is marked, its node's `updates` event or a `values`
+  event arrives, or the stream ends) and released in arrival order.
+
 ### Known limitations
 
 - **Claude Agent SDK**: tool governance is **unverified against the real Claude

@@ -422,3 +422,104 @@ def test_langgraph_example_exits_zero_with_or_without_the_framework(script):
     assert result.returncode == 0, result.stderr[-2000:]
     assert result.stdout.strip()
     assert "Traceback" not in result.stderr
+
+
+# -- a streamed message is held until it is complete, whatever arrives between --
+
+
+class _Marked(_Chunk):
+    """A chunk that says it is the last of its message, as LangChain's does."""
+
+    chunk_position = "last"
+
+
+def _stream(items: list[Any], **kw: Any) -> tuple[list[Any], BaseException | None]:
+    agent = LangGraphAdapter(firewall=_firewall()).wrap_agent(_StreamingGraph(items))
+    released: list[Any] = []
+    try:
+        for item in agent.stream({"messages": []}, **kw):
+            released.append(item)
+    except SecurityBlockedError as exc:
+        return released, exc
+    return released, None
+
+
+def test_interleaved_messages_are_each_screened_whole():
+    """Chunks of two messages interleave when nodes, or model calls, run in parallel."""
+    items = [(_Chunk("SEC", "a"), {}), (_Chunk("hello", "b"), {}), (_Chunk("RET-7", "a"), {})]
+    released, blocked = _stream(items, stream_mode="messages")
+    assert blocked is not None
+    assert released == [], "half of a blocked message reached the consumer"
+
+
+def test_interleaved_clean_messages_are_released_in_arrival_order():
+    items = [(_Chunk("he", "a"), {}), (_Chunk("wor", "b"), {}), (_Chunk("llo", "a"), {})]
+    items.append((_Chunk("ld", "b"), {}))
+    assert _stream(items, stream_mode="messages") == (items, None)
+
+
+def test_a_non_message_event_does_not_release_an_unfinished_message():
+    items = [
+        ("messages", (_Chunk("SEC", "a"), {"langgraph_node": "model"})),
+        ("custom", {"progress": 1}),
+        ("messages", (_Chunk("RET-7", "a"), {"langgraph_node": "model"})),
+    ]
+    released, blocked = _stream(items, stream_mode=["messages", "custom"])
+    assert blocked is not None and released == []
+
+
+def test_a_marked_final_chunk_releases_its_message_without_waiting_for_the_end():
+    first = [(_Chunk("he", "a"), {}), (_Marked("llo", "a"), {})]
+    poisoned = [(_Chunk("SEC", "b"), {}), (_Chunk("RET-7", "b"), {})]
+    released, blocked = _stream(first + poisoned, stream_mode="messages")
+    # Message `a` was complete and clean, so it was delivered before `b` blocked.
+    assert released == first and blocked is not None
+
+
+def test_an_unfinished_message_holds_back_what_arrived_after_it():
+    """Order is kept: a finished message does not overtake an earlier open one."""
+    items = [(_Chunk("SEC", "a"), {}), (_Marked("fine", "b"), {}), (_Chunk("RET-7", "a"), {})]
+    released, blocked = _stream(items, stream_mode="messages")
+    assert released == [] and blocked is not None
+
+
+def test_an_updates_event_finishes_the_message_its_node_produced():
+    chunk_a = ("messages", (_Chunk("done", "a"), {"langgraph_node": "model"}))
+    chunk_b = ("messages", (_Chunk("SEC", "b"), {"langgraph_node": "other"}))
+    update = ("updates", {"model": {"messages": []}})
+    tail = ("messages", (_Chunk("RET-7", "b"), {"langgraph_node": "other"}))
+    released, blocked = _stream(
+        [chunk_a, update, chunk_b, tail], stream_mode=["messages", "updates"]
+    )
+    # `model` finished, so `a` and the update are out; `other` never did, and is blocked.
+    assert released == [chunk_a, update] and blocked is not None
+
+
+def test_a_values_event_finishes_every_open_message_in_its_namespace():
+    chunk = ("messages", (_Chunk("hello", "a"), {}))
+    values = ("values", {"messages": []})
+    later = ("messages", (_Chunk("SEC", "b"), {}))
+    tail = ("messages", (_Chunk("RET-7", "b"), {}))
+    released, blocked = _stream([chunk, values, later, tail], stream_mode=["messages", "values"])
+    assert released == [chunk, values] and blocked is not None
+
+
+def test_a_whole_message_is_complete_on_arrival():
+    class ToolMessage:  # named as LangChain names it; not a chunk
+        def __init__(self, content: str, id: str):
+            self.content, self.id = content, id
+
+    whole = (ToolMessage("42 rows", "t1"), {})
+    poisoned = [(_Chunk("SEC", "b"), {}), (_Chunk("RET-7", "b"), {})]
+    released, blocked = _stream([whole, *poisoned], stream_mode="messages")
+    assert released == [whole] and blocked is not None
+
+
+def test_a_finish_reason_marks_the_last_chunk():
+    class Finished(_Chunk):
+        response_metadata = {"finish_reason": "stop"}
+
+    first = [(_Chunk("he", "a"), {}), (Finished("llo", "a"), {})]
+    rest = [(_Chunk("SEC", "b"), {}), (_Chunk("RET-7", "b"), {})]
+    released, blocked = _stream(first + rest, stream_mode="messages")
+    assert released == first and blocked is not None

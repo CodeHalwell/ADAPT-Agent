@@ -618,3 +618,13 @@ def test_a_candidate_that_crashes_on_some_rows_is_not_crowned():
     result = GridSearchOptimizer(harness()).optimize(agent, rows(6, expected="ok"))
     # Right on 3 rows, crashed on 3: a gain on half the rows is not significant.
     assert result.best_config == {} and state["a.t"] == 0
+
+
+def test_the_exact_test_handles_more_than_a_thousand_rows() -> None:
+    """2**1024 does not fit in a float; the p-value is an exact integer ratio."""
+    from adapt_agent.optimization.significance import compare_rows
+
+    comparison = compare_rows([0.0] * 1100, [1.0] * 1100)
+    assert comparison.p_value is not None and 0.0 <= comparison.p_value < 1e-100
+    mixed = compare_rows([0.0, 1.0] * 600, [1.0, 0.0] * 600)
+    assert mixed.p_value is not None and mixed.p_value > 0.4

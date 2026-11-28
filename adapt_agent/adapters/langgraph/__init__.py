@@ -132,10 +132,11 @@ class _LangGraphGovernedAgent(_GovernedAgent):
     screened with the output controls *before it is yielded*:
 
     * ``stream_mode="messages"``: token chunks are held per message (grouped by
-      message id) and released together once the whole message has passed. A
-      blocked pattern split across two tokens is therefore still caught; the
-      cost is that the consumer receives each message whole instead of token
-      by token.
+      message id) and released together once the message is complete and has
+      passed, in arrival order -- also when the chunks of several messages
+      interleave. A blocked pattern split across two tokens is therefore still
+      caught; the cost is that the consumer receives each message whole instead
+      of token by token. See ``_MessageBuffer`` for what counts as complete.
     * every other mode (``"updates"``, ``"values"``, ``"custom"``, ...): each
       item is screened and released on its own.
 
@@ -315,8 +316,51 @@ class _LangGraphGovernedAgent(_GovernedAgent):
             raise SecurityBlockedError("Output blocked by security controls", threats)
 
 
+#: LangChain message classes that are whole messages rather than stream chunks.
+_WHOLE_MESSAGE_TYPES = frozenset(
+    {"AIMessage", "ToolMessage", "HumanMessage", "SystemMessage", "FunctionMessage", "ChatMessage"}
+)
+
+
+class _Held:
+    """One streamed item waiting in the buffer, and whether it may be released."""
+
+    __slots__ = ("item", "ready")
+
+    def __init__(self, item: Any, *, ready: bool = False):
+        self.item = item
+        self.ready = ready
+
+
 class _MessageBuffer:
-    """Holds ``messages``-mode chunks of one message until it is complete.
+    """Holds ``messages``-mode chunks until their message is complete and screened.
+
+    A message is screened as a whole -- its chunks' text joined -- because a
+    pattern split across tokens is invisible to any chunk-by-chunk check. So no
+    chunk of a message may be released before that message is known to be
+    complete, and "the next chunk belongs to a different message" is **not**
+    evidence of that: parallel nodes, or one node awaiting two models at once,
+    interleave their chunks. Releasing on a change of message id let
+    ``(a, "TOP"), (b, "hello"), (a, "SECRET")`` through with a firewall
+    blocking ``TOPSECRET``, because neither half of ``a`` was ever screened
+    beside the other.
+
+    Chunks are therefore kept per ``(namespace, message id)`` until one of
+    these says the message is finished:
+
+    * the chunk itself -- LangChain marks the final chunk
+      (``chunk_position == "last"``), a provider's ``finish_reason`` /
+      ``stop_reason`` arrives in ``response_metadata``, or the item is a whole
+      message rather than a chunk;
+    * an ``updates`` event naming the node that produced it, or a ``values``
+      event in its namespace (the step that produced it has ended);
+    * the end of the stream.
+
+    Items are released strictly in arrival order: an unfinished message at the
+    head holds back whatever arrived after it. With a model that never marks
+    its last chunk and a stream of ``messages`` alone, that means delivery at
+    the end of the stream -- screening before release costs latency, and this
+    is where the cost is paid.
 
     Item shapes follow ``graph.stream``'s arguments: ``data`` for one mode,
     ``(mode, data)`` for a list of modes, with a leading namespace when
@@ -331,8 +375,10 @@ class _MessageBuffer:
         self._single_mode = None if self._modes_listed else mode
         self._subgraphs = bool(run_kwargs.get("subgraphs", False))
         self._v2 = run_kwargs.get("version") == "v2"
-        self._pending: list[Any] = []
-        self._key: Any = None
+        #: Every item not yet released, in arrival order.
+        self._queue: list[_Held] = []
+        #: Unfinished messages: key -> (producing node, its held chunks).
+        self._open: dict[Any, tuple[Any, list[_Held]]] = {}
 
     def _classify(self, item: Any) -> tuple[Any, Any, Any]:
         """``(namespace, mode, data)`` for one streamed item."""
@@ -348,29 +394,88 @@ class _MessageBuffer:
         return ns, self._single_mode, rest
 
     def push(self, item: Any) -> list[Any]:
+        """Take one streamed item; return the items that may now be released."""
         ns, mode, data = self._classify(item)
         if mode == "messages" and isinstance(data, tuple) and data:
-            key = (ns, getattr(data[0], "id", None))
-            if self._pending and key == self._key and key[1] is not None:
-                self._pending.append(item)
-                return []
-            released = self.flush()
-            self._pending, self._key = [item], key
-            return released
-        released = self.flush()
+            chunk = data[0]
+            metadata = data[1] if len(data) > 1 else None
+            key = (_hashable(ns), getattr(chunk, "id", None))
+            held = _Held(item)
+            self._queue.append(held)
+            node = metadata.get("langgraph_node") if isinstance(metadata, dict) else None
+            self._open.setdefault(key, (node, []))[1].append(held)
+            if _is_final_chunk(chunk):
+                self._close(key)
+            return self._drain()
+        # Not a message chunk: screened on its own, and released in its turn.
         self._agent._screen_items([data])
-        released.append(item)
-        return released
+        for key in self._finished_by(_hashable(ns), mode, data):
+            self._close(key)
+        self._queue.append(_Held(item, ready=True))
+        return self._drain()
 
     def flush(self) -> list[Any]:
-        if not self._pending:
-            return []
-        pending, self._pending, self._key = self._pending, [], None
+        """The stream has ended, so every message still open is complete."""
+        for key in list(self._open):
+            self._close(key)
+        return self._drain()
+
+    def _finished_by(self, ns: Any, mode: Any, data: Any) -> list[Any]:
+        """Open messages that a non-message event shows to be complete."""
+        if mode == "values":
+            return [key for key in self._open if key[0] == ns]
+        if mode == "updates" and isinstance(data, dict):
+            return [
+                key
+                for key, (node, _) in self._open.items()
+                if key[0] == ns and node is not None and node in data
+            ]
+        return []
+
+    def _close(self, key: Any) -> None:
+        """Screen a finished message as a whole and mark its chunks releasable.
+
+        Raises:
+            SecurityBlockedError: If the message is blocked; none of its chunks
+                has been released, and none will be.
+        """
+        _, held = self._open.pop(key)
+        chunks = [self._classify(h.item)[2][0] for h in held]
         # The chunks' text, joined: a pattern split across tokens is matched.
-        chunks = [self._classify(item)[2][0] for item in pending]
         joined = "".join(c for c in (_chunk_text(chunk) for chunk in chunks) if c)
         self._agent._screen_items([joined, chunks])
-        return pending
+        for h in held:
+            h.ready = True
+
+    def _drain(self) -> list[Any]:
+        """Release the screened items at the head of the queue, in order."""
+        released = 0
+        while released < len(self._queue) and self._queue[released].ready:
+            released += 1
+        ready, self._queue = self._queue[:released], self._queue[released:]
+        return [h.item for h in ready]
+
+
+def _hashable(ns: Any) -> Any:
+    """A namespace as a dict-key-safe value (LangGraph yields tuples; v2, lists)."""
+    return tuple(ns) if isinstance(ns, list) else ns
+
+
+def _is_final_chunk(chunk: Any) -> bool:
+    """Whether a ``messages`` datum is known to be the end of its message.
+
+    Positive evidence only. An object that says nothing about its position is
+    treated as an unfinished chunk, which costs latency; the opposite guess
+    would release a message in pieces.
+    """
+    if getattr(chunk, "chunk_position", None) == "last":
+        return True
+    if type(chunk).__name__ in _WHOLE_MESSAGE_TYPES:
+        return True
+    metadata = getattr(chunk, "response_metadata", None)
+    if isinstance(metadata, dict):
+        return bool(metadata.get("finish_reason") or metadata.get("stop_reason"))
+    return False
 
 
 def _chunk_text(chunk: Any) -> str:

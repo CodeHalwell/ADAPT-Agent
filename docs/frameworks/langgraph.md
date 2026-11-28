@@ -297,6 +297,15 @@ message is complete and released together, so a pattern split across tokens is
 still caught -- at the cost of token-by-token delivery. Other modes are screened
 item by item. A blocked item raises `SecurityBlockedError` and is never yielded.
 
+A message counts as complete when its last chunk says so (LangChain's
+`chunk_position == "last"`, or a provider `finish_reason` / `stop_reason`), when
+an `updates` event names the node that produced it or a `values` event arrives,
+or when the stream ends. A change of message id is *not* taken as completion:
+chunks of two messages interleave when nodes or model calls run in parallel, and
+each message is still screened whole. Items are released in arrival order, so
+with a model that never marks its last chunk and `stream_mode="messages"` alone,
+delivery happens at the end of the stream.
+
 When `block_on_violation=True`, the adapter raises
 `SecurityBlockedError("Input blocked by security controls", threats)` before the
 graph runs, `"Input blocked by policy"` for a `block` rule, and `"Output blocked by
